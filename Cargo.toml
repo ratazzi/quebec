@@ -1,0 +1,85 @@
+[package]
+name = "quebec"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "quebec"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.90"
+chrono = "0.4.38"
+env_logger = "0.11.5"
+futures = "0.3.31"
+log = { version = "0.4.22", optional = false }
+sea-orm = { version = "1.1.0", features = [
+  "sqlx-postgres",
+  "sqlx-sqlite",
+  "sqlx-mysql",
+  "macros",
+  "runtime-tokio-rustls",
+  "debug-print",
+  "mock",
+] }
+sqlx-postgres = "0.8.2"
+thiserror = "1.0.64"
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-postgres = "0.7.12"
+clap = { version = "4.5.4", features = ["derive", "env"] }
+url = "2.5.2"
+rand = "0.8.5"
+# pyo3 = { version = "0.23.1", features = ["abi3-py38"] }
+# pyo3-log = "0.11.0"
+tracing = { version = "0.1.40", optional = false }
+tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-log = "0.2.0"
+signal-hook = "0.3.17"
+serde_json = "1.0.132"
+colored = "2.1.0"
+# serde_json_path_macros_internal = "0.1.1"
+# serde_json_path_macros = "0.1.4"
+# serde_json_path = "0.6.7"
+croner = "2.0.5"
+english-to-cron = { version = "0.1.2" }
+tokio-cron-scheduler = { version = "0.13.0", features = [
+  "english-to-cron",
+  "log",
+  "tracing-subscriber",
+] }
+serde_yaml = "0.9.34"
+serde = { version = "1.0.214", features = ["derive"] }
+uuid = { version = "1.11.0", features = ["v1", "v4"] }
+hostname = "0.4.0"
+async-trait = "0.1.83"
+humantime = "2.1.0"
+tokio-util = "0.7.12"
+# pyo3-asyncio = "0.20.0"
+
+[features]
+use-log = []
+use-tracing = []
+default = ["use-tracing"]
+
+[dependencies.pyo3]
+version = "0.23.2"
+# "abi3-py38" tells pyo3 (and maturin) to build using the stable ABI with minimum Python version 3.8
+features = [
+  "abi3-py38",
+  "num-bigint",
+  "num-complex",
+  "chrono",
+  "chrono-tz",
+  "rust_decimal",
+  "anyhow",
+  "experimental-async",
+  "py-clone",
+]
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+# "extension-module" tells pyo3 we want to build an extension module (skips linking against libpython.so)
+features = ["pyo3/extension-module"]
