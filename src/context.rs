@@ -190,7 +190,7 @@ impl AppContext {
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 1 day
             default_concurrency_control_period: Duration::from_secs(60),    // 3 minutes
-            dispatcher_polling_interval: Duration::from_secs(30),           // 1s
+            dispatcher_polling_interval: Duration::from_secs(10),           // 1s
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_secs(1), // 100ms

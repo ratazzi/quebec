@@ -14,6 +14,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub arguments: Option<String>,
     pub priority: i32,
+    pub failed_attempts: i32,
     pub active_job_id: Option<String>,
     pub scheduled_at: Option<DateTime>,
     pub finished_at: Option<DateTime>,

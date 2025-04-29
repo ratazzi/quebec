@@ -181,8 +181,10 @@ impl PyQuebec {
 
         let dsn = Url::parse(&url).unwrap();
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
-        opt.min_connections(2) // 设置最小空闲连接数
-            .max_connections(30) // 设置最大连接数
+        let min_conns = if url.contains("sqlite") { 1 } else { 2 };
+        let max_conns = if url.contains("sqlite") { 1 } else { 30 };
+        opt.min_connections(min_conns) // 设置最小空闲连接数
+            .max_connections(max_conns) // 设置最大连接数
             // .acquire_timeout(Duration::from_millis(100))
             .connect_timeout(Duration::from_secs(3)) // 设置连接超时时间
             .idle_timeout(Duration::from_secs(600)) // 设置空闲连接超时时间
@@ -335,12 +337,21 @@ impl PyQuebec {
             loop {
                 let result = worker.pick_job().await;
 
-                // 获取 GIL 并将结果发送到 Python 的 queue.Queue 中
+                // 获取 GIL 并将结果发送到 Python 的队列中
                 Python::with_gil(|py| {
                     let queue = queue.bind(py);
-                    let put_method = queue.getattr("put").unwrap();
-                    let ret = put_method.call1((result.unwrap(),));
-                    debug!("queue.Queue.put {:?}", ret);
+                    // 检查队列类型并选择合适的方法
+                    if queue.hasattr("put_nowait").unwrap() {
+                        // 处理 asyncio.Queue
+                        let put_method = queue.getattr("put_nowait").unwrap();
+                        let _ = put_method.call1((result.unwrap(),));
+                    } else if queue.hasattr("put").unwrap() {
+                        // 处理 queue.Queue
+                        let put_method = queue.getattr("put").unwrap();
+                        let _ = put_method.call1((result.unwrap(),));
+                    } else {
+                        error!("Unsupported queue type");
+                    }
                 });
             }
         });
@@ -351,9 +362,20 @@ impl PyQuebec {
                   _ = graceful_shutdown.cancelled() => {
                       Python::with_gil(|py| {
                           let queue = queue1.bind(py);
-                          let put_method = queue.getattr("shutdown").unwrap();
-                          put_method.call0().unwrap();
-                          info!("<queue.Queue> are shutdown");
+                          // 检查队列类型并选择合适的方法
+                          if queue.hasattr("close").unwrap() {
+                              // 处理 asyncio.Queue
+                              let close_method = queue.getattr("close").unwrap();
+                              let _ = close_method.call0();
+                              info!("<asyncio.Queue> are shutdown");
+                          } else if queue.hasattr("join").unwrap() {
+                              // 处理 queue.Queue
+                              let join_method = queue.getattr("join").unwrap();
+                              let _ = join_method.call0();
+                              info!("<queue.Queue> are shutdown");
+                          } else {
+                              error!("Unsupported queue type");
+                          }
                       });
                       break;
                   }

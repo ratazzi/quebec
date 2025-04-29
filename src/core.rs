@@ -54,6 +54,7 @@ impl Quebec {
                         class_name: ActiveValue::Set(job.class_name),
                         arguments: ActiveValue::Set(Some(params.to_string())),
                         priority: ActiveValue::Set(job.priority),
+                        failed_attempts: ActiveValue::Set(0),
                         active_job_id: ActiveValue::Set(Some(job.active_job_id)),
                         scheduled_at: ActiveValue::Set(Some(job.scheduled_at)),
                         finished_at: ActiveValue::Set(None),

@@ -176,6 +176,7 @@ where
         class_name: ActiveValue::Set(entry.class),
         arguments: ActiveValue::Set(Some(params.to_string())),
         priority: ActiveValue::Set(0),
+        failed_attempts: ActiveValue::Set(0),
         active_job_id: ActiveValue::Set(Some("".to_string())),
         scheduled_at: ActiveValue::Set(Some(scheduled_at)),
         finished_at: ActiveValue::Set(None),

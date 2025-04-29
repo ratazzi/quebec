@@ -308,8 +308,8 @@ impl Runnable {
                 Err(e) => {
                     // 返回失败
                     error!("error: {:?}", e);
-                    debug!("is PyException: {:?}", e.is_instance_of::<PyException>(py));
-                    debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
+                    // debug!("is PyException: {:?}", e.is_instance_of::<PyException>(py));
+                    // debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
                     // debug!("bound: {:?}", bound);
 
                     // apply discard_on
@@ -465,17 +465,20 @@ impl Runnable {
                     //     }
                     // }
 
+                    job.failed_attempts += 1;
+
                     let mut backtrace: Vec<String> = vec![];
                     let traceback = e.traceback_bound(py);
-                    warn!("traceback: {:?}", traceback);
+                    // warn!("traceback: {:?}", traceback);
 
                     if let Some(tb) = traceback {
                         backtrace =
                             tb.format().unwrap().to_string().lines().map(String::from).collect();
                     }
 
-                    error!("error_type: {}", e.get_type_bound(py).str().unwrap());
-                    error!("error_description: {}", e.value_bound(py).to_string());
+                    // error!("error_type: {}", e.get_type_bound(py).str().unwrap());
+                    // error!("error_type: {}", e.get_type_bound(py).qualname().unwrap());
+                    // error!("error_description: {}", e.value_bound(py).to_string());
 
                     let error_payload = serde_json::json!({
                         "exception_class": e.get_type_bound(py).str().unwrap().to_string(),
@@ -693,8 +696,6 @@ impl Execution {
         // Ok(job)
         result
     }
-
-    async fn retry(&mut self) {}
 }
 
 #[pymethods]
@@ -732,9 +733,8 @@ impl Execution {
     fn perform(&mut self) -> PyResult<()> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ret = rt.block_on(async { self.invoke().await });
-        debug!("-------------------------- Job result: {:?}", ret);
+        // debug!("-------------------------- Job result: {:?}", ret);
         if let Err(e) = ret {
-            // return Err(PyErr::new::<PyException, _>(e.to_string()));
             return Err(e.into());
         }
 
@@ -778,6 +778,106 @@ impl Execution {
                 debug!("Job result post: {:?}", ret);
             });
         });
+    }
+
+    fn retry(
+        &mut self, py: Python, strategy: RetryStrategy, exc: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let job = self.job.clone();
+        let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
+        let args: serde_json::Value =
+            serde_json::from_str(job.arguments.unwrap().as_str()).unwrap();
+        let e = exc.downcast::<PyException>().unwrap();
+        let error_type = e.get_type().qualname().unwrap().to_string();
+
+        let params = serde_json::json!({
+            "job_class": job.class_name,
+            "job_id": job.id,
+            "provider_job_id": "",
+            "queue_name": job.queue_name,
+            "priority": job.priority,
+            "arguments": args["arguments"],
+            "executions": job.failed_attempts + 1,
+            "exception_executions": {
+              format!("[{}]", error_type): job.failed_attempts + 1
+            },
+            "locale": "en",
+            "timezone": "UTC",
+            "scheduled_at": scheduled_at,
+            "enqueued_at": scheduled_at,
+        });
+
+        let span = tracing::info_span!("runner", jid = job.id, tid = self.tid.clone());
+        let _enter = span.enter();
+
+        if (job.failed_attempts as i64) >= strategy.attempts {
+            error!("Job `{}' failed after {} attempts", job.class_name, job.failed_attempts);
+            return Ok(());
+        }
+
+        py.allow_threads(|| {
+            let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+            let span = span.clone();
+            let job = rt.block_on(
+                async {
+                    warn!(
+                        "Attempt {} scheduled due to `{}' on {:?}",
+                        format!("#{}", job.failed_attempts + 1).bright_purple(),
+                        error_type,
+                        scheduled_at
+                    );
+
+                    let db = self.ctx.get_db().await;
+                    db.transaction::<_, solid_queue_jobs::ActiveModel, DbErr>(|txn| {
+                        Box::pin(async move {
+                            let concurrency_key =
+                                job.concurrency_key.clone().unwrap_or("".to_string());
+                            let job = solid_queue_jobs::ActiveModel {
+                                id: ActiveValue::NotSet,
+                                queue_name: ActiveValue::Set(job.queue_name),
+                                class_name: ActiveValue::Set(job.class_name),
+                                arguments: ActiveValue::Set(Some(params.to_string())),
+                                priority: ActiveValue::Set(job.priority),
+                                failed_attempts: ActiveValue::Set(job.failed_attempts + 1),
+                                active_job_id: ActiveValue::Set(Some(job.active_job_id.unwrap())),
+                                scheduled_at: ActiveValue::Set(Some(scheduled_at)),
+                                finished_at: ActiveValue::Set(None),
+                                concurrency_key: ActiveValue::Set(Some(concurrency_key.clone())),
+                                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                            }
+                            .save(txn)
+                            .await?;
+
+                            let job_id = job.id.clone().unwrap();
+                            let scheduled_execution =
+                                solid_queue_scheduled_executions::ActiveModel {
+                                    id: ActiveValue::not_set(),
+                                    job_id: ActiveValue::Set(job_id),
+                                    queue_name: ActiveValue::Set(job.queue_name.clone().unwrap()),
+                                    priority: ActiveValue::Set(job.priority.clone().unwrap()),
+                                    scheduled_at: ActiveValue::Set(scheduled_at),
+                                    created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                }
+                                .save(txn)
+                                .await?;
+
+                            // debug!("{:?}", scheduled_execution);
+                            Ok(job)
+                        })
+                    })
+                    .await
+                }
+                .instrument(span),
+            );
+
+            // debug!("scheduled: {:?}", job);
+            if job.is_err() {
+                error!("Job `{}' failed to schedule", job.err().unwrap());
+            }
+        });
+
+        Ok(())
     }
 }
 
@@ -1034,7 +1134,7 @@ impl Worker {
                             continue;
                         }
 
-                        debug!("------------------- runnable: {:?}", runnable);
+                        // debug!("------------------- runnable: {:?}", runnable);
                         // let handler = self.get_job_class(&job.class_name);
                         // if handler.is_err() {
                         //     error!("Job handler not found: {:?}", &job.class_name);
