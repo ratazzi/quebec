@@ -87,7 +87,7 @@ pub trait ProcessTrait {
             });
 
             tid = format!("{}", thread_id);
-            debug!("-------------------- python thread_id: {:?}", tid)
+            trace!("python thread_id: {:?}", tid)
         }
 
         tid

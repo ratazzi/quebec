@@ -20,6 +20,7 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid;
+use std::borrow::BorrowMut;
 
 use crate::context::*;
 use crate::core::Quebec;
@@ -104,6 +105,17 @@ impl EntityTrait for solid_queue_semaphores::Entity {
     }
 }
 
+#[pyfunction]
+fn signal_handler(py: Python<'_>, signum: i32, _frame: PyObject, quebec: Py<PyAny>) -> PyResult<()> {
+    info!("Received signal {}, initiating graceful shutdown", signum);
+
+    if let Err(e) = quebec.bind(py).call_method0("graceful_shutdown") {
+        error!("Error calling graceful_shutdown: {:?}", e);
+    }
+
+    Ok(())
+}
+
 #[pyclass(name = "ActiveLogger", subclass)]
 #[derive(Debug, Clone)]
 pub struct ActiveLogger {
@@ -157,6 +169,7 @@ pub struct PyQuebec {
     pub dispatcher: Arc<Dispatcher>,
     pub scheduler: Arc<Scheduler>,
     pub job_classes: Arc<RwLock<HashMap<String, Py<PyAny>>>>,
+    pub shutdown_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pyqueue_mode: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -195,9 +208,9 @@ impl PyQuebec {
 
         let mut _ctx = AppContext::new(dsn.clone(), Arc::new(db), opt.clone());
         if let Some(kwargs) = kwargs {
-            debug!("========================= kwargs: {:?}", kwargs);
+            debug!("kwargs: {:?}", kwargs);
             kwargs.iter().for_each(|(k, v)| {
-                debug!("========================= k: {:?} => {:?}", k, v);
+                trace!("{:?} => {:?}", k, v);
 
                 let binding = k.extract::<String>().unwrap();
                 let field_name = binding.as_str();
@@ -216,6 +229,7 @@ impl PyQuebec {
         // debug!("Quebec: {:?}", quebec);
 
         let job_classes = Arc::new(RwLock::new(HashMap::<String, Py<PyAny>>::new()));
+        let shutdown_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
 
         PyQuebec {
             ctx,
@@ -226,6 +240,7 @@ impl PyQuebec {
             dispatcher,
             scheduler,
             job_classes,
+            shutdown_handlers,
             pyqueue_mode: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
         }
@@ -310,20 +325,20 @@ impl PyQuebec {
         let _ = self.rt.spawn(async move {
             // let _ = dispatcher.dispatch(job).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
-            debug!("----------------------------- async fn post_job");
+            debug!("async fn post_job");
         });
 
         // self.handles.lock().unwrap().push(handle);
-        debug!("----------------------------- async fn post_job");
+        debug!("async fn post_job");
         Ok(())
     }
 
-    fn poll_job(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
-        if self.pyqueue_mode.load(Ordering::Relaxed) {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Already in pyqueue mode",
-            ));
-        }
+    fn feed_jobs_to_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
+        // if self.pyqueue_mode.load(Ordering::Relaxed) {
+        //     return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+        //         "Already in pyqueue mode",
+        //     ));
+        // }
 
         let worker = self.worker.clone();
         let queue = queue.clone_ref(py);
@@ -346,7 +361,7 @@ impl PyQuebec {
                         let put_method = queue.getattr("put_nowait").unwrap();
                         let _ = put_method.call1((result.unwrap(),));
                     } else if queue.hasattr("put").unwrap() {
-                        // 处理 queue.Queue
+                        // 处理 queue.Queue, multiprocessing.Queue
                         let put_method = queue.getattr("put").unwrap();
                         let _ = put_method.call1((result.unwrap(),));
                     } else {
@@ -372,7 +387,7 @@ impl PyQuebec {
                               // 处理 queue.Queue
                               let join_method = queue.getattr("join").unwrap();
                               let _ = join_method.call0();
-                              info!("<queue.Queue> are shutdown");
+                              // info!("<queue.Queue> are shutdown");
                           } else {
                               error!("Unsupported queue type");
                           }
@@ -382,7 +397,7 @@ impl PyQuebec {
                 }
             }
 
-            info!("sink job poller shutdown");
+            // info!("sink job poller shutdown");
         });
         self.handles.lock().unwrap().push(handle);
 
@@ -400,7 +415,7 @@ impl PyQuebec {
     //     Ok(())
     // }
 
-    fn non_blocking_run_worker_polling(&self) -> PyResult<()> {
+    fn spawn_job_claim_poller(&self) -> PyResult<()> {
         let worker = self.worker.clone();
         let _ = self.rt.spawn(async move {
             let _ = worker.run_main_loop().await;
@@ -409,7 +424,7 @@ impl PyQuebec {
         Ok(())
     }
 
-    fn non_blocking_run_dispatcher(&self) -> PyResult<()> {
+    fn spawn_dispatcher(&self) -> PyResult<()> {
         let dispatcher = self.dispatcher.clone();
         let _ = self.rt.spawn(async move {
             let _ = dispatcher.run().await;
@@ -418,7 +433,7 @@ impl PyQuebec {
         Ok(())
     }
 
-    fn non_blocking_run_scheduler(&self) -> PyResult<()> {
+    fn spawn_scheduler(&self) -> PyResult<()> {
         let scheduler = self.scheduler.clone();
         let _ = self.rt.spawn(async move {
             let _ = scheduler.run().await;
@@ -495,34 +510,7 @@ impl PyQuebec {
     // }
 
     fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
-        let bound = job_class.bind(py);
-        // let job_instance = bound.call1((23,))?;
-        // // let job_class = job_class.getattr("new")?;
-        // // let job_instance = job_class.call1((self.secret_number,))?;
-        // let job_instance = job_instance.cast_as::<ActiveJob>(py)?;
-
-        // // call perform
-        // job_instance.call_method0("perform")?;
-
-        // let binding = bound.to_string();
-        // let mut class_name = binding.split(".").last().unwrap().to_string();
-        // class_name.truncate(class_name.len() - 2);
-        // debug!("Registered job class: {:?}", class_name);
-
-        // self.job_classes.write().unwrap().insert(class_name, job_class);
-        // debug!("job classes: {:?}", self.job_classes);
-
-        // debug!("----------------------- {:?}", bound.downcast::<PyType>().unwrap().qualname());
-        // if let Ok(ty) = any.cast_as::<PyType>() {
-        //     // If successful, get the type name
-        //     debug!(ty.name());
-        // }
-
-        // debug!("=================queue_as: {:?}", bound.hasattr("queue_as"));
-        // job_class.setattr(py, "quebec", *self);
-        // Python::with_gil(|_py| {
         let _ = self.worker.register_job_class(py, job_class).unwrap();
-        // });
         Ok(())
     }
 
@@ -559,7 +547,7 @@ impl PyQuebec {
         if instance.hasattr("limits_concurrency")? {
             let strategy =
                 instance.getattr("limits_concurrency")?.extract::<ConcurrencyStrategy>()?;
-            debug!("-------------- limits_concurrency enabled: {}, {:?}", class_name, strategy);
+            debug!("limits_concurrency enabled: {}, {:?}", class_name, strategy);
 
             let func = strategy.key.into_bound(py);
             concurrency_key = Some(func.call(args, kwargs)?.extract::<String>().map_err(|e| {
@@ -650,26 +638,47 @@ impl PyQuebec {
         // debug!("runnables: {:?}", self.worker.runnables);
     }
 
-    fn graceful_shutdown(&self, py: Python) {
+    fn setup_signal_handler(&self, py: Python) -> PyResult<Py<PyAny>> {
+        info!("Setting up signal handlers");
+        let signal = py.import("signal")?;
+
+        let handler_func = wrap_pyfunction!(signal_handler)(py)?;
+        let functools = py.import("functools")?;
+        let quebec_obj = self.clone().into_pyobject(py)?;
+
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("quebec", quebec_obj)?;
+
+        let wrapped_handler = functools.getattr("partial")?.call(
+            (handler_func,),
+            Some(&kwargs)
+        )?;
+
+        signal.call_method1("signal", (signal.getattr("SIGINT")?, wrapped_handler.clone()))?;
+        signal.call_method1("signal", (signal.getattr("SIGTERM")?, wrapped_handler.clone()))?;
+        signal.call_method1("signal", (signal.getattr("SIGQUIT")?, wrapped_handler.clone()))?;
+
+        info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
+        Ok(wrapped_handler.into_pyobject(py)?.into())
+    }
+
+    fn graceful_shutdown(&self, py: Python) -> PyResult<()> {
         info!("Graceful shutdown initiated");
         self.ctx.graceful_shutdown.cancel();
         let timeout = self.ctx.shutdown_timeout.clone();
         let quit = self.ctx.force_quit.clone();
 
-        // let _ = self.rt.spawn(async move {
-        //     let result = tokio::time::timeout(timeout, async {
-        //         tokio::time::sleep(timeout).await;
-        //     })
-        //     .await;
-
-        //     match result {
-        //         Ok(_) => info!("All tasks have exited gracefully"),
-        //         Err(_) => {
-        //             quit.cancel();
-        //             warn!("Force quit");
-        //         }
-        //     }
-        // });
+        // invoke all shutdown handlers
+        let handlers = self.shutdown_handlers.write().unwrap();
+        debug!("{} shutdown handlers registered", handlers.len());
+        for handler in handlers.iter() {
+            debug!("invoke shutdown handler: {:?}", handler);
+            // Call the handler and log any errors, but continue to the next handler
+            if let Err(e) = handler.bind(py).call0() {
+                error!("Error calling shutdown handler: {:?}", e);
+                // Continue to next handler even if this one failed
+            }
+        }
 
         let handles = self.handles.clone();
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
@@ -698,6 +707,22 @@ impl PyQuebec {
                 }
             });
         });
+
+        std::process::exit(0);
+    }
+
+    fn on_shutdown(&mut self, py: Python, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let callable = handler.bind(py);
+        if !callable.is_callable() {
+            return Err(PyTypeError::new_err("Expected a callable object for shutdown handler"));
+        }
+
+        {
+            self.shutdown_handlers.write().unwrap().push(handler.clone_ref(py));
+            debug!("shutdown handler: {:?} registered", handler);
+        }
+
+        Ok(handler)
     }
 }
 

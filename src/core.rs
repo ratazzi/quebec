@@ -26,7 +26,7 @@ impl Quebec {
         let db = self.ctx.get_db().await;
         let _ = db.ping().await?;
         let duration = self.ctx.default_concurrency_control_period.clone();
-        println!("------------ job: {:?}", job);
+        trace!("job: {:?}", job);
 
         let job = db
             .transaction::<_, solid_queue_jobs::ActiveModel, DbErr>(|txn| {

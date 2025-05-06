@@ -25,7 +25,6 @@ use tokio::sync::Mutex;
 use colored::*;
 use tracing::{info_span, Instrument};
 
-use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
 
 async fn fake_runner(
@@ -156,7 +155,7 @@ async fn runner(
         });
 
         tid = format!("{}", thread_id);
-        debug!("-------------------- python thread_id: {:?}", tid)
+        trace!("python thread_id: {:?}", tid)
     }
 
     loop {
@@ -1035,6 +1034,8 @@ impl Worker {
 
                     let records: Vec<solid_queue_ready_executions::Model> =
                         solid_queue_ready_executions::Entity::find()
+                            // .select_only()
+                            // .column(solid_queue_ready_executions::Column::JobId)
                             .order_by_asc(solid_queue_ready_executions::Column::Priority)
                             .order_by_asc(solid_queue_ready_executions::Column::JobId)
                             .lock_with_behavior(
