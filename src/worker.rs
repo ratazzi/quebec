@@ -1018,63 +1018,79 @@ impl Worker {
     ) -> Result<Vec<solid_queue_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
+        // 移到闭包外面以避免生命周期问题
+        let use_skip_locked = self.ctx.use_skip_locked;
 
         let jobs = db
             .transaction::<_, Vec<solid_queue_claimed_executions::ActiveModel>, DbErr>(|txn| {
                 Box::pin(async move {
                     // 获取多个未被锁定的任务
-                    // let records: Vec<solid_queue_ready_executions::Model> = solid_queue_ready_executions::Entity::find()
-                    //     .from_raw_sql(Statement::from_sql_and_values(
-                    //         DbBackend::Postgres,
-                    //         r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
-                    //         [batch_size.into()],
-                    //     ))
+                    let db_backend = txn.get_database_backend();
+
+                    let records: Vec<solid_queue_ready_executions::Model> = match db_backend {
+                        // 对 SQLite 需要特殊处理
+                        DbBackend::Sqlite => {
+                            // 简单版本: 使用 FOR UPDATE 但没有 SKIP LOCKED
+                            solid_queue_ready_executions::Entity::find()
+                                .from_raw_sql(Statement::from_sql_and_values(
+                                    DbBackend::Sqlite,
+                                    "SELECT * FROM solid_queue_ready_executions ORDER BY priority ASC, job_id ASC LIMIT ?",
+                                    [batch_size.into()],
+                                ))
+                                .all(txn)
+                                .await?
+                        },
+                        // PostgreSQL 和 MySQL 统一处理，使用 FOR UPDATE SKIP LOCKED
+                        _ => {
+                            solid_queue_ready_executions::Entity::find()
+                                .from_raw_sql(Statement::from_sql_and_values(
+                                    db_backend,
+                                    r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
+                                    [batch_size.into()],
+                                ))
+                                .all(txn)
+                                .await?
+                        }
+                    };
+
+                    // let records: Vec<solid_queue_ready_executions::Model> =
+                    // solid_queue_ready_executions::Entity::find()
+                    //     // .select_only()
+                    //     // .column(solid_queue_ready_executions::Column::JobId)
+                    //     .order_by_asc(solid_queue_ready_executions::Column::Priority)
+                    //     .order_by_asc(solid_queue_ready_executions::Column::JobId)
+                    //     .lock_with_behavior(
+                    //         sea_query::LockType::Update,
+                    //         LockBehavior::SkipLocked,
+                    //     )
+                    //     .limit(batch_size)
                     //     .all(txn)
                     //     .await?;
 
-                    let records: Vec<solid_queue_ready_executions::Model> =
-                        solid_queue_ready_executions::Entity::find()
-                            // .select_only()
-                            // .column(solid_queue_ready_executions::Column::JobId)
-                            .order_by_asc(solid_queue_ready_executions::Column::Priority)
-                            .order_by_asc(solid_queue_ready_executions::Column::JobId)
-                            .lock_with_behavior(
-                                sea_query::LockType::Update,
-                                LockBehavior::SkipLocked,
-                            )
-                            .limit(batch_size)
-                            .all(txn)
-                            .await?;
+                    let mut claimed_jobs = Vec::new();
 
-                    if !records.is_empty() {
-                        let mut claimed_jobs = Vec::new();
-
-                        for execution in records {
-                            let claimed = solid_queue_claimed_executions::ActiveModel {
-                                id: ActiveValue::NotSet,
-                                job_id: ActiveValue::Set(execution.job_id),
-                                process_id: ActiveValue::NotSet,
-                                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                            }
-                            .save(txn)
-                            .await
-                            .unwrap();
-
-                            execution.delete(txn).await?;
-                            claimed_jobs.push(claimed);
+                    for execution in records {
+                        let claimed = solid_queue_claimed_executions::ActiveModel {
+                            id: ActiveValue::NotSet,
+                            job_id: ActiveValue::Set(execution.job_id),
+                            process_id: ActiveValue::NotSet,
+                            created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                         }
+                        .save(txn)
+                        .await
+                        .unwrap();
 
-                        Ok(claimed_jobs)
-                    } else {
-                        Err(DbErr::Custom("No jobs found".into()))
+                        execution.delete(txn).await?;
+                        claimed_jobs.push(claimed);
                     }
+                    Ok(claimed_jobs)
                 })
             })
             .await?;
 
         let claimed_models: Result<Vec<solid_queue_claimed_executions::Model>, _> =
             jobs.into_iter().map(|job| job.try_into_model()).collect();
-        debug!("elpased: {:?}", timer.elapsed());
+        trace!("elpased: {:?}", timer.elapsed());
         claimed_models.map_err(|e| anyhow::Error::new(e))
     }
 
@@ -1116,7 +1132,7 @@ impl Worker {
                         //   error!("unknown error: {:?}", e);
                         // }
 
-                        trace!("no job found: {:?}", e);
+                        error!("no job found: {:?}", e);
                         continue;
                     }
 
