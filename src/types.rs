@@ -170,6 +170,8 @@ pub struct PyQuebec {
     pub scheduler: Arc<Scheduler>,
     pub job_classes: Arc<RwLock<HashMap<String, Py<PyAny>>>>,
     pub shutdown_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
+    pub start_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
+    pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pyqueue_mode: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
@@ -230,6 +232,8 @@ impl PyQuebec {
 
         let job_classes = Arc::new(RwLock::new(HashMap::<String, Py<PyAny>>::new()));
         let shutdown_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
+        let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
+        let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
 
         PyQuebec {
             ctx,
@@ -241,6 +245,8 @@ impl PyQuebec {
             scheduler,
             job_classes,
             shutdown_handlers,
+            start_handlers,
+            stop_handlers,
             pyqueue_mode: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
         }
@@ -493,21 +499,43 @@ impl PyQuebec {
         })
     }
 
-    // fn on_start(&self, py: Python<'_>, klass: Py<PyAny>) -> PyResult<()> {
-    //     Ok(())
-    // }
+    fn on_start(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let callable = handler.bind(py);
+        if !callable.is_callable() {
+            return Err(PyTypeError::new_err("Expected a callable object for start handler"));
+        }
 
-    // fn on_stop(&self, py: Python<'_>, klass: Py<PyAny>) -> PyResult<()> {
-    //     Ok(())
-    // }
+        {
+            self.start_handlers.write().unwrap().push(handler.clone_ref(py));
+            debug!("Start handler: {:?} registered", handler);
+        }
 
-    // fn on_worker_start(&self, py: Python<'_>, klass: Py<PyAny>) -> PyResult<()> {
-    //     Ok(())
-    // }
+        Ok(handler)
+    }
 
-    // fn on_worker_stop(&self, py: Python<'_>, klass: Py<PyAny>) -> PyResult<()> {
-    //     Ok(())
-    // }
+    fn on_stop(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let callable = handler.bind(py);
+        if !callable.is_callable() {
+            return Err(PyTypeError::new_err("Expected a callable object for stop handler"));
+        }
+
+        {
+            self.stop_handlers.write().unwrap().push(handler.clone_ref(py));
+            debug!("Stop handler: {:?} registered", handler);
+        }
+
+        Ok(handler)
+    }
+
+    fn on_worker_start(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        self.worker.register_start_handler(py, handler.clone())?;
+        Ok(handler)
+    }
+
+    fn on_worker_stop(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        self.worker.register_stop_handler(py, handler.clone())?;
+        Ok(handler)
+    }
 
     fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
         let _ = self.worker.register_job_class(py, job_class).unwrap();
@@ -627,10 +655,9 @@ impl PyQuebec {
 
         // let _ = job_class.setattr(py, pyo3::intern!(py, "quebec"), self.clone());
 
-        let _ = job_class.setattr(py, "quebec", self.clone().into_py(py));
+        let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
         let ret = self.worker.register_job_class(py, job_class);
-        debug!("register_job_class: {:?}", ret);
         Ok(dup)
     }
 
@@ -662,24 +689,43 @@ impl PyQuebec {
         Ok(wrapped_handler.into_pyobject(py)?.into())
     }
 
+    fn spawn_all(&mut self) -> PyResult<()> {
+        // Call start handlers before spawning components
+        if let Err(e) = self.invoke_start_handlers() {
+            error!("Error calling start handlers: {:?}", e);
+        }
+
+        // Spawn all components
+        self.spawn_dispatcher()?;
+        self.spawn_scheduler()?;
+        self.spawn_job_claim_poller()?;
+
+        Ok(())
+    }
+
     fn graceful_shutdown(&self, py: Python) -> PyResult<()> {
         info!("Graceful shutdown initiated");
-        self.ctx.graceful_shutdown.cancel();
-        let timeout = self.ctx.shutdown_timeout.clone();
-        let quit = self.ctx.force_quit.clone();
 
-        // invoke all shutdown handlers
-        let handlers = self.shutdown_handlers.write().unwrap();
-        debug!("{} shutdown handlers registered", handlers.len());
+        // Call stop handlers first
+        if let Err(e) = self.invoke_stop_handlers() {
+            error!("Error calling stop handlers: {:?}", e);
+        }
+
+        // Then call shutdown handlers
+        let handlers = self.shutdown_handlers.read().unwrap();
         for handler in handlers.iter() {
-            debug!("invoke shutdown handler: {:?}", handler);
+            debug!("Invoke shutdown handler: {:?}", handler);
             // Call the handler and log any errors, but continue to the next handler
             if let Err(e) = handler.bind(py).call0() {
                 error!("Error calling shutdown handler: {:?}", e);
-                // Continue to next handler even if this one failed
             }
         }
 
+        // Cancel the token to initiate component shutdown
+        self.ctx.graceful_shutdown.cancel();
+
+        let timeout = self.ctx.shutdown_timeout.clone();
+        let quit = self.ctx.force_quit.clone();
         let handles = self.handles.clone();
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
 
@@ -711,6 +757,30 @@ impl PyQuebec {
         std::process::exit(0);
     }
 
+    pub fn invoke_start_handlers(&self) -> PyResult<()> {
+        Python::with_gil(|py| {
+            let handlers = self.start_handlers.read().unwrap();
+            for handler in handlers.iter() {
+                if let Err(e) = handler.bind(py).call0() {
+                    error!("Error calling start handler: {:?}", e);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub fn invoke_stop_handlers(&self) -> PyResult<()> {
+        Python::with_gil(|py| {
+            let handlers = self.stop_handlers.read().unwrap();
+            for handler in handlers.iter() {
+                if let Err(e) = handler.bind(py).call0() {
+                    error!("Error calling stop handler: {:?}", e);
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn on_shutdown(&mut self, py: Python, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
@@ -719,7 +789,7 @@ impl PyQuebec {
 
         {
             self.shutdown_handlers.write().unwrap().push(handler.clone_ref(py));
-            debug!("shutdown handler: {:?} registered", handler);
+            debug!("Shutdown handler: {:?} registered", handler);
         }
 
         Ok(handler)

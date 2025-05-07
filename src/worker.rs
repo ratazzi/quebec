@@ -26,6 +26,7 @@ use colored::*;
 use tracing::{info_span, Instrument};
 
 use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::exceptions::PyTypeError;
 
 async fn fake_runner(
     job: solid_queue_jobs::Model, handler: Bound<'_, PyAny>,
@@ -885,6 +886,8 @@ impl Execution {
 pub struct Worker {
     pub ctx: Arc<AppContext>,
     pub runnables: Arc<RwLock<HashMap<String, Runnable>>>,
+    pub start_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
+    pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     polling: Arc<tokio::sync::Mutex<i32>>,
     token: Arc<tokio::sync::Mutex<i32>>,
     dispatch_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Execution>>>,
@@ -896,6 +899,8 @@ pub struct Worker {
 impl Worker {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let runnables = Arc::new(RwLock::new(HashMap::<String, Runnable>::new()));
+        let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
+        let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let polling = Arc::new(tokio::sync::Mutex::new(0));
         let token = Arc::new(tokio::sync::Mutex::new(0));
         let (tx, mut _rx) = tokio::sync::mpsc::channel::<Execution>(ctx.worker_threads as usize);
@@ -909,6 +914,8 @@ impl Worker {
         Self {
             ctx,
             runnables,
+            start_handlers,
+            stop_handlers,
             polling,
             token,
             dispatch_receiver,
@@ -916,6 +923,34 @@ impl Worker {
             sink_sender,
             sink_receiver,
         }
+    }
+
+    pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
+        let callable = handler.bind(py);
+        if !callable.is_callable() {
+            return Err(PyTypeError::new_err("Expected a callable object for worker start handler"));
+        }
+
+        {
+            self.start_handlers.write().unwrap().push(handler.clone_ref(py));
+            debug!("Worker start handler: {:?} registered", handler);
+        }
+
+        Ok(())
+    }
+
+    pub fn register_stop_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
+        let callable = handler.bind(py);
+        if !callable.is_callable() {
+            return Err(PyTypeError::new_err("Expected a callable object for worker stop handler"));
+        }
+
+        {
+            self.stop_handlers.write().unwrap().push(handler.clone_ref(py));
+            debug!("Worker stop handler: {:?} registered", handler);
+        }
+
+        Ok(())
     }
 
     fn get_runnables(&self) -> PyResult<Vec<String>> {
@@ -1107,6 +1142,17 @@ impl Worker {
 
         let quit = self.ctx.graceful_shutdown.clone();
 
+        // Call worker start handlers before starting the main loop
+        Python::with_gil(|py| {
+            let handlers = self.start_handlers.read().unwrap();
+            for handler in handlers.iter() {
+                match handler.bind(py).call0() {
+                    Ok(_) => debug!("Worker start handler executed successfully in main loop"),
+                    Err(e) => error!("Error calling worker start handler in main loop: {:?}", e)
+                }
+            }
+        });
+
         // 生产者发送任务
         loop {
             tokio::select! {
@@ -1119,8 +1165,20 @@ impl Worker {
                 //     quit.cancel();
                 // }
                 _ = quit.cancelled() => {
-                  info!("Graceful shutdown, stop polling");
-                  return Ok(());
+                    info!("Graceful shutdown, stop polling");
+
+                    // Call worker stop handlers before exiting
+                    Python::with_gil(|py| {
+                        let handlers = self.stop_handlers.read().unwrap();
+                        for handler in handlers.iter() {
+                            match handler.bind(py).call0() {
+                                Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
+                                Err(e) => error!("Error calling worker stop handler in main loop: {:?}", e)
+                            }
+                        }
+                    });
+
+                    return Ok(());
                 }
                 _ = polling_interval.tick() => {
                     let claimed = self.claim_jobs(worker_threads).instrument(tracing::info_span!("polling", tid=thread_id)).await;
@@ -1174,11 +1232,34 @@ impl Worker {
         let tid = Self::get_tid();
 
         debug!("Worker started: {:?}", tid);
+
+        // Call worker start handlers
+        Python::with_gil(|py| {
+            let handlers = self.start_handlers.read().unwrap();
+            for handler in handlers.iter() {
+                match handler.bind(py).call0() {
+                    Ok(_) => debug!("Worker start handler executed successfully"),
+                    Err(e) => error!("Error calling worker start handler: {:?}", e)
+                }
+            }
+        });
+
         let ret = runner(self.ctx.clone(), tid.clone(), state, rx)
             .instrument(info_span!("runner", tid = tid.clone()))
             .await;
-        debug!("Worker stopped: {:?} {:?}", &tid, ret);
-        Ok(())
+
+        // Call worker stop handlers
+        Python::with_gil(|py| {
+            let handlers = self.stop_handlers.read().unwrap();
+            for handler in handlers.iter() {
+                match handler.bind(py).call0() {
+                    Ok(_) => debug!("Worker stop handler executed successfully"),
+                    Err(e) => error!("Error calling worker stop handler: {:?}", e)
+                }
+            }
+        });
+
+        ret
     }
 
     pub async fn pick_job(&self) -> Result<Execution, anyhow::Error> {

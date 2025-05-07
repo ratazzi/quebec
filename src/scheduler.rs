@@ -264,10 +264,10 @@ impl Scheduler {
                     })
                     .await?;
 
-                debug!("upsert_task: {:?}", ret);
+                trace!("Upsert task: {:?}", ret);
             }
         }
-        debug!("scheduled: {:?}", scheduled);
+        debug!("Scheduled: {:?}", scheduled);
 
         // let num_intervals = 3; // 假设我们想创建 3 个 interval
         let entries = scheduled.clone();
@@ -375,7 +375,7 @@ impl Scheduler {
                     Err(_) => warn!("Some scheduler tasks did not complete within timeout"),
                 }
 
-                debug!("scheduler stopped");
+                debug!("Scheduler stopped");
                 return Ok(());
               }
               // _ = tokio::signal::ctrl_c() => {
