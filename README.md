@@ -4,6 +4,8 @@ Quebec is a simple background task queue for processing asynchronous tasks. The 
 
 This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 
+> **Warning:** This project is in early development stage. Not recommended for production use.
+
 ## Why Quebec?
 
 - **Simplified Architecture**: No dependencies on Redis or message queues

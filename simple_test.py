@@ -68,7 +68,14 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGQUIT, signal_handler)
 
-# @q.register_job
+# qc.setup_signal_handler()
+
+# @qc.on_shutdown
+# def handler1():
+#     logger.info("[DEBUG] shutdown handler1")
+
+
+@qc.register_job
 class FakeJob(quebec.BaseClass):
     queue_as = 'high'
     concurrency_limit = 1
@@ -151,24 +158,25 @@ class FakeJob(quebec.BaseClass):
 if __name__ == "__main__":
     current_pid = os.getpid()
     logger.info(f"The current process ID is \033[91m{current_pid}\033[0m")
-    q.register_job_class(FakeJob)
+    # qc.register_job_class(FakeJob)
 
     queued = FakeJob.perform_later(q, 3466, foo='bar')
 
-    qc.non_blocking_run_dispatcher()
-    qc.non_blocking_run_scheduler()
-    qc.non_blocking_run_worker_polling()
+    qc.spawn_dispatcher()
+    qc.spawn_scheduler()
+    qc.spawn_job_claim_poller()
 
     q = queue.Queue()
     threaded_runner = quebec.ThreadedRunner(q, event)
 
     threads = 1
     if threads > 0:
-        qc.poll_job(q)
+        qc.feed_jobs_to_queue(q)
     for i in range(threads):
         threading.Thread(target=threaded_runner.run).start()
 
     # app executor
+    # qc.wait_for_shutdown()
     while True:
         try:
             # print('--------------- running loop ---------------')
