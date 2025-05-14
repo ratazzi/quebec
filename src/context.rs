@@ -1,7 +1,8 @@
 use anyhow::Result;
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
-use sea_orm::{ConnectOptions, Database, DatabaseConnection};
+use sea_orm::*;
+use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -156,8 +157,8 @@ impl DiscardStrategy {
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
     pub dsn: Url,
-    pub db: Arc<DatabaseConnection>,
-    pub connect_options: ConnectOptions,
+    pub db: Option<Arc<DatabaseConnection>>, // 对于 SQLite 使用共享连接
+    pub connect_options: ConnectOptions, // 用于创建新连接
     pub use_skip_locked: bool,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
@@ -176,8 +177,13 @@ pub struct AppContext {
 }
 
 impl AppContext {
-    pub fn new(dsn: Url, db: Arc<DatabaseConnection>, connect_options: ConnectOptions) -> Self {
-        Self {
+    pub fn new(
+        dsn: Url, 
+        db: Option<Arc<DatabaseConnection>>, 
+        connect_options: ConnectOptions,
+        options: Option<HashMap<String, PyObject>>
+    ) -> Self {
+        let mut ctx = Self {
             cwd: std::env::current_dir().unwrap(),
             dsn,
             db,
@@ -198,12 +204,163 @@ impl AppContext {
             worker_threads: 3,
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
+        };
+        
+        // 如果有传入选项，则覆盖默认配置
+        if let Some(options) = options {
+            Python::with_gil(|py| {
+                // 处理 use_skip_locked
+                if let Some(val) = options.get("use_skip_locked") {
+                    if let Ok(value) = val.extract::<bool>(py) {
+                        ctx.use_skip_locked = value;
+                    }
+                }
+                
+                // 处理 process_heartbeat_interval
+                if let Some(val) = options.get("process_heartbeat_interval") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.process_heartbeat_interval = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.process_heartbeat_interval = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 process_alive_threshold
+                if let Some(val) = options.get("process_alive_threshold") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.process_alive_threshold = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.process_alive_threshold = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 shutdown_timeout
+                if let Some(val) = options.get("shutdown_timeout") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.shutdown_timeout = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.shutdown_timeout = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 silence_polling
+                if let Some(val) = options.get("silence_polling") {
+                    if let Ok(value) = val.extract::<bool>(py) {
+                        ctx.silence_polling = value;
+                    }
+                }
+                
+                // 处理 preserve_finished_jobs
+                if let Some(val) = options.get("preserve_finished_jobs") {
+                    if let Ok(value) = val.extract::<bool>(py) {
+                        ctx.preserve_finished_jobs = value;
+                    }
+                }
+                
+                // 处理 clear_finished_jobs_after
+                if let Some(val) = options.get("clear_finished_jobs_after") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.clear_finished_jobs_after = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.clear_finished_jobs_after = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 default_concurrency_control_period
+                if let Some(val) = options.get("default_concurrency_control_period") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.default_concurrency_control_period = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.default_concurrency_control_period = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 dispatcher_polling_interval
+                if let Some(val) = options.get("dispatcher_polling_interval") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.dispatcher_polling_interval = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.dispatcher_polling_interval = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 dispatcher_batch_size
+                if let Some(val) = options.get("dispatcher_batch_size") {
+                    if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.dispatcher_batch_size = value;
+                    }
+                }
+                
+                // 处理 dispatcher_concurrency_maintenance_interval
+                if let Some(val) = options.get("dispatcher_concurrency_maintenance_interval") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.dispatcher_concurrency_maintenance_interval = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs(value);
+                    }
+                }
+                
+                // 处理 worker_polling_interval
+                if let Some(val) = options.get("worker_polling_interval") {
+                    if let Ok(value) = val.extract::<Duration>(py) {
+                        ctx.worker_polling_interval = value;
+                    } else if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.worker_polling_interval = Duration::from_secs(value);
+                    } else if let Ok(value) = val.extract::<f64>(py) {
+                        ctx.worker_polling_interval = Duration::from_millis((value * 1000.0) as u64);
+                    }
+                }
+                
+                // 处理 worker_threads
+                if let Some(val) = options.get("worker_threads") {
+                    if let Ok(value) = val.extract::<u64>(py) {
+                        ctx.worker_threads = value;
+                    }
+                }
+            });
         }
+        
+        ctx
     }
 
+    // 新的方法，返回 Result 类型，允许调用者处理错误
+    pub async fn get_db_result(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
+        // 对于 SQLite 数据库，返回共享连接
+        if self.dsn.scheme().contains("sqlite") {
+            if let Some(db) = &self.db {
+                return Ok(db.clone());
+            }
+        }
+
+        // 对于 PostgreSQL，每次都创建新连接
+        // 这样可以确保高并发情况下不会出现连接竞争
+        let conn = Database::connect(self.connect_options.clone()).await?;
+        Ok(Arc::new(conn))
+    }
+
+    // 保持原来的接口，但内部使用新的错误处理方式
+    // 如果出错，会记录错误并尝试重试
     pub async fn get_db(&self) -> Arc<DatabaseConnection> {
-        // Database::connect(self.connect_options.clone()).await
-        self.db.clone()
+        // 尝试获取连接，如果失败则重试
+        for retry in 0..3 {
+            match self.get_db_result().await {
+                Ok(db) => return db,
+                Err(e) => {
+                    if retry < 2 {
+                        // 如果还有重试机会，记录错误并等待一会儿再重试
+                        warn!("Failed to get database connection, retrying ({}/3): {}", retry + 1, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * (retry + 1) as u64)).await;
+                    } else {
+                        // 如果所有重试都失败，记录错误并抛出异常
+                        error!("Failed to get database connection after 3 retries: {}", e);
+                        panic!("Failed to get database connection: {}", e);
+                    }
+                }
+            }
+        }
+
+        // 这里实际上不会到达，因为如果所有重试都失败，会在循环内抛出异常
+        unreachable!()
     }
 }
 

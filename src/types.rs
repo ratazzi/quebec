@@ -206,21 +206,31 @@ impl PyQuebec {
             .sqlx_logging(true)
             .sqlx_logging_level(log::LevelFilter::Trace);
 
+        // 为所有数据库类型预先创建一个连接
+        // 这个连接将被包装在 Arc 中并在需要时使用
+        // 对于高并发操作，将通过 get_connection 方法获取新连接
         let db = rt.block_on(async { Database::connect(opt.clone()).await.unwrap() });
+        let db_option = Some(Arc::new(db));
 
-        let mut _ctx = AppContext::new(dsn.clone(), Arc::new(db), opt.clone());
+        // 将 kwargs 转换为 HashMap<String, PyObject>
+        let options = if let Some(kwargs) = kwargs {
+            let mut options_map = HashMap::new();
+            kwargs.iter().for_each(|(k, v)| {
+                let key = k.extract::<String>().unwrap();
+                // 使用 Python::with_gil 来获取 GIL
+                Python::with_gil(|py| {
+                    options_map.insert(key, v.to_object(py));
+                });
+            });
+            Some(options_map)
+        } else {
+            None
+        };
+
+        let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
+        // 所有参数已经在 AppContext.new 中处理过了
         if let Some(kwargs) = kwargs {
             debug!("kwargs: {:?}", kwargs);
-            kwargs.iter().for_each(|(k, v)| {
-                trace!("{:?} => {:?}", k, v);
-
-                let binding = k.extract::<String>().unwrap();
-                let field_name = binding.as_str();
-                match field_name {
-                    "use_skip_locked" => _ctx.use_skip_locked = v.extract::<bool>().unwrap_or(true),
-                    &_ => todo!(),
-                }
-            });
         }
 
         let ctx = Arc::new(_ctx);
