@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workers - Control Plane</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-white text-black min-h-screen">
+  <div class="max-w-7xl mx-auto p-4 md:p-6">
+    <h1 class="text-3xl font-bold mb-6">Control Plane</h1>
+    
+    <nav class="flex flex-wrap border-b mb-6">
+      <a href="index.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Overview
+      </a>
+      <a href="queues.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Queues
+      </a>
+      <a href="failed-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Failed jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-900">3</span>
+      </a>
+      <a href="in-progress-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        In Progress jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-900">0</span>
+      </a>
+      <a href="blocked-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Blocked jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-900">0</span>
+      </a>
+      <a href="scheduled-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Scheduled jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-900">0</span>
+      </a>
+      <a href="finished-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Finished jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-900">0</span>
+      </a>
+      <a href="workers.html" class="px-4 h-8 font-medium border-b-2 border-black">
+        Workers
+      </a>
+    </nav>
+    
+    <!-- Workers Table -->
+    <div class="overflow-x-auto rounded-lg border border-gray-200">
+      <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+          <tr>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Worker ID
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Hostname
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              PID
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Queues
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Status
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Started At
+            </th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          <!-- Worker 1 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">worker-1</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">app-server-01</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">12345</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">default, mailers</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                Active
+              </span>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">2025-04-30 08:45:12</div>
+            </td>
+          </tr>
+          
+          <!-- Worker 2 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">worker-2</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">app-server-02</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">67890</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">default, low_priority</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
+                Active
+              </span>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">2025-04-30 08:47:35</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid;
 use std::borrow::BorrowMut;
+use crate::web::control_plane::ControlPlaneExt;
 
 use crate::context::*;
 use crate::core::Quebec;
@@ -188,7 +189,7 @@ impl PyQuebec {
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4) // 配置线程数量
+                .worker_threads(16) // 配置线程数量，增加以匹配数据库连接需求
                 .enable_all()
                 .build()
                 .unwrap(),
@@ -200,7 +201,7 @@ impl PyQuebec {
         let max_conns = if url.contains("sqlite") { 1 } else { 30 };
         opt.min_connections(min_conns) // 设置最小空闲连接数
             .max_connections(max_conns) // 设置最大连接数
-            // .acquire_timeout(Duration::from_millis(100))
+            .acquire_timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(3)) // 设置连接超时时间
             .idle_timeout(Duration::from_secs(600)) // 设置空闲连接超时时间
             .sqlx_logging(true)
@@ -803,6 +804,20 @@ impl PyQuebec {
         }
 
         Ok(handler)
+    }
+
+    fn start_control_plane(&self, addr: String) -> PyResult<()> {
+        let ctx = self.ctx.clone();
+        let rt = self.rt.clone();
+        let handle = rt.spawn(async move {
+            let server_handle = ControlPlaneExt::start_control_plane(&ctx, addr);
+            match server_handle.await {
+                Ok(_) => debug!("Control plane server task completed"),
+                Err(e) => error!("Control plane server task failed: {}", e),
+            }
+        });
+        self.handles.lock().unwrap().push(handle);
+        Ok(())
     }
 }
 

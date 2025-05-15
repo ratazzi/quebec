@@ -8,6 +8,7 @@ mod semaphore;
 mod supervisor;
 mod types;
 mod worker;
+pub mod web;
 
 use context::*;
 use entities::solid_queue_claimed_executions;

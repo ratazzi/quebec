@@ -1,0 +1,30 @@
+<!-- 使用 Turbo Streams 格式更新统计数据 -->
+<turbo-stream action="update" target="failed-jobs-count">
+  <template>
+    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ failed_jobs_count }}</span>
+  </template>
+</turbo-stream>
+
+<turbo-stream action="update" target="in-progress-jobs-count">
+  <template>
+    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ in_progress_jobs_count }}</span>
+  </template>
+</turbo-stream>
+
+<turbo-stream action="update" target="blocked-jobs-count">
+  <template>
+    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ blocked_jobs_count }}</span>
+  </template>
+</turbo-stream>
+
+<turbo-stream action="update" target="scheduled-jobs-count">
+  <template>
+    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ scheduled_jobs_count }}</span>
+  </template>
+</turbo-stream>
+
+<turbo-stream action="update" target="finished-jobs-count">
+  <template>
+    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ finished_jobs_count }}</span>
+  </template>
+</turbo-stream>

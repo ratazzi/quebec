@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Queue Details - Control Plane</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-white text-black min-h-screen">
+  <div class="max-w-7xl mx-auto p-4 md:p-6">
+    <h1 class="text-3xl font-bold mb-6">Control Plane</h1>
+    
+    <nav class="flex flex-wrap border-b mb-6">
+      <a href="index.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Overview
+      </a>
+      <a href="queues.html" class="px-4 h-8 font-medium border-b-2 border-black">
+        Queues
+      </a>
+      <a href="failed-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Failed jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">3</span>
+      </a>
+      <a href="in-progress-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        In Progress jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="blocked-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Blocked jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="scheduled-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Scheduled jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="finished-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Finished jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="workers.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Workers
+      </a>
+    </nav>
+    
+    <!-- Breadcrumb -->
+    <div class="flex items-center text-sm text-gray-500 mb-6">
+      <a href="queues.html" class="hover:text-black">Queues</a>
+      <span class="mx-2">/</span>
+      <span class="text-black">default</span>
+    </div>
+    
+    <!-- Queue Header -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
+      <div>
+        <h2 class="text-2xl font-bold">default</h2>
+        <p class="text-gray-500">Primary application queue</p>
+      </div>
+      <div class="flex mt-4 md:mt-0 space-x-3">
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+          Pause
+        </button>
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+          Clear
+        </button>
+      </div>
+    </div>
+    
+    <!-- Queue Stats -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <!-- Stat Card 1 -->
+      <div class="rounded-lg border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-500">Jobs Processed</div>
+        <div class="text-2xl font-bold mt-1">1,245</div>
+        <div class="text-xs text-gray-500 mt-1">Last 24 hours</div>
+      </div>
+      
+      <!-- Stat Card 2 -->
+      <div class="rounded-lg border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-500">Average Processing Time</div>
+        <div class="text-2xl font-bold mt-1">230ms</div>
+        <div class="text-xs text-gray-500 mt-1">Last 24 hours</div>
+      </div>
+      
+      <!-- Stat Card 3 -->
+      <div class="rounded-lg border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-500">Failure Rate</div>
+        <div class="text-2xl font-bold mt-1">0.24%</div>
+        <div class="text-xs text-gray-500 mt-1">Last 24 hours</div>
+      </div>
+      
+      <!-- Stat Card 4 -->
+      <div class="rounded-lg border border-gray-200 p-4">
+        <div class="text-sm font-medium text-gray-500">Active Workers</div>
+        <div class="text-2xl font-bold mt-1">2</div>
+        <div class="text-xs text-gray-500 mt-1">Currently processing</div>
+      </div>
+    </div>
+    
+    <!-- Tabs -->
+    <div class="border-b border-gray-200 mb-6">
+      <div class="flex flex-wrap -mb-px">
+        <button class="inline-flex items-center h-8 px-4 font-medium border-b-2 border-black text-black">
+          Pending Jobs
+        </button>
+        <button class="inline-flex items-center h-8 px-4 font-medium text-gray-500 hover:text-black border-b-2 border-transparent hover:border-gray-300">
+          Processing Jobs
+        </button>
+        <button class="inline-flex items-center h-8 px-4 font-medium text-gray-500 hover:text-black border-b-2 border-transparent hover:border-gray-300">
+          Failed Jobs
+        </button>
+        <button class="inline-flex items-center h-8 px-4 font-medium text-gray-500 hover:text-black border-b-2 border-transparent hover:border-gray-300">
+          Completed Jobs
+        </button>
+      </div>
+    </div>
+    
+    <!-- Filters -->
+    <div class="flex flex-wrap items-center gap-3 mb-6">
+      <div class="relative">
+        <select class="appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-black focus:border-black">
+          <option>Filter by job class...</option>
+          <option>Order::ProcessingJob</option>
+          <option>Payment::ProcessingJob</option>
+          <option>Shipping::ProcessingJob</option>
+        </select>
+        <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+          </svg>
+        </div>
+      </div>
+      
+      <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+        Clear
+      </button>
+    </div>
+    
+    <!-- Jobs Table -->
+    <div class="overflow-x-auto rounded-lg border border-gray-200">
+      <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+          <tr>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Job
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Arguments
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Enqueued At
+            </th>
+            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Actions
+            </th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          <!-- Job 1 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Order::ProcessingJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Order/644754881</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500 truncate max-w-xs">{"order_id": 644754881, "payment_method": "credit_card"}</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500">2025-04-30 10:05:12</div>
+              <div class="text-xs text-gray-400">4 minutes ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <a href="job-details.html" class="text-gray-600 hover:text-black mr-3">View</a>
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+          
+          <!-- Job 2 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Payment::ProcessingJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Payment/123456789</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500 truncate max-w-xs">{"payment_id": 123456789, "amount": 99.99, "currency": "USD"}</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500">2025-04-30 10:04:45</div>
+              <div class="text-xs text-gray-400">5 minutes ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <a href="job-details.html" class="text-gray-600 hover:text-black mr-3">View</a>
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+          
+          <!-- Job 3 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Shipping::ProcessingJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Shipment/987654321</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500 truncate max-w-xs">{"shipment_id": 987654321, "carrier": "FedEx", "tracking_number": "FDX123456789"}</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-500">2025-04-30 10:01:32</div>
+              <div class="text-xs text-gray-400">8 minutes ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <a href="job-details.html" class="text-gray-600 hover:text-black mr-3">View</a>
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+    <!-- Pagination -->
+    <div class="flex items-center justify-between mt-4">
+      <div class="text-sm text-gray-500">
+        Showing <span class="font-medium">1</span> to <span class="font-medium">3</span> of <span class="font-medium">42</span> jobs
+      </div>
+      <div class="flex space-x-2">
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+          Previous
+        </button>
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-3 py-1">
+          Next
+        </button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

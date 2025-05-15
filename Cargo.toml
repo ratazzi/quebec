@@ -55,6 +55,9 @@ async-trait = "0.1.83"
 humantime = "2.1.0"
 tokio-util = "0.7.12"
 # pyo3-asyncio = "0.20.0"
+axum = "0.7"
+tera = "1.19"
+tower-http = { version = "0.5", features = ["trace", "fs"] }
 
 [features]
 use-log = []

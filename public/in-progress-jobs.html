@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>In Progress Jobs - Control Plane</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-white text-black min-h-screen">
+  <div class="max-w-7xl mx-auto p-4 md:p-6">
+    <h1 class="text-3xl font-bold mb-6">Control Plane</h1>
+    
+    <nav class="flex flex-wrap border-b mb-6">
+      <a href="index.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Overview
+      </a>
+      <a href="queues.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Queues
+      </a>
+      <a href="failed-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Failed jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">3</span>
+      </a>
+      <a href="in-progress-jobs.html" class="px-4 h-8 font-medium border-b-2 border-black">
+        In Progress jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="blocked-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Blocked jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="scheduled-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Scheduled jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="finished-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Finished jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="workers.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Workers
+      </a>
+    </nav>
+    
+    <!-- Filters -->
+    <div class="flex flex-wrap items-center gap-3 mb-6">
+      <div class="relative">
+        <select class="appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-black focus:border-black">
+          <option>Filter by job class...</option>
+          <option>Order::ProcessingJob</option>
+          <option>Payment::ProcessingJob</option>
+          <option>Shipping::ProcessingJob</option>
+        </select>
+        <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+          </svg>
+        </div>
+      </div>
+      
+      <div class="relative">
+        <select class="appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-black focus:border-black">
+          <option>Filter by queue name</option>
+          <option>default</option>
+          <option>mailers</option>
+          <option>low_priority</option>
+        </select>
+        <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+          </svg>
+        </div>
+      </div>
+      
+      <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+        Clear
+      </button>
+      
+      <div class="flex-grow"></div>
+      
+      <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+        Clear all
+      </button>
+    </div>
+    
+    <!-- Table -->
+    <div class="overflow-x-auto rounded-lg border border-gray-200">
+      <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+          <tr>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Job
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Queue
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Worker
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Runtime
+            </th>
+            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Actions
+            </th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          <!-- Job 1 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Email::DeliveryJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Email/123456</div>
+              <div class="text-xs text-gray-400">Started 45 seconds ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">mailers</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">worker-1</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">45s</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+          
+          <!-- Job 2 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Order::ProcessingJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Order/789012</div>
+              <div class="text-xs text-gray-400">Started 2 minutes ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">default</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">worker-2</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">2m 12s</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+          
+          <!-- Job 3 -->
+          <tr>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm font-medium text-gray-900">Report::GenerationJob</div>
+              <div class="text-sm text-gray-500">gid://once-storefront/Report/345678</div>
+              <div class="text-xs text-gray-400">Started 8 minutes ago</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">default</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">worker-1</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap">
+              <div class="text-sm text-gray-900">8m 37s</div>
+            </td>
+            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+              <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+                Cancel
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    
+    <!-- Pagination -->
+    <div class="flex items-center justify-between mt-4">
+      <div class="text-sm text-gray-700">
+        1 / 1
+      </div>
+      <div class="flex space-x-2">
+        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
+          Previous page
+        </button>
+        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
+          Next page
+        </button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -28,38 +28,6 @@ use tracing::{info_span, Instrument};
 use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
 
-async fn fake_runner(
-    job: solid_queue_jobs::Model, handler: Bound<'_, PyAny>,
-) -> Result<solid_queue_jobs::Model> {
-    info!("Processing job: {:?}", job);
-
-    // 执行 perform
-    let ret = handler.call_method0("perform");
-    match ret {
-        Ok(_) => {
-            // 返回成功
-            Ok(job)
-        }
-        Err(e) => {
-            // 返回失败
-            error!("error: {:?}", e);
-            Err(anyhow::anyhow!("unknown error"))
-        }
-    }
-
-    // 生成一个随机数
-    // let mut rng = rand::thread_rng();
-    // let random_number: u8 = rng.gen_range(0..2);
-
-    // if random_number == 0 {
-    //     // 返回成功
-    //     Ok(job)
-    // } else {
-    //     // 返回失败
-    //     Err(anyhow::anyhow!("unknown error"))
-    // }
-}
-
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
     match value {
         serde_json::Value::String(s) => s.to_object(py),
@@ -92,50 +60,6 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
         serde_json::Value::Null => py.None(),
     }
 }
-
-// async fn after_executed(
-//     txn: &DatabaseTransaction, claimed: solid_queue_claimed_executions::Model,
-//     result: Result<solid_queue_jobs::Model>,
-// ) -> Result<solid_queue_jobs::ActiveModel, DbErr> {
-//     let job_id = claimed.id;
-
-//     if let Err(ref err) = result {
-//         error!("Job failed: {:?}", err);
-//         claimed.delete(txn).await?;
-
-//         // 写入 failed_executions 表
-//         let failed_execution = solid_queue_failed_executions::ActiveModel {
-//             id: ActiveValue::NotSet,
-//             job_id: ActiveValue::Set(job_id),
-//             error: ActiveValue::Set(Some(err.to_string())),
-//             created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-//         };
-//         failed_execution.save(txn).await?;
-
-//         let job = solid_queue_jobs::Entity::find_by_id(job_id).one(txn).await.unwrap();
-//         return Ok(job.unwrap().into());
-//     }
-
-//     let processed_job = result.unwrap();
-//     // 更新 jobs 表
-
-//     let mut job: solid_queue_jobs::ActiveModel = processed_job.into();
-//     job.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
-//     job.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-//     job.clone().update(txn).await?;
-
-//     // 直接删除 claimed_executions 表中的记录
-//     let delete_result = solid_queue_claimed_executions::Entity::delete_many()
-//         .filter(solid_queue_claimed_executions::Column::Id.eq(claimed.id))
-//         .exec(txn)
-//         .await?;
-
-//     if delete_result.rows_affected == 0 {
-//         return Err(DbErr::Custom("Claimed job not found".into()));
-//     }
-
-//     Ok(job)
-// }
 
 async fn runner(
     ctx: Arc<AppContext>, thread_id: String, state: Arc<Mutex<i32>>,
@@ -1053,35 +977,59 @@ impl Worker {
     ) -> Result<Vec<solid_queue_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
-        // 移到闭包外面以避免生命周期问题
         let use_skip_locked = self.ctx.use_skip_locked;
 
         let jobs = db
             .transaction::<_, Vec<solid_queue_claimed_executions::ActiveModel>, DbErr>(|txn| {
                 Box::pin(async move {
-                    // 获取多个未被锁定的任务
-                    let db_backend = txn.get_database_backend();
+                    // Get list of paused queues
+                    let paused_queues: Vec<String> = solid_queue_pauses::Entity::find()
+                        .select_only()
+                        .column(solid_queue_pauses::Column::QueueName)
+                        .into_tuple()
+                        .all(txn)
+                        .await?;
 
+                    if !paused_queues.is_empty() {
+                        debug!("Paused queues: {:?}", paused_queues);
+                    }
+
+                    // Get jobs from non-paused queues
+                    let db_backend = txn.get_database_backend();
                     let records: Vec<solid_queue_ready_executions::Model> = match db_backend {
-                        // 对 SQLite 需要特殊处理
                         DbBackend::Sqlite => {
-                            // 简单版本: 使用 FOR UPDATE 但没有 SKIP LOCKED
-                            solid_queue_ready_executions::Entity::find()
+                            // For SQLite, filter out paused queues in application code
+                            let mut records = solid_queue_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     DbBackend::Sqlite,
                                     "SELECT * FROM solid_queue_ready_executions ORDER BY priority ASC, job_id ASC LIMIT ?",
                                     [batch_size.into()],
                                 ))
                                 .all(txn)
-                                .await?
+                                .await?;
+
+                            records.retain(|record| !paused_queues.contains(&record.queue_name));
+                            records
                         },
-                        // PostgreSQL 和 MySQL 统一处理，使用 FOR UPDATE SKIP LOCKED
                         _ => {
+                            // For PostgreSQL and MySQL, filter in SQL
+                            let mut stmt = format!(
+                                r#"SELECT * FROM "solid_queue_ready_executions" WHERE "queue_name" NOT IN ({}) ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
+                                paused_queues.iter().enumerate().map(|(i, _)| format!("${}", i + 2)).collect::<Vec<_>>().join(",")
+                            );
+
+                            if paused_queues.is_empty() {
+                                stmt = r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#.to_string();
+                            }
+
+                            let mut values: Vec<Value> = vec![batch_size.into()];
+                            values.extend(paused_queues.iter().map(|q| q.clone().into()));
+
                             solid_queue_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     db_backend,
-                                    r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
-                                    [batch_size.into()],
+                                    &stmt,
+                                    values,
                                 ))
                                 .all(txn)
                                 .await?

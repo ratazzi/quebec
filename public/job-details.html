@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Job Details - Control Plane</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body class="bg-white text-black min-h-screen">
+  <div class="max-w-7xl mx-auto p-4 md:p-6">
+    <h1 class="text-3xl font-bold mb-6">Control Plane</h1>
+    
+    <nav class="flex flex-wrap border-b mb-6">
+      <a href="index.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Overview
+      </a>
+      <a href="queues.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Queues
+      </a>
+      <a href="failed-jobs.html" class="px-4 h-8 font-medium border-b-2 border-black">
+        Failed jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">3</span>
+      </a>
+      <a href="in-progress-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        In Progress jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="blocked-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Blocked jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="scheduled-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Scheduled jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="finished-jobs.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Finished jobs <span class="ml-1 px-2 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+      </a>
+      <a href="workers.html" class="px-4 h-8 font-medium text-gray-600 hover:text-black hover:border-b-2 hover:border-gray-300">
+        Workers
+      </a>
+    </nav>
+    
+    <!-- Breadcrumb -->
+    <div class="flex items-center text-sm text-gray-500 mb-6">
+      <a href="failed-jobs.html" class="hover:text-black">Failed jobs</a>
+      <span class="mx-2">/</span>
+      <span class="text-black">Order::ProcessingJob #644754880</span>
+    </div>
+    
+    <!-- Job Header -->
+    <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
+      <div>
+        <h2 class="text-2xl font-bold">Order::ProcessingJob</h2>
+        <p class="text-gray-500">gid://once-storefront/Order/644754880</p>
+      </div>
+      <div class="flex mt-4 md:mt-0 space-x-3">
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+          Discard
+        </button>
+        <button class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+          Retry
+        </button>
+      </div>
+    </div>
+    
+    <!-- Job Details -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+      <!-- Left Column -->
+      <div class="space-y-6">
+        <!-- Basic Info -->
+        <div class="rounded-lg border border-gray-200 overflow-hidden">
+          <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-medium">Basic Information</h3>
+          </div>
+          <div class="p-4 space-y-3">
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Status</div>
+              <div class="col-span-2 text-sm">
+                <span class="px-2 py-1 text-xs font-medium rounded-full bg-red-100 text-red-800">
+                  Failed
+                </span>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Queue</div>
+              <div class="col-span-2 text-sm">default</div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Priority</div>
+              <div class="col-span-2 text-sm">0</div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Created at</div>
+              <div class="col-span-2 text-sm">2025-04-30 09:30:12</div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Failed at</div>
+              <div class="col-span-2 text-sm">2025-04-30 09:30:15</div>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <div class="text-sm text-gray-500">Attempts</div>
+              <div class="col-span-2 text-sm">1</div>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Error Information -->
+        <div class="rounded-lg border border-gray-200 overflow-hidden">
+          <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-medium">Error Information</h3>
+          </div>
+          <div class="p-4 space-y-3">
+            <div class="text-sm text-red-600 font-medium">NoMethodError: undefined method `access_token' for nil:NilClass</div>
+            <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+              <pre class="text-xs text-gray-800 whitespace-pre-wrap">NoMethodError: undefined method `access_token' for nil:NilClass
+  from /app/models/order.rb:235:in `process_payment'
+  from /app/jobs/order/processing_job.rb:27:in `perform'
+  from /gems/activejob-7.1.0/lib/active_job/execution.rb:53:in `block in perform_now'
+  from /gems/activesupport-7.1.0/lib/active_support/callbacks.rb:110:in `block in run_callbacks'
+  from /gems/solid_queue-0.1.1/lib/solid_queue/job_wrapper.rb:29:in `perform'</pre>
+            </div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Right Column -->
+      <div class="space-y-6">
+        <!-- Arguments -->
+        <div class="rounded-lg border border-gray-200 overflow-hidden">
+          <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-medium">Arguments</h3>
+          </div>
+          <div class="p-4">
+            <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+              <pre class="text-xs text-gray-800 whitespace-pre-wrap">[
+  {
+    "order_id": 644754880,
+    "payment_method": "credit_card",
+    "notify_customer": true
+  }
+]</pre>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Job Context -->
+        <div class="rounded-lg border border-gray-200 overflow-hidden">
+          <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-medium">Job Context</h3>
+          </div>
+          <div class="p-4">
+            <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+              <pre class="text-xs text-gray-800 whitespace-pre-wrap">{
+  "locale": "en",
+  "timezone": "Eastern Time (US & Canada)",
+  "user_id": 12345,
+  "request_id": "f7ceb5a1-8e7d-4f37-b7fd-42388127a67c",
+  "correlation_id": "8d3f4c2e-1a2b-3c4d-5e6f-7g8h9i0j1k2l"
+}</pre>
+            </div>
+          </div>
+        </div>
+        
+        <!-- Execution History -->
+        <div class="rounded-lg border border-gray-200 overflow-hidden">
+          <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h3 class="text-sm font-medium">Execution History</h3>
+          </div>
+          <div class="divide-y divide-gray-200">
+            <div class="p-4">
+              <div class="flex justify-between items-start">
+                <div>
+                  <div class="text-sm font-medium">Attempt #1</div>
+                  <div class="text-xs text-gray-500">2025-04-30 09:30:15</div>
+                </div>
+                <span class="px-2 py-1 text-xs font-medium rounded-full bg-red-100 text-red-800">
+                  Failed
+                </span>
+              </div>
+              <div class="mt-2 text-sm text-red-600">NoMethodError: undefined method `access_token' for nil:NilClass</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
