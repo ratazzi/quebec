@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+
+{% block title %}Job Details: {{ job.id }} - Control Plane{% endblock %}
+
+{% block content %}
+<turbo-frame id="content">
+  <!-- Breadcrumb -->
+  <div class="flex items-center text-sm text-gray-500 mb-6">
+    {% if job.status == 'failed' %}
+      <a href="/failed-jobs" class="hover:text-black">Failed jobs</a>
+    {% elif job.status == 'scheduled' %}
+      <a href="/scheduled-jobs" class="hover:text-black">Scheduled jobs</a>
+    {% elif job.status == 'blocked' %}
+      <a href="/blocked-jobs" class="hover:text-black">Blocked jobs</a>
+    {% elif job.status == 'processing' %}
+      <a href="/in-progress-jobs" class="hover:text-black">In Progress jobs</a>
+    {% elif job.status == 'finished' %}
+      <a href="/finished-jobs" class="hover:text-black">Finished jobs</a>
+    {% else %}
+      <a href="/queues/{{ job.queue_name }}" class="hover:text-black">Queue: {{ job.queue_name }}</a>
+    {% endif %}
+    <span class="mx-2">/</span>
+    <span class="text-black">{{ job.class_name }} #{{ job.id }}</span>
+  </div>
+  
+  <!-- Job Header -->
+  <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6">
+    <div>
+      <h2 class="text-2xl font-bold">{{ job.class_name }}</h2>
+      <p class="text-gray-500">ID: {{ job.id }}</p>
+    </div>
+    <div class="flex mt-4 md:mt-0 space-x-3">
+      {% if job.status == 'failed' %}
+        <form action="/failed-jobs/{{ job.id }}/delete" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+            Discard
+          </button>
+        </form>
+        <form action="/failed-jobs/{{ job.id }}/retry" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+            Retry
+          </button>
+        </form>
+      {% elif job.status == 'scheduled' %}
+        <form action="/scheduled-jobs/{{ job.execution_id }}/cancel" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
+            Cancel
+          </button>
+        </form>
+      {% elif job.status == 'blocked' %}
+        <form action="/blocked-jobs/{{ job.execution_id }}/unblock" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+            Unblock
+          </button>
+        </form>
+      {% endif %}
+    </div>
+  </div>
+  
+  <!-- Job Details -->
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+    <!-- Left Column -->
+    <div class="space-y-6">
+      <!-- Basic Info -->
+      <div class="rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+          <h3 class="text-sm font-medium">Basic Information</h3>
+        </div>
+        <div class="p-4 space-y-3">
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Status</div>
+            <div class="col-span-2 text-sm">
+              <span class="px-2 py-1 text-xs font-medium rounded-full 
+                {% if job.status == 'failed' %}bg-red-100 text-red-800
+                {% elif job.status == 'processing' %}bg-blue-100 text-blue-800
+                {% elif job.status == 'scheduled' %}bg-purple-100 text-purple-800
+                {% elif job.status == 'blocked' %}bg-amber-100 text-amber-800
+                {% elif job.status == 'finished' %}bg-green-100 text-green-800
+                {% else %}bg-gray-100 text-gray-800{% endif %}">
+                {{ job.status | title }}
+              </span>
+            </div>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Queue</div>
+            <div class="col-span-2 text-sm">{{ job.queue_name }}</div>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Priority</div>
+            <div class="col-span-2 text-sm">0</div>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Created at</div>
+            <div class="col-span-2 text-sm">{{ job.created_at }}</div>
+          </div>
+          {% if job.status == 'failed' and job.failed_at %}
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Failed at</div>
+            <div class="col-span-2 text-sm">{{ job.failed_at }}</div>
+          </div>
+          {% endif %}
+          {% if job.status == 'finished' and job.finished_at %}
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Finished at</div>
+            <div class="col-span-2 text-sm">{{ job.finished_at }}</div>
+          </div>
+          {% endif %}
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Attempts</div>
+            <div class="col-span-2 text-sm">1</div>
+          </div>
+        </div>
+      </div>
+      
+      <!-- Error Information -->
+      <div class="rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+          <h3 class="text-sm font-medium">Error Information</h3>
+        </div>
+        <div class="p-4 space-y-3">
+          {% if job.error %}
+          <div class="text-sm text-red-600 font-medium">{{ job.error }}</div>
+          {% if job.backtrace %}
+          <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+            <pre class="text-xs text-gray-800 whitespace-pre-wrap">{{ job.backtrace }}</pre>
+          </div>
+          {% endif %}
+          {% else %}
+          <div class="text-sm text-gray-500">No errors reported for this job.</div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    
+    <!-- Right Column -->
+    <div class="space-y-6">
+      <!-- Arguments -->
+      <div class="rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+          <h3 class="text-sm font-medium">Arguments</h3>
+        </div>
+        <div class="p-4">
+          {% if job.arguments %}
+          <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+            <pre class="text-xs text-gray-800 whitespace-pre-wrap">{{ job.arguments }}</pre>
+          </div>
+          {% else %}
+          <div class="text-sm text-gray-500">No arguments for this job.</div>
+          {% endif %}
+        </div>
+      </div>
+      
+      <!-- Job Context -->
+      <div class="rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+          <h3 class="text-sm font-medium">Job Context</h3>
+        </div>
+        <div class="p-4">
+          {% if job.context %}
+          <div class="bg-gray-50 rounded p-3 overflow-x-auto">
+            <pre class="text-xs text-gray-800 whitespace-pre-wrap">{{ job.context }}</pre>
+          </div>
+          {% else %}
+          <div class="text-sm text-gray-500">{
+  "locale": "en",
+  "timezone": "Asia/Shanghai",
+  "request_id": "f7ceb5a1-8e7d-4f37-b7fd-42388127a67c"
+}</div>
+          {% endif %}
+        </div>
+      </div>
+      
+      <!-- Execution History -->
+      <div class="rounded-lg border border-gray-200 overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+          <h3 class="text-sm font-medium">Execution History</h3>
+        </div>
+        <div class="divide-y divide-gray-200">
+          <div class="p-4">
+            <div class="flex justify-between items-start">
+              <div>
+                <div class="text-sm font-medium">Attempt #1</div>
+                <div class="text-xs text-gray-500">{% if job.failed_at %}{{ job.failed_at }}{% elif job.finished_at %}{{ job.finished_at }}{% else %}{{ job.created_at }}{% endif %}</div>
+              </div>
+              <span class="px-2 py-1 text-xs font-medium rounded-full 
+                {% if job.status == 'failed' %}bg-red-100 text-red-800
+                {% elif job.status == 'finished' %}bg-green-100 text-green-800
+                {% else %}bg-gray-100 text-gray-800{% endif %}">
+                {{ job.status | title }}
+              </span>
+            </div>
+            {% if job.error %}
+            <div class="mt-2 text-sm text-red-600">{{ job.error }}</div>
+            {% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</turbo-frame>
+{% endblock %}

@@ -150,6 +150,40 @@ struct FinishedJobInfo {
     runtime: String,
 }
 
+// 添加 JobDetailsInfo 结构
+#[derive(Debug, Serialize)]
+struct JobDetailsInfo {
+    id: i64,
+    queue_name: String,
+    class_name: String,
+    status: String,
+    created_at: String,
+    failed_at: Option<String>,
+    scheduled_at: Option<String>,
+    scheduled_in: Option<String>,
+    concurrency_key: Option<String>,
+    waiting_time: Option<String>,
+    expires_at: Option<String>,
+    started_at: Option<String>,
+    runtime: Option<String>,
+    worker_id: Option<String>,
+    finished_at: Option<String>,
+    error: Option<String>,
+    backtrace: Option<String>,
+    arguments: Option<String>,
+    context: Option<String>,
+    execution_id: Option<i64>,
+    execution_history: Option<Vec<ExecutionHistoryItem>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionHistoryItem {
+    attempt: i32,
+    timestamp: String,
+    status: String,
+    error: Option<String>,
+}
+
 impl ControlPlane {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let start = Instant::now();
@@ -207,6 +241,7 @@ impl ControlPlane {
             .route("/scheduled-jobs", get(Self::scheduled_jobs))
             .route("/scheduled-jobs/:id/cancel", post(Self::cancel_scheduled_job))
             .route("/finished-jobs", get(Self::finished_jobs))
+            .route("/jobs/:id", get(Self::job_details))
             .route("/stats", get(Self::stats))
             .route("/workers", get(Self::workers))
             .layer(
@@ -2157,6 +2192,250 @@ impl ControlPlane {
         let html = state.render_template("workers.html", &mut context).await?;
 
         Ok(Html(html))
+    }
+
+    // 添加作业详情页面控制器方法
+    #[instrument(skip(state), fields(path = "/jobs/:id"))]
+    async fn job_details(
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
+    ) -> Result<Html<String>, (StatusCode, String)> {
+        let start = Instant::now();
+        let db = state.ctx.get_db().await;
+        let db = db.as_ref();
+        debug!("Database connection obtained in {:?}", start.elapsed());
+
+        let start = Instant::now();
+
+        // 获取作业基本信息
+        let job_result = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT
+                    j.id,
+                    j.queue_name,
+                    j.class_name,
+                    j.created_at,
+                    j.finished_at,
+                    j.arguments,
+                    CASE
+                        WHEN j.finished_at IS NOT NULL THEN 'finished'
+                        WHEN c.id IS NOT NULL THEN 'processing'
+                        WHEN f.id IS NOT NULL THEN 'failed'
+                        WHEN s.id IS NOT NULL THEN 'scheduled'
+                        WHEN b.id IS NOT NULL THEN 'blocked'
+                        ELSE 'pending'
+                    END AS status,
+                    c.id as claimed_id,
+                    f.id as failed_id,
+                    s.id as scheduled_id,
+                    b.id as blocked_id,
+                    f.error as error_message,
+                    s.scheduled_at,
+                    b.concurrency_key,
+                    b.expires_at,
+                    c.process_id
+                FROM solid_queue_jobs j
+                LEFT JOIN solid_queue_claimed_executions c ON j.id = c.job_id
+                LEFT JOIN solid_queue_failed_executions f ON j.id = f.job_id
+                LEFT JOIN solid_queue_scheduled_executions s ON j.id = s.job_id
+                LEFT JOIN solid_queue_blocked_executions b ON j.id = b.job_id
+                WHERE j.id = $1",
+                [Value::from(id)]
+            ))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        if let Some(row) = job_result {
+            // 解析基本信息
+            let job_id: i64 = row.try_get("", "id").unwrap_or_default();
+            let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
+            let class_name: String = row.try_get("", "class_name").unwrap_or_default();
+            let status: String = row.try_get("", "status").unwrap_or_default();
+            let arguments: Option<String> = row.try_get("", "arguments").ok();
+            let error: Option<String> = row.try_get("", "error_message").ok();
+
+            // 解析创建时间
+            let created_at = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
+                Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+                Err(_) => "未知时间".to_string(),
+            };
+
+            // 获取完成时间（如果有）
+            let finished_at = match row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at") {
+                Ok(Some(dt)) => Some(dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                _ => None,
+            };
+
+            // 计算运行时间（如果已完成）
+            let runtime = if let Some(finished) = row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at").ok().flatten() {
+                if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
+                    let duration = finished.signed_duration_since(created);
+                    Some(format!("{} seconds", duration.num_seconds()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // 根据作业状态获取特定信息
+            let mut job_details = JobDetailsInfo {
+                id: job_id,
+                queue_name,
+                class_name,
+                status: status.clone(),
+                created_at,
+                failed_at: None,
+                scheduled_at: None,
+                scheduled_in: None,
+                concurrency_key: None,
+                waiting_time: None,
+                expires_at: None,
+                started_at: None,
+                runtime,
+                worker_id: None,
+                finished_at,
+                error,
+                backtrace: None,
+                arguments,
+                context: None,
+                execution_id: None,
+                execution_history: None,
+            };
+
+            // 获取状态特定的详细信息
+            match status.as_str() {
+                "failed" => {
+                    let failed_id: i64 = row.try_get("", "failed_id").unwrap_or_default();
+                    job_details.execution_id = Some(failed_id);
+
+                    // 获取失败信息
+                    if let Ok(failed_info) = db
+                        .query_one(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT error, failed_at FROM solid_queue_failed_executions WHERE id = $1",
+                            [Value::from(failed_id)]
+                        ))
+                        .await
+                    {
+                        if let Some(row) = failed_info {
+                            job_details.error = row.try_get("", "error").ok();
+                            
+                            // 解析失败时间
+                            if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "failed_at") {
+                                job_details.failed_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                            }
+                        }
+                    }
+                },
+                "scheduled" => {
+                    let scheduled_id: i64 = row.try_get("", "scheduled_id").unwrap_or_default();
+                    job_details.execution_id = Some(scheduled_id);
+
+                    // 解析计划执行时间
+                    if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
+                        job_details.scheduled_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                        
+                        // 计算还有多长时间执行
+                        let now = chrono::Utc::now().naive_utc();
+                        if dt > now {
+                            let duration = dt.signed_duration_since(now);
+                            let scheduled_in = if duration.num_hours() > 0 {
+                                format!("in {}h {}m", duration.num_hours(), duration.num_minutes() % 60)
+                            } else if duration.num_minutes() > 0 {
+                                format!("in {}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
+                            } else {
+                                format!("in {}s", duration.num_seconds())
+                            };
+                            job_details.scheduled_in = Some(scheduled_in);
+                        } else {
+                            job_details.scheduled_in = Some("overdue".to_string());
+                        }
+                    }
+                },
+                "blocked" => {
+                    let blocked_id: i64 = row.try_get("", "blocked_id").unwrap_or_default();
+                    job_details.execution_id = Some(blocked_id);
+                    
+                    // 获取阻塞信息
+                    job_details.concurrency_key = row.try_get("", "concurrency_key").ok();
+                    
+                    // 解析过期时间
+                    if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "expires_at") {
+                        job_details.expires_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                        
+                        // 计算等待时间
+                        if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
+                            let duration = chrono::Utc::now().naive_utc().signed_duration_since(created);
+                            job_details.waiting_time = Some(format!("{} seconds", duration.num_seconds()));
+                        }
+                    }
+                },
+                "processing" => {
+                    let claimed_id: i64 = row.try_get("", "claimed_id").unwrap_or_default();
+                    job_details.execution_id = Some(claimed_id);
+                    
+                    // 获取处理信息
+                    if let Ok(process_id) = row.try_get::<i64>("", "process_id") {
+                        // 获取工作进程信息
+                        if let Ok(worker_info) = db
+                            .query_one(Statement::from_sql_and_values(
+                                DbBackend::Postgres,
+                                "SELECT name FROM solid_queue_processes WHERE id = $1",
+                                [Value::from(process_id)]
+                            ))
+                            .await
+                        {
+                            if let Some(row) = worker_info {
+                                job_details.worker_id = row.try_get("", "name").ok();
+                            }
+                        }
+                    }
+                    
+                    // 获取开始时间和运行时间
+                    if let Ok(claimed_info) = db
+                        .query_one(Statement::from_sql_and_values(
+                            DbBackend::Postgres,
+                            "SELECT created_at FROM solid_queue_claimed_executions WHERE id = $1",
+                            [Value::from(claimed_id)]
+                        ))
+                        .await
+                    {
+                        if let Some(row) = claimed_info {
+                            if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
+                                job_details.started_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                                
+                                // 计算当前运行时间
+                                let now = chrono::Utc::now().naive_utc();
+                                let duration = now.signed_duration_since(dt);
+                                job_details.runtime = Some(format!("{} seconds", duration.num_seconds()));
+                            }
+                        }
+                    }
+                },
+                _ => {}
+            }
+
+            // 渲染模板
+            let mut context = tera::Context::new();
+            context.insert("job", &job_details);
+            context.insert("active_page", match status.as_str() {
+                "failed" => "failed_jobs",
+                "scheduled" => "scheduled_jobs",
+                "blocked" => "blocked_jobs",
+                "processing" => "in_progress_jobs",
+                "finished" => "finished_jobs",
+                _ => "queues",
+            });
+
+            let html = state.render_template("job-details.html", &mut context).await?;
+            debug!("Template rendering completed in {:?}", start.elapsed());
+
+            Ok(Html(html))
+        } else {
+            Err((StatusCode::NOT_FOUND, format!("Job with ID {} not found", id)))
+        }
     }
 
     // 添加取消计划作业的控制器方法
