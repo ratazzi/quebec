@@ -50,6 +50,243 @@
       }
     })
 
+    // 图表控制器 - 负责管理图表的初始化和更新
+    Stimulus.register("charts", class extends Controller {
+      connect() {
+        // 控制器连接时初始化图表
+        this.initCharts();
+        
+        // 设置时间范围选择器的当前值
+        this.setTimeRangeSelector();
+        
+        // 初始化工具提示
+        this.initTooltips();
+        
+        // 监听窗口大小变化，使用防抖处理
+        this.setupResizeListener();
+      }
+      
+      disconnect() {
+        // 控制器断开连接时销毁图表
+        this.destroyCharts();
+        
+        // 移除窗口大小变化监听器
+        if (this.resizeTimer) {
+          clearTimeout(this.resizeTimer);
+        }
+        if (this.boundResizeHandler) {
+          window.removeEventListener('resize', this.boundResizeHandler);
+        }
+      }
+      
+      setupResizeListener() {
+        // 使用绑定的方法以便能够在 disconnect 中移除
+        this.boundResizeHandler = this.handleResize.bind(this);
+        window.addEventListener('resize', this.boundResizeHandler);
+      }
+      
+      handleResize() {
+        // 使用防抖处理窗口大小变化
+        if (this.resizeTimer) {
+          clearTimeout(this.resizeTimer);
+        }
+        this.resizeTimer = setTimeout(() => {
+          this.initCharts();
+        }, 250); // 250ms 防抖延迟
+      }
+      
+      // 图表初始化函数
+      initCharts() {
+        // 初始化作业处理图表
+        this.initJobsProcessedChart();
+        
+        // 初始化作业类型分布图表
+        this.initJobTypesChart();
+      }
+      
+      destroyCharts() {
+        // 销毁作业处理图表
+        if (this.jobsProcessedChart instanceof Chart) {
+          this.jobsProcessedChart.destroy();
+          this.jobsProcessedChart = null;
+        }
+        
+        // 销毁作业类型分布图表
+        if (this.jobTypesChart instanceof Chart) {
+          this.jobTypesChart.destroy();
+          this.jobTypesChart = null;
+        }
+      }
+      
+      // 初始化作业处理图表
+      initJobsProcessedChart() {
+        // 获取画布上下文
+        const jobsCtx = document.getElementById('jobsProcessedChart');
+        
+        if (!jobsCtx) return; // 如果元素不存在，直接返回
+        
+        // 如果已经存在图表，先销毁它
+        if (this.jobsProcessedChart instanceof Chart) {
+          this.jobsProcessedChart.destroy();
+        }
+        
+        // 创建新图表
+        const timeLabels = jobsCtx.getAttribute('data-time-labels');
+        const jobsProcessedData = jobsCtx.getAttribute('data-jobs-processed-data');
+        
+        if (!timeLabels || !jobsProcessedData) return; // 如果没有数据，直接返回
+        
+        this.jobsProcessedChart = new Chart(jobsCtx.getContext('2d'), {
+          type: 'line',
+          data: {
+            labels: JSON.parse(timeLabels),
+            datasets: [{
+              label: 'Jobs Processed',
+              data: JSON.parse(jobsProcessedData),
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              borderColor: 'rgba(59, 130, 246, 1)',
+              borderWidth: 2,
+              tension: 0.4,
+              fill: true
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  precision: 0 // 只显示整数刻度
+                }
+              },
+              x: {
+                ticks: {
+                  maxRotation: 45,
+                  minRotation: 45
+                }
+              }
+            },
+            plugins: {
+              legend: {
+                display: true,
+                position: 'top'
+              },
+              tooltip: {
+                mode: 'index',
+                intersect: false
+              }
+            },
+            animation: {
+              duration: 1000 // 控制动画时长
+            },
+            layout: {
+              padding: 10 // 为图表添加内边距
+            },
+            interaction: {
+              mode: 'nearest',
+              axis: 'x',
+              intersect: false
+            }
+          }
+        });
+      }
+      
+      // 初始化作业类型分布图表
+      initJobTypesChart() {
+        // 获取画布上下文
+        const typesCtx = document.getElementById('jobTypesChart');
+        
+        if (!typesCtx) return; // 如果元素不存在，直接返回
+        
+        // 如果已经存在图表，先销毁它
+        if (this.jobTypesChart instanceof Chart) {
+          this.jobTypesChart.destroy();
+        }
+        
+        // 创建新图表
+        const jobTypesLabels = typesCtx.getAttribute('data-job-types-labels');
+        const jobTypesData = typesCtx.getAttribute('data-job-types-data');
+        
+        if (!jobTypesLabels || !jobTypesData) return; // 如果没有数据，直接返回
+        
+        this.jobTypesChart = new Chart(typesCtx.getContext('2d'), {
+          type: 'doughnut',
+          data: {
+            labels: JSON.parse(jobTypesLabels),
+            datasets: [{
+              data: JSON.parse(jobTypesData),
+              backgroundColor: [
+                'rgba(59, 130, 246, 0.8)',
+                'rgba(16, 185, 129, 0.8)',
+                'rgba(245, 158, 11, 0.8)',
+                'rgba(239, 68, 68, 0.8)',
+                'rgba(139, 92, 246, 0.8)',
+                'rgba(236, 72, 153, 0.8)',
+                'rgba(75, 85, 99, 0.8)'
+              ],
+              borderWidth: 1
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'right',
+                labels: {
+                  boxWidth: 12,
+                  padding: 15
+                }
+              },
+              tooltip: {
+                callbacks: {
+                  label: function(context) {
+                    const label = context.label || '';
+                    const value = context.raw || 0;
+                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                    const percentage = Math.round((value / total) * 100);
+                    return `${label}: ${value} (${percentage}%)`;
+                  }
+                }
+              }
+            },
+            cutout: '60%',
+            animation: {
+              animateRotate: true,
+              animateScale: true,
+              duration: 1000
+            }
+          }
+        });
+      }
+      
+      // 设置时间范围选择器的当前值
+      setTimeRangeSelector() {
+        const selector = document.getElementById('time-range');
+        if (selector) {
+          // 从 URL 获取 hours 参数
+          const urlParams = new URLSearchParams(window.location.search);
+          const hours = urlParams.get('hours');
+          
+          if (hours) {
+            // 找到匹配的选项并设置为选中
+            for (let i = 0; i < selector.options.length; i++) {
+              if (selector.options[i].value === hours) {
+                selector.selectedIndex = i;
+                break;
+              }
+            }
+          }
+        }
+      }
+      
+      // 初始化工具提示功能
+      initTooltips() {
+        // 这个函数主要依赖于 CSS，但如果需要更复杂的工具提示行为，可以在这里添加
+      }
+    });
+    
     // 导航控制器 - 负责管理导航和激活页面
     Stimulus.register("nav", class extends Controller {
       static targets = ["navItem", "content"]
@@ -157,10 +394,10 @@
       </div>
 
       <!-- 内容部分，由导航控制器管理 -->
-      <turbo-frame id="content" data-nav-target="content">
+      <turbo-frame id="content" data-nav-target="content" class="mb-4">
         {% block content %}{% endblock %}
       </turbo-frame>
-      
+
       <!-- Footer -->
       <div class="mt-8 pt-4 border-t border-gray-200 mt-auto">
         <div class="flex flex-col md:flex-row justify-between items-center text-sm text-gray-500">

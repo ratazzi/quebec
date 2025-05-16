@@ -47,7 +47,7 @@
       {% for queue in queues %}
       <tr>
         <td class="px-6 py-4 whitespace-nowrap">
-          <div class="text-sm font-medium text-gray-900">{{ queue.name }}</div>
+          <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:text-blue-600 hover:underline">{{ queue.name }}</a>
         </td>
         <td class="px-6 py-4 whitespace-nowrap">
           <div class="text-sm text-gray-900">{{ queue.jobs_count }}</div>
@@ -58,7 +58,7 @@
           </span>
         </td>
         <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-          <a href="/queues/{{ queue.name }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium text-gray-900 underline-offset-4 hover:underline mr-3">
+          <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium text-gray-900 underline-offset-4 hover:underline mr-3">
             View
           </a>
           {% if queue.status == 'active' %}

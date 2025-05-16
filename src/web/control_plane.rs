@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use std::path::PathBuf;
 use std::env;
 use std::error::Error;
+use std::collections::HashMap;
 use axum::{
     Router,
     routing::{get, post},
@@ -42,9 +43,12 @@ use tracing::{Level, Span, instrument};
 use chrono::DateTime;
 use chrono::NaiveDateTime;
 
+use std::sync::RwLock;
+
 pub struct ControlPlane {
     ctx: Arc<AppContext>,
-    tera: Tera,
+    tera: RwLock<Tera>,  // 使用 RwLock 提供线程安全的内部可变性
+    template_path: String,
     page_size: usize,
 }
 
@@ -204,7 +208,8 @@ impl ControlPlane {
 
         Self {
             ctx,
-            tera,
+            tera: RwLock::new(tera),
+            template_path: template_paths[0].to_string(),
             page_size: 10
         }
     }
@@ -632,6 +637,11 @@ impl ControlPlane {
         let start = Instant::now();
 
         // 使用 Sea-ORM 的原生 SQL 查询功能，仅统计未完成的作业
+        // 获取所有的队列名称
+        let all_queue_names = state.get_queue_names(db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT queue_name, COUNT(*) as count
@@ -641,7 +651,8 @@ impl ControlPlane {
             []
         );
 
-        let queue_counts: Vec<(String, i64)> = db
+        // 获取有未完成作业的队列计数
+        let queue_counts_map: HashMap<String, i64> = db
             .query_all(stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -651,6 +662,12 @@ impl ControlPlane {
                 let count: i64 = row.try_get("", "count").unwrap_or_default();
                 (queue_name, count)
             })
+            .collect();
+            
+        // 确保所有队列都包含在结果中，即使没有未完成的作业
+        let queue_counts: Vec<(String, i64)> = all_queue_names
+            .into_iter()
+            .map(|queue_name| (queue_name.clone(), *queue_counts_map.get(&queue_name).unwrap_or(&0)))
             .collect();
 
         debug!("Fetched jobs in {:?}", start.elapsed());
@@ -989,13 +1006,32 @@ impl ControlPlane {
 
     /// 渲染模板并处理错误
     async fn render_template(&self, template_name: &str, context: &mut tera::Context) -> Result<String, (StatusCode, String)> {
+        // 在 debug 编译模式下，重新加载模板
+        #[cfg(debug_assertions)]
+        {
+            debug!("Debug mode detected, reloading templates");
+            match Tera::new(&self.template_path) {
+                Ok(new_tera) => {
+                    // 成功加载新模板，替换现有的 Tera 实例
+                    match self.tera.write() {
+                        Ok(mut tera) => {
+                            *tera = new_tera;
+                            tera.autoescape_on(vec!["html"]);
+                            debug!("Templates reloaded successfully");
+                        },
+                        Err(e) => error!("Failed to acquire write lock: {}", e)
+                    }
+                },
+                Err(e) => error!("Error reloading templates: {}", e)
+            }
+        }
         // 添加数据库连接信息
         let db = self.ctx.get_db().await;
-        
+
         // 直接从 AppContext 获取数据库 DSN 信息
         let dsn = self.ctx.dsn.to_string();
         debug!("Original DSN: {}", dsn);
-        
+
         // 处理不同类型的数据库连接
         let (db_type, connection_info) = if dsn.starts_with("postgres:") {
             // 如果是 PostgreSQL数据库
@@ -1009,7 +1045,7 @@ impl ControlPlane {
                     } else {
                         "postgres"
                     };
-                    
+
                     // 重新构造URL，去掉用户名密码
                     let host_part = parts[1];
                     format!("{0}://{1}", protocol, host_part)
@@ -1020,14 +1056,14 @@ impl ControlPlane {
                 // 不包含用户名密码
                 dsn.clone()
             };
-            
+
             // 如果有查询参数，删除它们
             let final_dsn = if clean_dsn.contains("?") {
                 clean_dsn.split("?").next().unwrap_or(&clean_dsn).to_string()
             } else {
                 clean_dsn
             };
-            
+
             debug!("Cleaned PostgreSQL DSN: {}", final_dsn);
             ("PostgreSQL", final_dsn)
         } else if dsn.starts_with("sqlite:") {
@@ -1040,7 +1076,7 @@ impl ControlPlane {
             debug!("Unknown database type: {}", dsn);
             ("Unknown", dsn)
         };
-        
+
         let db_info = serde_json::json!({
             "database_type": db_type,
             "connection_type": "Pool",
@@ -1048,13 +1084,35 @@ impl ControlPlane {
             "dsn": connection_info
         });
         context.insert("db_info", &db_info);
+
+        // 在 debug 编译模式下，每次渲染模板前重新加载模板文件
+        #[cfg(debug_assertions)]
+        {
+            debug!("Debug mode detected, reloading templates before rendering");
+            // 使用 RwLock 的 write 方法获取对 Tera 的可变访问
+            if let Ok(mut tera) = self.tera.write() {
+                match tera.full_reload() {
+                    Ok(_) => debug!("Templates reloaded successfully"),
+                    Err(e) => error!("Error reloading templates: {}", e)
+                }
+            } else {
+                error!("Failed to acquire write lock for template reloading");
+            }
+        }
         
         // 检查模板是否在 Tera 实例中存在
-        let templates = self.tera.get_template_names().collect::<Vec<_>>();
+        let tera_read_result = self.tera.read();
+        if let Err(e) = tera_read_result {
+            error!("Failed to acquire read lock: {}", e);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
+        }
+        
+        let tera = tera_read_result.unwrap();
+        let templates = tera.get_template_names().collect::<Vec<_>>();
         debug!("Available templates: {:?}", templates);
 
         // 尝试渲染模板
-        match self.tera.render(template_name, context) {
+        match tera.render(template_name, context) {
             Ok(html) => Ok(html),
             Err(e) => {
                 error!("Failed to render {}: {}", template_name, e);
@@ -2056,7 +2114,6 @@ impl ControlPlane {
     }
 
     // 实现 stats 方法，专门用于返回统计数据
-    #[instrument(skip(state), fields(path = "/stats"))]
     async fn stats(
         State(state): State<Arc<ControlPlane>>,
         req: axum::http::Request<axum::body::Body>,

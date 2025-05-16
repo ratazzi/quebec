@@ -53,11 +53,6 @@
     </form>
   </div>
 
-  {% if failed_jobs|length == 0 %}
-  <div class="bg-gray-50 rounded-lg p-8 text-center border">
-    <p class="text-gray-600">No failed jobs found.</p>
-  </div>
-  {% else %}
   <!-- Table -->
   <div class="overflow-x-auto rounded-lg border border-gray-200">
     <table class="min-w-full divide-y divide-gray-200">
@@ -75,6 +70,7 @@
         </tr>
       </thead>
       <tbody class="bg-white divide-y divide-gray-200">
+        {% if failed_jobs|length > 0 %}
         {% for job in failed_jobs %}
         <tr>
           <td class="px-6 py-4 whitespace-nowrap">
@@ -105,6 +101,13 @@
           </td>
         </tr>
         {% endfor %}
+        {% else %}
+        <tr>
+          <td colspan="3" class="px-6 py-4 text-center text-sm text-gray-500">
+            No failed jobs found.
+          </td>
+        </tr>
+        {% endif %}
       </tbody>
     </table>
   </div>
@@ -136,6 +139,5 @@
       {% endif %}
     </div>
   </div>
-  {% endif %}
   </turbo-frame>
 {% endblock %}

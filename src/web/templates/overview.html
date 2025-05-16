@@ -2,7 +2,7 @@
 
 {% block content %}
 <turbo-frame id="content">
-  <div class="max-w-7xl mx-auto p-4">
+  <div class="max-w-7xl mx-auto p-4" data-controller="charts">
 
     <!-- Time Range Selector -->
     <div class="flex justify-end mb-6">
@@ -93,7 +93,7 @@
       <div class="bg-white p-4 rounded-lg border border-gray-200">
         <h3 class="text-lg font-medium mb-4">Jobs Processed Over Time</h3>
         <div style="height: 250px; width: 100%;">
-          <canvas id="jobsProcessedChart"></canvas>
+          <canvas id="jobsProcessedChart" data-time-labels='{{ time_labels|safe }}' data-jobs-processed-data='{{ jobs_processed_data|safe }}'></canvas>
         </div>
       </div>
 
@@ -101,7 +101,7 @@
       <div class="bg-white p-4 rounded-lg border border-gray-200">
         <h3 class="text-lg font-medium mb-4">Job Types Distribution</h3>
         <div style="height: 250px; width: 100%;">
-          <canvas id="jobTypesChart"></canvas>
+          <canvas id="jobTypesChart" data-job-types-labels='{{ job_types_labels|safe }}' data-job-types-data='{{ job_types_data|safe }}'></canvas>
         </div>
       </div>
     </div>
@@ -124,7 +124,7 @@
             {% for queue in queue_stats %}
             <tr>
               <td class="px-6 py-4 whitespace-nowrap">
-                <a href="/queues/{{ queue.name }}" class="text-blue-600 hover:text-blue-900">{{ queue.name }}</a>
+                <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-900">{{ queue.name }}</a>
               </td>
               <td class="px-6 py-4 whitespace-nowrap">{{ queue.jobs_processed }}</td>
               <td class="px-6 py-4 whitespace-nowrap">{{ queue.avg_duration }}</td>
@@ -241,185 +241,7 @@
     }
   </style>
 
-  <script>
-    // 全局变量初始化
-    window.jobsProcessedChart = null;
-    window.jobTypesChart = null;
-
-    document.addEventListener('DOMContentLoaded', function() {
-      // 初始化图表
-      initCharts();
-
-      // 设置时间范围选择器的当前值
-      setTimeRangeSelector();
-
-      // 初始化工具提示
-      initTooltips();
-
-      // 显示当前时间
-      updateCurrentTime();
-
-      // 监听窗口大小变化，使用防抖处理
-      let resizeTimer;
-      window.addEventListener('resize', function() {
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(function() {
-          // 销毁旧图表并重新创建，避免膨胀问题
-          initCharts();
-        }, 250); // 250ms 防抖延迟
-      });
-
-      // 监听 Turbo 导航事件
-      document.addEventListener('turbo:render', function() {
-        // 销毁旧图表并重新创建
-        initCharts();
-        // 更新时间范围选择器
-        setTimeRangeSelector();
-      });
-
-      // 图表初始化函数
-      function initCharts() {
-        // 初始化作业处理图表
-        initJobsProcessedChart();
-
-        // 初始化作业类型分布图表
-        initJobTypesChart();
-      }
-
-      // 初始化作业处理图表
-      function initJobsProcessedChart() {
-        // 获取画布上下文
-        const jobsCtx = document.getElementById('jobsProcessedChart');
-
-        if (!jobsCtx) return; // 如果元素不存在，直接返回
-
-        // 如果已经存在图表，先销毁它
-        if (window.jobsProcessedChart instanceof Chart) {
-          window.jobsProcessedChart.destroy();
-        }
-
-        // 创建新图表
-        window.jobsProcessedChart = new Chart(jobsCtx.getContext('2d'), {
-          type: 'line',
-          data: {
-            labels: {{ time_labels|safe }},
-            datasets: [{
-              label: 'Jobs Processed',
-              data: {{ jobs_processed_data|safe }},
-              backgroundColor: 'rgba(59, 130, 246, 0.1)',
-              borderColor: 'rgba(59, 130, 246, 1)',
-              borderWidth: 2,
-              tension: 0.4,
-              fill: true
-            }]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            scales: {
-              y: {
-                beginAtZero: true,
-                ticks: {
-                  precision: 0 // 只显示整数刻度
-                }
-              },
-              x: {
-                ticks: {
-                  maxRotation: 45,
-                  minRotation: 45
-                }
-              }
-            },
-            plugins: {
-              legend: {
-                display: true,
-                position: 'top'
-              },
-              tooltip: {
-                mode: 'index',
-                intersect: false
-              }
-            },
-            animation: {
-              duration: 1000 // 控制动画时长
-            },
-            layout: {
-              padding: 10 // 为图表添加内边距
-            },
-            interaction: {
-              mode: 'nearest',
-              axis: 'x',
-              intersect: false
-            }
-          }
-        });
-      }
-
-      // 初始化作业类型分布图表
-      function initJobTypesChart() {
-        // 获取画布上下文
-        const typesCtx = document.getElementById('jobTypesChart');
-
-        if (!typesCtx) return; // 如果元素不存在，直接返回
-
-        // 如果已经存在图表，先销毁它
-        if (window.jobTypesChart instanceof Chart) {
-          window.jobTypesChart.destroy();
-        }
-
-        // 创建新图表
-        window.jobTypesChart = new Chart(typesCtx.getContext('2d'), {
-          type: 'doughnut',
-          data: {
-            labels: {{ job_types_labels|safe }},
-            datasets: [{
-              data: {{ job_types_data|safe }},
-              backgroundColor: [
-                'rgba(59, 130, 246, 0.8)',
-                'rgba(16, 185, 129, 0.8)',
-                'rgba(245, 158, 11, 0.8)',
-                'rgba(239, 68, 68, 0.8)',
-                'rgba(139, 92, 246, 0.8)',
-                'rgba(236, 72, 153, 0.8)',
-                'rgba(75, 85, 99, 0.8)'
-              ],
-              borderWidth: 1
-            }]
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-              legend: {
-                position: 'right',
-                labels: {
-                  boxWidth: 12,
-                  padding: 15
-                }
-              },
-              tooltip: {
-                callbacks: {
-                  label: function(context) {
-                    const label = context.label || '';
-                    const value = context.raw || 0;
-                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                    const percentage = Math.round((value / total) * 100);
-                    return `${label}: ${value} (${percentage}%)`;
-                  }
-                }
-              }
-            },
-            cutout: '60%',
-            animation: {
-              animateRotate: true,
-              animateScale: true,
-              duration: 1000
-            }
-          }
-        });
-      }
-    });
-  </script>
+  <!-- 图表初始化由 base.html 中的 charts 控制器处理 -->
 
   <script>
     // 时间范围选择器
@@ -432,38 +254,15 @@
       }
     });
 
-    // 设置时间范围选择器的当前值
-    function setTimeRangeSelector() {
+    // 确保在 Turbo 导航后也能正常工作
+    document.addEventListener('turbo:render', function() {
       const selector = document.getElementById('time-range');
       if (selector) {
-        // 从 URL 获取 hours 参数
-        const urlParams = new URLSearchParams(window.location.search);
-        const hours = urlParams.get('hours');
-
-        if (hours) {
-          // 找到匹配的选项并设置为选中
-          for (let i = 0; i < selector.options.length; i++) {
-            if (selector.options[i].value === hours) {
-              selector.selectedIndex = i;
-              break;
-            }
-          }
-        }
+        selector.addEventListener('change', function() {
+          window.location.href = '/?hours=' + this.value;
+        });
       }
-    }
-
-    // 初始化工具提示功能
-    function initTooltips() {
-      // 这个函数主要依赖于 CSS，但如果需要更复杂的工具提示行为，可以在这里添加
-      // 例如，可以添加点击事件来显示/隐藏工具提示，或者添加关闭按钮等
-
-      // 监听 Turbo 导航事件，确保在页面更新后重新初始化工具提示
-      document.addEventListener('turbo:render', function() {
-        // 如果有需要的话，在这里添加额外的工具提示初始化代码
-      });
-    }
-
-
+    });
   </script>
 </turbo-frame>
 {% endblock %}
