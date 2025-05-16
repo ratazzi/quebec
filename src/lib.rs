@@ -145,15 +145,18 @@ fn quebec(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     #[cfg(feature = "use-tracing")]
     {
-        // tracing_subscriber::fmt::init();
+        // 使用自定义的 EnvFilter，默认开启 DEBUG 级别
+        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"))
+            .add_directive("debug".parse().unwrap());
+
         let subscriber = tracing_subscriber::FmtSubscriber::builder()
-            // .event_format(SqlHighlighter)
             .with_max_level(tracing::Level::DEBUG)
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_env_filter(env_filter)
             .finish();
+
         tracing::subscriber::set_global_default(subscriber)
             .expect("setting default subscriber failed");
-        // debug!("Using tracing crate");
     }
 
     // debug!("duration: {:?}", parse_duration("1s"));
