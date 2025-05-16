@@ -44,6 +44,7 @@ use chrono::DateTime;
 use chrono::NaiveDateTime;
 
 use std::sync::RwLock;
+use crate::web::templates;
 
 pub struct ControlPlane {
     ctx: Arc<AppContext>,
@@ -152,64 +153,34 @@ struct FinishedJobInfo {
 impl ControlPlane {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let start = Instant::now();
-
-        let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        debug!("Current directory: {}", current_dir.display());
-
-        let current_dir_templates = format!("{}/src/web/templates/**/*", current_dir.display());
-        let template_paths = vec![
-            // "src/web/templates/**/*",
-            // "web/templates/**/*",
-            // "templates/**/*",
-            &current_dir_templates,
-        ];
-
-        // 先尝试标准路径
-        let mut tera = match Tera::new(&template_paths[0]) {
-            Ok(t) => {
-                debug!("Successfully loaded templates from '{}'", template_paths[0]);
-                t
-            },
-            Err(e) => {
-                error!("Failed to load templates from '{}': {}", template_paths[0], e);
-
-                let mut found = false;
-                let mut t = Tera::default();
-
-                // for path in &template_paths[1..] {
-                //     match Tera::new(path) {
-                //         Ok(loaded) => {
-                //             info!("Successfully loaded templates from '{}'", path);
-                //             t = loaded;
-                //             found = true;
-                //             break;
-                //         },
-                //         Err(e) => {
-                //             error!("Failed to load templates from '{}': {}", path, e);
-                //         }
-                //     }
-                // }
-
-                // if !found {
-                //     warn!("No template directories found, falling back to manually adding templates");
-                // }
-
-                t
+        
+        // 初始化 Tera
+        let mut tera = Tera::default();
+        
+        // 添加所有模板
+        for template_name in templates::list_templates() {
+            if let Some(content) = templates::get_template_content(&template_name) {
+                if let Err(e) = tera.add_raw_template(&template_name, &content) {
+                    error!("Failed to add template {}: {}", template_name, e);
+                }
             }
-        };
+        }
 
-        // 设置自动转义
+        // 设置自动转义 HTML
         tera.autoescape_on(vec!["html"]);
 
         // 输出最终模板列表
-        let templates = tera.get_template_names().collect::<Vec<_>>();
-        debug!("Available templates: {:?}", templates);
+        let template_list = tera.get_template_names().collect::<Vec<_>>();
+        debug!("Available templates: {:?}", template_list);
         debug!("Tera template engine initialized in {:?}", start.elapsed());
+
+        // 保存模板路径，用于热重载
+        let template_path = "src/web/templates/**/*".to_string();
 
         Self {
             ctx,
             tera: RwLock::new(tera),
-            template_path: template_paths[0].to_string(),
+            template_path,
             page_size: 10
         }
     }
@@ -1085,21 +1056,35 @@ impl ControlPlane {
         });
         context.insert("db_info", &db_info);
 
-        // 在 debug 编译模式下，每次渲染模板前重新加载模板文件
+        // 在 debug 编译模式下，重新加载模板
         #[cfg(debug_assertions)]
         {
             debug!("Debug mode detected, reloading templates before rendering");
-            // 使用 RwLock 的 write 方法获取对 Tera 的可变访问
-            if let Ok(mut tera) = self.tera.write() {
-                match tera.full_reload() {
-                    Ok(_) => debug!("Templates reloaded successfully"),
-                    Err(e) => error!("Error reloading templates: {}", e)
+            
+            // 初始化新的 Tera 实例
+            let mut new_tera = Tera::default();
+            
+            // 使用嵌入式模板系统重新加载所有模板
+            for template_name in templates::list_templates() {
+                if let Some(content) = templates::get_template_content(&template_name) {
+                    if let Err(e) = new_tera.add_raw_template(&template_name, &content) {
+                        error!("Failed to add template {}: {}", template_name, e);
+                    }
                 }
+            }
+            
+            // 设置自动转义 HTML
+            new_tera.autoescape_on(vec!["html"]);
+            
+            // 更新 Tera 实例
+            if let Ok(mut tera) = self.tera.write() {
+                *tera = new_tera;
+                debug!("Templates reloaded successfully");
             } else {
                 error!("Failed to acquire write lock for template reloading");
             }
         }
-        
+
         // 检查模板是否在 Tera 实例中存在
         let tera_read_result = self.tera.read();
         if let Err(e) = tera_read_result {

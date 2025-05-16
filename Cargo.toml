@@ -58,6 +58,7 @@ tokio-util = "0.7.12"
 axum = "0.7"
 tera = "1.19"
 tower-http = { version = "0.5", features = ["trace", "fs"] }
+rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] }
 
 [features]
 use-log = []

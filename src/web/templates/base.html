@@ -55,21 +55,21 @@
       connect() {
         // 控制器连接时初始化图表
         this.initCharts();
-        
+
         // 设置时间范围选择器的当前值
         this.setTimeRangeSelector();
-        
+
         // 初始化工具提示
         this.initTooltips();
-        
+
         // 监听窗口大小变化，使用防抖处理
         this.setupResizeListener();
       }
-      
+
       disconnect() {
         // 控制器断开连接时销毁图表
         this.destroyCharts();
-        
+
         // 移除窗口大小变化监听器
         if (this.resizeTimer) {
           clearTimeout(this.resizeTimer);
@@ -78,13 +78,13 @@
           window.removeEventListener('resize', this.boundResizeHandler);
         }
       }
-      
+
       setupResizeListener() {
         // 使用绑定的方法以便能够在 disconnect 中移除
         this.boundResizeHandler = this.handleResize.bind(this);
         window.addEventListener('resize', this.boundResizeHandler);
       }
-      
+
       handleResize() {
         // 使用防抖处理窗口大小变化
         if (this.resizeTimer) {
@@ -94,48 +94,48 @@
           this.initCharts();
         }, 250); // 250ms 防抖延迟
       }
-      
+
       // 图表初始化函数
       initCharts() {
         // 初始化作业处理图表
         this.initJobsProcessedChart();
-        
+
         // 初始化作业类型分布图表
         this.initJobTypesChart();
       }
-      
+
       destroyCharts() {
         // 销毁作业处理图表
         if (this.jobsProcessedChart instanceof Chart) {
           this.jobsProcessedChart.destroy();
           this.jobsProcessedChart = null;
         }
-        
+
         // 销毁作业类型分布图表
         if (this.jobTypesChart instanceof Chart) {
           this.jobTypesChart.destroy();
           this.jobTypesChart = null;
         }
       }
-      
+
       // 初始化作业处理图表
       initJobsProcessedChart() {
         // 获取画布上下文
         const jobsCtx = document.getElementById('jobsProcessedChart');
-        
+
         if (!jobsCtx) return; // 如果元素不存在，直接返回
-        
+
         // 如果已经存在图表，先销毁它
         if (this.jobsProcessedChart instanceof Chart) {
           this.jobsProcessedChart.destroy();
         }
-        
+
         // 创建新图表
         const timeLabels = jobsCtx.getAttribute('data-time-labels');
         const jobsProcessedData = jobsCtx.getAttribute('data-jobs-processed-data');
-        
+
         if (!timeLabels || !jobsProcessedData) return; // 如果没有数据，直接返回
-        
+
         this.jobsProcessedChart = new Chart(jobsCtx.getContext('2d'), {
           type: 'line',
           data: {
@@ -191,25 +191,25 @@
           }
         });
       }
-      
+
       // 初始化作业类型分布图表
       initJobTypesChart() {
         // 获取画布上下文
         const typesCtx = document.getElementById('jobTypesChart');
-        
+
         if (!typesCtx) return; // 如果元素不存在，直接返回
-        
+
         // 如果已经存在图表，先销毁它
         if (this.jobTypesChart instanceof Chart) {
           this.jobTypesChart.destroy();
         }
-        
+
         // 创建新图表
         const jobTypesLabels = typesCtx.getAttribute('data-job-types-labels');
         const jobTypesData = typesCtx.getAttribute('data-job-types-data');
-        
+
         if (!jobTypesLabels || !jobTypesData) return; // 如果没有数据，直接返回
-        
+
         this.jobTypesChart = new Chart(typesCtx.getContext('2d'), {
           type: 'doughnut',
           data: {
@@ -260,7 +260,7 @@
           }
         });
       }
-      
+
       // 设置时间范围选择器的当前值
       setTimeRangeSelector() {
         const selector = document.getElementById('time-range');
@@ -268,7 +268,7 @@
           // 从 URL 获取 hours 参数
           const urlParams = new URLSearchParams(window.location.search);
           const hours = urlParams.get('hours');
-          
+
           if (hours) {
             // 找到匹配的选项并设置为选中
             for (let i = 0; i < selector.options.length; i++) {
@@ -280,13 +280,13 @@
           }
         }
       }
-      
+
       // 初始化工具提示功能
       initTooltips() {
         // 这个函数主要依赖于 CSS，但如果需要更复杂的工具提示行为，可以在这里添加
       }
     });
-    
+
     // 导航控制器 - 负责管理导航和激活页面
     Stimulus.register("nav", class extends Controller {
       static targets = ["navItem", "content"]
@@ -419,8 +419,6 @@
           </div>
           <div class="flex space-x-4 items-center">
             <a href="#" class="hover:text-black">Documentation</a>
-            <a href="#" class="hover:text-black">API</a>
-            <a href="#" class="hover:text-black">Support</a>
             <a href="https://github.com/ratazzi/quebec" class="hover:text-black flex items-center">
               <svg class="h-4 w-4 mr-1" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
                 <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
@@ -435,7 +433,7 @@
       </div>
     </div>
   </div>
-  
+
   <script>
     // 更新当前时间
     function updateCurrentTime() {
@@ -452,12 +450,12 @@
           hour12: false
         };
         timeElement.textContent = now.toLocaleString('zh-CN', options);
-        
+
         // 每秒更新一次
         setTimeout(updateCurrentTime, 1000);
       }
     }
-    
+
     document.addEventListener('DOMContentLoaded', function() {
       updateCurrentTime();
     });
