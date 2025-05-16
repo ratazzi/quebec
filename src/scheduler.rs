@@ -243,9 +243,26 @@ impl Scheduler {
             self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap(),
         );
         let mut scheduled = Vec::<ScheduledEntry>::new();
-        let contents = std::fs::read_to_string("schedule.yml").unwrap();
-        let schedule: Vec<HashMap<String, ScheduledEntry>> =
-            serde_yaml::from_str(&contents).unwrap();
+        let schedule: Vec<HashMap<String, ScheduledEntry>> = match std::fs::read_to_string("schedule.yml") {
+            Ok(contents) => match serde_yaml::from_str(&contents) {
+                Ok(parsed) => {
+                    debug!("Schedule loaded successfully");
+                    parsed
+                },
+                Err(e) => {
+                    error!("Failed to parse schedule.yml: {}", e);
+                    return Err(anyhow::anyhow!("Failed to parse schedule.yml: {}", e));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!("No schedule.yml found, running without scheduled tasks");
+                Vec::new()
+            },
+            Err(e) => {
+                error!("Failed to read schedule.yml: {}", e);
+                return Err(anyhow::anyhow!("Failed to read schedule.yml: {}", e));
+            }
+        };
         debug!("Schedule: {:?}", schedule);
 
         // let kind = "Scheduler".to_string();
