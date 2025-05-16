@@ -1894,31 +1894,10 @@ impl ControlPlane {
             let status: String = row.try_get("", "status").unwrap_or_default();
 
             // 获取时间并记录调试信息
-            let created_at_debug = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                Ok(dt) => format!("{:?}", dt),
-                Err(_) => format!("无法解析时间")
-            };
-            debug!("Job {}, created_at value: {}", id, created_at_debug);
-
-            // 尝试多种方式解析时间
+            // 简化的时间解析代码，与其他方法保持一致
             let created_at_str = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                 Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                Err(e1) => {
-                    debug!("Failed to parse as NaiveDateTime: {}", e1);
-                    match row.try_get::<DateTime<chrono::Utc>>("", "created_at") {
-                        Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                        Err(e2) => {
-                            debug!("Failed to parse as DateTime<Utc>: {}", e2);
-                            match row.try_get::<String>("", "created_at") {
-                                Ok(s) => s,
-                                Err(e3) => {
-                                    debug!("Failed to parse as String: {}", e3);
-                                    "未知时间".to_string()
-                                }
-                            }
-                        }
-                    }
-                }
+                Err(_) => "未知时间".to_string(),
             };
 
             jobs.push(QueueJobInfo {
