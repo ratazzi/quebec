@@ -21,6 +21,7 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Web dashboard
 - Automatic retries
 - Signal handling
+- Lifecycle hooks
 
 ## Database Support
 
@@ -55,6 +56,23 @@ qc.create_table()
 qc.setup_signal_handler()
 event = threading.Event()
 
+# Register lifecycle hooks
+@qc.on_start
+def on_start():
+    logger.info("Quebec is starting...")
+
+@qc.on_stop
+def on_stop():
+    logger.info("Quebec is stopping...")
+
+@qc.on_worker_start
+def on_worker_start():
+    logger.info("Worker is starting...")
+
+@qc.on_worker_stop
+def on_worker_stop():
+    logger.info("Worker is stopping...")
+
 @qc.on_shutdown
 def cleanup():
     logger.info("Shutting down gracefully...")
@@ -88,3 +106,20 @@ while True:
         logger.debug('KeyboardInterrupt received, shutting down...')
         qc.graceful_shutdown()
 ```
+
+## Lifecycle Hooks
+
+Quebec provides several lifecycle hooks that you can use to execute code at different stages of the application lifecycle:
+
+- `@qc.on_start`: Called when Quebec starts
+- `@qc.on_stop`: Called when Quebec stops
+- `@qc.on_worker_start`: Called when a worker starts
+- `@qc.on_worker_stop`: Called when a worker stops
+- `@qc.on_shutdown`: Called during graceful shutdown
+
+These hooks are useful for:
+- Initializing resources
+- Cleaning up resources
+- Logging application state
+- Monitoring worker lifecycle
+- Graceful shutdown handling

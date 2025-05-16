@@ -1,4 +1,4 @@
-from .quebec import *
+from .quebec import * # NOQA
 import logging
 import time
 import queue
