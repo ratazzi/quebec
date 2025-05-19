@@ -220,7 +220,7 @@ impl PyQuebec {
                 let key = k.extract::<String>().unwrap();
                 // 使用 Python::with_gil 来获取 GIL
                 Python::with_gil(|py| {
-                    options_map.insert(key, v.to_object(py));
+                    options_map.insert(key, v.into_pyobject(py).unwrap().into());
                 });
             });
             Some(options_map)
@@ -268,7 +268,7 @@ impl PyQuebec {
     //     LIST_CELL
     //         .get_or_init(py, || {
     //             PyQuebec::new("postgres://ratazzi:@localhost:5432/helvetica_test".to_string())
-    //                 .into_py(py)
+    //                 .to_object(py)
     //                 .into_bound(py)
     //                 .unbind()
     //                 .extract(py)
@@ -286,7 +286,7 @@ impl PyQuebec {
             return Ok(instance.clone());
         }
 
-        let instance = PyQuebec::new(url.clone(), None).into_py(py);
+        let instance = Py::new(py, PyQuebec::new(url.clone(), None))?;
         map.insert(url, instance.clone().extract(py).unwrap());
         Ok(instance.extract(py).unwrap())
     }
@@ -682,7 +682,7 @@ impl PyQuebec {
 
         let handler_func = wrap_pyfunction!(signal_handler)(py)?;
         let functools = py.import("functools")?;
-        let quebec_obj = self.clone().into_pyobject(py)?;
+        let quebec_obj: Py<PyAny> = self.clone().into_pyobject(py).unwrap().into();
 
         let kwargs = PyDict::new(py);
         kwargs.set_item("quebec", quebec_obj)?;
@@ -697,7 +697,7 @@ impl PyQuebec {
         signal.call_method1("signal", (signal.getattr("SIGQUIT")?, wrapped_handler.clone()))?;
 
         info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
-        Ok(wrapped_handler.into_pyobject(py)?.into())
+        Ok(wrapped_handler.into_pyobject(py).unwrap().into())
     }
 
     fn spawn_all(&mut self) -> PyResult<()> {

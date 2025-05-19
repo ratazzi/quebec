@@ -25,37 +25,40 @@ use tokio::sync::Mutex;
 use colored::*;
 use tracing::{info_span, Instrument};
 
-use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
 
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
     match value {
-        serde_json::Value::String(s) => s.to_object(py),
+        serde_json::Value::String(s) => s.into_pyobject(py).unwrap().into(),
         serde_json::Value::Number(n) => {
             if n.is_i64() {
-                n.as_i64().unwrap().to_object(py)
+                let val: i64 = n.as_i64().unwrap();
+                val.into_pyobject(py).unwrap().into()
             } else if n.is_u64() {
-                n.as_u64().unwrap().to_object(py)
+                let val: u64 = n.as_u64().unwrap();
+                val.into_pyobject(py).unwrap().into()
             } else if n.is_f64() {
-                n.as_f64().unwrap().to_object(py)
+                let val: f64 = n.as_f64().unwrap();
+                val.into_pyobject(py).unwrap().into()
             } else {
                 py.None()
             }
         }
-        serde_json::Value::Bool(b) => b.to_object(py),
+        serde_json::Value::Bool(b) => PyBool::new(py, *b).as_ref().into_pyobject(py).unwrap().into(),
         serde_json::Value::Array(arr) => {
             let py_list = PyList::empty(py);
             for item in arr {
                 py_list.append(json_to_py(py, item)).unwrap();
             }
-            py_list.to_object(py)
+            py_list.into_pyobject(py).unwrap().into()
         }
         serde_json::Value::Object(obj) => {
             let py_dict = PyDict::new(py);
             for (key, value) in obj {
                 py_dict.set_item(key, json_to_py(py, value)).unwrap();
             }
-            py_dict.to_object(py)
+            py_dict.into_pyobject(py).unwrap().into()
         }
         serde_json::Value::Null => py.None(),
     }
@@ -73,7 +76,7 @@ async fn runner(
     if true {
         let mut thread_id: u64 = 0;
         Python::with_gil(|py| {
-            let threading = PyModule::import_bound(py, "threading").unwrap();
+            let threading = PyModule::import(py, "threading").unwrap();
             let bound = threading.getattr("get_ident").unwrap();
             let ident = bound.call0().unwrap();
             thread_id = ident.extract::<u64>().unwrap();
@@ -198,7 +201,7 @@ impl Runnable {
             let args = args.unwrap();
 
             // 初始化 kwargs
-            let kwargs = PyDict::new_bound(py);
+            let kwargs = PyDict::new(py);
 
             if args.len() > 1 {
                 let last_index = args.len() - 1;
@@ -215,14 +218,14 @@ impl Runnable {
 
             // debug!("args: {:?}", args);
             // debug!("kwargs: {:?}", kwargs);
-            let args = PyTuple::new_bound(py, args);
+            let args = PyTuple::new(py, args);
 
             let bound = self.handler.bind(py);
             let instance = bound.call0().unwrap();
             // let ret = instance.call_method0("perform");
             instance.setattr("id", job.id).unwrap();
             let func = instance.getattr("perform").unwrap();
-            let ret = func.call(args, Some(&kwargs));
+            let ret = func.call((&args.unwrap(),), Some(&kwargs));
 
             match ret {
                 Ok(_) => {
@@ -260,7 +263,7 @@ impl Runnable {
                     //             if let Ok(exception_type) = exception.downcast::<PyType>() {
                     //                 let exception_name = exception_type.qualname()?;
 
-                    //                 let exception_any = exception.into_py(py).into_bound(py);
+                    //                 let exception_any = exception.into_pyobject(py).into_bound(py);
                     //                 if e.is_instance_bound(py, &exception_any) {
                     //                     // deal with handler
                     //                     warn!("Job was discarded due to: {}", exception_name);
@@ -309,7 +312,7 @@ impl Runnable {
                     //             if let Ok(exception_type) = exception.downcast::<PyType>() {
                     //                 let exception_name = exception_type.qualname()?;
 
-                    //                 let exception_any = exception.into_py(py).into_bound(py);
+                    //                 let exception_any = exception.into_pyobject(py).into_bound(py);
                     //                 if e.is_instance_bound(py, &exception_any) {
                     //                     // warn!("Job rescued due to: {}", exception_name);
 
@@ -351,7 +354,7 @@ impl Runnable {
                     //                         let _ = args.append(&e);
                     //                     }
 
-                    //                     let args = PyTuple::new_bound(py, args);
+                    //                     let args = Py::new(py, PyTuple::new(py, args)).unwrap();
                     //                     // debug!("args: {:?}", args);
                     //                     let ret = func.call(args, None);
                     //                     debug!("rescue_from ret: {:?}", ret);
@@ -379,7 +382,7 @@ impl Runnable {
                     //             let exception_name = exception_type.name()?;
                     //             // debug!("exception_name: {:?}", exception_name);
 
-                    //             let exception_any = exception.into_py(py).into_bound(py);
+                    //             let exception_any = exception.into_pyobject(py).into_bound(py);
                     //             if e.is_instance_bound(py, &exception_any) {
                     //                 warn!("------- got exception can be retry: {}", exception_name);
                     //             }
@@ -392,7 +395,7 @@ impl Runnable {
                     job.failed_attempts += 1;
 
                     let mut backtrace: Vec<String> = vec![];
-                    let traceback = e.traceback_bound(py);
+                    let traceback = e.traceback(py);
                     // warn!("traceback: {:?}", traceback);
 
                     if let Some(tb) = traceback {
@@ -405,8 +408,8 @@ impl Runnable {
                     // error!("error_description: {}", e.value_bound(py).to_string());
 
                     let error_payload = serde_json::json!({
-                        "exception_class": e.get_type_bound(py).str().unwrap().to_string(),
-                        "message": e.value_bound(py).to_string(),
+                        "exception_class": e.get_type(py).str().unwrap().to_string(),
+                        "message": e.value(py).to_string(),
                         "backtrace": backtrace,
                     });
 
