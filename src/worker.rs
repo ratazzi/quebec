@@ -376,145 +376,14 @@ impl Runnable {
                 }
                 Err(e) => {
                     // 返回失败
-                    error!("------------------- [DEBUG] error: {:?}", e);
+                    error!("error: {:?}", e);
                     // debug!("is PyException: {:?}", e.is_instance_of::<PyException>(py));
                     // debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
                     // debug!("bound: {:?}", bound);
 
-                    // apply discard_on
-                    // if bound.hasattr("discard_on")? {
-                    //     let values = bound.getattr("discard_on")?;
-                    //     let strategies = if let Ok(tuple) = values.extract::<&PyTuple>() {
-                    //         tuple
-                    //             .iter()
-                    //             .map(|item| item.extract::<DiscardStrategy>())
-                    //             .collect::<Result<Vec<_>, _>>()?
-                    //     } else if let Ok(list) = values.extract::<&PyList>() {
-                    //         list.iter()
-                    //             .map(|item| item.extract::<DiscardStrategy>())
-                    //             .collect::<Result<Vec<_>, _>>()?
-                    //     } else {
-                    //         vec![]
-                    //     };
-
-                    //     for strategy in strategies.iter() {
-                    //         let exceptions = strategy.exceptions.extract::<&PyTuple>(py)?;
-                    //         debug!("exceptions: {:?}", exceptions);
-
-                    //         for exception in exceptions.iter() {
-                    //             if let Ok(exception_type) = exception.downcast::<PyType>() {
-                    //                 let exception_name = exception_type.qualname()?;
-
-                    //                 let exception_any = exception.into_pyobject(py).into_bound(py);
-                    //                 if e.is_instance_bound(py, &exception_any) {
-                    //                     // deal with handler
-                    //                     warn!("Job was discarded due to: {}", exception_name);
-                    //                     return Ok(job.clone());
-                    //                 }
-                    //             } else {
-                    //                 error!("{:?} is not a PyType", exception);
-                    //             }
-                    //         }
-                    //     }
-                    // }
-
-                    // // apply rescue_from
-                    // let rescue_from_name = "rescue_from";
-                    // if bound.hasattr(rescue_from_name)? {
-                    //     // let rescue_strategies =
-                    //     //     bound.getattr("rescue_from")?.extract::<&PyList>()?;
-                    //     let values = bound.getattr(rescue_from_name)?;
-                    //     let rescue_strategies = if let Ok(tuple) = values.extract::<&PyTuple>() {
-                    //         tuple
-                    //             .iter()
-                    //             .map(|item| item.extract::<RescueStrategy>())
-                    //             .collect::<Result<Vec<_>, _>>()?
-                    //     } else if let Ok(list) = values.extract::<&PyList>() {
-                    //         list.iter()
-                    //             .map(|item| item.extract::<RescueStrategy>())
-                    //             .collect::<Result<Vec<_>, _>>()?
-                    //     } else {
-                    //         vec![]
-                    //     };
-
-                    //     debug!("############# apply rescue_strategies: {:?}", rescue_strategies);
-
-                    //     for strategy in rescue_strategies.iter() {
-                    //         // let strategy = strategy.extract::<RescueStrategy>()?;
-                    //         debug!("strategy: {:?}", strategy);
-
-                    //         let exceptions = strategy.exceptions.extract::<&PyTuple>(py)?;
-                    //         debug!("exceptions: {:?}", exceptions);
-                    //         let handler = strategy.handler.clone().into_bound(py);
-                    //         // let handler = strategy.handler;
-                    //         // debug!("handler: {:?}", handler);
-
-                    //         // let mut value: Result<pyo3::Bound<'_, pyo3::PyAny>, E> = Ok(handler);
-                    //         for exception in exceptions.iter() {
-                    //             if let Ok(exception_type) = exception.downcast::<PyType>() {
-                    //                 let exception_name = exception_type.qualname()?;
-
-                    //                 let exception_any = exception.into_pyobject(py).into_bound(py);
-                    //                 if e.is_instance_bound(py, &exception_any) {
-                    //                     // warn!("Job rescued due to: {}", exception_name);
-
-                    //                     if handler.is_instance_of::<pyo3::types::PyString>() {
-                    //                         // debug!("handler is a PyString");
-                    //                     } else if handler.is_callable() {
-                    //                         // debug!("handler is a PyFunction");
-                    //                     } else {
-                    //                         // error!("rescue_from handler is not a PyFunction");
-                    //                         continue;
-                    //                     }
-
-                    //                     let func =
-                    //                         if let Ok(func_name) = handler.extract::<&PyString>() {
-                    //                             instance.getattr(func_name.to_str()?)
-                    //                         } else {
-                    //                             Ok(handler.clone())
-                    //                         };
-
-                    //                     if func.is_err() {
-                    //                         error!("rescue_from handler is not a PyFunction");
-                    //                         continue;
-                    //                     }
-                    //                     let func = func.unwrap();
-                    //                     // debug!("handler: {:?}", func);
-                    //                     warn!(
-                    //                         "Job was rescued by {:?} due to: {}",
-                    //                         handler, exception_name
-                    //                     );
-                    //                     // let args = PyList::new_bound(py, vec![&instance]);
-                    //                     let mut args = PyList::new_bound(py, vec![&e]);
-                    //                     // let _ = args.append(&e);
-
-                    //                     if func.hasattr("__self__")? {
-                    //                         debug!("............ func is instance method");
-                    //                     } else {
-                    //                         debug!("............ func is not instance method");
-                    //                         args = PyList::new_bound(py, vec![&instance]);
-                    //                         let _ = args.append(&e);
-                    //                     }
-
-                    //                     let args = Py::new(py, PyTuple::new(py, args)).unwrap();
-                    //                     // debug!("args: {:?}", args);
-                    //                     let ret = func.call(args, None);
-                    //                     debug!("rescue_from ret: {:?}", ret);
-
-                    //                     if ret.is_ok() {
-                    //                         return Ok(job.clone());
-                    //                     }
-                    //                 }
-                    //             } else {
-                    //                 error!("{:?} is not a PyType", exception);
-                    //             }
-                    //         }
-                    //     }
-                    // }
-
                     // 检查是否应该重试
                     if let Some(retry_strategy) = self.should_retry(py, &bound, &e, job.failed_attempts)? {
-                        warn!("Job will be retried (attempt {})", job.failed_attempts + 1);
+                        warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
                         let delay = retry_strategy.wait;
                         let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).unwrap();
@@ -614,6 +483,7 @@ pub struct Execution {
     runnable: Runnable,
     metric: Option<Metric>,
     result: Option<Result<solid_queue_jobs::Model>>,
+    retry_info: Option<RetryInfo>,
 }
 
 impl Execution {
@@ -642,6 +512,7 @@ impl Execution {
             runnable,
             metric: None,
             result: None,
+            retry_info: None,
         }
     }
 
@@ -655,7 +526,14 @@ impl Execution {
         let job_id = self.claimed.job_id;
         let span = tracing::info_span!("runner", queue=self.runnable.queue_as, jid = job_id, tid = self.tid.clone());
         // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
-        let result = async { self.runnable.invoke(&mut job) }.instrument(span.clone()).await;
+        let result = async {
+            let invoke_result = self.runnable.invoke(&mut job);
+            // 将重试信息从 runnable 移动到 execution
+            if let Some(retry_info) = self.runnable.retry_info.take() {
+                self.retry_info = Some(retry_info);
+            }
+            invoke_result
+        }.instrument(span.clone()).await;
 
         let failed = result.is_err();
         let ret = self.after_executed(result).instrument(span).await;
@@ -698,8 +576,8 @@ impl Execution {
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
-        // 检查是否需要重试（通过 runnable.retry_info 判断）
-        let retry_job_data = if let Some(ref retry_info) = self.runnable.retry_info {
+        // 检查是否需要重试（通过 execution.retry_info 判断）
+        let retry_job_data = if let Some(ref retry_info) = self.retry_info {
             Some((retry_info.scheduled_at, retry_info.failed_attempts))
         } else {
             None
