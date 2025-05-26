@@ -220,8 +220,8 @@ impl Runnable {
         Ok(Some(false))
     }
 
-    /// 检查是否有救援处理
-    fn should_rescue(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<bool>> {
+    /// 检查是否有救援处理，返回匹配的救援策略
+    fn should_rescue(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<RescueStrategy>> {
         if !bound.hasattr("rescue_from")? {
             return Ok(None);
         }
@@ -230,16 +230,11 @@ impl Runnable {
 
         for strategy in rescue_strategies {
             if self.is_exception_match(py, &strategy.exceptions, error)? {
-                // 调用救援处理器
-                if let Err(rescue_error) = strategy.handler.call1(py, (error.value(py),)) {
-                    warn!("Error in rescue handler: {}", rescue_error);
-                    return Ok(Some(false));
-                }
-                return Ok(Some(true));
+                return Ok(Some(strategy));
             }
         }
 
-        Ok(Some(false))
+        Ok(None)
     }
 
     /// 检查异常是否匹配
@@ -267,7 +262,7 @@ impl Runnable {
 
 
 
-    /// 处理丢弃
+    /// 处理丢弃 - 直接标记任务为完成，不记录失败信息
     fn handle_discard(
         &self, py: Python, bound: &Bound<PyAny>, error: &PyErr, job: solid_queue_jobs::Model,
     ) -> Result<solid_queue_jobs::Model> {
@@ -286,8 +281,8 @@ impl Runnable {
                         .unwrap_or_else(|_| "unknown error".to_string());
                     info!("Job discarded due to {}", error_name);
 
-                    // 返回一个特殊的错误，表示任务应该被丢弃
-                    return Err(anyhow::anyhow!("JOB_DISCARDED"));
+                    // 直接返回成功，表示任务被丢弃并标记为完成
+                    return Ok(job);
                 }
             }
         }
@@ -543,10 +538,17 @@ impl Runnable {
                     }
 
                     // 检查是否有救援处理
-                    if let Some(rescue_result) = self.should_rescue(py, &bound, &e)? {
-                        if rescue_result {
-                            info!("Job rescued from error");
-                            return Ok(job.clone());
+                    if let Some(rescue_strategy) = self.should_rescue(py, &bound, &e)? {
+                        // 调用救援处理器
+                        match rescue_strategy.handler.call1(py, (e.value(py),)) {
+                            Ok(_) => {
+                                info!("Job rescued from error");
+                                return Ok(job.clone());
+                            }
+                            Err(rescue_error) => {
+                                warn!("Error in rescue handler: {}", rescue_error);
+                                // 救援失败，继续到失败处理
+                            }
                         }
                     }
 
