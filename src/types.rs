@@ -868,6 +868,7 @@ pub struct ActiveJob {
     pub class_name: String,
     pub arguments: String,
     pub priority: i32,
+    pub failed_attempts: i32,
     pub active_job_id: String,
     pub scheduled_at: chrono::NaiveDateTime,
     pub finished_at: Option<chrono::NaiveDateTime>,
@@ -919,6 +920,7 @@ impl ActiveJob {
             class_name: "".to_string(),
             arguments: "[]".to_string(),
             priority: 0,
+            failed_attempts: 0,
             active_job_id: "".to_string(),
             scheduled_at: chrono::Utc::now().naive_utc(),
             finished_at: None,
@@ -957,6 +959,16 @@ impl ActiveJob {
     #[getter]
     pub fn get_priority(&self) -> i32 {
         self.priority
+    }
+
+    #[getter]
+    pub fn get_failed_attempts(&self) -> i32 {
+        self.failed_attempts
+    }
+
+    #[setter]
+    fn set_failed_attempts(&mut self, failed_attempts: i32) {
+        self.failed_attempts = failed_attempts;
     }
 
     #[getter]

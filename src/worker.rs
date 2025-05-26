@@ -224,6 +224,7 @@ impl Runnable {
             let instance = bound.call0().unwrap();
             // let ret = instance.call_method0("perform");
             instance.setattr("id", job.id).unwrap();
+            instance.setattr("failed_attempts", job.failed_attempts).unwrap();
             let func = instance.getattr("perform").unwrap();
             let ret = func.call((&args.unwrap(),), Some(&kwargs));
 
