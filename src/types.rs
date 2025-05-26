@@ -1017,8 +1017,8 @@ impl ActiveJob {
 
     pub fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "ActiveJob(id={:?}, queue_name={}, class_name={}, arguments={}, priority={}, active_job_id={}, scheduled_at={})",
-            self.id, self.queue_name, self.class_name, self.arguments, self.priority, self.active_job_id, self.scheduled_at
+            "ActiveJob(id={:?}, queue_name={}, class_name={}, arguments={}, priority={}, failed_attempts={}, active_job_id={}, scheduled_at={})",
+            self.id, self.queue_name, self.class_name, self.arguments, self.priority, self.failed_attempts, self.active_job_id, self.scheduled_at
         ))
     }
 

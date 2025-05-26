@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use colored::*;
 use tracing::{info_span, Instrument};
 
-use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
 
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
@@ -166,14 +166,160 @@ pub struct Runnable {
     handler: Py<PyAny>,
     queue_as: String,
     priority: i64,
+    retry_info: Option<RetryInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct RetryInfo {
+    scheduled_at: chrono::NaiveDateTime,
+    failed_attempts: i32,
 }
 
 impl Runnable {
     pub fn new(class_name: String, handler: Py<PyAny>, queue_as: String, priority: i64) -> Self {
-        Self { class_name, handler, queue_as, priority }
+        Self { class_name, handler, queue_as, priority, retry_info: None }
     }
 
-    fn invoke(&self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
+    /// 检查是否应该重试，返回匹配的重试策略
+    fn should_retry(
+        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr, failed_attempts: i32,
+    ) -> PyResult<Option<RetryStrategy>> {
+        if !bound.hasattr("retry_on")? {
+            return Ok(None);
+        }
+
+        let retry_strategies = bound.getattr("retry_on")?.extract::<Vec<RetryStrategy>>()?;
+
+        for strategy in retry_strategies {
+            if i64::from(failed_attempts) >= strategy.attempts {
+                continue; // 超过最大重试次数
+            }
+
+            if self.is_exception_match(py, &strategy.exceptions, error)? {
+                return Ok(Some(strategy));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// 检查是否应该丢弃
+    fn should_discard(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<bool>> {
+        if !bound.hasattr("discard_on")? {
+            return Ok(None);
+        }
+
+        let discard_strategies = bound.getattr("discard_on")?.extract::<Vec<DiscardStrategy>>()?;
+
+        for strategy in discard_strategies {
+            if self.is_exception_match(py, &strategy.exceptions, error)? {
+                return Ok(Some(true));
+            }
+        }
+
+        Ok(Some(false))
+    }
+
+    /// 检查是否有救援处理
+    fn should_rescue(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<bool>> {
+        if !bound.hasattr("rescue_from")? {
+            return Ok(None);
+        }
+
+        let rescue_strategies = bound.getattr("rescue_from")?.extract::<Vec<RescueStrategy>>()?;
+
+        for strategy in rescue_strategies {
+            if self.is_exception_match(py, &strategy.exceptions, error)? {
+                // 调用救援处理器
+                if let Err(rescue_error) = strategy.handler.call1(py, (error.value(py),)) {
+                    warn!("Error in rescue handler: {}", rescue_error);
+                    return Ok(Some(false));
+                }
+                return Ok(Some(true));
+            }
+        }
+
+        Ok(Some(false))
+    }
+
+    /// 检查异常是否匹配
+    fn is_exception_match(&self, py: Python, exceptions: &Py<PyAny>, error: &PyErr) -> PyResult<bool> {
+        let exceptions_bound = exceptions.bind(py);
+
+        // 处理单个异常类型
+        if let Ok(exception_type) = exceptions_bound.downcast::<PyType>() {
+            return Ok(error.is_instance(py, exception_type));
+        }
+
+        // 处理异常类型元组
+        if let Ok(exception_tuple) = exceptions_bound.downcast::<PyTuple>() {
+            for item in exception_tuple.iter() {
+                if let Ok(exception_type) = item.downcast::<PyType>() {
+                    if error.is_instance(py, exception_type) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+
+
+    /// 处理丢弃
+    fn handle_discard(
+        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr, job: solid_queue_jobs::Model,
+    ) -> Result<solid_queue_jobs::Model> {
+        if let Ok(discard_strategies) = bound.getattr("discard_on").and_then(|d| d.extract::<Vec<DiscardStrategy>>()) {
+            for strategy in discard_strategies {
+                if self.is_exception_match(py, &strategy.exceptions, error).unwrap_or(false) {
+                    // 调用丢弃处理器（如果有）
+                    if let Some(handler) = &strategy.handler {
+                        if let Err(handler_error) = handler.call1(py, (error.value(py),)) {
+                            warn!("Error in discard handler: {}", handler_error);
+                        }
+                    }
+
+                    let error_name = error.get_type(py).name()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "unknown error".to_string());
+                    info!("Job discarded due to {}", error_name);
+
+                    // 返回一个特殊的错误，表示任务应该被丢弃
+                    return Err(anyhow::anyhow!("JOB_DISCARDED"));
+                }
+            }
+        }
+
+        // 如果没有找到匹配的丢弃策略，返回原始错误
+        let error_payload = self.create_error_payload(py, error);
+        Err(anyhow::anyhow!(error_payload))
+    }
+
+    /// 创建错误负载
+    fn create_error_payload(&self, py: Python, error: &PyErr) -> String {
+        let mut backtrace: Vec<String> = vec![];
+        if let Some(tb) = error.traceback(py) {
+            if let Ok(formatted) = tb.format() {
+                backtrace = formatted.to_string().lines().map(String::from).collect();
+            }
+        }
+
+        let exception_class = error.get_type(py).name()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "UnknownError".to_string());
+
+        let error_payload = serde_json::json!({
+            "exception_class": exception_class,
+            "message": error.value(py).to_string(),
+            "backtrace": backtrace,
+        });
+
+        serde_json::to_string(&error_payload).unwrap_or_else(|_| "Failed to serialize error".to_string())
+    }
+
+    fn invoke(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
         Python::with_gil(|py| {
             // py.allow_threads(|| {
             // deserialize json arguments
@@ -235,7 +381,7 @@ impl Runnable {
                 }
                 Err(e) => {
                     // 返回失败
-                    error!("error: {:?}", e);
+                    error!("------------------- [DEBUG] error: {:?}", e);
                     // debug!("is PyException: {:?}", e.is_instance_of::<PyException>(py));
                     // debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
                     // debug!("bound: {:?}", bound);
@@ -371,50 +517,43 @@ impl Runnable {
                     //     }
                     // }
 
-                    // if bound.hasattr("retry_on")? {
-                    //     let retry_on = bound.getattr("retry_on")?.extract::<RetryStrategy>()?;
-                    //     debug!("retry_on: {:?}", retry_on);
+                    // 检查是否应该重试
+                    if let Some(retry_strategy) = self.should_retry(py, &bound, &e, job.failed_attempts)? {
+                        warn!("Job will be retried (attempt {})", job.failed_attempts + 1);
 
-                    //     let exceptions = retry_on.exceptions.extract::<&PyTuple>(py)?;
-                    //     debug!("exceptions: {:?}", exceptions);
+                        let delay = retry_strategy.wait;
+                        let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).unwrap();
+                        let failed_attempts = job.failed_attempts + 1;
 
-                    //     for exception in exceptions.iter() {
-                    //         if let Ok(exception_type) = exception.downcast::<PyType>() {
-                    //             let exception_name = exception_type.name()?;
-                    //             // debug!("exception_name: {:?}", exception_name);
+                        // 设置重试信息到 runnable
+                        self.retry_info = Some(RetryInfo {
+                            scheduled_at,
+                            failed_attempts,
+                        });
 
-                    //             let exception_any = exception.into_pyobject(py).into_bound(py);
-                    //             if e.is_instance_bound(py, &exception_any) {
-                    //                 warn!("------- got exception can be retry: {}", exception_name);
-                    //             }
-                    //         } else {
-                    //             debug!("Element is not a PyType");
-                    //         }
-                    //     }
-                    // }
-
-                    job.failed_attempts += 1;
-
-                    let mut backtrace: Vec<String> = vec![];
-                    let traceback = e.traceback(py);
-                    // warn!("traceback: {:?}", traceback);
-
-                    if let Some(tb) = traceback {
-                        backtrace =
-                            tb.format().unwrap().to_string().lines().map(String::from).collect();
+                        return Ok(job.clone());
                     }
 
-                    // error!("error_type: {}", e.get_type_bound(py).str().unwrap());
-                    // error!("error_type: {}", e.get_type_bound(py).qualname().unwrap());
-                    // error!("error_description: {}", e.value_bound(py).to_string());
+                    // 检查是否应该丢弃
+                    if let Some(discard_result) = self.should_discard(py, &bound, &e)? {
+                        if discard_result {
+                            warn!("Job will be discarded");
+                            return self.handle_discard(py, &bound, &e, job.clone());
+                        }
+                    }
 
-                    let error_payload = serde_json::json!({
-                        "exception_class": e.get_type(py).str().unwrap().to_string(),
-                        "message": e.value(py).to_string(),
-                        "backtrace": backtrace,
-                    });
+                    // 检查是否有救援处理
+                    if let Some(rescue_result) = self.should_rescue(py, &bound, &e)? {
+                        if rescue_result {
+                            info!("Job rescued from error");
+                            return Ok(job.clone());
+                        }
+                    }
 
-                    Err(anyhow::anyhow!(serde_json::to_string(&error_payload).unwrap()))
+                    // 如果没有任何错误处理策略匹配，则标记为失败
+                    job.failed_attempts += 1;
+                    let error_payload = self.create_error_payload(py, &e);
+                    Err(anyhow::anyhow!(error_payload))
                 }
             }
 
@@ -430,7 +569,7 @@ impl Runnable {
         self.handler.clone()
     }
 
-    fn perform(&self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
+    fn perform(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
         self.invoke(job)
     }
 
@@ -557,10 +696,50 @@ impl Execution {
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
+        // 检查是否需要重试（通过 runnable.retry_info 判断）
+        let retry_job_data = if let Some(ref retry_info) = self.runnable.retry_info {
+            Some((retry_info.scheduled_at, retry_info.failed_attempts))
+        } else {
+            None
+        };
+
         db.transaction::<_, solid_queue_jobs::Model, DbErr>(|txn| {
             // Box::pin(async move { Ok(after_executed(txn, claimed, result).await.unwrap()) })
             Box::pin(async move {
                 let claimed_id = claimed.id;
+
+                // 处理重试逻辑
+                if let Some((scheduled_at, failed_attempts)) = retry_job_data {
+                    let retry_job = solid_queue_jobs::ActiveModel {
+                        id: ActiveValue::NotSet,
+                        queue_name: ActiveValue::Set(job.queue_name.clone()),
+                        class_name: ActiveValue::Set(job.class_name.clone()),
+                        arguments: ActiveValue::Set(job.arguments.clone()),
+                        priority: ActiveValue::Set(job.priority),
+                        failed_attempts: ActiveValue::Set(failed_attempts),
+                        active_job_id: ActiveValue::Set(job.active_job_id.clone()),
+                        scheduled_at: ActiveValue::Set(Some(scheduled_at)),
+                        finished_at: ActiveValue::Set(None),
+                        concurrency_key: ActiveValue::Set(job.concurrency_key.clone()),
+                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                        updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                    };
+                    let saved_job = retry_job.save(txn).await?;
+                    let new_job_id = saved_job.id.clone().unwrap();
+
+                    // 创建 scheduled_execution 记录
+                    let scheduled_execution = solid_queue_scheduled_executions::ActiveModel {
+                        id: ActiveValue::NotSet,
+                        job_id: ActiveValue::Set(new_job_id),
+                        queue_name: ActiveValue::Set(job.queue_name.clone()),
+                        priority: ActiveValue::Set(job.priority),
+                        scheduled_at: ActiveValue::Set(scheduled_at),
+                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                    };
+                    scheduled_execution.save(txn).await?;
+
+                    info!("Retry job {} scheduled for {}", new_job_id, scheduled_at);
+                }
 
                 if failed {
                     error!("Job failed: {:?}", err);
@@ -914,6 +1093,7 @@ impl Worker {
                 handler: klass,
                 queue_as: queue_name,
                 priority: 0,
+                retry_info: None,
             };
             info!("Registered job: {:?}", runnable);
 
