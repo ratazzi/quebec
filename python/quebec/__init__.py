@@ -33,23 +33,13 @@ class NoNewOverrideMeta(type):
         return super().__new__(cls, name, bases, dct)
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
-    @classmethod
-    def rescue_from(cls, *exceptions):
-        def decorator(func):
-            @wraps(func)
-            def wrapper(self, *args, **kwargs):
-                # print(f"........................... wrapper: self: {self}, args: {args}, kwargs: {kwargs}")
-                return func(self, *args, **kwargs)
-            cls.register_rescue_strategy(RescueStrategy(exceptions, wrapper))
-            return wrapper
-        return decorator
+    pass
 
 
 class ThreadedRunner:
     def __init__(self, queue: queue.Queue, event: threading.Event):
         self.queue = queue
         self.event = event
-        self.failed_attempts = 0
         self.execution: Optional[Any] = None
 
     def run(self):
@@ -63,6 +53,7 @@ class ThreadedRunner:
                 self.queue.task_done()
                 self.execution.tid = str(threading.get_ident())
 
+                # 错误处理现在完全在 Rust 层面进行
                 self.execution.perform()
                 logger.debug(self.execution.metric)
 
@@ -71,67 +62,12 @@ class ThreadedRunner:
             except (queue.ShutDown, KeyboardInterrupt) as e:
                 break
             except Exception as e:
-                self.handle_exception(e)
+                # 所有异常都应该在 Rust 层面处理，这里只记录未预期的错误
+                logger.error(f"Unexpected exception in ThreadedRunner: {e}", exc_info=True)
             finally:
                 self.cleanup()
 
         logger.debug("threaded_runner exit")
-
-    def handle_exception(self, exception: Exception):
-        """Handle different types of exceptions"""
-        try:
-            # if self.should_discard(exception):
-            #     return
-
-            # if self.should_rescue(exception):
-            #     return
-
-            if self.should_retry(exception):
-                return
-
-            # If none of the above handlers processed the exception
-            logger.error(f"Unhandled exception: {exception}", exc_info=True)
-
-        except Exception as e:
-            logger.error(f"Error in exception handling: {e}", exc_info=True)
-
-    def should_discard(self, exception: Exception) -> bool:
-        """Apply discard_on strategy"""
-        if not hasattr(self.execution.runnable.handler, 'discard_on'):
-            return False
-
-        for strategy in self.execution.runnable.handler.discard_on:
-            if isinstance(exception, strategy.exceptions):
-                logger.debug(f"Discarding job due to {exception.__class__.__name__}")
-                return True
-        return False
-
-    def should_rescue(self, exception: Exception) -> bool:
-        """Apply rescue_from strategy"""
-        if not hasattr(self.execution.runnable.handler, 'rescue_from'):
-            return False
-
-        for strategy in self.execution.runnable.handler.rescue_from:
-            if isinstance(exception, strategy.exceptions):
-                logger.debug(f"Rescuing from {exception.__class__.__name__}")
-                # Call rescue method if defined
-                if hasattr(strategy, 'rescue'):
-                    strategy.rescue(self.execution, exception)
-                return True
-        return False
-
-    def should_retry(self, exception: Exception) -> bool:
-        """Apply retry_on strategy"""
-        if not hasattr(self.execution.runnable.handler, 'retry_on'):
-            return False
-
-        for strategy in self.execution.runnable.handler.retry_on:
-            if isinstance(exception, strategy.exceptions) and self.failed_attempts < strategy.attempts:
-                logger.debug(f"Retrying due to {exception.__class__.__name__}")
-                self.failed_attempts += 1
-                self.execution.retry(strategy, exception)
-                return True
-        return False
 
     def cleanup(self):
         """Cleanup after job execution"""
