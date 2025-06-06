@@ -2,7 +2,7 @@ use crate::context::*;
 use crate::entities::{prelude::*, *};
 use crate::semaphore::acquire_semaphore;
 use crate::types::ActiveJob;
-use log::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use pyo3::PyResult;

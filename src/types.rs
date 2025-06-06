@@ -30,10 +30,6 @@ use crate::entities::{prelude::*, *};
 use crate::scheduler::Scheduler;
 use crate::worker::{Execution, Metric, Worker};
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 trait EntityTrait {
@@ -205,7 +201,7 @@ impl PyQuebec {
             .connect_timeout(Duration::from_secs(3)) // 设置连接超时时间
             .idle_timeout(Duration::from_secs(600)) // 设置空闲连接超时时间
             .sqlx_logging(true)
-            .sqlx_logging_level(log::LevelFilter::Trace);
+            .sqlx_logging_level(tracing::log::LevelFilter::Trace);
 
         // 为所有数据库类型预先创建一个连接
         // 这个连接将被包装在 Arc 中并在需要时使用

@@ -1,4 +1,5 @@
 use rust_embed::RustEmbed;
+use tracing::error;
 
 // 定义嵌入式模板资源
 #[derive(RustEmbed)]
@@ -16,7 +17,7 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
         match std::fs::read_to_string(&path) {
             Ok(content) => Some(content),
             Err(e) => {
-                log::error!("Failed to read template {} from disk: {}", template_name, e);
+                error!("Failed to read template {} from disk: {}", template_name, e);
                 None
             }
         }
@@ -31,13 +32,13 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
                 match std::str::from_utf8(content.data.as_ref()) {
                     Ok(s) => Some(s.to_string()),
                     Err(e) => {
-                        log::error!("Failed to decode template {}: {}", template_name, e);
+                        error!("Failed to decode template {}: {}", template_name, e);
                         None
                     }
                 }
             },
             None => {
-                log::error!("Template {} not found in embedded assets", template_name);
+                error!("Template {} not found in embedded assets", template_name);
                 None
             }
         }
@@ -64,7 +65,7 @@ pub fn list_templates() -> Vec<String> {
                         }
                     })
                     .collect();
-                
+
                 // 确保基础模板先加载
                 templates.sort_by(|a, b| {
                     // base.html 总是最先加载
@@ -76,11 +77,11 @@ pub fn list_templates() -> Vec<String> {
                         a.cmp(b)
                     }
                 });
-                
+
                 templates
             },
             Err(e) => {
-                log::error!("Failed to read templates directory: {}", e);
+                error!("Failed to read templates directory: {}", e);
                 Vec::new()
             }
         }
@@ -99,7 +100,7 @@ pub fn list_templates() -> Vec<String> {
                 }
             })
             .collect();
-            
+
         // 确保基础模板先加载
         templates.sort_by(|a, b| {
             // base.html 总是最先加载
@@ -111,7 +112,7 @@ pub fn list_templates() -> Vec<String> {
                 a.cmp(b)
             }
         });
-        
+
         templates
     }
 }

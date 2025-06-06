@@ -10,9 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1.0.90"
 chrono = "0.4.38"
-env_logger = "0.11.5"
+
 futures = "0.3.31"
-log = { version = "0.4.22", optional = false }
+
 sea-orm = { version = "1.1.0", features = [
   "sqlx-postgres",
   "sqlx-sqlite",
@@ -59,11 +59,6 @@ axum = "0.7"
 tera = "1.19"
 tower-http = { version = "0.5", features = ["trace", "fs"] }
 rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] }
-
-[features]
-use-log = []
-use-tracing = []
-default = ["use-tracing"]
 
 [lints.rust]
 dead_code = "allow"

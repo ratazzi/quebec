@@ -19,11 +19,7 @@ use worker::{Execution, Metric, Runnable};
 
 use pyo3::prelude::*;
 
-// #[cfg(feature = "use-log")]
-// use log::{debug, error, info, trace, warn};
 
-// #[cfg(feature = "use-tracing")]
-// use tracing::{debug, error, info, trace, warn};
 
 // pyo3::create_exception!(quebec, CustomError, PyException);
 
@@ -35,14 +31,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 会导致莫名其妙的死锁
     // pyo3_log::init();
 
-    // 暂时未发现问题
-    #[cfg(feature = "use-log")]
-    {
-        env_logger::Builder::from_default_env().format_timestamp_micros().init();
-        debug!("Using log crate");
-    }
-
-    #[cfg(feature = "use-tracing")]
+    // 使用 tracing
     {
         // 使用自定义的 EnvFilter，默认开启 DEBUG 级别
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()

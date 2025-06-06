@@ -8,11 +8,7 @@ use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::sync::Arc;
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
 use tracing::Instrument;
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 #[derive(Debug)]

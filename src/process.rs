@@ -8,10 +8,6 @@ use sea_orm::*;
 
 use pyo3::prelude::*;
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 pub fn is_running_in_pyo3() -> bool {

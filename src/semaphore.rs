@@ -1,6 +1,6 @@
 // use crate::context::*;
 use crate::entities::{prelude::*, *};
-use log::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
 pub async fn acquire_semaphore<C>(db: &C, key: String) -> Result<bool, DbErr>

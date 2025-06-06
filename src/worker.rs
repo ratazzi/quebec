@@ -4,11 +4,7 @@ use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
 use sea_query::LockBehavior;
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;

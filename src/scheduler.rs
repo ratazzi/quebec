@@ -12,10 +12,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 // ```sql

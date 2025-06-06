@@ -10,10 +10,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-#[cfg(feature = "use-log")]
-use log::{debug, error, info, trace, warn};
-
-#[cfg(feature = "use-tracing")]
 use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;
@@ -178,8 +174,8 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        dsn: Url, 
-        db: Option<Arc<DatabaseConnection>>, 
+        dsn: Url,
+        db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
         options: Option<HashMap<String, PyObject>>
     ) -> Self {
@@ -205,7 +201,7 @@ impl AppContext {
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
         };
-        
+
         // 如果有传入选项，则覆盖默认配置
         if let Some(options) = options {
             Python::with_gil(|py| {
@@ -215,7 +211,7 @@ impl AppContext {
                         ctx.use_skip_locked = value;
                     }
                 }
-                
+
                 // 处理 process_heartbeat_interval
                 if let Some(val) = options.get("process_heartbeat_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -224,7 +220,7 @@ impl AppContext {
                         ctx.process_heartbeat_interval = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 process_alive_threshold
                 if let Some(val) = options.get("process_alive_threshold") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -233,7 +229,7 @@ impl AppContext {
                         ctx.process_alive_threshold = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 shutdown_timeout
                 if let Some(val) = options.get("shutdown_timeout") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -242,21 +238,21 @@ impl AppContext {
                         ctx.shutdown_timeout = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 silence_polling
                 if let Some(val) = options.get("silence_polling") {
                     if let Ok(value) = val.extract::<bool>(py) {
                         ctx.silence_polling = value;
                     }
                 }
-                
+
                 // 处理 preserve_finished_jobs
                 if let Some(val) = options.get("preserve_finished_jobs") {
                     if let Ok(value) = val.extract::<bool>(py) {
                         ctx.preserve_finished_jobs = value;
                     }
                 }
-                
+
                 // 处理 clear_finished_jobs_after
                 if let Some(val) = options.get("clear_finished_jobs_after") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -265,7 +261,7 @@ impl AppContext {
                         ctx.clear_finished_jobs_after = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 default_concurrency_control_period
                 if let Some(val) = options.get("default_concurrency_control_period") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -274,7 +270,7 @@ impl AppContext {
                         ctx.default_concurrency_control_period = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 dispatcher_polling_interval
                 if let Some(val) = options.get("dispatcher_polling_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -283,14 +279,14 @@ impl AppContext {
                         ctx.dispatcher_polling_interval = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 dispatcher_batch_size
                 if let Some(val) = options.get("dispatcher_batch_size") {
                     if let Ok(value) = val.extract::<u64>(py) {
                         ctx.dispatcher_batch_size = value;
                     }
                 }
-                
+
                 // 处理 dispatcher_concurrency_maintenance_interval
                 if let Some(val) = options.get("dispatcher_concurrency_maintenance_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -299,7 +295,7 @@ impl AppContext {
                         ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs(value);
                     }
                 }
-                
+
                 // 处理 worker_polling_interval
                 if let Some(val) = options.get("worker_polling_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
@@ -310,7 +306,7 @@ impl AppContext {
                         ctx.worker_polling_interval = Duration::from_millis((value * 1000.0) as u64);
                     }
                 }
-                
+
                 // 处理 worker_threads
                 if let Some(val) = options.get("worker_threads") {
                     if let Ok(value) = val.extract::<u64>(py) {
@@ -319,7 +315,7 @@ impl AppContext {
                 }
             });
         }
-        
+
         ctx
     }
 
