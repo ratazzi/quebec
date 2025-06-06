@@ -187,10 +187,10 @@ struct ExecutionHistoryItem {
 impl ControlPlane {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let start = Instant::now();
-        
+
         // 初始化 Tera
         let mut tera = Tera::default();
-        
+
         // 添加所有模板
         for template_name in templates::list_templates() {
             if let Some(content) = templates::get_template_content(&template_name) {
@@ -647,7 +647,7 @@ impl ControlPlane {
         let all_queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            
+
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT queue_name, COUNT(*) as count
@@ -669,7 +669,7 @@ impl ControlPlane {
                 (queue_name, count)
             })
             .collect();
-            
+
         // 确保所有队列都包含在结果中，即使没有未完成的作业
         let queue_counts: Vec<(String, i64)> = all_queue_names
             .into_iter()
@@ -808,7 +808,7 @@ impl ControlPlane {
         // 直接执行 SQL count 查询
         let total_count: i64 = solid_queue_failed_executions::Entity::find()
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::asterisk())), "count")
+            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
             .into_tuple()
             .one(db)
             .await
@@ -1095,10 +1095,10 @@ impl ControlPlane {
         #[cfg(debug_assertions)]
         {
             debug!("Debug mode detected, reloading templates before rendering");
-            
+
             // 初始化新的 Tera 实例
             let mut new_tera = Tera::default();
-            
+
             // 使用嵌入式模板系统重新加载所有模板
             for template_name in templates::list_templates() {
                 if let Some(content) = templates::get_template_content(&template_name) {
@@ -1107,10 +1107,10 @@ impl ControlPlane {
                     }
                 }
             }
-            
+
             // 设置自动转义 HTML
             new_tera.autoescape_on(vec!["html"]);
-            
+
             // 更新 Tera 实例
             if let Ok(mut tera) = self.tera.write() {
                 *tera = new_tera;
@@ -1126,7 +1126,7 @@ impl ControlPlane {
             error!("Failed to acquire read lock: {}", e);
             return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
         }
-        
+
         let tera = tera_read_result.unwrap();
         let templates = tera.get_template_names().collect::<Vec<_>>();
         debug!("Available templates: {:?}", templates);
@@ -1194,11 +1194,11 @@ impl ControlPlane {
             .count(db)
             .await?;
 
-        let failed_count = if let Ok(count) = usize::try_from(failed_jobs_count) { count } else { 0 };
-        let in_progress_count = if let Ok(count) = usize::try_from(in_progress_jobs_count) { count } else { 0 };
-        let scheduled_count = if let Ok(count) = usize::try_from(scheduled_jobs_count) { count } else { 0 };
-        let blocked_count = if let Ok(count) = usize::try_from(blocked_jobs_count) { count } else { 0 };
-        let finished_count = if let Ok(count) = usize::try_from(finished_jobs_count) { count } else { 0 };
+        let failed_count = usize::try_from(failed_jobs_count).unwrap_or(0);
+        let in_progress_count = usize::try_from(in_progress_jobs_count).unwrap_or(0);
+        let scheduled_count = usize::try_from(scheduled_jobs_count).unwrap_or(0);
+        let blocked_count = usize::try_from(blocked_jobs_count).unwrap_or(0);
+        let finished_count = usize::try_from(finished_jobs_count).unwrap_or(0);
 
         context.insert("failed_jobs_count", &failed_count);
         context.insert("in_progress_jobs_count", &in_progress_count);
@@ -1439,7 +1439,7 @@ impl ControlPlane {
         // 执行 SQL count 查询
         let total_count: i64 = crate::entities::solid_queue_claimed_executions::Entity::find()
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::asterisk())), "count")
+            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
             .into_tuple()
             .one(db)
             .await
@@ -1602,7 +1602,7 @@ impl ControlPlane {
         // 执行 SQL count 查询
         let total_count: i64 = crate::entities::solid_queue_blocked_executions::Entity::find()
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::asterisk())), "count")
+            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
             .into_tuple()
             .one(db)
             .await
@@ -2073,7 +2073,7 @@ impl ControlPlane {
         let total_count: i64 = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .select_only()
-            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::asterisk())), "count")
+            .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
             .into_tuple()
             .one(db)
             .await
@@ -2321,7 +2321,7 @@ impl ControlPlane {
                     {
                         if let Some(row) = failed_info {
                             job_details.error = row.try_get("", "error").ok();
-                            
+
                             // 解析失败时间
                             if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "failed_at") {
                                 job_details.failed_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
@@ -2336,7 +2336,7 @@ impl ControlPlane {
                     // 解析计划执行时间
                     if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
                         job_details.scheduled_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                        
+
                         // 计算还有多长时间执行
                         let now = chrono::Utc::now().naive_utc();
                         if dt > now {
@@ -2357,14 +2357,14 @@ impl ControlPlane {
                 "blocked" => {
                     let blocked_id: i64 = row.try_get("", "blocked_id").unwrap_or_default();
                     job_details.execution_id = Some(blocked_id);
-                    
+
                     // 获取阻塞信息
                     job_details.concurrency_key = row.try_get("", "concurrency_key").ok();
-                    
+
                     // 解析过期时间
                     if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "expires_at") {
                         job_details.expires_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                        
+
                         // 计算等待时间
                         if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                             let duration = chrono::Utc::now().naive_utc().signed_duration_since(created);
@@ -2375,7 +2375,7 @@ impl ControlPlane {
                 "processing" => {
                     let claimed_id: i64 = row.try_get("", "claimed_id").unwrap_or_default();
                     job_details.execution_id = Some(claimed_id);
-                    
+
                     // 获取处理信息
                     if let Ok(process_id) = row.try_get::<i64>("", "process_id") {
                         // 获取工作进程信息
@@ -2392,7 +2392,7 @@ impl ControlPlane {
                             }
                         }
                     }
-                    
+
                     // 获取开始时间和运行时间
                     if let Ok(claimed_info) = db
                         .query_one(Statement::from_sql_and_values(
@@ -2405,7 +2405,7 @@ impl ControlPlane {
                         if let Some(row) = claimed_info {
                             if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                                 job_details.started_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                                
+
                                 // 计算当前运行时间
                                 let now = chrono::Utc::now().naive_utc();
                                 let duration = now.signed_duration_since(dt);

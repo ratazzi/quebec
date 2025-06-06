@@ -389,28 +389,25 @@ impl PyQuebec {
         });
 
         let handle = self.rt.spawn(async move {
-            loop {
-                tokio::select! {
-                  _ = graceful_shutdown.cancelled() => {
-                      Python::with_gil(|py| {
-                          let queue = queue1.bind(py);
-                          // 检查队列类型并选择合适的方法
-                          if queue.hasattr("close").unwrap() {
-                              // 处理 asyncio.Queue
-                              let close_method = queue.getattr("close").unwrap();
-                              let _ = close_method.call0();
-                              info!("<asyncio.Queue> are shutdown");
-                          } else if queue.hasattr("join").unwrap() {
-                              // 处理 queue.Queue
-                              let join_method = queue.getattr("join").unwrap();
-                              let _ = join_method.call0();
-                              // info!("<queue.Queue> are shutdown");
-                          } else {
-                              error!("Unsupported queue type");
-                          }
-                      });
-                      break;
-                  }
+            tokio::select! {
+                _ = graceful_shutdown.cancelled() => {
+                    Python::with_gil(|py| {
+                        let queue = queue1.bind(py);
+                        // 检查队列类型并选择合适的方法
+                        if queue.hasattr("close").unwrap() {
+                            // 处理 asyncio.Queue
+                            let close_method = queue.getattr("close").unwrap();
+                            let _ = close_method.call0();
+                            info!("<asyncio.Queue> are shutdown");
+                        } else if queue.hasattr("join").unwrap() {
+                            // 处理 queue.Queue
+                            let join_method = queue.getattr("join").unwrap();
+                            let _ = join_method.call0();
+                            // info!("<queue.Queue> are shutdown");
+                        } else {
+                            error!("Unsupported queue type");
+                        }
+                    });
                 }
             }
 
@@ -735,7 +732,7 @@ impl PyQuebec {
         // Cancel the token to initiate component shutdown
         self.ctx.graceful_shutdown.cancel();
 
-        let timeout = self.ctx.shutdown_timeout.clone();
+        let timeout = self.ctx.shutdown_timeout;
         let quit = self.ctx.force_quit.clone();
         let handles = self.handles.clone();
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
@@ -745,9 +742,12 @@ impl PyQuebec {
             // block 调用会持续占用 GIL 导致其他线程无法执行
             rt.block_on(async move {
                 let result = tokio::time::timeout(timeout, async {
-                    let mut handles = handles.lock().unwrap();
-                    debug!("Waiting for {} tasks to exit gracefully", handles.len());
-                    for handle in handles.drain(..) {
+                    let handles = {
+                        let mut handles = handles.lock().unwrap();
+                        debug!("Waiting for {} tasks to exit gracefully", handles.len());
+                        handles.drain(..).collect::<Vec<_>>()
+                    };
+                    for handle in handles {
                         if let Err(e) = handle.await {
                             warn!("Task failed: {:?}", e);
                         }
@@ -828,7 +828,7 @@ impl PyQuebec {
 //     }
 // }
 
-fn py_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> Value {
+fn py_to_json_value(_py: Python, obj: &Bound<'_, PyAny>) -> Value {
     if obj.is_instance_of::<PyInt>() {
         Value::Number(obj.extract::<i64>().unwrap().into())
     } else if obj.is_instance_of::<PyFloat>() {
@@ -840,17 +840,17 @@ fn py_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> Value {
         let mut map = serde_json::Map::new();
         for (key, value) in dict {
             let key: String = key.extract().unwrap();
-            let value = py_to_json_value(py, &value);
+            let value = py_to_json_value(_py, &value);
             map.insert(key, value);
         }
         Value::Object(map)
     } else if obj.is_instance_of::<PyList>() {
         let list = obj.downcast::<PyList>().unwrap();
-        let vec: Vec<Value> = list.iter().map(|item| py_to_json_value(py, &item)).collect();
+        let vec: Vec<Value> = list.iter().map(|item| py_to_json_value(_py, &item)).collect();
         Value::Array(vec)
     } else if obj.is_instance_of::<PyTuple>() {
         let tuple = obj.downcast::<PyTuple>().unwrap();
-        let vec: Vec<Value> = tuple.iter().map(|item| py_to_json_value(py, &item)).collect();
+        let vec: Vec<Value> = tuple.iter().map(|item| py_to_json_value(_py, &item)).collect();
         Value::Array(vec)
     } else if obj.is_none() {
         Value::Null

@@ -174,7 +174,7 @@ impl Dispatcher {
                           let _ = solid_queue_ready_executions::ActiveModel {
                               id: ActiveValue::NotSet,
                               queue_name: ActiveValue::Set("default".to_string()),
-                              job_id: ActiveValue::Set(scheduled_execution.job_id.clone()),
+                              job_id: ActiveValue::Set(scheduled_execution.job_id),
                               priority: ActiveValue::Set(0),
                               created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                           }

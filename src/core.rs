@@ -25,7 +25,7 @@ impl Quebec {
     ) -> Result<solid_queue_jobs::Model, anyhow::Error> {
         let db = self.ctx.get_db().await;
         let _ = db.ping().await?;
-        let duration = self.ctx.default_concurrency_control_period.clone();
+        let duration = self.ctx.default_concurrency_control_period;
         trace!("job: {:?}", job);
 
         let job = db

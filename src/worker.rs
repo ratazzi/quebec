@@ -120,7 +120,6 @@ async fn runner(
                       _ = force_quit.cancelled() => {
                           error!("Job `{}' cancelled", class_name);
                           break;
-                          Err(anyhow::anyhow!("Job `{}' cancelled", class_name))
                       }
                       _ = tokio::time::sleep(timeout_duration) => {
                           error!("Job `{}' timeout", class_name);
@@ -994,7 +993,7 @@ impl Worker {
     }
 
     pub async fn claim_job(&self) -> Result<solid_queue_claimed_executions::Model, anyhow::Error> {
-        let mut opts = self.ctx.connect_options.clone();
+        let opts = self.ctx.connect_options.clone();
         // if self.ctx.silence_polling {
         //     opts.sqlx_logging(false); //.sqlx_logging_level(log::LevelFilter::Error);
         //                               // warn!("-------------------- opts: {:?}", opts);

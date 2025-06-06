@@ -277,7 +277,7 @@ impl Scheduler {
 
                 let ret = db
                     .transaction::<_, ExecResult, DbErr>(|txn| {
-                        Box::pin(async move { Ok(upsert_task(txn, value.clone()).await?) })
+                        Box::pin(async move { upsert_task(txn, value.clone()).await })
                     })
                     .await?;
 
