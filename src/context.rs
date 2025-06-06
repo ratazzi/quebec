@@ -1,16 +1,15 @@
 use anyhow::Result;
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
-use sea_orm::*;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, warn};
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -153,8 +152,8 @@ impl DiscardStrategy {
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
     pub dsn: Url,
-    pub db: Option<Arc<DatabaseConnection>>, // 对于 SQLite 使用共享连接
-    pub connect_options: ConnectOptions, // 用于创建新连接
+    pub db: Option<Arc<DatabaseConnection>>, // Use shared connection for SQLite
+    pub connect_options: ConnectOptions, // For creating new connections
     pub use_skip_locked: bool,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
@@ -190,29 +189,28 @@ impl AppContext {
             shutdown_timeout: Duration::from_secs(5),
             silence_polling: true,
             preserve_finished_jobs: true,
-            clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 1 day
-            default_concurrency_control_period: Duration::from_secs(60),    // 3 minutes
-            dispatcher_polling_interval: Duration::from_secs(10),           // 1s
+            clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
+            default_concurrency_control_period: Duration::from_secs(60),    // 1 minute
+            dispatcher_polling_interval: Duration::from_secs(1),           // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
-            worker_polling_interval: Duration::from_secs(1), // 100ms
-            // worker_polling_interval: Duration::from_millis(100),
+            worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
         };
 
-        // 如果有传入选项，则覆盖默认配置
+        // Override default configuration if options are provided
         if let Some(options) = options {
             Python::with_gil(|py| {
-                // 处理 use_skip_locked
+                // Handle use_skip_locked
                 if let Some(val) = options.get("use_skip_locked") {
                     if let Ok(value) = val.extract::<bool>(py) {
                         ctx.use_skip_locked = value;
                     }
                 }
 
-                // 处理 process_heartbeat_interval
+                // Handle process_heartbeat_interval
                 if let Some(val) = options.get("process_heartbeat_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.process_heartbeat_interval = value;
@@ -221,7 +219,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 process_alive_threshold
+                // Handle process_alive_threshold
                 if let Some(val) = options.get("process_alive_threshold") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.process_alive_threshold = value;
@@ -230,7 +228,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 shutdown_timeout
+                // Handle shutdown_timeout
                 if let Some(val) = options.get("shutdown_timeout") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.shutdown_timeout = value;
@@ -239,21 +237,21 @@ impl AppContext {
                     }
                 }
 
-                // 处理 silence_polling
+                // Handle silence_polling
                 if let Some(val) = options.get("silence_polling") {
                     if let Ok(value) = val.extract::<bool>(py) {
                         ctx.silence_polling = value;
                     }
                 }
 
-                // 处理 preserve_finished_jobs
+                // Handle preserve_finished_jobs
                 if let Some(val) = options.get("preserve_finished_jobs") {
                     if let Ok(value) = val.extract::<bool>(py) {
                         ctx.preserve_finished_jobs = value;
                     }
                 }
 
-                // 处理 clear_finished_jobs_after
+                // Handle clear_finished_jobs_after
                 if let Some(val) = options.get("clear_finished_jobs_after") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.clear_finished_jobs_after = value;
@@ -262,7 +260,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 default_concurrency_control_period
+                // Handle default_concurrency_control_period
                 if let Some(val) = options.get("default_concurrency_control_period") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.default_concurrency_control_period = value;
@@ -271,7 +269,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 dispatcher_polling_interval
+                // Handle dispatcher_polling_interval
                 if let Some(val) = options.get("dispatcher_polling_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.dispatcher_polling_interval = value;
@@ -280,14 +278,14 @@ impl AppContext {
                     }
                 }
 
-                // 处理 dispatcher_batch_size
+                // Handle dispatcher_batch_size
                 if let Some(val) = options.get("dispatcher_batch_size") {
                     if let Ok(value) = val.extract::<u64>(py) {
                         ctx.dispatcher_batch_size = value;
                     }
                 }
 
-                // 处理 dispatcher_concurrency_maintenance_interval
+                // Handle dispatcher_concurrency_maintenance_interval
                 if let Some(val) = options.get("dispatcher_concurrency_maintenance_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.dispatcher_concurrency_maintenance_interval = value;
@@ -296,7 +294,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 worker_polling_interval
+                // Handle worker_polling_interval
                 if let Some(val) = options.get("worker_polling_interval") {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.worker_polling_interval = value;
@@ -307,7 +305,7 @@ impl AppContext {
                     }
                 }
 
-                // 处理 worker_threads
+                // Handle worker_threads
                 if let Some(val) = options.get("worker_threads") {
                     if let Ok(value) = val.extract::<u64>(py) {
                         ctx.worker_threads = value;
@@ -319,35 +317,35 @@ impl AppContext {
         ctx
     }
 
-    // 新的方法，返回 Result 类型，允许调用者处理错误
+    // New method that returns Result type, allowing callers to handle errors
     pub async fn get_db_result(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
-        // 对于 SQLite 数据库，返回共享连接
+        // For SQLite database, return shared connection
         if self.dsn.scheme().contains("sqlite") {
             if let Some(db) = &self.db {
                 return Ok(db.clone());
             }
         }
 
-        // 对于 PostgreSQL，每次都创建新连接
-        // 这样可以确保高并发情况下不会出现连接竞争
+        // For PostgreSQL, create new connection each time
+        // This ensures no connection competition in high concurrency scenarios
         let conn = Database::connect(self.connect_options.clone()).await?;
         Ok(Arc::new(conn))
     }
 
-    // 保持原来的接口，但内部使用新的错误处理方式
-    // 如果出错，会记录错误并尝试重试
+    // Keep original interface, but use new error handling internally
+    // If error occurs, log error and attempt retry
     pub async fn get_db(&self) -> Arc<DatabaseConnection> {
-        // 尝试获取连接，如果失败则重试
+        // Try to get connection, retry if failed
         for retry in 0..3 {
             match self.get_db_result().await {
                 Ok(db) => return db,
                 Err(e) => {
                     if retry < 2 {
-                        // 如果还有重试机会，记录错误并等待一会儿再重试
+                        // If there are retry attempts left, log error and wait before retrying
                         warn!("Failed to get database connection, retrying ({}/3): {}", retry + 1, e);
                         tokio::time::sleep(tokio::time::Duration::from_millis(100 * (retry + 1) as u64)).await;
                     } else {
-                        // 如果所有重试都失败，记录错误并抛出异常
+                        // If all retries failed, log error and panic
                         error!("Failed to get database connection after 3 retries: {}", e);
                         panic!("Failed to get database connection: {}", e);
                     }
@@ -355,7 +353,7 @@ impl AppContext {
             }
         }
 
-        // 这里实际上不会到达，因为如果所有重试都失败，会在循环内抛出异常
+        // This should never be reached, as panic occurs in loop if all retries fail
         unreachable!()
     }
 }

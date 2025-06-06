@@ -1,5 +1,5 @@
-use crate::context::*;
-use crate::entities::{prelude::*, *};
+
+use crate::entities::*;
 use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -8,16 +8,16 @@ use sea_orm::*;
 
 use pyo3::prelude::*;
 
-use tracing::{debug, error, info, trace, warn};
+use tracing::{info, trace};
 
 pub fn is_running_in_pyo3() -> bool {
     let result = std::panic::catch_unwind(|| {
         Python::with_gil(|_py| {
-            // 如果能够获取到 GIL，则认为是在 PyO3 环境中
+            // If GIL can be acquired, assume running in PyO3 environment
             true
         })
     });
-    result.unwrap_or(false) // 如果发生 panic，则返回 false
+    result.unwrap_or(false) // Return false if panic occurs
 }
 
 #[async_trait]
@@ -52,7 +52,6 @@ pub trait ProcessTrait {
             })
             .await?;
 
-        // debug!("process: {:?}", process.clone().try_into_model());
         let process = process.try_into_model()?;
         info!(
             "Process started: name={} pid={} hostname={:?}",
@@ -103,7 +102,6 @@ pub trait ProcessTrait {
         let mut process = process.clone().into_active_model();
         process.last_heartbeat_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
         process.clone().update(db).await?;
-        // debug!("process: {:?}", process.clone().try_into_model());
 
         Ok(())
     }

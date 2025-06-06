@@ -13,9 +13,9 @@ mod web;
 use context::*;
 use entities::solid_queue_claimed_executions;
 use entities::solid_queue_jobs;
-use process::is_running_in_pyo3;
+
 use types::*;
-use worker::{Execution, Metric, Runnable};
+use worker::{Execution, Runnable};
 
 use pyo3::prelude::*;
 
@@ -28,12 +28,11 @@ use pyo3::prelude::*;
 /// import the module.
 #[pymodule]
 fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // 会导致莫名其妙的死锁
-    // pyo3_log::init();
+    // pyo3_log::init(); // Can cause mysterious deadlocks
 
-    // 使用 tracing
+    // Use tracing
     {
-        // 使用自定义的 EnvFilter，默认开启 DEBUG 级别
+        // Use custom EnvFilter, default to DEBUG level
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
 

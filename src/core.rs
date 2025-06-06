@@ -1,11 +1,11 @@
 use crate::context::*;
-use crate::entities::{prelude::*, *};
+use crate::entities::*;
 use crate::semaphore::acquire_semaphore;
 use crate::types::ActiveJob;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{info, trace, warn};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
-use pyo3::PyResult;
+
 use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ impl Quebec {
     }
 
     pub async fn perform_later(
-        &self, klass: &Bound<'_, PyType>, job: ActiveJob,
+        &self, _klass: &Bound<'_, PyType>, job: ActiveJob,
     ) -> Result<solid_queue_jobs::Model, anyhow::Error> {
         let db = self.ctx.get_db().await;
         let _ = db.ping().await?;
@@ -76,11 +76,11 @@ impl Quebec {
 
                             // Release the semaphore
                             // quebec.release_semaphore(&txn, key).await?;
-                            // println!("--------------- Semaphore released!");
+
                         } else {
                             warn!("Failed to acquire semaphore");
 
-                            let blocked_execution = solid_queue_blocked_executions::ActiveModel {
+                            let _blocked_execution = solid_queue_blocked_executions::ActiveModel {
                                 id: ActiveValue::NotSet,
                                 queue_name: ActiveValue::Set("default".to_string()),
                                 job_id: ActiveValue::Set(job.id.clone().unwrap()),
@@ -96,7 +96,7 @@ impl Quebec {
                         }
                     }
 
-                    let ready_execution = solid_queue_ready_executions::ActiveModel {
+                    let _ready_execution = solid_queue_ready_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         queue_name: ActiveValue::Set("default".to_string()),
                         job_id: ActiveValue::Set(job.id.clone().unwrap()),

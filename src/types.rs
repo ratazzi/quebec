@@ -1,12 +1,12 @@
 use chrono;
 use chrono::NaiveDateTime;
-use pyo3::exceptions::PyException;
+
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyTuple, PyType};
 use pyo3::types::{PyFloat, PyInt, PyList, PyString};
-use pyo3::PyTypeInfo;
+
 // use pyo3_asyncio::tokio::future_into_py;
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::*;
@@ -17,18 +17,18 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
-use tokio_util::sync::CancellationToken;
+
 use url::Url;
 use uuid;
-use std::borrow::BorrowMut;
+
 use crate::web::control_plane::ControlPlaneExt;
 
 use crate::context::*;
 use crate::core::Quebec;
 use crate::dispatcher::Dispatcher;
-use crate::entities::{prelude::*, *};
+use crate::entities::*;
 use crate::scheduler::Scheduler;
-use crate::worker::{Execution, Metric, Worker};
+use crate::worker::{Execution, Worker};
 
 use tracing::{debug, error, info, trace, warn};
 
@@ -185,7 +185,7 @@ impl PyQuebec {
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(16) // 配置线程数量，增加以匹配数据库连接需求
+                .worker_threads(16)
                 .enable_all()
                 .build()
                 .unwrap(),
@@ -195,26 +195,26 @@ impl PyQuebec {
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
         let min_conns = if url.contains("sqlite") { 1 } else { 2 };
         let max_conns = if url.contains("sqlite") { 1 } else { 30 };
-        opt.min_connections(min_conns) // 设置最小空闲连接数
-            .max_connections(max_conns) // 设置最大连接数
+        opt.min_connections(min_conns)
+            .max_connections(max_conns)
             .acquire_timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(3)) // 设置连接超时时间
-            .idle_timeout(Duration::from_secs(600)) // 设置空闲连接超时时间
+            .connect_timeout(Duration::from_secs(3))
+            .idle_timeout(Duration::from_secs(600))
             .sqlx_logging(true)
             .sqlx_logging_level(tracing::log::LevelFilter::Trace);
 
-        // 为所有数据库类型预先创建一个连接
-        // 这个连接将被包装在 Arc 中并在需要时使用
-        // 对于高并发操作，将通过 get_connection 方法获取新连接
+        // Pre-create a connection for all database types
+        // This connection will be wrapped in Arc and used when needed
+        // For high concurrency operations, new connections will be obtained through get_connection method
         let db = rt.block_on(async { Database::connect(opt.clone()).await.unwrap() });
         let db_option = Some(Arc::new(db));
 
-        // 将 kwargs 转换为 HashMap<String, PyObject>
+        // Convert kwargs to HashMap<String, PyObject>
         let options = if let Some(kwargs) = kwargs {
             let mut options_map = HashMap::new();
             kwargs.iter().for_each(|(k, v)| {
                 let key = k.extract::<String>().unwrap();
-                // 使用 Python::with_gil 来获取 GIL
+                // Use Python::with_gil to get GIL
                 Python::with_gil(|py| {
                     options_map.insert(key, v.into_pyobject(py).unwrap().into());
                 });
@@ -225,17 +225,14 @@ impl PyQuebec {
         };
 
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
-        // 所有参数已经在 AppContext.new 中处理过了
-        if let Some(kwargs) = kwargs {
-            debug!("kwargs: {:?}", kwargs);
-        }
+        // All parameters have been processed in AppContext.new
 
         let ctx = Arc::new(_ctx);
         let quebec = Arc::new(Quebec::new(ctx.clone()));
         let worker = Arc::new(Worker::new(ctx.clone()));
         let dispatcher = Arc::new(Dispatcher::new(ctx.clone()));
         let scheduler = Arc::new(Scheduler::new(ctx.clone()));
-        // debug!("Quebec: {:?}", quebec);
+
 
         let job_classes = Arc::new(RwLock::new(HashMap::<String, Py<PyAny>>::new()));
         let shutdown_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
@@ -305,53 +302,18 @@ impl PyQuebec {
             Ok(ret.unwrap())
         })
 
-        // 创建一个 oneshot 通道
-        // let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // // 使用 tokio::spawn 启动异步任务
-        // self.rt.spawn(async move {
-        //     let result = worker.pick_job().await;
-        //     let _ = tx.send(result);
-        // });
-
-        // // 释放 GIL 并等待异步任务完成
-        // py.allow_threads(|| {
-        //     let job_result = self.rt.block_on(rx).map_err(|e| {
-        //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Task failed: {:?}", e))
-        //     })??;
-
-        //     Ok(job_result)
-        // })
-
-        // 将异步任务转换为 Python Future
-        // future_into_py(py, async move {
-        //     let result = worker.pick_job().await;
-        //     result.map_err(|e| {
-        //         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Task failed: {:?}", e))
-        //     })
-        // })
     }
 
     async fn post_job(&self) -> Result<(), anyhow::Error> {
-        // let job = job.extract::<Job>().unwrap();
-        // let dispatcher = self.dispatcher.clone();
         let _ = self.rt.spawn(async move {
-            // let _ = dispatcher.dispatch(job).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
-            debug!("async fn post_job");
         });
 
-        // self.handles.lock().unwrap().push(handle);
-        debug!("async fn post_job");
         Ok(())
     }
 
     fn feed_jobs_to_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
-        // if self.pyqueue_mode.load(Ordering::Relaxed) {
-        //     return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        //         "Already in pyqueue mode",
-        //     ));
-        // }
 
         let worker = self.worker.clone();
         let queue = queue.clone_ref(py);
@@ -360,21 +322,21 @@ impl PyQuebec {
 
         self.pyqueue_mode.store(true, Ordering::Relaxed);
 
-        // 使用 tokio::spawn 启动异步任务
+        // Use tokio::spawn to start async task
         self.rt.spawn(async move {
             loop {
                 let result = worker.pick_job().await;
 
-                // 获取 GIL 并将结果发送到 Python 的队列中
+                // Get GIL and send result to Python queue
                 Python::with_gil(|py| {
                     let queue = queue.bind(py);
-                    // 检查队列类型并选择合适的方法
+                    // Check queue type and choose appropriate method
                     if queue.hasattr("put_nowait").unwrap() {
-                        // 处理 asyncio.Queue
+                        // Handle asyncio.Queue
                         let put_method = queue.getattr("put_nowait").unwrap();
                         let _ = put_method.call1((result.unwrap(),));
                     } else if queue.hasattr("put").unwrap() {
-                        // 处理 queue.Queue, multiprocessing.Queue
+                        // Handle queue.Queue, multiprocessing.Queue
                         let put_method = queue.getattr("put").unwrap();
                         let _ = put_method.call1((result.unwrap(),));
                     } else {
@@ -389,17 +351,16 @@ impl PyQuebec {
                 _ = graceful_shutdown.cancelled() => {
                     Python::with_gil(|py| {
                         let queue = queue1.bind(py);
-                        // 检查队列类型并选择合适的方法
+                        // Check queue type and choose appropriate method
                         if queue.hasattr("close").unwrap() {
-                            // 处理 asyncio.Queue
+                            // Handle asyncio.Queue
                             let close_method = queue.getattr("close").unwrap();
                             let _ = close_method.call0();
-                            info!("<asyncio.Queue> are shutdown");
+                            info!("<asyncio.Queue> shutdown");
                         } else if queue.hasattr("join").unwrap() {
-                            // 处理 queue.Queue
+                            // Handle queue.Queue
                             let join_method = queue.getattr("join").unwrap();
                             let _ = join_method.call0();
-                            // info!("<queue.Queue> are shutdown");
                         } else {
                             error!("Unsupported queue type");
                         }
@@ -459,7 +420,7 @@ impl PyQuebec {
             match db.ping().await {
                 Ok(_) => Ok(true),
                 Err(err) => {
-                    eprintln!("Ping failed: {:?}", err);
+                    error!("Ping failed: {:?}", err);
                     Ok(false)
                 }
             }
@@ -511,7 +472,7 @@ impl PyQuebec {
 
         {
             self.start_handlers.write().unwrap().push(handler.clone_ref(py));
-            debug!("Start handler: {:?} registered", handler);
+            trace!("Start handler registered");
         }
 
         Ok(handler)
@@ -525,7 +486,7 @@ impl PyQuebec {
 
         {
             self.stop_handlers.write().unwrap().push(handler.clone_ref(py));
-            debug!("Stop handler: {:?} registered", handler);
+            trace!("Stop handler registered");
         }
 
         Ok(handler)
@@ -661,7 +622,7 @@ impl PyQuebec {
 
         let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
-        let ret = self.worker.register_job_class(py, job_class);
+        let _ = self.worker.register_job_class(py, job_class);
         Ok(dup)
     }
 
@@ -733,9 +694,9 @@ impl PyQuebec {
         let handles = self.handles.clone();
         let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
 
-        // 临时释放 GIL
+        // Temporarily release GIL
         py.allow_threads(|| {
-            // block 调用会持续占用 GIL 导致其他线程无法执行
+            // block call would continuously occupy GIL preventing other threads from executing
             rt.block_on(async move {
                 let result = tokio::time::timeout(timeout, async {
                     let handles = {
@@ -818,7 +779,7 @@ impl PyQuebec {
 }
 
 // impl PyQuebec {
-//     // 这个方法是私有的，不会暴露给 Python
+    //     // This method is private and won't be exposed to Python
 //     fn internal_method(&self) {
 //         println!("This is an internal method");
 //     }
@@ -1034,10 +995,10 @@ impl ActiveJob {
         debug!("after_perform");
     }
 
-    #[pyo3(signature = (*args, **kwargs))]
-    fn perform(&self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
-        debug!("perform");
-    }
+    // #[pyo3(signature = (*args, **kwargs))]
+    // fn perform(&self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
+    //     debug!("perform");
+    // }
 
     #[getter]
     fn get_logger(&self) -> PyResult<ActiveLogger> {

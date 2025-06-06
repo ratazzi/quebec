@@ -1,5 +1,5 @@
 use crate::context::{AppContext, ScheduledEntry};
-use crate::entities::{prelude::*, *};
+use crate::entities::*;
 use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 // ```sql
 // INSERT INTO "solid_queue_recurring_tasks" (
@@ -185,7 +185,7 @@ where
 
     let job = job.try_into_model()?;
 
-    // let scheduled_execution = solid_queue_scheduled_executions::ActiveModel {
+
     //     id: ActiveValue::not_set(),
     //     job_id: ActiveValue::Set(job.id.unwrap()),
     //     queue_name: ActiveValue::Set(job.queue_name.clone().unwrap()),
@@ -196,7 +196,7 @@ where
     // .save(db)
     // .await?;
 
-    let recurring_execution = solid_queue_recurring_executions::ActiveModel {
+    let _recurring_execution = solid_queue_recurring_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
         task_key: ActiveValue::Set(entry.key.unwrap()),
@@ -206,7 +206,7 @@ where
     .save(db)
     .await?;
 
-    let ready_execution = solid_queue_ready_executions::ActiveModel {
+    let _ready_execution = solid_queue_ready_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
         queue_name: ActiveValue::Set(job.queue_name),
@@ -235,14 +235,14 @@ impl Scheduler {
         let mut interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
 
-        let delta = chrono::Duration::seconds(
+        let _delta = chrono::Duration::seconds(
             self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap(),
         );
         let mut scheduled = Vec::<ScheduledEntry>::new();
         let schedule: Vec<HashMap<String, ScheduledEntry>> = match std::fs::read_to_string("schedule.yml") {
             Ok(contents) => match serde_yaml::from_str(&contents) {
                 Ok(parsed) => {
-                    debug!("Schedule loaded successfully");
+                    info!("Schedule loaded successfully");
                     parsed
                 },
                 Err(e) => {
@@ -259,12 +259,12 @@ impl Scheduler {
                 return Err(anyhow::anyhow!("Failed to read schedule.yml: {}", e));
             }
         };
-        debug!("Schedule: {:?}", schedule);
+        trace!("Schedule: {:?}", schedule);
 
-        // let kind = "Scheduler".to_string();
-        // let name = "scheduler".to_string();
-        // let process = self.on_start(&db, kind, name).await?;
-        // info!(">> Process started: {:?}", process);
+        let kind = "Scheduler".to_string();
+        let name = "scheduler".to_string();
+        let process = self.on_start(&db, kind, name).await?;
+        info!(">> Process started: {:?}", process);
 
         for entry in schedule {
             for (key, mut value) in entry {
@@ -280,30 +280,24 @@ impl Scheduler {
                 trace!("Upsert task: {:?}", ret);
             }
         }
-        debug!("Scheduled: {:?}", scheduled);
+        trace!("Scheduled: {:?}", scheduled);
 
-        // let num_intervals = 3; // 假设我们想创建 3 个 interval
         let entries = scheduled.clone();
-        // debug!("------------ scheduled entries: {:?}", entries);
-
         let mut task_handles = Vec::new();
 
         for (i, entry) in entries.into_iter().enumerate() {
-            // let opts = self.ctx.connect_options.clone();
-            // debug!("------------ entry: {:?}", entry);
             let db = self.ctx.get_db().await;
             let graceful_shutdown = self.ctx.graceful_shutdown.clone();
 
             let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
             let handle = tokio::spawn(async move {
-                // let db = Database::connect(opts).await.unwrap();
-                // let db = db.await;
+
 
                 let cron = entry.as_cron();
                 let cron = cron.unwrap();
                 let time = chrono::Local::now();
                 let mut last = cron.find_next_occurrence(&time, false).unwrap();
-                debug!("Starting scheduled task: {}", task_key);
+                info!("Starting scheduled task: {}", task_key);
 
                 loop {
                     if graceful_shutdown.is_cancelled() {
@@ -322,16 +316,16 @@ impl Scheduler {
                         last = next;
                     }
 
-                    debug!("next: {:?}", next);
+                    trace!("next: {:?}", next);
 
-                    // 如果 delta 为零，设置一个最小的睡眠时间
+                    // If delta is zero, set a minimum sleep time
                     let sleep_duration = if delta.num_seconds() <= 0 {
                         tokio::time::Duration::from_secs(2)
                     } else {
                         tokio::time::Duration::from_millis(delta.num_milliseconds() as u64)
                     };
 
-                    debug!("Job({:?}) next tick: {:?}", &task_key, next);
+                    trace!("Job({:?}) next tick: {:?}", &task_key, next);
 
                     tokio::select! {
                         _ = tokio::time::sleep(sleep_duration) => {
@@ -353,15 +347,15 @@ impl Scheduler {
                             let entry = entry.clone();
                             let task_key = task_key.clone();
                             Box::pin(async move {
-                                let ret = enqueue_job(txn, entry, scheduled_at).await;
-                                debug!("Job({:?}) enqueue_job: {:?}", task_key, ret);
+                                let _ret = enqueue_job(txn, entry, scheduled_at).await;
+                                trace!("Job({:?}) enqueued", task_key);
                                 Ok(())
                             })
                         })
                         .await;
 
                     let duration = start_time.elapsed();
-                    debug!("Interval({:?}) {} ticked!: {:?}", &task_key, i, duration);
+                    trace!("Interval({:?}) {} ticked: {:?}", &task_key, i, duration);
                 }
 
                 info!("Scheduler task for {} completed", task_key);
@@ -375,31 +369,25 @@ impl Scheduler {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
         loop {
             tokio::select! {
-              _ = heartbeat_interval.tick() => {
-                // self.heartbeat(&db, &process).await?;
-                debug!("heartbeat_interval.tick()");
-              }
-              _ = graceful_shutdown.cancelled() => {
-                debug!("scheduler stopping - waiting for {} tasks to complete", task_handles.len());
-
-                let shutdown_timeout = tokio::time::Duration::from_secs(5);
-                match tokio::time::timeout(shutdown_timeout, futures::future::join_all(task_handles)).await {
-                    Ok(_) => info!("All scheduler tasks completed gracefully"),
-                    Err(_) => warn!("Some scheduler tasks did not complete within timeout"),
+                _ = heartbeat_interval.tick() => {
+                    self.heartbeat(&db, &process).await?;
+                    trace!("Scheduler heartbeat");
                 }
+                _ = graceful_shutdown.cancelled() => {
+                    info!("Scheduler stopping - waiting for {} tasks to complete", task_handles.len());
 
-                debug!("Scheduler stopped");
-                return Ok(());
-              }
-              // _ = tokio::signal::ctrl_c() => {
-              //   info!("ctrl-c received");
-              //   return Ok(());
-              // }
-              _ = interval.tick() => {
-                // let pool = db.get_postgres_connection_pool();
-                // debug!("----- scheduler Max connections: {}, Idle connections: {}", pool.size(), pool.num_idle());
-                debug!("interval.tick()");
-              }
+                    let shutdown_timeout = tokio::time::Duration::from_secs(5);
+                    match tokio::time::timeout(shutdown_timeout, futures::future::join_all(task_handles)).await {
+                        Ok(_) => info!("All scheduler tasks completed gracefully"),
+                        Err(_) => warn!("Some scheduler tasks did not complete within timeout"),
+                    }
+
+                    info!("Scheduler stopped");
+                    return Ok(());
+                }
+                _ = interval.tick() => {
+                    trace!("Scheduler interval tick");
+                }
             }
         }
     }

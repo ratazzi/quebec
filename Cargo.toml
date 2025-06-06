@@ -2,6 +2,23 @@
 name = "quebec"
 version = "0.1.0"
 edition = "2021"
+authors = ["ratazzi"]
+description = "A simple, database-powered background task queue for Python, written in Rust"
+documentation = "https://docs.rs/quebec"
+homepage = "https://github.com/ratazzi/quebec"
+repository = "https://github.com/ratazzi/quebec"
+license = "MIT"
+keywords = ["queue", "background", "tasks", "async", "database"]
+categories = ["asynchronous", "database", "web-programming"]
+readme = "README.md"
+exclude = [
+    "*.db",
+    "*.sqlite",
+    "test_*.py",
+    "demo.db",
+    ".runtime/",
+    "__pycache__/",
+]
 
 [lib]
 name = "quebec"
@@ -61,9 +78,9 @@ tower-http = { version = "0.5", features = ["trace", "fs"] }
 rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] }
 
 [lints.rust]
-dead_code = "allow"
-unused_variables = "allow"
-unused_imports = "allow"
+dead_code = "warn"
+unused_variables = "warn"
+unused_imports = "warn"
 
 [lints.clippy]
 almost_complete_range = "allow"

@@ -1,6 +1,4 @@
-// use crate::context::*;
-use crate::entities::{prelude::*, *};
-use tracing::{debug, error, info, trace, warn};
+use tracing::trace;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
 pub async fn acquire_semaphore<C>(db: &C, key: String) -> Result<bool, DbErr>
@@ -28,15 +26,6 @@ where
              expires_at = VALUES(expires_at), \
              updated_at = VALUES(updated_at)"
         },
-        // DatabaseBackend::Sqlite => {
-        //     "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
-        //      VALUES (?, ?, ?, ?, ?) \
-        //      ON CONFLICT(key) DO UPDATE SET \
-        //      value = CASE WHEN value > 0 THEN value - 1 ELSE value END, \
-        //      expires_at = excluded.expires_at, \
-        //      updated_at = excluded.updated_at \
-        //      WHERE value > 0"
-        // },
     };
 
     let result = db
@@ -49,7 +38,7 @@ where
 
     match result {
         Ok(exec_result) => {
-            debug!("-------------------- exec_result: {:?}", exec_result);
+            trace!("Semaphore operation result: {:?}", exec_result);
             if exec_result.rows_affected() > 0 {
                 Ok(true) // Successfully acquired the semaphore
             } else {
@@ -80,13 +69,7 @@ where
              ON DUPLICATE KEY UPDATE \
              value = value + 1, \
              updated_at = VALUES(updated_at)"
-        } // DatabaseBackend::Sqlite => {
-          //     "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
-          //      VALUES (?, ?, ?, ?, ?) \
-          //      ON CONFLICT(key) DO UPDATE SET \
-          //      value = value + 1, \
-          //      updated_at = excluded.updated_at"
-          // }
+        }
     };
 
     let result = db

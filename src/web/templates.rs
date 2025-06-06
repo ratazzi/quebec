@@ -1,18 +1,18 @@
 use rust_embed::RustEmbed;
 use tracing::error;
 
-// 定义嵌入式模板资源
+// Define embedded template resources
 #[derive(RustEmbed)]
 #[folder = "src/web/templates/"]
 #[prefix = "templates/"]
 #[include = "*.html"]
 pub struct Templates;
 
-// 在开发模式下从文件系统读取模板，在生产模式下使用嵌入式资源
+// Read templates from filesystem in development mode, use embedded resources in production mode
 pub fn get_template_content(template_name: &str) -> Option<String> {
     #[cfg(debug_assertions)]
     {
-        // 在开发模式下，直接从文件系统读取
+        // In development mode, read directly from filesystem
         let path = format!("src/web/templates/{}", template_name);
         match std::fs::read_to_string(&path) {
             Ok(content) => Some(content),
@@ -25,7 +25,7 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
 
     #[cfg(not(debug_assertions))]
     {
-        // 在生产模式下，从嵌入式资源读取
+        // In production mode, read from embedded resources
         let asset_path = format!("templates/{}", template_name);
         match Templates::get(&asset_path) {
             Some(content) => {
@@ -45,11 +45,11 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
     }
 }
 
-// 获取所有可用模板的列表
+// Get list of all available templates
 pub fn list_templates() -> Vec<String> {
     #[cfg(debug_assertions)]
     {
-        // 在开发模式下，从文件系统读取
+        // In development mode, read from filesystem
         match std::fs::read_dir("src/web/templates") {
             Ok(entries) => {
                 let mut templates: Vec<String> = entries
@@ -66,9 +66,9 @@ pub fn list_templates() -> Vec<String> {
                     })
                     .collect();
 
-                // 确保基础模板先加载
+                // Ensure base templates are loaded first
                 templates.sort_by(|a, b| {
-                    // base.html 总是最先加载
+                    // base.html is always loaded first
                     if a == "base.html" {
                         std::cmp::Ordering::Less
                     } else if b == "base.html" {
@@ -89,7 +89,7 @@ pub fn list_templates() -> Vec<String> {
 
     #[cfg(not(debug_assertions))]
     {
-        // 在生产模式下，从嵌入式资源读取
+        // In production mode, read from embedded resources
         let mut templates: Vec<String> = Templates::iter()
             .filter_map(|path| {
                 let path_str = path.as_ref();
@@ -101,9 +101,9 @@ pub fn list_templates() -> Vec<String> {
             })
             .collect();
 
-        // 确保基础模板先加载
+        // Ensure base templates are loaded first
         templates.sort_by(|a, b| {
-            // base.html 总是最先加载
+            // base.html is always loaded first
             if a == "base.html" {
                 std::cmp::Ordering::Less
             } else if b == "base.html" {

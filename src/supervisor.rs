@@ -1,18 +1,12 @@
-use crate::context::{AppContext, ScheduledEntry};
-use crate::entities::{prelude::*, *};
+use crate::context::AppContext;
+
 use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
-use croner::Cron;
-use english_to_cron::str_cron_syntax;
-use sea_orm::TransactionTrait;
-use sea_orm::*;
-use serde_json::json;
-use serde_yaml;
-use std::collections::HashMap;
+
 use std::sync::Arc;
 
-use tracing::{debug, error, info, trace, warn};
+use tracing::info;
 
 #[derive(Debug)]
 pub struct Supervisor {

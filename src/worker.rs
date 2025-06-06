@@ -1,5 +1,5 @@
 use crate::context::*;
-use crate::entities::{prelude::*, *};
+use crate::entities::*;
 use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use rand::Rng;
+
 use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::collections::HashMap;
@@ -61,13 +61,13 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
 }
 
 async fn runner(
-    ctx: Arc<AppContext>, thread_id: String, state: Arc<Mutex<i32>>,
+    ctx: Arc<AppContext>, _thread_id: String, _state: Arc<Mutex<i32>>,
     rx: Arc<Mutex<Receiver<Execution>>>,
 ) -> Result<()> {
     let mut tid = format!("{:?}", std::thread::current().id());
     let graceful_shutdown = ctx.graceful_shutdown.clone();
     let force_quit = ctx.force_quit.clone();
-    // let opts = ctx.connect_options.clone();
+
 
     if true {
         let mut thread_id: u64 = 0;
@@ -86,31 +86,31 @@ async fn runner(
         let mut receiver = rx.lock().await;
         tokio::select! {
           _ = graceful_shutdown.cancelled() => {
-            info!("Graceful shutdown");
-            break;
+              info!("Graceful shutdown");
+              break;
           }
           execution = receiver.recv() => {
               drop(receiver);
               if execution.is_none() {
-                continue;
+                  continue;
               }
               let mut execution = execution.unwrap();
               execution.tid = tid.clone();
-              let job_id = execution.claimed.job_id;
+              let _job_id = execution.claimed.job_id;
 
               // async {
-                  // 尝试获取锁，如果成功则处理任务
+                  // Try to acquire lock, process task if successful
                   // let _lock = state.lock().await;
                   let class_name = execution.job.class_name.clone();
 
                   info!("Job `{}' started", class_name);
 
-                  let timeout_duration = std::time::Duration::from_secs(10); // 设置超时时间
+                  let timeout_duration = std::time::Duration::from_secs(10);
 
                   let result = tokio::select! {
                       _ = graceful_shutdown.cancelled() => {
                           info!("Graceful cancelling");
-                          // break;
+
                           Err(anyhow::anyhow!("Job `{}' cancelling", class_name))
                       }
                       _ = force_quit.cancelled() => {
@@ -121,9 +121,6 @@ async fn runner(
                           error!("Job `{}' timeout", class_name);
                           Err(anyhow::anyhow!("Job `{}' timeout", class_name))
                       }
-                      // result = execution.invoke() => {
-                      //     result
-                      // }
                       result = tokio::task::spawn_blocking(move || {
                           tokio::runtime::Handle::current().block_on(execution.invoke())
                       }) => {
@@ -140,7 +137,7 @@ async fn runner(
                   }
 
                   if graceful_shutdown.is_cancelled() {
-                      debug!("Current job executed, shutdown gracefully");
+                      trace!("Current job executed, shutdown gracefully");
                       break;
                   }
               // }
@@ -150,7 +147,7 @@ async fn runner(
         }
     }
 
-    debug!("Stopped");
+    trace!("Worker thread stopped");
     Ok(())
 }
 
@@ -175,7 +172,7 @@ impl Runnable {
         Self { class_name, handler, queue_as, priority, retry_info: None }
     }
 
-    /// 检查是否应该重试，返回匹配的重试策略
+    /// Check if should retry, return matching retry strategy
     fn should_retry(
         &self, py: Python, bound: &Bound<PyAny>, error: &PyErr, failed_attempts: i32,
     ) -> PyResult<Option<RetryStrategy>> {
@@ -187,7 +184,7 @@ impl Runnable {
 
         for strategy in retry_strategies {
             if i64::from(failed_attempts) >= strategy.attempts {
-                continue; // 超过最大重试次数
+                continue; // Exceeded maximum retry count
             }
 
             if self.is_exception_match(py, &strategy.exceptions, error)? {
@@ -198,7 +195,7 @@ impl Runnable {
         Ok(None)
     }
 
-    /// 检查是否应该丢弃，返回匹配的丢弃策略
+    /// Check if should discard, return matching discard strategy
     fn should_discard(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<DiscardStrategy>> {
         if !bound.hasattr("discard_on")? {
             return Ok(None);
@@ -215,7 +212,7 @@ impl Runnable {
         Ok(None)
     }
 
-    /// 检查是否有救援处理，返回匹配的救援策略
+    /// Check if has rescue handling, return matching rescue strategy
     fn should_rescue(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<RescueStrategy>> {
         if !bound.hasattr("rescue_from")? {
             return Ok(None);
@@ -232,16 +229,16 @@ impl Runnable {
         Ok(None)
     }
 
-    /// 检查异常是否匹配
+    /// Check if exception matches
     fn is_exception_match(&self, py: Python, exceptions: &Py<PyAny>, error: &PyErr) -> PyResult<bool> {
         let exceptions_bound = exceptions.bind(py);
 
-        // 处理单个异常类型
+
         if let Ok(exception_type) = exceptions_bound.downcast::<PyType>() {
             return Ok(error.is_instance(py, exception_type));
         }
 
-        // 处理异常类型元组
+
         if let Ok(exception_tuple) = exceptions_bound.downcast::<PyTuple>() {
             for item in exception_tuple.iter() {
                 if let Ok(exception_type) = item.downcast::<PyType>() {
@@ -257,11 +254,11 @@ impl Runnable {
 
 
 
-    /// 处理丢弃 - 直接标记任务为完成，不记录失败信息
+    /// Handle discard - directly mark task as completed without recording failure information
     fn handle_discard(
         &self, py: Python, strategy: &DiscardStrategy, error: &PyErr, job: solid_queue_jobs::Model,
     ) -> Result<solid_queue_jobs::Model> {
-        // 调用丢弃处理器（如果有）
+        // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
             if let Err(handler_error) = handler.call1(py, (error.value(py),)) {
                 warn!("Error in discard handler: {}", handler_error);
@@ -273,11 +270,11 @@ impl Runnable {
             .unwrap_or_else(|_| "unknown error".to_string());
         info!("Job discarded due to {}", error_name);
 
-        // 直接返回成功，表示任务被丢弃并标记为完成
+        // Return success directly, indicating task was discarded and marked as completed
         Ok(job)
     }
 
-    /// 创建错误负载
+    /// Create error payload
     fn create_error_payload(&self, py: Python, error: &PyErr) -> String {
         let mut backtrace: Vec<String> = vec![];
         if let Some(tb) = error.traceback(py) {
@@ -301,23 +298,23 @@ impl Runnable {
 
     fn invoke(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
         Python::with_gil(|py| {
-            // 1. 执行 Python 任务
+            // 1. Execute Python task
             match self.execute_python_task(py, job) {
                 Ok(_) => Ok(job.clone()),
                 Err(error) => {
-                    // 2. 处理执行错误
+                    // 2. Handle execution error
                     self.handle_execution_error(py, job, &error)
                 }
             }
         })
     }
 
-    /// 执行 Python 任务（参数解析 + 调用）
+    /// Execute Python task (parameter parsing + invocation)
     fn execute_python_task(&self, py: Python, job: &solid_queue_jobs::Model) -> PyResult<()> {
-        // 解析任务参数
+        // Parse task parameters
         let (args, kwargs) = self.parse_job_arguments(py, job)?;
 
-        // 创建 Python 实例并调用
+        // Create Python instance and invoke
         let bound = self.handler.bind(py);
         let instance = bound.call0()?;
         instance.setattr("id", job.id)?;
@@ -329,9 +326,9 @@ impl Runnable {
         Ok(())
     }
 
-    /// 解析任务参数
+    /// Parse task parameters
     fn parse_job_arguments(&self, py: Python, job: &solid_queue_jobs::Model) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
-        // 反序列化 JSON 参数
+        // Deserialize JSON parameters
         let mut v = serde_json::Value::Array(vec![]);
         if let Some(arguments) = job.arguments.as_ref() {
             v = serde_json::from_str(arguments)
@@ -350,10 +347,10 @@ impl Runnable {
         let args = binding.downcast_bound::<pyo3::types::PyList>(py)
             .map_err(|e| PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e)))?;
 
-        // 初始化 kwargs
+        // Initialize kwargs
         let kwargs = PyDict::new(py);
 
-        // 处理最后一个参数如果是字典的话，作为 kwargs
+        // Handle the last parameter as kwargs if it's a dictionary
         if args.len() > 1 {
             let last_index = args.len() - 1;
             let last = args.get_item(last_index)?;
@@ -371,35 +368,35 @@ impl Runnable {
         Ok((args_tuple.into(), kwargs.into()))
     }
 
-    /// 处理执行错误
+    /// Handle execution error
     fn handle_execution_error(&mut self, py: Python, job: &mut solid_queue_jobs::Model, error: &PyErr) -> Result<solid_queue_jobs::Model> {
         error!("Job execution error: {:?}", error);
 
         let bound = self.handler.bind(py);
 
-        // 按优先级检查错误处理策略
+        // Check error handling strategies by priority
 
-        // 1. 检查是否应该重试
+        // 1. Check if should retry
         if let Some(retry_strategy) = self.should_retry(py, &bound, error, job.failed_attempts)? {
             return self.apply_retry_strategy(job, retry_strategy);
         }
 
-        // 2. 检查是否应该丢弃
+        // 2. Check if should discard
         if let Some(discard_strategy) = self.should_discard(py, &bound, error)? {
             warn!("Job will be discarded");
             return self.handle_discard(py, &discard_strategy, error, job.clone());
         }
 
-        // 3. 检查是否有救援处理
+        // 3. Check if there's rescue handling
         if let Some(rescue_strategy) = self.should_rescue(py, &bound, error)? {
             return self.apply_rescue_strategy(py, job, &rescue_strategy, error);
         }
 
-        // 4. 默认失败处理
+        // 4. Default failure handling
         self.handle_job_failure(py, job, error)
     }
 
-    /// 应用重试策略
+    /// Apply retry strategy
     fn apply_retry_strategy(&mut self, job: &solid_queue_jobs::Model, strategy: RetryStrategy) -> Result<solid_queue_jobs::Model> {
         warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
@@ -407,7 +404,7 @@ impl Runnable {
         let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).unwrap();
         let failed_attempts = job.failed_attempts + 1;
 
-        // 设置重试信息到 runnable
+        // Set retry information to runnable
         self.retry_info = Some(RetryInfo {
             scheduled_at,
             failed_attempts,
@@ -416,7 +413,7 @@ impl Runnable {
         Ok(job.clone())
     }
 
-    /// 应用救援策略
+    /// Apply rescue strategy
     fn apply_rescue_strategy(&self, py: Python, job: &mut solid_queue_jobs::Model, strategy: &RescueStrategy, error: &PyErr) -> Result<solid_queue_jobs::Model> {
         match strategy.handler.call1(py, (error.value(py),)) {
             Ok(_) => {
@@ -425,13 +422,13 @@ impl Runnable {
             }
             Err(rescue_error) => {
                 warn!("Error in rescue handler: {}", rescue_error);
-                // 救援失败，继续到失败处理
+                // Rescue failed, continue to failure handling
                 self.handle_job_failure(py, job, error)
             }
         }
     }
 
-    /// 处理任务失败
+    /// Handle task failure
     fn handle_job_failure(&self, py: Python, job: &mut solid_queue_jobs::Model, error: &PyErr) -> Result<solid_queue_jobs::Model> {
         job.failed_attempts += 1;
         let error_payload = self.create_error_payload(py, error);
@@ -497,13 +494,13 @@ impl Execution {
         ctx: Arc<AppContext>, claimed: solid_queue_claimed_executions::Model,
         job: solid_queue_jobs::Model, runnable: Runnable,
     ) -> Self {
-        // 获取当前线程的 ThreadId
+        // Get current thread's ThreadId
         let thread_id = std::thread::current().id();
 
-        // 将 ThreadId 转换为字符串
+        // Convert ThreadId to string
         let thread_id_str = format!("{:?}", thread_id);
 
-        // 提取数字部分
+        // Extract numeric part
         let thread_id_num: u64 = thread_id_str
             .trim_start_matches("ThreadId(")
             .trim_end_matches(")")
@@ -534,7 +531,7 @@ impl Execution {
         // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
         let result = async {
             let invoke_result = self.runnable.invoke(&mut job);
-            // 将重试信息从 runnable 移动到 execution
+            // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
                 self.retry_info = Some(retry_info);
             }
@@ -582,7 +579,7 @@ impl Execution {
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
-        // 检查是否需要重试（通过 execution.retry_info 判断）
+        // Check if retry is needed (determined by execution.retry_info)
         let retry_job_data = if let Some(ref retry_info) = self.retry_info {
             Some((retry_info.scheduled_at, retry_info.failed_attempts))
         } else {
@@ -590,11 +587,11 @@ impl Execution {
         };
 
         db.transaction::<_, solid_queue_jobs::Model, DbErr>(|txn| {
-            // Box::pin(async move { Ok(after_executed(txn, claimed, result).await.unwrap()) })
+
             Box::pin(async move {
                 let claimed_id = claimed.id;
 
-                // 处理重试逻辑
+                // Handle retry logic
                 if let Some((scheduled_at, failed_attempts)) = retry_job_data {
                     let retry_job = solid_queue_jobs::ActiveModel {
                         id: ActiveValue::NotSet,
@@ -613,7 +610,7 @@ impl Execution {
                     let saved_job = retry_job.save(txn).await?;
                     let new_job_id = saved_job.id.clone().unwrap();
 
-                    // 创建 scheduled_execution 记录
+                    // Create scheduled_execution record
                     let scheduled_execution = solid_queue_scheduled_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         job_id: ActiveValue::Set(new_job_id),
@@ -629,12 +626,10 @@ impl Execution {
 
                 if failed {
                     error!("Job failed: {:?}", err);
-                    // claimed.delete(txn).await?;
+                    // SolidQueue strategy: pass exception info as arguments to create a new Job
+                    // My strategy: increase failed_attempts field, stop execution if attempts exceed limit
 
-                    // SolidQueue 的策略是 将异常信息作为参数传递创建一个新的 Job
-                    // 我的策略是增加 failed_attempts 字段，如果失败次数超过一定次数则不再执行
-
-                    // 写入 failed_executions 表
+                    // Write to failed_executions table
                     let failed_execution = solid_queue_failed_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         job_id: ActiveValue::Set(job_id),
@@ -647,13 +642,13 @@ impl Execution {
                     // return Ok(job.unwrap().into());
                 }
 
-                // 更新 jobs 表
+                // Update jobs table
                 let mut job: solid_queue_jobs::ActiveModel = job.clone().into();
                 job.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                 job.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                 let updated = job.update(txn).await?;
 
-                // 直接删除 claimed_executions 表中的记录
+                // Directly delete record from claimed_executions table
                 let delete_result = solid_queue_claimed_executions::Entity::delete_many()
                     .filter(solid_queue_claimed_executions::Column::Id.eq(claimed_id))
                     .exec(txn)
@@ -669,9 +664,7 @@ impl Execution {
         .await
         .map(|job| {
             let duration = self.timer.elapsed();
-            // info!("Job `{}' processed in: {:?}", duration);
             let job_model = job.try_into_model().unwrap();
-            // debug!("Job: {:?}", job_model);
 
             if job_model.finished_at.is_none() {
                 error!("Job `{}' processed in: {:?}", class_name, duration);
@@ -685,8 +678,7 @@ impl Execution {
         })
         .ok();
 
-        // let job = self.job.clone();
-        // Ok(job)
+
         result
     }
 }
@@ -726,7 +718,7 @@ impl Execution {
     fn perform(&mut self) -> PyResult<()> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ret = rt.block_on(async { self.invoke().await });
-        // debug!("-------------------------- Job result: {:?}", ret);
+
         if let Err(e) = ret {
             return Err(e.into());
         }
@@ -734,7 +726,7 @@ impl Execution {
         Ok(())
     }
 
-    // post execution result
+
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
         let result = if exc.is_instance_of::<PyException>() {
             let e = exc.downcast::<PyException>().unwrap();
@@ -843,7 +835,7 @@ impl Execution {
                             .await?;
 
                             let job_id = job.id.clone().unwrap();
-                            let scheduled_execution =
+                            let _scheduled_execution =
                                 solid_queue_scheduled_executions::ActiveModel {
                                     id: ActiveValue::not_set(),
                                     job_id: ActiveValue::Set(job_id),
@@ -963,7 +955,7 @@ impl Worker {
     //     Ok(job_class.clone())
     // }
 
-    pub fn register_job_class(&self, py: Python, klass: Py<PyAny>) -> PyResult<()> {
+    pub fn register_job_class(&self, _py: Python, klass: Py<PyAny>) -> PyResult<()> {
         Python::with_gil(|py| {
             let bound = klass.bind(py);
             let class_name = bound.downcast::<PyType>().unwrap().qualname().unwrap();
@@ -989,7 +981,7 @@ impl Worker {
     }
 
     pub async fn claim_job(&self) -> Result<solid_queue_claimed_executions::Model, anyhow::Error> {
-        let opts = self.ctx.connect_options.clone();
+        let _opts = self.ctx.connect_options.clone();
         // if self.ctx.silence_polling {
         //     opts.sqlx_logging(false); //.sqlx_logging_level(log::LevelFilter::Error);
         //                               // warn!("-------------------- opts: {:?}", opts);
@@ -999,7 +991,7 @@ impl Worker {
         let job = db
             .transaction::<_, solid_queue_claimed_executions::ActiveModel, DbErr>(|txn| {
                 Box::pin(async move {
-                    // 获取一个未被锁定的任务
+                    // Get an unlocked task
                     // let record: Option<solid_queue_ready_executions::Model> = solid_queue_ready_executions::Entity::find()
                     //     .from_raw_sql(Statement::from_sql_and_values(
                     //         DbBackend::Postgres,
@@ -1047,7 +1039,7 @@ impl Worker {
     ) -> Result<Vec<solid_queue_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
-        let use_skip_locked = self.ctx.use_skip_locked;
+        let _use_skip_locked = self.ctx.use_skip_locked;
 
         let jobs = db
             .transaction::<_, Vec<solid_queue_claimed_executions::ActiveModel>, DbErr>(|txn| {
@@ -1154,7 +1146,7 @@ impl Worker {
         let tx = self.dispatch_sender.clone();
         let ctx = self.ctx.clone();
 
-        // 确保只有一个主循环在运行
+        // Ensure only one main loop is running
         let _ = self.polling.lock().await;
         let thread_id = Self::get_tid();
 
@@ -1171,7 +1163,7 @@ impl Worker {
             }
         });
 
-        // 生产者发送任务
+        // Producer sends tasks
         loop {
             tokio::select! {
                 // _ = heartbeat_interval.tick() => {

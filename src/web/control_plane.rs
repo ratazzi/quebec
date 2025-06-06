@@ -1,28 +1,26 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::path::PathBuf;
-use std::env;
+
 use std::error::Error;
 use std::collections::HashMap;
 use axum::{
     Router,
     routing::{get, post},
     extract::{State, Query, Path},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse},
     http::StatusCode,
-    body::Body,
 };
 use serde::{Deserialize, Serialize};
 use tera::Tera;
 use crate::context::AppContext;
-use sea_orm::{EntityTrait, ActiveModelTrait, Set, ActiveValue};
-use sea_orm::{QueryFilter, ColumnTrait, DeleteMany, DbErr};
+use sea_orm::{EntityTrait, ActiveModelTrait, ActiveValue};
+use sea_orm::{QueryFilter, ColumnTrait, DbErr};
 use sea_orm::QuerySelect;
-use sea_orm::prelude::Expr;
+
 use sea_orm::Order;
 use sea_orm::ConnectionTrait;
 use sea_orm::TransactionTrait;
-use sea_orm::sea_query::Func;
+
 use sea_orm::PaginatorTrait;
 use sea_orm::Value;
 use sea_orm::Statement;
@@ -32,7 +30,7 @@ use crate::entities::solid_queue_jobs;
 use crate::entities::solid_queue_pauses;
 use crate::entities::solid_queue_failed_executions;
 use crate::entities::solid_queue_claimed_executions;
-use crate::entities::solid_queue_ready_executions;
+
 use crate::entities::solid_queue_scheduled_executions;
 use crate::entities::solid_queue_blocked_executions;
 use crate::entities::solid_queue_processes;
@@ -40,7 +38,7 @@ use tracing::{error, info, debug, warn};
 use tokio::time::sleep;
 use tower_http::trace::{self, TraceLayer};
 use tracing::{Level, Span, instrument};
-use chrono::DateTime;
+
 use chrono::NaiveDateTime;
 
 use std::sync::RwLock;
@@ -48,7 +46,7 @@ use crate::web::templates;
 
 pub struct ControlPlane {
     ctx: Arc<AppContext>,
-    tera: RwLock<Tera>,  // 使用 RwLock 提供线程安全的内部可变性
+    tera: RwLock<Tera>,  // Use RwLock to provide thread-safe interior mutability
     template_path: String,
     page_size: usize,
 }
@@ -82,7 +80,7 @@ fn default_page() -> usize {
     1
 }
 
-// 添加失败任务的数据结构
+// Add data structure for failed tasks
 #[derive(Debug, Serialize)]
 struct FailedJobInfo {
     id: i64,
@@ -92,7 +90,7 @@ struct FailedJobInfo {
     failed_at: String,
 }
 
-// 添加 InProgressJobInfo 结构
+// Add InProgressJobInfo structure
 #[derive(Debug, Serialize)]
 struct InProgressJobInfo {
     id: i64,
@@ -104,7 +102,7 @@ struct InProgressJobInfo {
     runtime: String,
 }
 
-// 添加队列内作业的数据结构
+// Add data structure for jobs in queue
 #[derive(Debug, Serialize)]
 struct QueueJobInfo {
     id: i64,
@@ -114,7 +112,7 @@ struct QueueJobInfo {
     execution_id: Option<i64>,
 }
 
-// 在适当位置添加 ScheduledJobInfo 结构
+// Add ScheduledJobInfo structure at appropriate location
 #[derive(Debug, Serialize)]
 struct ScheduledJobInfo {
     id: i64,
@@ -126,7 +124,7 @@ struct ScheduledJobInfo {
     scheduled_in: String,
 }
 
-// 添加 BlockedJobInfo 结构
+// Add BlockedJobInfo structure
 #[derive(Debug, Serialize)]
 struct BlockedJobInfo {
     id: i64,
@@ -139,7 +137,7 @@ struct BlockedJobInfo {
     expires_at: String,
 }
 
-// 添加 FinishedJobInfo 结构
+// Add FinishedJobInfo structure
 #[derive(Debug, Serialize)]
 struct FinishedJobInfo {
     id: i64,
@@ -150,7 +148,7 @@ struct FinishedJobInfo {
     runtime: String,
 }
 
-// 添加 JobDetailsInfo 结构
+// Add JobDetailsInfo structure
 #[derive(Debug, Serialize)]
 struct JobDetailsInfo {
     id: i64,
@@ -188,10 +186,10 @@ impl ControlPlane {
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let start = Instant::now();
 
-        // 初始化 Tera
+        // Initialize Tera
         let mut tera = Tera::default();
 
-        // 添加所有模板
+        // Add all templates
         for template_name in templates::list_templates() {
             if let Some(content) = templates::get_template_content(&template_name) {
                 if let Err(e) = tera.add_raw_template(&template_name, &content) {
@@ -200,15 +198,15 @@ impl ControlPlane {
             }
         }
 
-        // 设置自动转义 HTML
+        // Set automatic HTML escaping
         tera.autoescape_on(vec!["html"]);
 
-        // 输出最终模板列表
+        // Output final template list
         let template_list = tera.get_template_names().collect::<Vec<_>>();
         debug!("Available templates: {:?}", template_list);
         debug!("Tera template engine initialized in {:?}", start.elapsed());
 
-        // 保存模板路径，用于热重载
+        // Save template path for hot reload
         let template_path = "src/web/templates/**/*".to_string();
 
         Self {
@@ -276,7 +274,7 @@ impl ControlPlane {
         let db = db.as_ref();
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // 获取时间范围参数，默认为24小时
+        // Get time range parameter, default to 24 hours
         let hours: i64 = params.get("hours")
             .and_then(|h| h.parse().ok())
             .unwrap_or(24);
@@ -285,7 +283,7 @@ impl ControlPlane {
         let period_start = now - chrono::Duration::hours(hours);
         let previous_period_start = period_start - chrono::Duration::hours(hours);
 
-        // 获取当前周期内已完成的作业总数
+        // Get total number of completed jobs in current period
         let total_jobs_processed = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .filter(solid_queue_jobs::Column::FinishedAt.gt(period_start))
@@ -293,7 +291,7 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 获取上一个周期内已完成的作业总数，用于计算变化率
+        // Get total number of completed jobs in previous period for calculating change rate
         let previous_jobs_processed = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .filter(solid_queue_jobs::Column::FinishedAt.gt(previous_period_start))
@@ -302,14 +300,14 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 计算作业处理数量的变化率
+        // Calculate change rate of job processing count
         let jobs_processed_change = if previous_jobs_processed > 0 {
             ((total_jobs_processed as f64 - previous_jobs_processed as f64) / previous_jobs_processed as f64 * 100.0).round() as i32
         } else {
             0
         };
 
-        // 获取当前周期内作业的平均处理时间
+        // Get average processing time of jobs in current period
         let avg_duration_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
@@ -325,7 +323,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get("", "avg_duration").unwrap_or(0.0));
 
-        // 获取上一个周期内作业的平均处理时间
+        // Get average processing time of jobs in previous period
         let prev_avg_duration_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
@@ -342,7 +340,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get("", "avg_duration").unwrap_or(0.0));
 
-        // 计算平均处理时间的变化率
+        // Calculate change rate of average processing time
         let avg_duration_change = match (avg_duration, prev_avg_duration) {
             (Some(curr), Some(prev)) if prev > 0.0 => {
                 ((curr - prev) / prev * 100.0).round() as i32
@@ -350,7 +348,7 @@ impl ControlPlane {
             _ => 0
         };
 
-        // 格式化平均处理时间
+        // Format average processing time
         let avg_job_duration = match avg_duration {
             Some(secs) if secs >= 3600.0 => {
                 format!("{:.1}h", secs / 3600.0)
@@ -364,20 +362,20 @@ impl ControlPlane {
             None => "N/A".to_string()
         };
 
-        // 获取活跃的 worker 数量
+        // Get number of active workers
         let active_workers = solid_queue_processes::Entity::find()
             .filter(solid_queue_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 获取上一个周期的活跃 worker 数量（这里简化处理，实际上应该查询历史数据）
-        let prev_active_workers = active_workers; // 假设没有变化，实际应该从历史数据中获取
+        // Get number of active workers in previous period (simplified here, should query historical data)
+        let prev_active_workers = active_workers; // Assume no change, should get from historical data
 
-        // 计算活跃 worker 数量的变化
+        // Calculate change in number of active workers
         let active_workers_change = active_workers as i32 - prev_active_workers as i32;
 
-        // 计算失败率
+        // Calculate failure rate
         let failed_jobs = solid_queue_failed_executions::Entity::find()
             .filter(solid_queue_failed_executions::Column::CreatedAt.gt(period_start))
             .count(db)
@@ -396,7 +394,7 @@ impl ControlPlane {
             0
         };
 
-        // 获取上一个周期的失败率
+        // Get failure rate of previous period
         let prev_failed_jobs = solid_queue_failed_executions::Entity::find()
             .filter(solid_queue_failed_executions::Column::CreatedAt.gt(previous_period_start))
             .filter(solid_queue_failed_executions::Column::CreatedAt.lte(period_start))
@@ -419,27 +417,27 @@ impl ControlPlane {
 
         let failed_rate_change = failed_jobs_rate - prev_failed_jobs_rate;
 
-        // 准备时间标签和作业处理数据（用于图表）
+        // Prepare time labels and job processing data (for charts)
         let mut time_labels = Vec::new();
         let mut jobs_processed_data = Vec::new();
 
-        // 根据选择的时间范围确定时间间隔
+        // Determine time interval based on selected time range
         let (interval_hours, format_string) = if hours <= 24 {
-            (1, "%H:%M") // 每小时，显示时:分
-        } else if hours <= 168 { // 7天
-            (6, "%m-%d %H:%M") // 每6小时，显示月-日 时:分
+            (1, "%H:%M") // Every hour, display hour:minute
+        } else if hours <= 168 { // 7 days
+            (6, "%m-%d %H:%M") // Every 6 hours, display month-day hour:minute
         } else {
-            (24, "%m-%d") // 每天，显示月-日
+            (24, "%m-%d") // Every day, display month-day
         };
 
-        // 生成时间序列数据
+        // Generate time series data
         for i in 0..(hours / interval_hours) {
             let end_time = now - chrono::Duration::hours(i * interval_hours);
             let start_time = end_time - chrono::Duration::hours(interval_hours);
 
             time_labels.push(end_time.format(format_string).to_string());
 
-            // 查询该时间段内完成的作业数
+            // Query number of jobs completed in this time period
             let period_jobs = solid_queue_jobs::Entity::find()
                 .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
                 .filter(solid_queue_jobs::Column::FinishedAt.gt(start_time))
@@ -451,11 +449,11 @@ impl ControlPlane {
             jobs_processed_data.push(period_jobs);
         }
 
-        // 反转数组以便按时间顺序显示
+        // Reverse arrays to display in chronological order
         time_labels.reverse();
         jobs_processed_data.reverse();
 
-        // 获取作业类型分布
+        // Get job type distribution
         let job_types_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"SELECT class_name, COUNT(*) as count
@@ -483,7 +481,7 @@ impl ControlPlane {
             job_types_data.push(count);
         }
 
-        // 获取队列性能统计
+        // Get queue performance statistics
         let queue_performance_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"SELECT
@@ -503,7 +501,7 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 获取暂停的队列
+        // Get paused queues
         let paused_queues = solid_queue_pauses::Entity::find()
             .all(db)
             .await
@@ -522,7 +520,7 @@ impl ControlPlane {
             let failed_jobs: i64 = row.try_get("", "failed_jobs").unwrap_or_default();
             let total_jobs: i64 = row.try_get("", "total_jobs").unwrap_or_default();
 
-            // 格式化平均处理时间
+            // Format average processing time
             let avg_duration_str = match avg_duration {
                 Some(secs) if secs >= 3600.0 => {
                     format!("{:.1}h", secs / 3600.0)
@@ -536,14 +534,14 @@ impl ControlPlane {
                 None => "N/A".to_string()
             };
 
-            // 计算失败率
+            // Calculate failure rate
             let failed_rate = if total_jobs > 0 {
                 ((failed_jobs as f64 / total_jobs as f64) * 100.0).round() as i32
             } else {
                 0
             };
 
-            // 检查队列状态
+            // Check queue status
             let status = if paused_queue_names.contains(&queue_name) {
                 "paused"
             } else {
@@ -559,7 +557,7 @@ impl ControlPlane {
             }));
         }
 
-        // 准备模板上下文
+        // Prepare template context
         let mut context = tera::Context::new();
         context.insert("total_jobs_processed", &total_jobs_processed);
         context.insert("jobs_processed_change", &jobs_processed_change);
@@ -570,7 +568,7 @@ impl ControlPlane {
         context.insert("failed_jobs_rate", &failed_jobs_rate);
         context.insert("failed_rate_change", &failed_rate_change);
 
-        // 获取最近失败的作业
+        // Get recently failed jobs
         let recent_failed_jobs_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"SELECT
@@ -601,8 +599,7 @@ impl ControlPlane {
             let failed_at: Option<NaiveDateTime> = row.try_get("", "failed_at").ok();
             let error: String = row.try_get("", "error").unwrap_or_default();
 
-            let formatted_failed_at = failed_at
-                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            let formatted_failed_at = Self::format_optional_datetime(failed_at)
                 .unwrap_or_else(|| "N/A".to_string());
 
             recent_failed_jobs.push(serde_json::json!({
@@ -614,7 +611,7 @@ impl ControlPlane {
             }));
         }
 
-        // 将数组序列化为 JSON 字符串
+        // Serialize arrays to JSON strings
         context.insert("time_labels", &serde_json::to_string(&time_labels).unwrap_or_else(|_| "[]".to_string()));
         context.insert("jobs_processed_data", &serde_json::to_string(&jobs_processed_data).unwrap_or_else(|_| "[]".to_string()));
         context.insert("job_types_labels", &serde_json::to_string(&job_types_labels).unwrap_or_else(|_| "[]".to_string()));
@@ -623,7 +620,7 @@ impl ControlPlane {
         context.insert("recent_failed_jobs", &recent_failed_jobs);
         context.insert("active_page", "overview");
 
-        // 渲染模板
+        // Render template
         let html = state.render_template("overview.html", &mut context).await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
@@ -642,8 +639,8 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 使用 Sea-ORM 的原生 SQL 查询功能，仅统计未完成的作业
-        // 获取所有的队列名称
+        // Use Sea-ORM's native SQL query functionality, only count unfinished jobs
+        // Get all queue names
         let all_queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -657,7 +654,7 @@ impl ControlPlane {
             []
         );
 
-        // 获取有未完成作业的队列计数
+        // Get queue counts with unfinished jobs
         let queue_counts_map: HashMap<String, i64> = db
             .query_all(stmt)
             .await
@@ -670,7 +667,7 @@ impl ControlPlane {
             })
             .collect();
 
-        // 确保所有队列都包含在结果中，即使没有未完成的作业
+        // Ensure all queues are included in results, even if they have no unfinished jobs
         let queue_counts: Vec<(String, i64)> = all_queue_names
             .into_iter()
             .map(|queue_name| (queue_name.clone(), *queue_counts_map.get(&queue_name).unwrap_or(&0)))
@@ -771,11 +768,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate pagination offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取失败的执行记录
+        // Get failed execution records
         let failed_executions = solid_queue_failed_executions::Entity::find()
             .offset(offset as u64)
             .limit(page_size as u64)
@@ -783,10 +780,10 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 创建一个存储失败任务信息的向量
+        // Create a vector to store failed job information
         let mut failed_jobs: Vec<FailedJobInfo> = Vec::with_capacity(failed_executions.len());
 
-        // 获取每个失败执行对应的作业信息
+        // Get job information for each failed execution
         for execution in failed_executions {
             if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
                 failed_jobs.push(FailedJobInfo {
@@ -794,7 +791,7 @@ impl ControlPlane {
                     queue_name: job.queue_name.clone(),
                     class_name: job.class_name.clone(),
                     error: execution.error.unwrap_or_default(),
-                    failed_at: execution.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    failed_at: Self::format_naive_datetime(execution.created_at),
                 });
             }
         }
@@ -802,10 +799,10 @@ impl ControlPlane {
         debug!("Fetched failed jobs in {:?}", start.elapsed());
         info!("Found {} failed jobs", failed_jobs.len());
 
-        // 获取失败任务总数以计算分页
+        // Get total count of failed jobs for pagination calculation
         let start = Instant::now();
 
-        // 直接执行 SQL count 查询
+        // Execute SQL count query directly
         let total_count: i64 = solid_queue_failed_executions::Entity::find()
             .select_only()
             .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
@@ -830,7 +827,7 @@ impl ControlPlane {
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "failed-jobs");
 
-        // 使用辅助方法渲染模板
+        // Use helper method to render template
         let html = state.render_template("failed-jobs.html", &mut context).await?;
 
         debug!("Template rendering completed in {:?}", start.elapsed());
@@ -843,15 +840,15 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Model as FailedExecutionModel, Retryable};
+        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Retryable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction for operation
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 先获取失败的执行记录
+                // First get failed execution record
                 let failed_execution = FailedExecutionEntity::find()
                     .filter(crate::entities::solid_queue_failed_executions::Column::JobId.eq(id))
                     .one(txn)
@@ -859,7 +856,7 @@ impl ControlPlane {
 
                 match failed_execution {
                     Some(execution) => {
-                        // 使用 Retryable trait 实现的 retry 方法
+                        // Use Retryable trait's retry method
                         execution.retry(txn).await?;
                         Ok(())
                     },
@@ -885,15 +882,15 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Model as FailedExecutionModel, Discardable};
+        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Discardable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction for operation
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 先获取失败的执行记录
+                // First get failed execution record
                 let failed_execution = FailedExecutionEntity::find()
                     .filter(crate::entities::solid_queue_failed_executions::Column::JobId.eq(id))
                     .one(txn)
@@ -901,7 +898,7 @@ impl ControlPlane {
 
                 match failed_execution {
                     Some(execution) => {
-                        // 使用 Discardable trait 实现的 discard 方法
+                        // Use Discardable trait's discard method
                         execution.discard(txn).await?;
                         Ok(())
                     },
@@ -931,10 +928,10 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction for operation
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
-                // 使用 Retryable trait 实现的 retry_all 方法
+                // Use Retryable trait's retry_all method
                 let count = FailedExecutionEntity.retry_all(txn).await?;
                 Ok(count)
             })
@@ -959,10 +956,10 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction for operation
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
-                // 使用 Discardable trait 实现的 discard_all 方法
+                // Use Discardable trait's discard_all method
                 let count = FailedExecutionEntity.discard_all(txn).await?;
                 Ok(count)
             })
@@ -978,9 +975,9 @@ impl ControlPlane {
         })
     }
 
-    // 添加以下辅助方法，用于提取共用功能
+    // Add the following helper methods for extracting common functionality
 
-    /// 获取所有唯一的队列名称
+    /// Get all unique queue names
     async fn get_queue_names(&self, db: &sea_orm::DatabaseConnection) -> Result<Vec<String>, DbErr> {
         db.query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -995,7 +992,7 @@ impl ControlPlane {
         })
     }
 
-    /// 获取所有唯一的作业类名
+    /// Get all unique job class names
     async fn get_job_classes(&self, db: &sea_orm::DatabaseConnection) -> Result<Vec<String>, DbErr> {
         db.query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1010,15 +1007,15 @@ impl ControlPlane {
         })
     }
 
-    /// 渲染模板并处理错误
+    /// Render template and handle errors
     async fn render_template(&self, template_name: &str, context: &mut tera::Context) -> Result<String, (StatusCode, String)> {
-        // 在 debug 编译模式下，重新加载模板
+        // In debug compilation mode, reload templates
         #[cfg(debug_assertions)]
         {
             debug!("Debug mode detected, reloading templates");
             match Tera::new(&self.template_path) {
                 Ok(new_tera) => {
-                    // 成功加载新模板，替换现有的 Tera 实例
+                    // Successfully loaded new templates, replace existing Tera instance
                     match self.tera.write() {
                         Ok(mut tera) => {
                             *tera = new_tera;
@@ -1031,39 +1028,39 @@ impl ControlPlane {
                 Err(e) => error!("Error reloading templates: {}", e)
             }
         }
-        // 添加数据库连接信息
-        let db = self.ctx.get_db().await;
+        // Add database connection information
+        let _db = self.ctx.get_db().await;
 
-        // 直接从 AppContext 获取数据库 DSN 信息
+        // Get database DSN information directly from AppContext
         let dsn = self.ctx.dsn.to_string();
         debug!("Original DSN: {}", dsn);
 
-        // 处理不同类型的数据库连接
+        // Handle different types of database connections
         let (db_type, connection_info) = if dsn.starts_with("postgres:") {
-            // 如果是 PostgreSQL数据库
+            // If it's a PostgreSQL database
             let clean_dsn = if dsn.contains("@") {
-                // 包含用户名密码，需要删除
+                // Contains username and password, need to remove
                 let parts: Vec<&str> = dsn.split("@").collect();
                 if parts.len() > 1 {
-                    // 获取协议部分
+                    // Get protocol part
                     let protocol = if parts[0].contains("://") {
                         parts[0].split("://").next().unwrap_or("postgres")
                     } else {
                         "postgres"
                     };
 
-                    // 重新构造URL，去掉用户名密码
+                    // Reconstruct URL, removing username and password
                     let host_part = parts[1];
                     format!("{0}://{1}", protocol, host_part)
                 } else {
                     dsn.clone()
                 }
             } else {
-                // 不包含用户名密码
+                // Does not contain username and password
                 dsn.clone()
             };
 
-            // 如果有查询参数，删除它们
+            // If there are query parameters, remove them
             let final_dsn = if clean_dsn.contains("?") {
                 clean_dsn.split("?").next().unwrap_or(&clean_dsn).to_string()
             } else {
@@ -1073,12 +1070,12 @@ impl ControlPlane {
             debug!("Cleaned PostgreSQL DSN: {}", final_dsn);
             ("PostgreSQL", final_dsn)
         } else if dsn.starts_with("sqlite:") {
-            // 如果是 SQLite 数据库
+            // If it's a SQLite database
             let path = dsn.replace("sqlite:", "").replace("//", "");
             debug!("SQLite path: {}", path);
             ("SQLite", format!("sqlite://{}", path))
         } else {
-            // 其他类型的数据库
+            // Other types of databases
             debug!("Unknown database type: {}", dsn);
             ("Unknown", dsn)
         };
@@ -1091,15 +1088,15 @@ impl ControlPlane {
         });
         context.insert("db_info", &db_info);
 
-        // 在 debug 编译模式下，重新加载模板
+        // In debug compilation mode, reload templates
         #[cfg(debug_assertions)]
         {
             debug!("Debug mode detected, reloading templates before rendering");
 
-            // 初始化新的 Tera 实例
+            // Initialize new Tera instance
             let mut new_tera = Tera::default();
 
-            // 使用嵌入式模板系统重新加载所有模板
+            // Use embedded template system to reload all templates
             for template_name in templates::list_templates() {
                 if let Some(content) = templates::get_template_content(&template_name) {
                     if let Err(e) = new_tera.add_raw_template(&template_name, &content) {
@@ -1108,10 +1105,10 @@ impl ControlPlane {
                 }
             }
 
-            // 设置自动转义 HTML
+            // Set automatic HTML escaping
             new_tera.autoescape_on(vec!["html"]);
 
-            // 更新 Tera 实例
+            // Update Tera instance
             if let Ok(mut tera) = self.tera.write() {
                 *tera = new_tera;
                 debug!("Templates reloaded successfully");
@@ -1120,7 +1117,7 @@ impl ControlPlane {
             }
         }
 
-        // 检查模板是否在 Tera 实例中存在
+        // Check if template exists in Tera instance
         let tera_read_result = self.tera.read();
         if let Err(e) = tera_read_result {
             error!("Failed to acquire read lock: {}", e);
@@ -1131,13 +1128,13 @@ impl ControlPlane {
         let templates = tera.get_template_names().collect::<Vec<_>>();
         debug!("Available templates: {:?}", templates);
 
-        // 尝试渲染模板
+        // Try to render template
         match tera.render(template_name, context) {
             Ok(html) => Ok(html),
             Err(e) => {
                 error!("Failed to render {}: {}", template_name, e);
 
-                // 输出完整的错误链
+                // Output complete error chain
                 let mut error_detail = format!("Template error: {}", e);
                 let mut current_error = e.source();
                 let mut level = 1;
@@ -1148,10 +1145,10 @@ impl ControlPlane {
                     level += 1;
                 }
 
-                // 输出 Tera 特定的错误详情
+                // Output Tera-specific error details
                 error!("Detailed error: {}", error_detail);
 
-                // 输出源模板内容
+                // Output source template content
                 let template_path = format!("src/web/templates/{}", template_name);
                 match std::fs::read_to_string(&template_path) {
                     Ok(content) => {
@@ -1166,29 +1163,29 @@ impl ControlPlane {
         }
     }
 
-    /// 填充通用的导航统计信息到模板上下文
+    /// Populate common navigation statistics into template context
     async fn populate_nav_stats(&self, db: &sea_orm::DatabaseConnection, context: &mut tera::Context) -> Result<(), DbErr> {
-        // 获取失败的作业数
+        // Get number of failed jobs
         let failed_jobs_count = solid_queue_failed_executions::Entity::find()
             .count(db)
             .await?;
 
-        // 获取进行中的作业数
+        // Get number of in-progress jobs
         let in_progress_jobs_count = solid_queue_claimed_executions::Entity::find()
             .count(db)
             .await?;
 
-        // 获取计划中的作业数
+        // Get number of scheduled jobs
         let scheduled_jobs_count = solid_queue_scheduled_executions::Entity::find()
             .count(db)
             .await?;
 
-        // 获取被阻塞的作业数
+        // Get number of blocked jobs
         let blocked_jobs_count = solid_queue_blocked_executions::Entity::find()
             .count(db)
             .await?;
 
-        // 获取已完成的作业数
+        // Get number of finished jobs
         let finished_jobs_count = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .count(db)
@@ -1209,15 +1206,30 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// 解析时间戳并格式化为人类可读的形式
-    fn format_timestamp(&self, datetime: Result<chrono::NaiveDateTime, DbErr>, format: &str) -> String {
+    /// Parse timestamp and format it in human-readable form
+    fn format_timestamp(datetime: Result<chrono::NaiveDateTime, DbErr>, format: &str) -> String {
         match datetime {
             Ok(dt) => dt.format(format).to_string(),
-            Err(_) => "未知时间".to_string(),
+            Err(_) => "Unknown time".to_string(),
         }
     }
 
-    // 修改 scheduled_jobs 方法，使用这些辅助方法
+    /// Format timestamp with default datetime format
+    fn format_datetime(datetime: Result<chrono::NaiveDateTime, DbErr>) -> String {
+        Self::format_timestamp(datetime, "%Y-%m-%d %H:%M:%S")
+    }
+
+    /// Format optional timestamp with default datetime format
+    fn format_optional_datetime(datetime: Option<chrono::NaiveDateTime>) -> Option<String> {
+        datetime.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    }
+
+    /// Format chrono::NaiveDateTime directly
+    fn format_naive_datetime(datetime: chrono::NaiveDateTime) -> String {
+        datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+    }
+
+    // Modify scheduled_jobs method to use these helper methods
     #[instrument(skip(state), fields(path = "/scheduled-jobs"))]
     async fn scheduled_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -1230,11 +1242,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate page offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取计划中的作业，包含相关信息
+        // Get scheduled jobs with related information
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1258,8 +1270,8 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 获取当前时间，用于计算距离执行还有多长时间
-        let now = chrono::Utc::now().naive_utc();
+        // Get current time, for calculating how long until execution
+        let _now = chrono::Utc::now().naive_utc();
 
         let mut scheduled_jobs = Vec::with_capacity(scheduled_jobs_result.len());
         for row in scheduled_jobs_result {
@@ -1268,16 +1280,13 @@ impl ControlPlane {
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
 
-            // 解析创建时间
-            let created_at_str = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                Err(_) => "未知时间".to_string(),
-            };
+            // Parse creation time
+            let created_at_str = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
-            // 解析计划执行时间
-            let scheduled_at = match row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
+            // Parse scheduled execution time
+            let (scheduled_at_str, scheduled_in) = match row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
                 Ok(dt) => {
-                    // 计算还有多长时间执行
+                    let now = chrono::Utc::now().naive_utc();
                     let scheduled_in = if dt > now {
                         let duration = dt.signed_duration_since(now);
                         if duration.num_hours() > 0 {
@@ -1291,10 +1300,10 @@ impl ControlPlane {
                         "overdue".to_string()
                     };
 
-                    (dt.format("%Y-%m-%d %H:%M:%S").to_string(), scheduled_in)
-                },
-                Err(_) => ("未知时间".to_string(), "未知".to_string()),
-            };
+                (Self::format_naive_datetime(dt), scheduled_in)
+            },
+            Err(_) => ("Unknown time".to_string(), "Unknown".to_string()),
+        };
 
             scheduled_jobs.push(ScheduledJobInfo {
                 id: execution_id,
@@ -1302,14 +1311,14 @@ impl ControlPlane {
                 queue_name,
                 class_name,
                 created_at: created_at_str,
-                scheduled_at: scheduled_at.0,
-                scheduled_in: scheduled_at.1,
+                scheduled_at: scheduled_at_str,
+                scheduled_in,
             });
         }
 
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
-        // 获取计划作业总数以计算分页
+        // Get total number of scheduled jobs for pagination
         let total_count = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1329,7 +1338,7 @@ impl ControlPlane {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
 
-        // 使用抽象方法获取所有队列名称和作业类
+        // Use abstract method to get all queue names and job classes
         let queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1353,7 +1362,7 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 修改 in_progress_jobs 方法，使用辅助方法
+    // Modify in_progress_jobs method, use helper method
     #[instrument(skip(state), fields(path = "/in-progress-jobs"))]
     async fn in_progress_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -1366,11 +1375,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate page offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取声明（正在执行）的作业
+        // Get claimed (in-progress) jobs
         let claimed_executions = crate::entities::solid_queue_claimed_executions::Entity::find()
             .offset(offset as u64)
             .limit(page_size as u64)
@@ -1378,22 +1387,22 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 获取进程信息
+        // Get process information
         let processes = crate::entities::solid_queue_processes::Entity::find()
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 创建一个存储正在进行中作业信息的向量
+        // Create a vector to store in-progress job information
         let mut in_progress_jobs: Vec<InProgressJobInfo> = Vec::with_capacity(claimed_executions.len());
 
-        // 获取当前时间，用于计算运行时间
+        // Get current time, for calculating runtime
         let now = chrono::Utc::now().naive_utc();
 
-        // 获取每个正在进行中执行对应的作业信息
+        // Get job information for each in-progress execution
         for execution in claimed_executions {
             if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
-                // 查找进程信息
+                // Find process information
                 let worker_id = match execution.process_id {
                     Some(pid) => {
                         let process = processes.iter().find(|p| p.id == pid);
@@ -1405,7 +1414,7 @@ impl ControlPlane {
                     None => "Unknown".to_string(),
                 };
 
-                // 计算运行时间
+                // Calculate runtime
                 let runtime = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
@@ -1424,7 +1433,7 @@ impl ControlPlane {
                     queue_name: job.queue_name.clone(),
                     class_name: job.class_name.clone(),
                     worker_id,
-                    started_at: execution.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    started_at: Self::format_naive_datetime(execution.created_at),
                     runtime,
                 });
             }
@@ -1433,10 +1442,10 @@ impl ControlPlane {
         debug!("Fetched in-progress jobs in {:?}", start.elapsed());
         info!("Found {} in-progress jobs", in_progress_jobs.len());
 
-        // 获取正在进行中任务总数以计算分页
+        // Get total number of in-progress jobs for pagination
         let start = Instant::now();
 
-        // 执行 SQL count 查询
+        // Execute SQL count query
         let total_count: i64 = crate::entities::solid_queue_claimed_executions::Entity::find()
             .select_only()
             .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
@@ -1454,7 +1463,7 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // 使用抽象方法获取所有队列名称和作业类
+        // Use abstract method to get all queue names and job classes
         let queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1478,7 +1487,7 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 实现取消单个正在进行中作业的方法
+    // Implement method to cancel a single in-progress job
     #[instrument(skip(state), fields(path = "/in-progress-jobs/:id/cancel"))]
     async fn cancel_in_progress_job(
         State(state): State<Arc<ControlPlane>>,
@@ -1487,29 +1496,29 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 查找需要取消的执行记录
+                // Find execution record to cancel
                 let claimed_execution = crate::entities::solid_queue_claimed_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?;
 
                 if let Some(execution) = claimed_execution {
-                    // 首先将作业标记为已完成
+                    // First mark job as completed
                     let job_result = solid_queue_jobs::Entity::find_by_id(execution.job_id)
                         .one(txn)
                         .await?;
 
                     if let Some(job) = job_result {
-                        // 更新作业状态为已完成
+                        // Update job status to completed
                         let mut job_model: solid_queue_jobs::ActiveModel = job.into();
                         job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
-                    // 删除claimed_execution记录
+                    // Delete claimed_execution record
                     crate::entities::solid_queue_claimed_executions::Entity::delete_by_id(id)
                         .exec(txn)
                         .await?;
@@ -1533,7 +1542,7 @@ impl ControlPlane {
         })
     }
 
-    // 实现 blocked_jobs 方法，显示所有被阻塞的作业
+    // Implement blocked_jobs method, display all blocked jobs
     #[instrument(skip(state), fields(path = "/blocked-jobs"))]
     async fn blocked_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -1546,11 +1555,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate page offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取被阻塞的作业
+        // Get blocked jobs
         let blocked_executions = crate::entities::solid_queue_blocked_executions::Entity::find()
             .offset(offset as u64)
             .limit(page_size as u64)
@@ -1558,25 +1567,25 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 创建一个存储被阻塞作业信息的向量
+        // Create a vector to store blocked job information
         let mut blocked_jobs: Vec<BlockedJobInfo> = Vec::with_capacity(blocked_executions.len());
 
-        // 获取当前时间，用于计算等待时间
+        // Get current time, for calculating waiting time
         let now = chrono::Utc::now().naive_utc();
 
-        // 获取每个被阻塞执行对应的作业信息
+        // Get job information for each blocked execution
         for execution in blocked_executions {
             if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
-                // 计算等待时间
+                // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
-                        format!("{}小时 {}分钟", duration.num_hours(), duration.num_minutes() % 60)
+                        format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                     },
                     duration if duration.num_minutes() >= 1 => {
-                        format!("{}分钟 {}秒", duration.num_minutes(), duration.num_seconds() % 60)
+                        format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
                     },
                     duration => {
-                        format!("{}秒", duration.num_seconds())
+                        format!("{}s", duration.num_seconds())
                     },
                 };
 
@@ -1586,9 +1595,9 @@ impl ControlPlane {
                     queue_name: execution.queue_name.clone(),
                     class_name: job.class_name.clone(),
                     concurrency_key: execution.concurrency_key.clone(),
-                    created_at: execution.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    created_at: Self::format_naive_datetime(execution.created_at),
                     waiting_time,
-                    expires_at: execution.expires_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    expires_at: Self::format_naive_datetime(execution.expires_at),
                 });
             }
         }
@@ -1596,10 +1605,10 @@ impl ControlPlane {
         debug!("Fetched blocked jobs in {:?}", start.elapsed());
         info!("Found {} blocked jobs", blocked_jobs.len());
 
-        // 获取被阻塞任务总数以计算分页
+        // Get total number of blocked jobs for pagination
         let start = Instant::now();
 
-        // 执行 SQL count 查询
+        // Execute SQL count query
         let total_count: i64 = crate::entities::solid_queue_blocked_executions::Entity::find()
             .select_only()
             .column_as(sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::count(sea_orm::sea_query::Expr::cust("*"))), "count")
@@ -1617,7 +1626,7 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // 使用抽象方法获取所有队列名称和作业类
+        // Use abstract method to get all queue names and job classes
         let queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -1641,7 +1650,7 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 实现解除单个被阻塞作业的方法
+    // Implement method to unblock a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/unblock"))]
     async fn unblock_job(
         State(state): State<Arc<ControlPlane>>,
@@ -1650,16 +1659,16 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 查找被阻塞的执行
-                let blocked_execution = solid_queue_blocked_executions::Entity::find_by_id(id)
+                // Find blocked execution
+                let _blocked_execution = solid_queue_blocked_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?
                     .ok_or_else(|| DbErr::Custom(format!("Blocked execution with ID {} not found", id)))?;
 
-                // 删除被阻塞的执行
+                // Delete blocked execution
                 solid_queue_blocked_executions::Entity::delete_by_id(id)
                     .exec(txn)
                     .await?;
@@ -1681,7 +1690,7 @@ impl ControlPlane {
         })
     }
 
-    // 实现取消单个被阻塞作业的方法
+    // Implement method to cancel a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/cancel"))]
     async fn cancel_blocked_job(
         State(state): State<Arc<ControlPlane>>,
@@ -1690,10 +1699,10 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 查找被阻塞的执行
+                // Find blocked execution
                 let blocked_execution = solid_queue_blocked_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?
@@ -1701,12 +1710,12 @@ impl ControlPlane {
 
                 let job_id = blocked_execution.job_id;
 
-                // 删除被阻塞的执行
+                // Delete blocked execution
                 solid_queue_blocked_executions::Entity::delete_by_id(id)
                     .exec(txn)
                     .await?;
 
-                // 删除相关的作业
+                // Delete related job
                 solid_queue_jobs::Entity::delete_by_id(job_id)
                     .exec(txn)
                     .await?;
@@ -1728,7 +1737,7 @@ impl ControlPlane {
         })
     }
 
-    // 实现解除所有被阻塞作业的方法
+    // Implement method to unblock all blocked jobs
     #[instrument(skip(state), fields(path = "/blocked-jobs/all/unblock"))]
     async fn unblock_all_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -1736,10 +1745,10 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
-                // 删除所有被阻塞的执行
+                // Delete all blocked executions
                 let result = solid_queue_blocked_executions::Entity::delete_many()
                     .exec(txn)
                     .await?;
@@ -1750,7 +1759,7 @@ impl ControlPlane {
             })
         })
         .await
-        .map(|count| {
+        .map(|_count| {
             (StatusCode::SEE_OTHER, "/blocked-jobs".to_string())
         })
         .map_err(|e| {
@@ -1759,7 +1768,7 @@ impl ControlPlane {
         })
     }
 
-    // 实现取消所有正在进行中作业的方法
+    // Implement method to cancel all in-progress jobs
     #[instrument(skip(state), fields(path = "/in-progress-jobs/all/cancel"))]
     async fn cancel_all_in_progress_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -1767,10 +1776,10 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
-                // 获取所有正在进行中的作业
+                // Get all in-progress jobs
                 let claimed_executions = crate::entities::solid_queue_claimed_executions::Entity::find()
                     .all(txn)
                     .await?;
@@ -1783,10 +1792,10 @@ impl ControlPlane {
                     .map(|execution| execution.job_id)
                     .collect();
 
-                // 更新所有相关作业为已完成状态
+                // Update all related jobs to completed status
                 let now = chrono::Utc::now().naive_utc();
 
-                // 使用批量更新
+                // Use batch update
                 let update_sql = r#"
                     UPDATE solid_queue_jobs
                     SET finished_at = $1, updated_at = $1
@@ -1801,7 +1810,7 @@ impl ControlPlane {
 
                 txn.execute(stmt).await?;
 
-                // 删除所有claimed_execution记录
+                // Delete all claimed_execution records
                 let delete_result = crate::entities::solid_queue_claimed_executions::Entity::delete_many()
                     .exec(txn)
                     .await?;
@@ -1835,11 +1844,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate page offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取队列状态信息
+        // Get queue status information
         let is_paused = solid_queue_pauses::Entity::find()
             .filter(solid_queue_pauses::Column::QueueName.eq(queue_name.clone()))
             .count(db)
@@ -1849,7 +1858,7 @@ impl ControlPlane {
 
         let status = if is_paused { "paused" } else { "active" };
 
-        // 获取队列中未完成的作业总数
+        // Get total number of uncompleted jobs in queue
         let total_count = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::QueueName.eq(queue_name.clone()))
             .filter(solid_queue_jobs::Column::FinishedAt.is_null())
@@ -1857,7 +1866,7 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 等待中的作业数（未完成且未被其他表关联的）
+        // Number of waiting jobs (uncompleted and not associated with other tables)
         let waiting_count = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1875,7 +1884,7 @@ impl ControlPlane {
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
             .unwrap_or(0);
 
-        // 查询正在处理中的作业数（使用claimed_executions表，且未完成）
+        // Number of jobs being processed (using claimed_executions table, and not completed)
         let processing_count = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1891,7 +1900,7 @@ impl ControlPlane {
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
             .unwrap_or(0);
 
-        // 获取队列中的作业，包括作业状态（只显示未完成的作业）
+        // Get jobs in queue, including job status (only display uncompleted jobs)
         let jobs_result = db
             .query_all(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1928,12 +1937,9 @@ impl ControlPlane {
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
             let status: String = row.try_get("", "status").unwrap_or_default();
 
-            // 获取时间并记录调试信息
-            // 简化的时间解析代码，与其他方法保持一致
-            let created_at_str = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                Err(_) => "未知时间".to_string(),
-            };
+            // Get time and record debug information
+            // Simplified time parsing code, consistent with other methods
+            let created_at_str = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
             jobs.push(QueueJobInfo {
                 id,
@@ -1946,13 +1952,13 @@ impl ControlPlane {
 
         debug!("Fetched queue details in {:?}", start.elapsed());
 
-        // 计算分页 - 使用未完成的作业数
+        // Calculate pagination - use number of uncompleted jobs
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as usize;
         if total_pages > 0 && pagination.page > total_pages {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
 
-        // 使用SQL统计失败的作业数（未完成的）
+        // Use SQL to count failed jobs (uncompleted)
         let failed_count = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -1968,7 +1974,7 @@ impl ControlPlane {
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
             .unwrap_or(0);
 
-        // 使用SQL统计计划中的作业数（未完成的）
+        // Use SQL to count scheduled jobs (uncompleted)
         let scheduled_count = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -2004,7 +2010,7 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 实现 finished_jobs 方法，显示所有已完成的作业
+    // Implement finished_jobs method, display all completed jobs
     #[instrument(skip(state), fields(path = "/finished-jobs"))]
     async fn finished_jobs(
         State(state): State<Arc<ControlPlane>>,
@@ -2017,11 +2023,11 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 计算分页偏移
+        // Calculate page offset
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // 获取已完成的作业
+        // Get completed jobs
         let finished_jobs_query = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .order_by_desc(solid_queue_jobs::Column::FinishedAt)
@@ -2033,22 +2039,22 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 创建一个存储已完成作业信息的向量
+        // Create a vector to store completed job information
         let mut finished_jobs: Vec<FinishedJobInfo> = Vec::with_capacity(finished_jobs_models.len());
 
-        // 获取每个已完成作业的信息
+        // Get information for each completed job
         for job in finished_jobs_models {
             if let Some(finished_at) = job.finished_at {
-                // 计算运行时间
+                // Calculate runtime
                 let runtime = match finished_at.signed_duration_since(job.created_at) {
                     duration if duration.num_hours() >= 1 => {
-                        format!("{}小时 {}分钟", duration.num_hours(), duration.num_minutes() % 60)
+                        format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                     },
                     duration if duration.num_minutes() >= 1 => {
-                        format!("{}分钟 {}秒", duration.num_minutes(), duration.num_seconds() % 60)
+                        format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
                     },
                     duration => {
-                        format!("{}秒", duration.num_seconds())
+                        format!("{}s", duration.num_seconds())
                     },
                 };
 
@@ -2056,8 +2062,8 @@ impl ControlPlane {
                     id: job.id,
                     queue_name: job.queue_name,
                     class_name: job.class_name,
-                    created_at: job.created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    finished_at: finished_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    created_at: Self::format_naive_datetime(job.created_at),
+                    finished_at: Self::format_naive_datetime(finished_at),
                     runtime,
                 });
             }
@@ -2066,10 +2072,10 @@ impl ControlPlane {
         debug!("Fetched finished jobs in {:?}", start.elapsed());
         info!("Found {} finished jobs", finished_jobs.len());
 
-        // 获取已完成任务总数以计算分页
+        // Get total number of completed jobs for pagination
         let start = Instant::now();
 
-        // 执行 SQL count 查询
+        // Execute SQL count query
         let total_count: i64 = solid_queue_jobs::Entity::find()
             .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
             .select_only()
@@ -2088,7 +2094,7 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // 使用抽象方法获取所有队列名称和作业类
+        // Use abstract method to get all queue names and job classes
         let queue_names = state.get_queue_names(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2112,10 +2118,10 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 实现 stats 方法，专门用于返回统计数据
+    // Implement stats method, specifically for returning statistics
     async fn stats(
         State(state): State<Arc<ControlPlane>>,
-        req: axum::http::Request<axum::body::Body>,
+        _req: axum::http::Request<axum::body::Body>,
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -2124,15 +2130,15 @@ impl ControlPlane {
 
         let mut context = tera::Context::new();
 
-        // 使用 populate_nav_stats 方法填充统计信息
+        // Use populate_nav_stats method to fill statistics
         state.populate_nav_stats(db, &mut context)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 直接返回 Turbo Stream 格式的响应
+        // Return Turbo Stream format response directly
         let html = state.render_template("stats.html", &mut context).await?;
 
-        // 设置正确的 Content-Type
+        // Set correct Content-Type
         let response = axum::response::Response::builder()
             .header("Content-Type", "text/vnd.turbo-stream.html")
             .body(axum::body::Body::from(html))
@@ -2141,7 +2147,7 @@ impl ControlPlane {
         Ok(response)
     }
 
-    // 实现 workers 方法，用于显示所有 worker 进程
+    // Implement workers method, used to display all worker processes
     #[instrument(skip(state), fields(path = "/workers"))]
     async fn workers(
         State(state): State<Arc<ControlPlane>>,
@@ -2151,22 +2157,22 @@ impl ControlPlane {
         let db = db.as_ref();
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // 查询所有 worker 进程
+        // Query all worker processes
         let workers = solid_queue_processes::Entity::find()
             .order_by(solid_queue_processes::Column::LastHeartbeatAt, Order::Desc)
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // 为每个 worker 计算距离上次心跳的时间
+        // Calculate time since last heartbeat for each worker
         let workers_info: Vec<WorkerInfo> = workers.into_iter().map(|worker| {
             let last_heartbeat = worker.last_heartbeat_at;
             let now = chrono::Utc::now().naive_utc();
-            // 计算时间差（秒）
+            // Calculate time difference (seconds)
             let duration = now.signed_duration_since(last_heartbeat);
             let seconds_since_heartbeat = duration.num_seconds();
 
-            // 如果超过 30 秒没有心跳，认为 worker 已经挂掉
+            // If heartbeat is not received for more than 30 seconds, consider worker dead
             let status = if seconds_since_heartbeat > 30 {
                 "dead"
             } else {
@@ -2179,7 +2185,7 @@ impl ControlPlane {
                 kind: worker.kind,
                 hostname: worker.hostname,
                 pid: worker.pid,
-                last_heartbeat_at: last_heartbeat.format("%Y-%m-%d %H:%M:%S").to_string(),
+                last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
                 seconds_since_heartbeat,
                 status: status.to_string(),
             }
@@ -2194,7 +2200,7 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
-    // 添加作业详情页面控制器方法
+    // Add job details page controller method
     #[instrument(skip(state), fields(path = "/jobs/:id"))]
     async fn job_details(
         State(state): State<Arc<ControlPlane>>,
@@ -2207,7 +2213,7 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // 获取作业基本信息
+        // Get job basic information
         let job_result = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -2247,7 +2253,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         if let Some(row) = job_result {
-            // 解析基本信息
+            // Parse basic information
             let job_id: i64 = row.try_get("", "id").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
@@ -2255,19 +2261,16 @@ impl ControlPlane {
             let arguments: Option<String> = row.try_get("", "arguments").ok();
             let error: Option<String> = row.try_get("", "error_message").ok();
 
-            // 解析创建时间
-            let created_at = match row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                Ok(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-                Err(_) => "未知时间".to_string(),
-            };
+            // Parse creation time
+            let created_at = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
-            // 获取完成时间（如果有）
+            // Get completion time (if any)
             let finished_at = match row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at") {
-                Ok(Some(dt)) => Some(dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+                Ok(dt_opt) => Self::format_optional_datetime(dt_opt),
                 _ => None,
             };
 
-            // 计算运行时间（如果已完成）
+            // Calculate runtime (if completed)
             let runtime = if let Some(finished) = row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at").ok().flatten() {
                 if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                     let duration = finished.signed_duration_since(created);
@@ -2279,7 +2282,7 @@ impl ControlPlane {
                 None
             };
 
-            // 根据作业状态获取特定信息
+            // Get specific information based on job status
             let mut job_details = JobDetailsInfo {
                 id: job_id,
                 queue_name,
@@ -2304,13 +2307,13 @@ impl ControlPlane {
                 execution_history: None,
             };
 
-            // 获取状态特定的详细信息
+            // Get specific detailed information based on status
             match status.as_str() {
                 "failed" => {
                     let failed_id: i64 = row.try_get("", "failed_id").unwrap_or_default();
                     job_details.execution_id = Some(failed_id);
 
-                    // 获取失败信息
+                    // Get failure information
                     if let Ok(failed_info) = db
                         .query_one(Statement::from_sql_and_values(
                             DbBackend::Postgres,
@@ -2322,9 +2325,9 @@ impl ControlPlane {
                         if let Some(row) = failed_info {
                             job_details.error = row.try_get("", "error").ok();
 
-                            // 解析失败时间
+                            // Parse failure time
                             if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "failed_at") {
-                                job_details.failed_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                                job_details.failed_at = Some(Self::format_naive_datetime(dt));
                             }
                         }
                     }
@@ -2333,11 +2336,11 @@ impl ControlPlane {
                     let scheduled_id: i64 = row.try_get("", "scheduled_id").unwrap_or_default();
                     job_details.execution_id = Some(scheduled_id);
 
-                    // 解析计划执行时间
+                    // Parse scheduled execution time
                     if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
-                        job_details.scheduled_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                        job_details.scheduled_at = Some(Self::format_naive_datetime(dt));
 
-                        // 计算还有多长时间执行
+                        // Calculate how much time is left to execute
                         let now = chrono::Utc::now().naive_utc();
                         if dt > now {
                             let duration = dt.signed_duration_since(now);
@@ -2358,14 +2361,14 @@ impl ControlPlane {
                     let blocked_id: i64 = row.try_get("", "blocked_id").unwrap_or_default();
                     job_details.execution_id = Some(blocked_id);
 
-                    // 获取阻塞信息
+                    // Get blocked information
                     job_details.concurrency_key = row.try_get("", "concurrency_key").ok();
 
-                    // 解析过期时间
+                    // Parse expiration time
                     if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "expires_at") {
-                        job_details.expires_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                        job_details.expires_at = Some(Self::format_naive_datetime(dt));
 
-                        // 计算等待时间
+                        // Calculate waiting time
                         if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                             let duration = chrono::Utc::now().naive_utc().signed_duration_since(created);
                             job_details.waiting_time = Some(format!("{} seconds", duration.num_seconds()));
@@ -2376,9 +2379,9 @@ impl ControlPlane {
                     let claimed_id: i64 = row.try_get("", "claimed_id").unwrap_or_default();
                     job_details.execution_id = Some(claimed_id);
 
-                    // 获取处理信息
+                    // Get processing information
                     if let Ok(process_id) = row.try_get::<i64>("", "process_id") {
-                        // 获取工作进程信息
+                        // Get worker process information
                         if let Ok(worker_info) = db
                             .query_one(Statement::from_sql_and_values(
                                 DbBackend::Postgres,
@@ -2393,7 +2396,7 @@ impl ControlPlane {
                         }
                     }
 
-                    // 获取开始时间和运行时间
+                    // Get start time and runtime
                     if let Ok(claimed_info) = db
                         .query_one(Statement::from_sql_and_values(
                             DbBackend::Postgres,
@@ -2404,9 +2407,9 @@ impl ControlPlane {
                     {
                         if let Some(row) = claimed_info {
                             if let Ok(dt) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                                job_details.started_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
+                                job_details.started_at = Some(Self::format_naive_datetime(dt));
 
-                                // 计算当前运行时间
+                                // Calculate current runtime
                                 let now = chrono::Utc::now().naive_utc();
                                 let duration = now.signed_duration_since(dt);
                                 job_details.runtime = Some(format!("{} seconds", duration.num_seconds()));
@@ -2417,7 +2420,6 @@ impl ControlPlane {
                 _ => {}
             }
 
-            // 渲染模板
             let mut context = tera::Context::new();
             context.insert("job", &job_details);
             context.insert("active_page", match status.as_str() {
@@ -2438,7 +2440,7 @@ impl ControlPlane {
         }
     }
 
-    // 添加取消计划作业的控制器方法
+    // Add controller method to cancel scheduled job
     #[instrument(skip(state), fields(path = "/scheduled-jobs/:id/cancel"))]
     async fn cancel_scheduled_job(
         State(state): State<Arc<ControlPlane>>,
@@ -2447,29 +2449,29 @@ impl ControlPlane {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
-        // 使用事务进行操作
+        // Use transaction to operate
         let txn_result = db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
-                // 查找需要取消的计划执行记录
+                // Find scheduled execution record to cancel
                 let scheduled_execution = solid_queue_scheduled_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?;
 
                 if let Some(execution) = scheduled_execution {
-                    // 首先将作业标记为已完成
+                    // First mark job as completed
                     let job_result = solid_queue_jobs::Entity::find_by_id(execution.job_id)
                         .one(txn)
                         .await?;
 
                     if let Some(job) = job_result {
-                        // 更新作业状态为已完成
+                        // Update job status to completed
                         let mut job_model: solid_queue_jobs::ActiveModel = job.into();
                         job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
-                    // 删除scheduled_execution记录
+                    // Delete scheduled_execution record
                     solid_queue_scheduled_executions::Entity::delete_by_id(id)
                         .exec(txn)
                         .await?;
