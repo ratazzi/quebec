@@ -1,0 +1,9 @@
+pub mod overview;
+pub mod queues;
+pub mod failed_jobs;
+pub mod scheduled_jobs;
+pub mod in_progress_jobs;
+pub mod blocked_jobs;
+pub mod finished_jobs;
+pub mod job_details;
+pub mod workers;

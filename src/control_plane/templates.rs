@@ -3,7 +3,7 @@ use tracing::error;
 
 // Define embedded template resources
 #[derive(RustEmbed)]
-#[folder = "src/web/templates/"]
+#[folder = "src/control_plane/templates/"]
 #[prefix = "templates/"]
 #[include = "*.html"]
 pub struct Templates;
@@ -13,7 +13,7 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
     #[cfg(debug_assertions)]
     {
         // In development mode, read directly from filesystem
-        let path = format!("src/web/templates/{}", template_name);
+        let path = format!("src/control_plane/templates/{}", template_name);
         match std::fs::read_to_string(&path) {
             Ok(content) => Some(content),
             Err(e) => {
@@ -50,7 +50,7 @@ pub fn list_templates() -> Vec<String> {
     #[cfg(debug_assertions)]
     {
         // In development mode, read from filesystem
-        match std::fs::read_dir("src/web/templates") {
+        match std::fs::read_dir("src/control_plane/templates") {
             Ok(entries) => {
                 let mut templates: Vec<String> = entries
                     .filter_map(|entry| {

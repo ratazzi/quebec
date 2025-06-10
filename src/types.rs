@@ -21,7 +21,7 @@ use tokio::time::Duration;
 use url::Url;
 use uuid;
 
-use crate::web::control_plane::ControlPlaneExt;
+use crate::control_plane::ControlPlaneExt;
 
 use crate::context::*;
 use crate::core::Quebec;

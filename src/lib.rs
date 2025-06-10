@@ -1,4 +1,5 @@
 mod context;
+mod control_plane;
 mod core;
 mod dispatcher;
 mod entities;
@@ -8,8 +9,8 @@ mod semaphore;
 mod supervisor;
 mod types;
 mod worker;
-mod web;
 
+pub use control_plane::ControlPlaneExt;
 use context::*;
 use entities::solid_queue_claimed_executions;
 use entities::solid_queue_jobs;
