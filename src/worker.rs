@@ -15,7 +15,7 @@ use sea_orm::*;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Mutex;
 
 use colored::*;
@@ -23,6 +23,10 @@ use tracing::{info_span, Instrument};
 
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
+
+use crate::notify::NotifyManager;
+
+
 
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
     match value {
@@ -1140,7 +1144,7 @@ impl Worker {
     }
 
     pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        // 不在这里获取长期连接，而是在每次需要时获取
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
@@ -1151,6 +1155,25 @@ impl Worker {
         let thread_id = Self::get_tid();
 
         let quit = self.ctx.graceful_shutdown.clone();
+
+        // Set up PostgreSQL LISTEN if available
+        // Now using real sqlx PgListener for immediate notifications
+        let mut notify_rx = None;
+        if self.ctx.is_postgres() {
+            info!("PostgreSQL detected, enabling LISTEN/NOTIFY for immediate job processing");
+            let notify_manager = NotifyManager::new(self.ctx.clone(), "default");
+            match notify_manager.start_listener().await {
+                Ok(rx) => {
+                    notify_rx = Some(rx);
+                    info!("LISTEN started - jobs will be processed immediately when notified");
+                }
+                Err(e) => {
+                    warn!("Failed to start real LISTEN, falling back to polling only: {}", e);
+                }
+            }
+        } else {
+            info!("Non-PostgreSQL database detected, using polling only");
+        }
 
         // Call worker start handlers before starting the main loop
         Python::with_gil(|py| {
@@ -1190,50 +1213,94 @@ impl Worker {
 
                     return Ok(());
                 }
-                _ = polling_interval.tick() => {
-                    let claimed = self.claim_jobs(worker_threads).instrument(tracing::info_span!("polling", tid=thread_id)).await;
-
-                    if let Err(e) = claimed {
-                        // if let Some(io_err) = e.downcast_ref::<QueryError>() {
-                        //   error!("db error: {:?}", io_err);
-                        // } else {
-                        //   error!("unknown error: {:?}", e);
-                        // }
-
-                        error!("no job found: {:?}", e);
-                        continue;
+                // Handle real PostgreSQL NOTIFY messages for immediate job processing
+                notify_msg = async {
+                    if let Some(ref mut rx) = notify_rx {
+                        rx.recv().await
+                    } else {
+                        // If no LISTEN is active, this branch will never be taken
+                        std::future::pending().await
                     }
-
-                    let claimed = claimed.unwrap();
-                    let txn = db.begin().await.unwrap();
-                    for row in claimed {
-                        let job_id = row.job_id;
-                        let job = solid_queue_jobs::Entity::find_by_id(job_id).one(&txn).await.unwrap();
-                        // debug!("Job claimed: {:?}", job);
-                        // info!("Job `{}' started", job.clone().unwrap().class_name);
-                        let job = job.unwrap();
-
-                        let runnable = self.get_runnable(&job.class_name);
-                        if runnable.is_err() {
-                            error!("Job handler not found: {:?}", &job.class_name);
-                            continue;
+                } => {
+                    if notify_msg.is_some() {
+                        // Simple batching: consume additional immediate messages
+                        let mut total_notifies = 1;
+                        while let Ok(_) = notify_rx.as_mut().unwrap().try_recv() {
+                            total_notifies += 1;
                         }
 
-                        // debug!("------------------- runnable: {:?}", runnable);
-                        // let handler = self.get_job_class(&job.class_name);
-                        // if handler.is_err() {
-                        //     error!("Job handler not found: {:?}", &job.class_name);
-                        //     continue;
-                        // }
+                        async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("notify", consumed=total_notifies)).await;
+                        trace!("Received {} NOTIFY message(s), processing jobs immediately", total_notifies);
 
-                        let execution = Execution::new(ctx.clone(), row.clone(), job, runnable.unwrap());
+                        // Process jobs with timeout protection to prevent blocking main loop
+                        let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
+                        let timeout_duration = tokio::time::Duration::from_millis(100); // 100ms max
 
-                        tx.lock().await.send(execution).await.unwrap();
+                        match tokio::time::timeout(timeout_duration, process_future).await {
+                            Ok(_) => {
+                                trace!("NOTIFY job processing completed within timeout");
+                            }
+                            Err(_) => {
+                                warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
+                            }
+                        }
                     }
-                    txn.commit().await.unwrap();
+                }
+                _ = polling_interval.tick() => {
+                    // debug!("⏰ POLLING triggered - regular interval check");
+                    // Regular polling at configured interval (backup for reliability) - get fresh connection
+                    self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "POLLING").await;
                 }
             }
         }
+    }
+
+    /// Extract job processing logic to avoid duplication
+    async fn process_available_jobs(
+        &self,
+        worker_threads: u64,
+        tx: &Arc<Mutex<Sender<Execution>>>,
+        ctx: &Arc<AppContext>,
+        thread_id: &str,
+        source: &str,
+    ) {
+        let claimed = self.claim_jobs(worker_threads).instrument(tracing::info_span!("polling", tid=thread_id)).await;
+
+        if let Err(e) = claimed {
+            debug!("[{}] no job found: {:?}", source, e);
+            return;
+        }
+
+        let claimed = claimed.unwrap();
+        if claimed.is_empty() {
+            // debug!("[{}] no jobs available", source);
+            return;
+        }
+
+        async { debug!("found {} job(s) to process", claimed.len()); }.instrument(tracing::info_span!("polling", tid=thread_id, source=source)).await;
+
+        // 每次处理都获取新连接，避免长期占用
+        let processing_db = ctx.get_db().await;
+        let txn = processing_db.begin().await.unwrap();
+
+        for row in claimed {
+            let job_id = row.job_id;
+            let job = solid_queue_jobs::Entity::find_by_id(job_id).one(&txn).await.unwrap();
+            let job = job.unwrap();
+
+            let runnable = self.get_runnable(&job.class_name);
+            if runnable.is_err() {
+                error!("Job handler not found: {:?}", &job.class_name);
+                continue;
+            }
+
+            let execution = Execution::new(ctx.clone(), row.clone(), job, runnable.unwrap());
+            tx.lock().await.send(execution).await.unwrap();
+        }
+
+        // 快速提交事务并释放连接
+        txn.commit().await.unwrap();
+        // processing_db 连接会在作用域结束时自动释放到连接池
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {

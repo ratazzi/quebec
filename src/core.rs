@@ -1,5 +1,6 @@
 use crate::context::*;
 use crate::entities::*;
+use crate::notify::NotifyManager;
 use crate::semaphore::acquire_semaphore;
 use crate::types::ActiveJob;
 use tracing::{info, trace, warn};
@@ -112,6 +113,15 @@ impl Quebec {
             })
             .await?;
 
-        Ok(job.try_into_model()?)
+        let job_model = job.try_into_model()?;
+
+        // Send PostgreSQL NOTIFY after job is successfully created
+        if self.ctx.is_postgres() {
+            if let Err(e) = NotifyManager::send_notify(&*db, &job_model.queue_name, "new_job").await {
+                warn!("Failed to send NOTIFY: {}", e);
+            }
+        }
+
+        Ok(job_model)
     }
 }

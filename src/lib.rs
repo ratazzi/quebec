@@ -3,6 +3,7 @@ mod control_plane;
 mod core;
 mod dispatcher;
 mod entities;
+mod notify;
 mod process;
 mod scheduler;
 mod semaphore;

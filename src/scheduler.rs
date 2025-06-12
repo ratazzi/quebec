@@ -1,5 +1,6 @@
 use crate::context::{AppContext, ScheduledEntry};
 use crate::entities::*;
+use crate::notify::NotifyManager;
 use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -145,7 +146,7 @@ where
 }
 
 pub async fn enqueue_job<C>(
-    db: &C, entry: ScheduledEntry, scheduled_at: NaiveDateTime,
+    ctx: &Arc<AppContext>, db: &C, entry: ScheduledEntry, scheduled_at: NaiveDateTime,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
@@ -209,12 +210,19 @@ where
     let _ready_execution = solid_queue_ready_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
-        queue_name: ActiveValue::Set(job.queue_name),
+        queue_name: ActiveValue::Set(job.queue_name.clone()),
         priority: ActiveValue::Set(job.priority),
         created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
     }
     .save(db)
     .await?;
+
+    // Send PostgreSQL NOTIFY after scheduled job is created
+    if ctx.is_postgres() {
+        if let Err(e) = NotifyManager::send_notify(db, &job.queue_name, "new_job").await {
+            warn!("Failed to send NOTIFY for scheduled job: {}", e);
+        }
+    }
 
     Ok(true)
 }
@@ -288,6 +296,7 @@ impl Scheduler {
         for (i, entry) in entries.into_iter().enumerate() {
             let db = self.ctx.get_db().await;
             let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+            let ctx = self.ctx.clone(); // Clone context for the async move block
 
             let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
             let handle = tokio::spawn(async move {
@@ -346,8 +355,9 @@ impl Scheduler {
                         .transaction::<_, (), DbErr>(|txn| {
                             let entry = entry.clone();
                             let task_key = task_key.clone();
+                            let ctx = ctx.clone(); // Clone for each transaction
                             Box::pin(async move {
-                                let _ret = enqueue_job(txn, entry, scheduled_at).await;
+                                let _ret = enqueue_job(&ctx, txn, entry, scheduled_at).await;
                                 trace!("Job({:?}) enqueued", task_key);
                                 Ok(())
                             })

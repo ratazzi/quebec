@@ -24,14 +24,15 @@ impl Dispatcher {
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let db = self.ctx.get_db().await;
         let mut polling_interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         let batch_size = self.ctx.dispatcher_batch_size;
 
         let kind = "Dispatcher".to_string();
         let name = "dispatcher".to_string();
-        let process = self.on_start(&db, kind, name).await?;
+
+        let init_db = self.ctx.get_db().await;
+        let process = self.on_start(&init_db, kind, name).await?;
         info!(">> Process started: {:?}", process);
 
         let quit = self.ctx.graceful_shutdown.clone();
@@ -39,11 +40,13 @@ impl Dispatcher {
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    self.heartbeat(&db, &process).await?;
+                    let heartbeat_db = self.ctx.get_db().await;
+                    self.heartbeat(&heartbeat_db, &process).await?;
                 }
                 _ = quit.cancelled() => {
                     info!("Stopped");
-                    self.on_stop(&db, &process).await?;
+                    let stop_db = self.ctx.get_db().await;
+                    self.on_stop(&stop_db, &process).await?;
                     return Ok(());
                 }
                 // _ = tokio::signal::ctrl_c() => {
@@ -51,7 +54,8 @@ impl Dispatcher {
                 //   return Ok(());
                 // }
                 _ = polling_interval.tick() => {
-                    let _ = db.transaction::<_, (), DbErr>(|txn| {
+                    let polling_db = self.ctx.get_db().await;
+                    let _ = polling_db.transaction::<_, (), DbErr>(|txn| {
                         Box::pin(async move {
                           // Clean up expired semaphores
                           let expired_semaphores_result = solid_queue_semaphores::Entity::delete_many()
