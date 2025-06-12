@@ -376,6 +376,8 @@ impl Scheduler {
                 _ = graceful_shutdown.cancelled() => {
                     info!("Scheduler stopping - waiting for {} tasks to complete", task_handles.len());
 
+                    self.on_stop(&db, &process).await?;
+
                     let shutdown_timeout = tokio::time::Duration::from_secs(5);
                     match tokio::time::timeout(shutdown_timeout, futures::future::join_all(task_handles)).await {
                         Ok(_) => info!("All scheduler tasks completed gracefully"),

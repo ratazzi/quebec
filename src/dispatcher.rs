@@ -43,6 +43,7 @@ impl Dispatcher {
                 }
                 _ = quit.cancelled() => {
                     info!("Stopped");
+                    self.on_stop(&db, &process).await?;
                     return Ok(());
                 }
                 // _ = tokio::signal::ctrl_c() => {

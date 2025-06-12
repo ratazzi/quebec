@@ -1,4 +1,3 @@
-
 use crate::entities::*;
 use anyhow::Error;
 use anyhow::Result;
@@ -102,6 +101,24 @@ pub trait ProcessTrait {
         let mut process = process.clone().into_active_model();
         process.last_heartbeat_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
         process.clone().update(db).await?;
+
+        Ok(())
+    }
+
+    async fn on_stop(
+        &self, db: &DatabaseConnection, process: &solid_queue_processes::Model,
+    ) -> Result<(), Error> {
+        let process_name = process.name.clone();
+        let process_pid = process.pid;
+        let process_hostname = process.hostname.clone();
+
+        // Delete the process record
+        process.clone().delete(db).await?;
+
+        info!(
+            "Process stopped: name={} pid={} hostname={:?}",
+            process_name, process_pid, process_hostname
+        );
 
         Ok(())
     }

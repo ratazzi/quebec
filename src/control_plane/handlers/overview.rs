@@ -14,10 +14,6 @@ use crate::entities::{solid_queue_jobs, solid_queue_processes, solid_queue_faile
 use crate::control_plane::ControlPlane;
 
 impl ControlPlane {
-    pub async fn index() -> &'static str {
-        "Quebec Control Plane"
-    }
-
     #[instrument(skip(state), fields(path = "/"))]
     pub async fn overview(
         State(state): State<Arc<ControlPlane>>,
