@@ -92,3 +92,7 @@ build/
 
 # Runtime
 .runtime/
+
+*.yml
+*.yaml
+uv.lock
