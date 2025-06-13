@@ -35,8 +35,9 @@ impl ControlPlane {
             let duration = now.signed_duration_since(last_heartbeat);
             let seconds_since_heartbeat = duration.num_seconds();
 
-            // If heartbeat is not received for more than 30 seconds, consider worker dead
-            let status = if seconds_since_heartbeat > 30 {
+            // Use process_alive_threshold from context to determine worker status
+            let threshold_seconds = state.ctx.process_alive_threshold.as_secs() as i64;
+            let status = if seconds_since_heartbeat > threshold_seconds {
                 "dead"
             } else {
                 "alive"

@@ -1146,6 +1146,7 @@ impl Worker {
     pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
         // 不在这里获取长期连接，而是在每次需要时获取
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
+        let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
         let ctx = self.ctx.clone();
@@ -1155,6 +1156,11 @@ impl Worker {
         let thread_id = Self::get_tid();
 
         let quit = self.ctx.graceful_shutdown.clone();
+
+        // Initialize process record
+        let init_db = self.ctx.get_db().await;
+        let process = self.on_start(&init_db, "Worker".to_string(), "worker".to_string()).await?;
+        info!(">> Process started: {:?}", process);
 
         // Set up PostgreSQL LISTEN if available
         // Now using real sqlx PgListener for immediate notifications
@@ -1189,14 +1195,10 @@ impl Worker {
         // Producer sends tasks
         loop {
             tokio::select! {
-                // _ = heartbeat_interval.tick() => {
-                //   // self.heartbeat(&db, &process).await?;
-                // }
-                // _ = tokio::signal::ctrl_c() => {
-                //     info!("ctrl-c received");
-                //     // return Ok(());
-                //     quit.cancel();
-                // }
+                _ = heartbeat_interval.tick() => {
+                    let heartbeat_db = self.ctx.get_db().await;
+                    self.heartbeat(&heartbeat_db, &process).await?;
+                }
                 _ = quit.cancelled() => {
                     info!("Graceful shutdown, stop polling");
 
@@ -1210,6 +1212,10 @@ impl Worker {
                             }
                         }
                     });
+
+                    // Clean up process record
+                    let stop_db = self.ctx.get_db().await;
+                    self.on_stop(&stop_db, &process).await?;
 
                     return Ok(());
                 }
@@ -1229,7 +1235,7 @@ impl Worker {
                             total_notifies += 1;
                         }
 
-                        async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("notify", consumed=total_notifies)).await;
+                        async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("listener", consumed=total_notifies)).await;
                         trace!("Received {} NOTIFY message(s), processing jobs immediately", total_notifies);
 
                         // Process jobs with timeout protection to prevent blocking main loop
