@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+
+{% block title %}Queue Details: {{ queue_name }} - Control Plane{% endblock %}
+
+{% block content %}
+<turbo-frame id="content">
+<div class="mb-8">
+  <div class="flex items-center justify-between mb-6">
+    <div>
+      <h1 class="text-2xl font-bold text-gray-900">Queue: {{ queue_name }}</h1>
+      <p class="text-sm text-gray-500 mt-1">Status: <span class="font-medium {% if status == 'active' %}text-green-600{% else %}text-amber-600{% endif %}">{{ status }}</span></p>
+    </div>
+    <div class="flex gap-2">
+      {% if status == 'active' %}
+        <form action="/queues/{{ queue_name }}/pause" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
+            Pause Queue
+          </button>
+        </form>
+      {% else %}
+        <form action="/queues/{{ queue_name }}/resume" method="post">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-9 px-4 py-2">
+            Resume Queue
+          </button>
+        </form>
+      {% endif %}
+      <a href="/queues" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
+        Back to Queues
+      </a>
+    </div>
+  </div>
+
+  <!-- Queue Stats -->
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
+      <h3 class="text-sm font-medium text-gray-500">Waiting</h3>
+      <p class="text-2xl font-bold text-gray-900 mt-1">{{ waiting_count }}</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
+      <h3 class="text-sm font-medium text-gray-500">Processing</h3>
+      <p class="text-2xl font-bold text-gray-900 mt-1">{{ processing_count }}</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
+      <h3 class="text-sm font-medium text-gray-500">Scheduled</h3>
+      <p class="text-2xl font-bold text-gray-900 mt-1">{{ scheduled_count }}</p>
+    </div>
+    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
+      <h3 class="text-sm font-medium text-gray-500">Failed</h3>
+      <p class="text-2xl font-bold text-gray-900 mt-1">{{ failed_count }}</p>
+    </div>
+  </div>
+
+  <!-- Jobs Table -->
+  <div class="mb-6">
+    <h2 class="text-lg font-semibold text-gray-900 mb-4">Jobs in Queue</h2>
+    <div class="overflow-x-auto rounded-lg border border-gray-200">
+      <table class="min-w-full divide-y divide-gray-200">
+        <thead class="bg-gray-50">
+          <tr>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Job Class
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Job ID
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Status
+            </th>
+            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Created At
+            </th>
+            <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+              Actions
+            </th>
+          </tr>
+        </thead>
+        <tbody class="bg-white divide-y divide-gray-200">
+          {% if jobs|length > 0 %}
+            {% for job in jobs %}
+            <tr>
+              <td class="px-6 py-4 whitespace-nowrap">
+                <div class="text-sm font-medium text-gray-900">
+                  <a href="/jobs/{{ job.id }}" class="hover:underline">{{ job.class_name }}</a>
+                </div>
+              </td>
+              <td class="px-6 py-4 whitespace-nowrap">
+                <div class="text-sm text-gray-500">{{ job.id }}</div>
+              </td>
+              <td class="px-6 py-4 whitespace-nowrap">
+                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                  {% if job.status == 'processing' %}
+                    bg-blue-100 text-blue-800
+                  {% elif job.status == 'scheduled' %}
+                    bg-purple-100 text-purple-800
+                  {% elif job.status == 'failed' %}
+                    bg-red-100 text-red-800
+                  {% else %}
+                    bg-gray-100 text-gray-800
+                  {% endif %}
+                ">
+                  {{ job.status }}
+                </span>
+              </td>
+              <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                {{ job.created_at }}
+              </td>
+              <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                {% if job.status == 'failed' %}
+                  <form action="/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
+                    <button type="submit" class="text-indigo-600 hover:text-indigo-900">Retry</button>
+                  </form>
+                {% elif job.status == 'processing' %}
+                  <form action="/in-progress-jobs/{{ job.execution_id }}/cancel" method="post" class="inline">
+                    <button type="submit" class="text-indigo-600 hover:text-indigo-900">Cancel</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          {% else %}
+            <tr>
+              <td colspan="5" class="px-6 py-4 text-center text-sm text-gray-500">
+                No jobs found in this queue
+              </td>
+            </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Pagination -->
+  <div class="flex items-center justify-between mt-4">
+    <div class="text-sm text-gray-700">
+      Page {{ current_page_num }} of {{ total_pages }}
+    </div>
+    <div class="flex space-x-2">
+      {% if current_page_num > 1 %}
+        <a href="/queues/{{ queue_name }}?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+          Previous page
+        </a>
+      {% else %}
+        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
+          Previous page
+        </button>
+      {% endif %}
+
+      {% if current_page_num < total_pages %}
+        <a href="/queues/{{ queue_name }}?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+          Next page
+        </a>
+      {% else %}
+        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
+          Next page
+        </button>
+      {% endif %}
+    </div>
+  </div>
+</div>
+</turbo-frame>
+{% endblock %}

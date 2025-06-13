@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+
+{% block content %}
+<turbo-frame id="content">
+  <div class="max-w-7xl mx-auto p-4" data-controller="charts">
+
+    <!-- Time Range Selector -->
+    <div class="flex justify-end mb-6">
+      <div class="relative">
+        <select id="time-range" class="appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-2 focus:ring-black focus:border-black">
+          <option value="24">Last 24 hours</option>
+          <option value="168">Last 7 days</option>
+          <option value="720">Last 30 days</option>
+        </select>
+        <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+          <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stats Overview -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+      <!-- Total Jobs Processed -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-sm font-medium text-gray-500">Total Jobs Processed</h3>
+        <p class="text-2xl font-bold">{{ total_jobs_processed }}</p>
+        <div class="text-sm text-gray-500">
+          {% if jobs_processed_change > 0 %}
+          <span class="text-green-500">↑ {{ jobs_processed_change }}%</span>
+          {% elif jobs_processed_change < 0 %}
+          <span class="text-red-500">↓ {{ jobs_processed_change|abs }}%</span>
+          {% else %}
+          <span>No change</span>
+          {% endif %}
+          from previous period
+        </div>
+      </div>
+
+      <!-- Average Job Duration -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-sm font-medium text-gray-500">Average Job Duration</h3>
+        <p class="text-2xl font-bold">{{ avg_job_duration }}</p>
+        <div class="text-sm text-gray-500">
+          {% if avg_duration_change > 0 %}
+          <span class="text-red-500">↑ {{ avg_duration_change }}%</span>
+          {% elif avg_duration_change < 0 %}
+          <span class="text-green-500">↓ {{ avg_duration_change|abs }}%</span>
+          {% else %}
+          <span>No change</span>
+          {% endif %}
+          from previous period
+        </div>
+      </div>
+
+      <!-- Active Workers -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-sm font-medium text-gray-500">Active Workers</h3>
+        <p class="text-2xl font-bold">{{ active_workers }}</p>
+        <div class="text-sm text-gray-500">
+          {% if active_workers_change > 0 %}
+          <span class="text-green-500">↑ {{ active_workers_change }}</span>
+          {% elif active_workers_change < 0 %}
+          <span class="text-red-500">↓ {{ active_workers_change|abs }}</span>
+          {% else %}
+          <span>No change</span>
+          {% endif %}
+          from previous period
+        </div>
+      </div>
+
+      <!-- Failed Jobs Rate -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-sm font-medium text-gray-500">Failed Jobs Rate</h3>
+        <p class="text-2xl font-bold">{{ failed_jobs_rate }}%</p>
+        <div class="text-sm text-gray-500">
+          {% if failed_rate_change > 0 %}
+          <span class="text-red-500">↑ {{ failed_rate_change }}%</span>
+          {% elif failed_rate_change < 0 %}
+          <span class="text-green-500">↓ {{ failed_rate_change|abs }}%</span>
+          {% else %}
+          <span>No change</span>
+          {% endif %}
+          from previous period
+        </div>
+      </div>
+    </div>
+
+    <!-- Charts Section -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <!-- Jobs Processed Over Time -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-lg font-medium mb-4">Jobs Processed Over Time</h3>
+        <div style="height: 250px; width: 100%;">
+          <canvas id="jobsProcessedChart" data-time-labels='{{ time_labels|safe }}' data-jobs-processed-data='{{ jobs_processed_data|safe }}'></canvas>
+        </div>
+      </div>
+
+      <!-- Job Types Distribution -->
+      <div class="bg-white p-4 rounded-lg border border-gray-200">
+        <h3 class="text-lg font-medium mb-4">Job Types Distribution</h3>
+        <div style="height: 250px; width: 100%;">
+          <canvas id="jobTypesChart" data-job-types-labels='{{ job_types_labels|safe }}' data-job-types-data='{{ job_types_data|safe }}'></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Queue Performance -->
+    <div class="bg-white p-4 rounded-lg border border-gray-200 mb-6">
+      <h3 class="text-lg font-medium mb-4">Queue Performance</h3>
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead>
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue Name</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Jobs Processed</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg. Duration</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed Rate</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+            </tr>
+          </thead>
+          <tbody class="bg-white divide-y divide-gray-200">
+            {% for queue in queue_stats %}
+            <tr>
+              <td class="px-6 py-4 whitespace-nowrap">
+                <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-900">{{ queue.name }}</a>
+              </td>
+              <td class="px-6 py-4 whitespace-nowrap">{{ queue.jobs_processed }}</td>
+              <td class="px-6 py-4 whitespace-nowrap">{{ queue.avg_duration }}</td>
+              <td class="px-6 py-4 whitespace-nowrap">{{ queue.failed_rate }}%</td>
+              <td class="px-6 py-4 whitespace-nowrap">
+                {% if queue.status == "paused" %}
+                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">Paused</span>
+                {% else %}
+                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Active</span>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Recent Failed Jobs -->
+    <div class="bg-white p-4 rounded-lg border border-gray-200 mb-6">
+      <h3 class="text-lg font-medium mb-4">Recent Failed Jobs</h3>
+      <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-gray-200">
+          <thead>
+            <tr>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Job ID</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class Name</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed At</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Error</th>
+              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="bg-white divide-y divide-gray-200">
+            {% if recent_failed_jobs|length > 0 %}
+              {% for job in recent_failed_jobs %}
+              <tr>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                  {{ job.id }}
+                </td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                  {{ job.class_name }}
+                </td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                  {{ job.queue_name }}
+                </td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                  {{ job.failed_at }}
+                </td>
+                <td class="px-6 py-4 text-sm max-w-xs truncate">
+                  <div class="tooltip">
+                    <span>{{ job.error|truncate(length=50) }}</span>
+                    <span class="tooltip-text">{{ job.error }}</span>
+                  </div>
+                </td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                  <a href="/failed-jobs/{{ job.id }}" class="text-blue-600 hover:text-blue-800">Details</a>
+                </td>
+              </tr>
+              {% endfor %}
+            {% else %}
+              <tr>
+                <td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">
+                  No failed jobs in the selected time period
+                </td>
+              </tr>
+            {% endif %}
+          </tbody>
+        </table>
+      </div>
+      {% if recent_failed_jobs|length > 0 %}
+        <div class="mt-4 text-right">
+          <a href="/failed-jobs" class="text-sm text-blue-600 hover:text-blue-800">View all failed jobs →</a>
+        </div>
+      {% endif %}
+    </div>
+
+
+  </div>
+
+  <style>
+    /* Tooltip styles */
+    .tooltip {
+      position: relative;
+      display: inline-block;
+      cursor: pointer;
+    }
+
+    .tooltip .tooltip-text {
+      visibility: hidden;
+      width: 300px;
+      background-color: #333;
+      color: #fff;
+      text-align: left;
+      border-radius: 6px;
+      padding: 8px;
+      position: absolute;
+      z-index: 1;
+      bottom: 125%;
+      left: 50%;
+      transform: translateX(-50%);
+      opacity: 0;
+      transition: opacity 0.3s;
+      word-wrap: break-word;
+      font-size: 12px;
+      line-height: 1.4;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .tooltip:hover .tooltip-text {
+      visibility: visible;
+      opacity: 1;
+    }
+  </style>
+
+  <!-- 图表初始化由 base.html 中的 charts 控制器处理 -->
+
+  <script>
+    // 时间范围选择器
+    document.addEventListener('DOMContentLoaded', function() {
+      const selector = document.getElementById('time-range');
+      if (selector) {
+        selector.addEventListener('change', function() {
+          window.location.href = '/?hours=' + this.value;
+        });
+      }
+    });
+
+    // 确保在 Turbo 导航后也能正常工作
+    document.addEventListener('turbo:render', function() {
+      const selector = document.getElementById('time-range');
+      if (selector) {
+        selector.addEventListener('change', function() {
+          window.location.href = '/?hours=' + this.value;
+        });
+      }
+    });
+  </script>
+</turbo-frame>
+{% endblock %}

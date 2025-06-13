@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Control Plane{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@latest/dist/turbo.es2017-esm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <script type="module">
+    import { Application, Controller } from "https://unpkg.com/@hotwired/stimulus/dist/stimulus.js"
+    window.Stimulus = Application.start()
+
+    // 简化的自动刷新控制器
+    Stimulus.register("reload", class extends Controller {
+      static values = {
+        interval: { type: Number, default: 5000 }, // 默认 5 秒刷新一次
+        url: String
+      }
+
+      static targets = ["frame"]
+
+      connect() {
+        this.startReloading()
+      }
+
+      disconnect() {
+        this.stopReloading()
+      }
+
+      startReloading() {
+        this.refreshTimer = setInterval(() => {
+          this.refresh()
+        }, this.intervalValue)
+      }
+
+      stopReloading() {
+        if (this.refreshTimer) {
+          clearInterval(this.refreshTimer)
+        }
+      }
+
+      refresh() {
+        // 重新加载 turbo-frame
+        if (this.hasFrameTarget) {
+          this.frameTarget.reload()
+        }
+      }
+    })
+
+    // 图表控制器 - 负责管理图表的初始化和更新
+    Stimulus.register("charts", class extends Controller {
+      connect() {
+        // 控制器连接时初始化图表
+        this.initCharts();
+
+        // 设置时间范围选择器的当前值
+        this.setTimeRangeSelector();
+
+        // 初始化工具提示
+        this.initTooltips();
+
+        // 监听窗口大小变化，使用防抖处理
+        this.setupResizeListener();
+      }
+
+      disconnect() {
+        // 控制器断开连接时销毁图表
+        this.destroyCharts();
+
+        // 移除窗口大小变化监听器
+        if (this.resizeTimer) {
+          clearTimeout(this.resizeTimer);
+        }
+        if (this.boundResizeHandler) {
+          window.removeEventListener('resize', this.boundResizeHandler);
+        }
+      }
+
+      setupResizeListener() {
+        // 使用绑定的方法以便能够在 disconnect 中移除
+        this.boundResizeHandler = this.handleResize.bind(this);
+        window.addEventListener('resize', this.boundResizeHandler);
+      }
+
+      handleResize() {
+        // 使用防抖处理窗口大小变化
+        if (this.resizeTimer) {
+          clearTimeout(this.resizeTimer);
+        }
+        this.resizeTimer = setTimeout(() => {
+          this.initCharts();
+        }, 250); // 250ms 防抖延迟
+      }
+
+      // 图表初始化函数
+      initCharts() {
+        // 初始化作业处理图表
+        this.initJobsProcessedChart();
+
+        // 初始化作业类型分布图表
+        this.initJobTypesChart();
+      }
+
+      destroyCharts() {
+        // 销毁作业处理图表
+        if (this.jobsProcessedChart instanceof Chart) {
+          this.jobsProcessedChart.destroy();
+          this.jobsProcessedChart = null;
+        }
+
+        // 销毁作业类型分布图表
+        if (this.jobTypesChart instanceof Chart) {
+          this.jobTypesChart.destroy();
+          this.jobTypesChart = null;
+        }
+      }
+
+      // 初始化作业处理图表
+      initJobsProcessedChart() {
+        // 获取画布上下文
+        const jobsCtx = document.getElementById('jobsProcessedChart');
+
+        if (!jobsCtx) return; // 如果元素不存在，直接返回
+
+        // 如果已经存在图表，先销毁它
+        if (this.jobsProcessedChart instanceof Chart) {
+          this.jobsProcessedChart.destroy();
+        }
+
+        // 创建新图表
+        const timeLabels = jobsCtx.getAttribute('data-time-labels');
+        const jobsProcessedData = jobsCtx.getAttribute('data-jobs-processed-data');
+
+        if (!timeLabels || !jobsProcessedData) return; // 如果没有数据，直接返回
+
+        this.jobsProcessedChart = new Chart(jobsCtx.getContext('2d'), {
+          type: 'line',
+          data: {
+            labels: JSON.parse(timeLabels),
+            datasets: [{
+              label: 'Jobs Processed',
+              data: JSON.parse(jobsProcessedData),
+              backgroundColor: 'rgba(59, 130, 246, 0.1)',
+              borderColor: 'rgba(59, 130, 246, 1)',
+              borderWidth: 2,
+              tension: 0.4,
+              fill: true
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+              y: {
+                beginAtZero: true,
+                ticks: {
+                  precision: 0 // 只显示整数刻度
+                }
+              },
+              x: {
+                ticks: {
+                  maxRotation: 45,
+                  minRotation: 45
+                }
+              }
+            },
+            plugins: {
+              legend: {
+                display: true,
+                position: 'top'
+              },
+              tooltip: {
+                mode: 'index',
+                intersect: false
+              }
+            },
+            animation: {
+              duration: 1000 // 控制动画时长
+            },
+            layout: {
+              padding: 10 // 为图表添加内边距
+            },
+            interaction: {
+              mode: 'nearest',
+              axis: 'x',
+              intersect: false
+            }
+          }
+        });
+      }
+
+      // 初始化作业类型分布图表
+      initJobTypesChart() {
+        // 获取画布上下文
+        const typesCtx = document.getElementById('jobTypesChart');
+
+        if (!typesCtx) return; // 如果元素不存在，直接返回
+
+        // 如果已经存在图表，先销毁它
+        if (this.jobTypesChart instanceof Chart) {
+          this.jobTypesChart.destroy();
+        }
+
+        // 创建新图表
+        const jobTypesLabels = typesCtx.getAttribute('data-job-types-labels');
+        const jobTypesData = typesCtx.getAttribute('data-job-types-data');
+
+        if (!jobTypesLabels || !jobTypesData) return; // 如果没有数据，直接返回
+
+        this.jobTypesChart = new Chart(typesCtx.getContext('2d'), {
+          type: 'doughnut',
+          data: {
+            labels: JSON.parse(jobTypesLabels),
+            datasets: [{
+              data: JSON.parse(jobTypesData),
+              backgroundColor: [
+                'rgba(59, 130, 246, 0.8)',
+                'rgba(16, 185, 129, 0.8)',
+                'rgba(245, 158, 11, 0.8)',
+                'rgba(239, 68, 68, 0.8)',
+                'rgba(139, 92, 246, 0.8)',
+                'rgba(236, 72, 153, 0.8)',
+                'rgba(75, 85, 99, 0.8)'
+              ],
+              borderWidth: 1
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+              legend: {
+                position: 'right',
+                labels: {
+                  boxWidth: 12,
+                  padding: 15
+                }
+              },
+              tooltip: {
+                callbacks: {
+                  label: function(context) {
+                    const label = context.label || '';
+                    const value = context.raw || 0;
+                    const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                    const percentage = Math.round((value / total) * 100);
+                    return `${label}: ${value} (${percentage}%)`;
+                  }
+                }
+              }
+            },
+            cutout: '60%',
+            animation: {
+              animateRotate: true,
+              animateScale: true,
+              duration: 1000
+            }
+          }
+        });
+      }
+
+      // 设置时间范围选择器的当前值
+      setTimeRangeSelector() {
+        const selector = document.getElementById('time-range');
+        if (selector) {
+          // 从 URL 获取 hours 参数
+          const urlParams = new URLSearchParams(window.location.search);
+          const hours = urlParams.get('hours');
+
+          if (hours) {
+            // 找到匹配的选项并设置为选中
+            for (let i = 0; i < selector.options.length; i++) {
+              if (selector.options[i].value === hours) {
+                selector.selectedIndex = i;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // 初始化工具提示功能
+      initTooltips() {
+        // 这个函数主要依赖于 CSS，但如果需要更复杂的工具提示行为，可以在这里添加
+      }
+    });
+
+    // 导航控制器 - 负责管理导航和激活页面
+    Stimulus.register("nav", class extends Controller {
+      static targets = ["navItem", "content"]
+      static values = {
+        activeClass: { type: String, default: "border-b-2 border-black" }
+      }
+
+      connect() {
+        // 初始化时根据 URL 路径设置激活页面
+        this.setActivePageFromUrl()
+      }
+
+      setActivePageFromUrl() {
+        const path = window.location.pathname
+        this.navItemTargets.forEach(item => {
+          const href = item.getAttribute('href')
+          // 重置所有导航项的样式
+          this.removeActiveClass(item)
+
+          // 如果当前路径匹配，添加激活样式
+          if (href === path) {
+            this.addActiveClass(item)
+          }
+        })
+      }
+
+      navigate(event) {
+        // 如果点击的是导航项，则阻止默认行为并手动处理
+        if (this.navItemTargets.includes(event.currentTarget)) {
+          event.preventDefault()
+
+          // 更新激活状态
+          this.navItemTargets.forEach(item => {
+            // 只移除激活状态的类
+            this.removeActiveClass(item)
+          })
+
+          // 添加激活状态类
+          this.addActiveClass(event.currentTarget)
+
+          // 使用 Turbo 加载新内容
+          const href = event.currentTarget.getAttribute('href')
+          this.contentTarget.setAttribute('src', href)
+
+          // 更新 URL，但不刷新页面
+          history.pushState({}, '', href)
+        }
+      }
+
+      // 添加激活类
+      addActiveClass(element) {
+        const classes = this.activeClassValue.split(' ')
+        element.classList.add(...classes)
+      }
+
+      // 移除激活类
+      removeActiveClass(element) {
+        const classes = this.activeClassValue.split(' ')
+        element.classList.remove(...classes)
+      }
+    })
+  </script>
+</head>
+<body class="bg-white text-black min-h-screen flex flex-col">
+  <div class="max-w-7xl mx-auto p-4 md:p-6 w-full flex-grow flex flex-col">
+    <h1 class="text-3xl font-bold mb-6">Control Plane</h1>
+
+    <!-- 导航部分使用 nav 和 auto-refresh 控制器 -->
+    <div data-controller="nav" data-nav-active-class-value="border-b-2 border-black" class="flex flex-col flex-grow">
+      <turbo-frame id="nav-frame">
+        <nav class="flex flex-wrap border-b mb-6">
+          <a href="/" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Overview
+          </a>
+          <a href="/queues" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Queues
+          </a>
+
+          <!-- 统计数据部分 -->
+          <a href="/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Failed jobs <span id="failed-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+          </a>
+          <a href="/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            In Progress jobs <span id="in-progress-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+          </a>
+          <a href="/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Blocked jobs <span id="blocked-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+          </a>
+          <a href="/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Scheduled jobs <span id="scheduled-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+          </a>
+          <a href="/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+          </a>
+
+          <a href="/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Workers
+          </a>
+        </nav>
+      </turbo-frame>
+
+      <!-- 使用 reload 控制器自动刷新统计数据 -->
+      <div data-controller="reload" data-reload-interval-value="5000">
+        <turbo-frame id="stats-frame" src="/stats" data-reload-target="frame" class="hidden"></turbo-frame>
+      </div>
+
+      <!-- 内容部分，由导航控制器管理 -->
+      <turbo-frame id="content" data-nav-target="content" class="mb-4">
+        {% block content %}{% endblock %}
+      </turbo-frame>
+
+      <!-- Footer -->
+      <div class="mt-8 pt-4 border-t border-gray-200 mt-auto">
+        <div class="flex flex-col md:flex-row justify-between items-center text-sm text-gray-500">
+          <div class="mb-2 md:mb-0">
+            <span>Version: 0.1.0</span>
+            <span class="mx-2">|</span>
+            <span class="inline-flex items-center">
+              <span class="h-2 w-2 rounded-full bg-green-500 mr-1"></span>
+              <span>Operational</span>
+            </span>
+            {% if db_info %}
+            <span class="mx-2">|</span>
+            <span class="inline-flex items-center">
+              <span class="h-2 w-2 rounded-full {% if db_info.status == 'Connected' %}bg-green-500{% else %}bg-red-500{% endif %} mr-1"></span>
+              <span>{{ db_info.database_type }} ({{ db_info.connection_type }})</span>
+              <span class="ml-1 text-xs text-gray-400" title="{{ db_info.dsn }}">{{ db_info.dsn }}</span>
+            </span>
+            {% endif %}
+          </div>
+          <div class="flex space-x-4 items-center">
+            <a href="#" class="hover:text-black">Documentation</a>
+            <a href="https://github.com/ratazzi/quebec" class="hover:text-black flex items-center">
+              <svg class="h-4 w-4 mr-1" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" />
+              </svg>
+              GitHub
+            </a>
+          </div>
+        </div>
+        <div class="mt-2 text-xs text-gray-400 text-right">
+          Last updated: <span id="current-time"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 更新当前时间
+    function updateCurrentTime() {
+      const timeElement = document.getElementById('current-time');
+      if (timeElement) {
+        const now = new Date();
+        const options = {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false
+        };
+        timeElement.textContent = now.toLocaleString('zh-CN', options);
+
+        // 每秒更新一次
+        setTimeout(updateCurrentTime, 1000);
+      }
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+      updateCurrentTime();
+    });
+  </script>
+</body>
+</html>
