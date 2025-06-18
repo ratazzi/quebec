@@ -167,6 +167,24 @@ where
         "enqueued_at": chrono::Utc::now().naive_utc(),
     });
 
+    // Get concurrency constraint using runnable
+    let concurrency_constraint = if ctx.has_concurrency_control(&entry.class.to_string()) {
+        // Only if concurrency control is enabled, get the runnable and compute constraint
+
+        if let Ok(runnable) = ctx.get_runnable(&entry.class) {
+            if let Some(args) = &entry.args {
+                // Assume args is a list of arguments, no kwargs for scheduled jobs
+                runnable.get_concurrency_constraint(Some(args), None::<&serde_yaml::Value>).unwrap_or(None)
+            } else {
+                runnable.get_concurrency_constraint(None::<&serde_yaml::Value>, None::<&serde_yaml::Value>).unwrap_or(None)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let job = solid_queue_jobs::ActiveModel {
         id: ActiveValue::NotSet,
         queue_name: ActiveValue::Set(queue_name.to_string()),
@@ -177,7 +195,7 @@ where
         active_job_id: ActiveValue::Set(Some("".to_string())),
         scheduled_at: ActiveValue::Set(Some(scheduled_at)),
         finished_at: ActiveValue::Set(None),
-        concurrency_key: ActiveValue::Set(Some("".to_string())),
+        concurrency_key: ActiveValue::Set(concurrency_constraint.as_ref().map(|c| c.key.clone())),
         created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
         updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
     }
@@ -185,17 +203,6 @@ where
     .await?;
 
     let job = job.try_into_model()?;
-
-
-    //     id: ActiveValue::not_set(),
-    //     job_id: ActiveValue::Set(job.id.unwrap()),
-    //     queue_name: ActiveValue::Set(job.queue_name.clone().unwrap()),
-    //     priority: ActiveValue::Set(job.priority.clone().unwrap()),
-    //     scheduled_at: ActiveValue::Set(scheduled_at),
-    //     created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-    // }
-    // .save(db)
-    // .await?;
 
     let _recurring_execution = solid_queue_recurring_executions::ActiveModel {
         id: ActiveValue::not_set(),
@@ -207,15 +214,56 @@ where
     .save(db)
     .await?;
 
-    let _ready_execution = solid_queue_ready_executions::ActiveModel {
-        id: ActiveValue::not_set(),
-        job_id: ActiveValue::Set(job.id),
-        queue_name: ActiveValue::Set(job.queue_name.clone()),
-        priority: ActiveValue::Set(job.priority),
-        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+    // Apply concurrency control logic
+    if let Some(constraint) = &concurrency_constraint {
+        use crate::semaphore::acquire_semaphore_with_constraint;
+
+        // Try to acquire the semaphore using the constraint
+        if acquire_semaphore_with_constraint(db, constraint).await.unwrap() {
+            info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
+
+            // Create ready execution - job can run immediately
+            let _ready_execution = solid_queue_ready_executions::ActiveModel {
+                id: ActiveValue::not_set(),
+                job_id: ActiveValue::Set(job.id),
+                queue_name: ActiveValue::Set(job.queue_name.clone()),
+                priority: ActiveValue::Set(job.priority),
+                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            }
+            .save(db)
+            .await?;
+        } else {
+            warn!("Scheduler: Failed to acquire semaphore for key: {}", constraint.key);
+
+            // Create blocked execution - job must wait
+            let now = chrono::Utc::now().naive_utc();
+            let duration = ctx.default_concurrency_control_period;
+            let expires_at = now + duration;
+
+            let _blocked_execution = solid_queue_blocked_executions::ActiveModel {
+                id: ActiveValue::NotSet,
+                queue_name: ActiveValue::Set(job.queue_name.clone()),
+                job_id: ActiveValue::Set(job.id),
+                priority: ActiveValue::Set(job.priority),
+                concurrency_key: ActiveValue::Set(constraint.key.clone()),
+                expires_at: ActiveValue::Set(expires_at),
+                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            }
+            .save(db)
+            .await?;
+        }
+    } else {
+        // No concurrency control - create ready execution immediately
+        let _ready_execution = solid_queue_ready_executions::ActiveModel {
+            id: ActiveValue::not_set(),
+            job_id: ActiveValue::Set(job.id),
+            queue_name: ActiveValue::Set(job.queue_name.clone()),
+            priority: ActiveValue::Set(job.priority),
+            created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+        }
+        .save(db)
+        .await?;
     }
-    .save(db)
-    .await?;
 
     // Send PostgreSQL NOTIFY after scheduled job is created
     if ctx.is_postgres() {

@@ -55,6 +55,7 @@ impl Dispatcher {
                 // }
                 _ = polling_interval.tick() => {
                     let polling_db = self.ctx.get_db().await;
+                    let ctx = self.ctx.clone(); // Clone ctx for the async closure
                     let _ = polling_db.transaction::<_, (), DbErr>(|txn| {
                         Box::pin(async move {
                           // Clean up expired semaphores
@@ -97,36 +98,53 @@ impl Dispatcher {
                                   .one(txn)
                                   .await?;
 
-                              if let Some(execution) = blocked_execution {
-                                  // Try to acquire semaphore for this concurrency key
-                                  match acquire_semaphore(txn, concurrency_key.clone()).await {
-                                      Ok(true) => {
-                                          info!("Semaphore acquired for key: {}", concurrency_key);
+                                                            if let Some(execution) = blocked_execution {
+                                  // Get the job to access concurrency information (like original Solid Queue)
+                                  let job = solid_queue_jobs::Entity::find_by_id(execution.job_id)
+                                      .one(txn)
+                                      .await?;
 
-                                          // Move blocked execution to ready execution
-                                          let ready_execution = solid_queue_ready_executions::ActiveModel {
-                                              id: ActiveValue::NotSet,
-                                              queue_name: ActiveValue::Set("default".to_string()),
-                                              job_id: ActiveValue::Set(execution.job_id),
-                                              priority: ActiveValue::Set(0),
-                                              created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                          };
+                                  if let Some(job) = job {
+                                      // Get concurrency_limit from registered runnable
+                                      let concurrency_limit = {
+                                          let runnables = ctx.runnables.read().unwrap();
+                                          runnables.get(&job.class_name)
+                                              .and_then(|runnable| runnable.concurrency_limit)
+                                              .unwrap_or(1) // Default to 1 if not found
+                                      };
 
-                                          ready_execution.save(txn).await?;
+                                      // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
+                                      match acquire_semaphore(txn, concurrency_key.clone(), concurrency_limit, None).await {
+                                          Ok(true) => {
+                                              info!("Semaphore acquired for key: {}", concurrency_key);
 
-                                          // Remove from blocked executions
-                                          solid_queue_blocked_executions::Entity::delete_by_id(execution.id)
-                                              .exec(txn)
-                                              .await?;
+                                              // Move blocked execution to ready execution
+                                              let ready_execution = solid_queue_ready_executions::ActiveModel {
+                                                  id: ActiveValue::NotSet,
+                                                  queue_name: ActiveValue::Set("default".to_string()),
+                                                  job_id: ActiveValue::Set(execution.job_id),
+                                                  priority: ActiveValue::Set(0),
+                                                  created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                              };
 
-                                          info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
-                                      },
-                                      Ok(false) => {
-                                          warn!("Failed to acquire semaphore for key: {}", concurrency_key);
-                                      },
-                                      Err(e) => {
-                                          warn!("Error acquiring semaphore for key {}: {:?}", concurrency_key, e);
+                                              ready_execution.save(txn).await?;
+
+                                              // Remove from blocked executions
+                                              solid_queue_blocked_executions::Entity::delete_by_id(execution.id)
+                                                  .exec(txn)
+                                                  .await?;
+
+                                              info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
+                                          },
+                                          Ok(false) => {
+                                              trace!("Failed to acquire semaphore for key: {} (no available slots)", concurrency_key);
+                                          },
+                                          Err(e) => {
+                                              warn!("Error acquiring semaphore for key {}: {:?}", concurrency_key, e);
+                                          }
                                       }
+                                  } else {
+                                      warn!("Job {} not found for blocked execution", execution.job_id);
                                   }
                               }
                           }

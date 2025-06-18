@@ -12,7 +12,6 @@ use pyo3::prelude::*;
 
 use sea_orm::TransactionTrait;
 use sea_orm::*;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -156,13 +155,15 @@ async fn runner(
 }
 
 #[pyclass(name = "Runnable", subclass)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Runnable {
-    class_name: String,
-    handler: Py<PyAny>,
-    queue_as: String,
-    priority: i64,
-    retry_info: Option<RetryInfo>,
+    pub class_name: String,
+    pub handler: Py<PyAny>,
+    pub queue_as: String,
+    pub priority: i64,
+    pub retry_info: Option<RetryInfo>,
+    pub concurrency_limit: Option<i32>,
+    pub concurrency_duration: Option<i32>, // in seconds
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +174,119 @@ struct RetryInfo {
 
 impl Runnable {
     pub fn new(class_name: String, handler: Py<PyAny>, queue_as: String, priority: i64) -> Self {
-        Self { class_name, handler, queue_as, priority, retry_info: None }
+        Self {
+            class_name,
+            handler,
+            queue_as,
+            priority,
+            retry_info: None,
+            concurrency_limit: None,
+            concurrency_duration: None,
+
+        }
+    }
+
+    /// Safe clone method that requires GIL
+    pub fn clone_with_gil(&self, py: Python<'_>) -> Self {
+        Self {
+            class_name: self.class_name.clone(),
+            handler: self.handler.clone_ref(py),
+            queue_as: self.queue_as.clone(),
+            priority: self.priority,
+            retry_info: self.retry_info.clone(),
+            concurrency_limit: self.concurrency_limit,
+            concurrency_duration: self.concurrency_duration,
+
+        }
+    }
+
+    /// Get the concurrency constraint for this job with given arguments
+    /// Returns Some(ConcurrencyConstraint) if concurrency control is enabled, None otherwise
+    /// Handles Python GIL internally and performs all checks once
+    pub fn get_concurrency_constraint<T, K>(&self, args: Option<T>, kwargs: Option<K>) -> Result<Option<ConcurrencyConstraint>>
+    where
+        T: crate::utils::IntoPython,
+        K: crate::utils::IntoPython,
+    {
+        Python::with_gil(|py| {
+            let bound = self.handler.bind(py);
+            let instance = bound.call0()?;
+
+            // Check if the instance has a concurrency_key method (not just the property)
+            if !instance.hasattr("concurrency_key")? {
+                return Ok(None);
+            }
+
+            // Get the concurrency_key attribute and check if it's callable
+            let concurrency_key_attr = instance.getattr("concurrency_key")?;
+            if concurrency_key_attr.is_none() || !concurrency_key_attr.is_callable() {
+                return Ok(None);
+            }
+
+            // Convert args to Python tuple
+            let py_args: Py<pyo3::types::PyTuple> = if let Some(args_value) = args {
+                let args_py = args_value.into_python(py)?;
+                let args_bound = args_py.bind(py);
+
+                if args_bound.is_instance_of::<pyo3::types::PyTuple>() {
+                    args_bound.downcast::<pyo3::types::PyTuple>()?.clone().into()
+                } else if args_bound.is_instance_of::<pyo3::types::PyList>() {
+                    let list = args_bound.downcast::<pyo3::types::PyList>()?;
+                    pyo3::types::PyTuple::new(py, list)?.into()
+                } else {
+                    // Single value - wrap in tuple
+                    pyo3::types::PyTuple::new(py, &[args_bound])?.into()
+                }
+            } else {
+                pyo3::types::PyTuple::empty(py).into()
+            };
+
+            // Convert kwargs to Python dict
+            let py_kwargs: Py<pyo3::types::PyDict> = if let Some(kwargs_value) = kwargs {
+                let kwargs_py = kwargs_value.into_python(py)?;
+                let kwargs_bound = kwargs_py.bind(py);
+
+                if kwargs_bound.is_instance_of::<pyo3::types::PyDict>() {
+                    kwargs_bound.downcast::<pyo3::types::PyDict>()?.clone().into()
+                } else {
+                    // If not a dict, create empty dict
+                    pyo3::types::PyDict::new(py).into()
+                }
+            } else {
+                pyo3::types::PyDict::new(py).into()
+            };
+
+            // Call the concurrency_key method with the job arguments
+            let result = concurrency_key_attr.call(py_args.bind(py), Some(&py_kwargs.bind(py)))?;
+
+            // Check if the result is None or empty string - if so, no concurrency control
+            if result.is_none() {
+                return Ok(None);
+            }
+
+            let raw_key = result.extract::<String>()?;
+            if raw_key.is_empty() {
+                return Ok(None);
+            }
+
+            // Get concurrency_group (defaults to class name)
+            let concurrency_group = if instance.hasattr("concurrency_group")? {
+                instance.getattr("concurrency_group")?.extract::<String>()?
+            } else {
+                self.class_name.clone()
+            };
+
+            // Build final concurrency_key as "group/key"
+            let key = format!("{}/{}", concurrency_group, raw_key);
+
+            // Return explicit limit or default to 1 (per Solid Queue spec)
+            let limit = self.concurrency_limit.unwrap_or(1);
+
+            // Return duration (convert from seconds to chrono::Duration)
+            let duration = self.concurrency_duration.map(|seconds| chrono::Duration::seconds(seconds as i64));
+
+            Ok(Some(ConcurrencyConstraint { key, limit, duration }))
+        }).map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
     }
 
     /// Check if should retry, return matching retry strategy
@@ -301,16 +414,20 @@ impl Runnable {
     }
 
     fn invoke(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
-        Python::with_gil(|py| {
-            // 1. Execute Python task
-            match self.execute_python_task(py, job) {
-                Ok(_) => Ok(job.clone()),
-                Err(error) => {
-                    // 2. Handle execution error
+        // Execute Python task with minimal GIL hold time
+        let execution_result = Python::with_gil(|py| {
+            self.execute_python_task(py, job)
+        });
+
+        match execution_result {
+            Ok(_) => Ok(job.clone()),
+            Err(error) => {
+                // Handle execution error - this may also need GIL but keep it separate
+                Python::with_gil(|py| {
                     self.handle_execution_error(py, job, &error)
-                }
+                })
             }
-        })
+        }
     }
 
     /// Execute Python task (parameter parsing + invocation)
@@ -716,7 +833,9 @@ impl Execution {
 
     #[getter]
     fn get_runnable(&self) -> Runnable {
-        self.runnable.clone()
+        Python::with_gil(|py| {
+            self.runnable.clone_with_gil(py)
+        })
     }
 
     fn perform(&mut self) -> PyResult<()> {
@@ -871,10 +990,9 @@ impl Execution {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Worker {
     pub ctx: Arc<AppContext>,
-    pub runnables: Arc<RwLock<HashMap<String, Runnable>>>,
     pub start_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     polling: Arc<tokio::sync::Mutex<i32>>,
@@ -887,7 +1005,6 @@ pub struct Worker {
 
 impl Worker {
     pub fn new(ctx: Arc<AppContext>) -> Self {
-        let runnables = Arc::new(RwLock::new(HashMap::<String, Runnable>::new()));
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let polling = Arc::new(tokio::sync::Mutex::new(0));
@@ -902,7 +1019,6 @@ impl Worker {
 
         Self {
             ctx,
-            runnables,
             start_handlers,
             stop_handlers,
             polling,
@@ -942,15 +1058,9 @@ impl Worker {
         Ok(())
     }
 
-    fn get_runnables(&self) -> PyResult<Vec<String>> {
-        Ok(self.runnables.read().unwrap().keys().cloned().collect())
-    }
 
-    fn get_runnable(&self, class_name: &str) -> Result<Runnable> {
-        let runnables = self.runnables.read().unwrap();
-        let runnable = runnables.get(class_name).unwrap();
-        Python::with_gil(|_py| Ok(runnable.clone()))
-    }
+
+
 
     // fn get_job_class(&self, class_name: &str) -> PyResult<Py<PyAny>> {
     //     let runnables = self.runnables.read().unwrap();
@@ -970,16 +1080,55 @@ impl Worker {
                 queue_name = bound.getattr("queue_as").unwrap().extract::<String>().unwrap();
             }
 
+            let mut concurrency_limit: Option<i32> = None;
+            let mut concurrency_duration: Option<i32> = None;
+
+            // Extract concurrency_limit if exists
+            if bound.hasattr("concurrency_limit").unwrap() {
+                concurrency_limit = Some(bound.getattr("concurrency_limit").unwrap().extract::<i32>().unwrap());
+            }
+
+            // Extract concurrency_duration if exists (convert to seconds)
+            if bound.hasattr("concurrency_duration").unwrap() {
+                concurrency_duration = Some(bound.getattr("concurrency_duration").unwrap().extract::<i32>().unwrap());
+            }
+
+            // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)
+            let has_concurrency_control = if bound.hasattr("concurrency_key").unwrap() {
+                let concurrency_key_attr = bound.getattr("concurrency_key").unwrap();
+                if concurrency_key_attr.is_none() {
+                    false
+                } else if concurrency_key_attr.is_callable() {
+                    // If it's a method, assume it provides concurrency control
+                    true
+                } else {
+                    // If it's a property, check if it's not empty string
+                    match concurrency_key_attr.extract::<String>() {
+                        Ok(key) => !key.is_empty(),
+                        Err(_) => false
+                    }
+                }
+            } else {
+                false
+            };
+
             let runnable = Runnable {
                 class_name: class_name.to_string().clone(),
                 handler: klass,
                 queue_as: queue_name,
                 priority: 0,
                 retry_info: None,
+                concurrency_limit,
+                concurrency_duration,
             };
             info!("Registered job: {:?}", runnable);
 
-            self.runnables.write().unwrap().insert(class_name.to_string(), runnable);
+            self.ctx.runnables.write().unwrap().insert(class_name.to_string(), runnable);
+
+            // Only store concurrency info if concurrency control is actually enabled
+            if has_concurrency_control {
+                self.ctx.enable_concurrency_control(class_name.to_string());
+            }
         });
         Ok(())
     }
@@ -1285,28 +1434,52 @@ impl Worker {
 
         async { debug!("found {} job(s) to process", claimed.len()); }.instrument(tracing::info_span!("polling", tid=thread_id, source=source)).await;
 
-        // 每次处理都获取新连接，避免长期占用
-        let processing_db = ctx.get_db().await;
-        let txn = processing_db.begin().await.unwrap();
+        // Process claimed jobs without holding a long transaction
+        // First collect all job data quickly, then create executions
+        let job_ids: Vec<i64> = claimed.iter().map(|row| row.job_id).collect();
+        let job_data = {
+            let processing_db = ctx.get_db().await;
+            // Use a single quick transaction to fetch all job data
+            let jobs_result = processing_db.transaction::<_, Vec<solid_queue_jobs::Model>, DbErr>(|txn| {
+                Box::pin(async move {
+                    let mut jobs = Vec::new();
+                    for job_id in job_ids {
+                        if let Some(job) = solid_queue_jobs::Entity::find_by_id(job_id).one(txn).await? {
+                            jobs.push(job);
+                        }
+                    }
+                    Ok(jobs)
+                })
+            }).await;
 
-        for row in claimed {
-            let job_id = row.job_id;
-            let job = solid_queue_jobs::Entity::find_by_id(job_id).one(&txn).await.unwrap();
-            let job = job.unwrap();
+            match jobs_result {
+                Ok(jobs) => jobs,
+                Err(e) => {
+                    error!("Failed to fetch job data: {:?}", e);
+                    return;
+                }
+            }
+        }; // processing_db is released here
 
-            let runnable = self.get_runnable(&job.class_name);
+        // Now create executions without holding any database connections
+        for (row, job) in claimed.into_iter().zip(job_data.into_iter()) {
+            // Get runnable with proper GIL handling
+            let runnable = Python::with_gil(|_py| {
+                self.ctx.get_runnable(&job.class_name)
+            });
+
             if runnable.is_err() {
                 error!("Job handler not found: {:?}", &job.class_name);
                 continue;
             }
 
-            let execution = Execution::new(ctx.clone(), row.clone(), job, runnable.unwrap());
-            tx.lock().await.send(execution).await.unwrap();
-        }
+            let execution = Execution::new(ctx.clone(), row, job, runnable.unwrap());
 
-        // 快速提交事务并释放连接
-        txn.commit().await.unwrap();
-        // processing_db 连接会在作用域结束时自动释放到连接池
+            // Send execution to worker thread - this may block but no database connections are held
+            if let Err(e) = tx.lock().await.send(execution).await {
+                error!("Failed to send execution to worker thread: {:?}", e);
+            }
+        }
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {

@@ -44,7 +44,12 @@ if len(sys.argv) > 1:
     dsn = f'sqlite://{db_path}?mode=rwc'
 
 # dsn = 'sqlite::memory:'
-qc = q = quebec.Quebec(dsn, use_skip_locked=True)
+qc = q = quebec.Quebec(dsn,
+    use_skip_locked=True,
+    dispatcher_polling_interval=timedelta(milliseconds=30000),
+    dispatcher_concurrency_maintenance_interval=timedelta(milliseconds=30000),
+    worker_polling_interval=timedelta(milliseconds=30000)
+)
 # if not db_path.exists():
 qc.create_table()
 if 'memory' in dsn:
@@ -77,12 +82,12 @@ signal.signal(signal.SIGQUIT, signal_handler)
 
 @qc.register_job
 class FakeJob(quebec.BaseClass):
-    queue_as = 'high'
+    queue_as = 'default'  # 修改为 default 以匹配 LISTEN 频道
     concurrency_limit = 1
     concurrency_duration = 120 # seconds
 
     retry_on = [
-        quebec.RetryStrategy((RuntimeError,), wait=timedelta(seconds=10), attempts=1),
+        quebec.RetryStrategy((RuntimeError,), wait=timedelta(seconds=10), attempts=1, handler=lambda exc: True),
     ]
 
     def concurrency_key(self, *args, **kwargs):
@@ -142,7 +147,7 @@ class FakeJob(quebec.BaseClass):
 
         # 示例调用
         # conn.close()
-        self.logger.debug(str(execute_sql("SELECT * FROM users LIMIT 1")[0:4]))
+        # self.logger.debug(str(execute_sql("SELECT * FROM users LIMIT 1")[0:4]))
 
         # time.sleep(0.01)
         # time.sleep(1)
@@ -174,6 +179,14 @@ if __name__ == "__main__":
         qc.feed_jobs_to_queue(q)
     for i in range(threads):
         threading.Thread(target=threaded_runner.run).start()
+
+
+    def feed_jobs(qc):
+        time.sleep(1)
+        for i in range(10):
+            FakeJob.perform_later(qc, 3466, foo='bar')
+
+    threading.Thread(target=feed_jobs, args=(qc,)).start()
 
     # app executor
     # qc.wait_for_shutdown()

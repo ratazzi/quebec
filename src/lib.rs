@@ -9,6 +9,7 @@ mod scheduler;
 mod semaphore;
 mod supervisor;
 mod types;
+mod utils;
 mod worker;
 
 pub use control_plane::ControlPlaneExt;

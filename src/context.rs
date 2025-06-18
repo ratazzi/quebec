@@ -3,8 +3,8 @@ use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -14,6 +14,13 @@ use tracing::{debug, error, warn};
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 pyo3::create_exception!(quebec, CustomError, PyException);
+
+#[derive(Debug, Clone)]
+pub struct ConcurrencyConstraint {
+    pub key: String,
+    pub limit: i32,
+    pub duration: Option<chrono::Duration>,
+}
 
 #[pyclass]
 #[derive(Debug, Clone)]
@@ -148,6 +155,10 @@ impl DiscardStrategy {
     }
 }
 
+
+
+
+
 #[derive(Debug)]
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
@@ -169,6 +180,8 @@ pub struct AppContext {
     pub worker_threads: u64,
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
+    pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
+    pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
 }
 
 impl AppContext {
@@ -198,6 +211,8 @@ impl AppContext {
             worker_threads: 3,
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
+            runnables: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
         };
 
         // Override default configuration if options are provided
@@ -365,6 +380,35 @@ impl AppContext {
     /// Check if the database is PostgreSQL
     pub fn is_postgres(&self) -> bool {
         self.dsn.scheme().starts_with("postgres")
+    }
+
+    /// Get a runnable by class name
+    pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable, anyhow::Error> {
+        let runnables = self.runnables.read().unwrap();
+        let runnable = runnables.get(class_name)
+            .ok_or_else(|| anyhow::anyhow!("Runnable not found for class: {}", class_name))?;
+
+        // Clone with GIL since Runnable contains Py<PyAny>
+        Python::with_gil(|py| {
+            Ok(runnable.clone_with_gil(py))
+        })
+    }
+
+    /// Get all registered runnable class names
+    pub fn get_runnable_names(&self) -> Vec<String> {
+        self.runnables.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Check if a job class has concurrency control enabled
+    pub fn has_concurrency_control(&self, class_name: &str) -> bool {
+        let concurrency_enabled = self.concurrency_enabled.read().unwrap();
+        concurrency_enabled.contains(class_name)
+    }
+
+    /// Enable concurrency control for a job class
+    pub fn enable_concurrency_control(&self, class_name: String) {
+        let mut concurrency_enabled = self.concurrency_enabled.write().unwrap();
+        concurrency_enabled.insert(class_name);
     }
 }
 

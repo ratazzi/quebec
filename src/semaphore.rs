@@ -1,52 +1,83 @@
-use tracing::trace;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
+use crate::context::ConcurrencyConstraint;
 
-pub async fn acquire_semaphore<C>(db: &C, key: String) -> Result<bool, DbErr>
+pub async fn acquire_semaphore<C>(db: &C, key: String, concurrency_limit: i32, duration: Option<chrono::Duration>) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
     let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + chrono::Duration::minutes(1);
+    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2)); // Default to 2 minutes
 
-    let sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+    // First, try to create a new semaphore (attempt_creation)
+    let create_sql = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
             "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (key) DO UPDATE SET \
-             value = CASE WHEN solid_queue_semaphores.value > 0 THEN solid_queue_semaphores.value - 1 ELSE solid_queue_semaphores.value END, \
-             expires_at = EXCLUDED.expires_at, \
-             updated_at = EXCLUDED.updated_at \
-             WHERE solid_queue_semaphores.value > 0"
+             ON CONFLICT (key) DO NOTHING"
+        },
+        DatabaseBackend::Sqlite => {
+            "INSERT OR IGNORE INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5)"
         },
         DatabaseBackend::MySql => {
-            "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE \
-             value = CASE WHEN value > 0 THEN value - 1 ELSE value END, \
-             expires_at = VALUES(expires_at), \
-             updated_at = VALUES(updated_at)"
+            "INSERT IGNORE INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?)"
         },
     };
 
-    let result = db
+    let create_result = db
         .execute(Statement::from_sql_and_values(
             db.get_database_backend(),
-            sql,
-            vec![key.into(), 1.into(), expires_at.into(), now.into(), now.into()],
+            create_sql,
+            vec![key.clone().into(), (concurrency_limit - 1).into(), expires_at.into(), now.into(), now.into()],
         ))
-        .await;
+        .await?;
 
-    match result {
-        Ok(exec_result) => {
-            trace!("Semaphore operation result: {:?}", exec_result);
-            if exec_result.rows_affected() > 0 {
-                Ok(true) // Successfully acquired the semaphore
-            } else {
-                Ok(false) // Semaphore is already acquired by someone else or value is 0
-            }
-        }
-        Err(e) => Err(e),
+    if create_result.rows_affected() > 0 {
+        // Successfully created semaphore, we got it!
+        return Ok(true);
     }
+
+    // Semaphore already exists, try to decrement if value > 0 (attempt_decrement)
+    // But first check the limit == 1 case (check_limit_or_decrement)
+    if concurrency_limit == 1 {
+        return Ok(false); // limit == 1, don't try to decrement
+    }
+
+    let decrement_sql = match db.get_database_backend() {
+        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+            "UPDATE solid_queue_semaphores SET \
+             value = value - 1, \
+             expires_at = $2, \
+             updated_at = $3 \
+             WHERE key = $1 AND value > 0"
+        },
+        DatabaseBackend::MySql => {
+            "UPDATE solid_queue_semaphores SET \
+             value = value - 1, \
+             expires_at = ?, \
+             updated_at = ? \
+             WHERE key = ? AND value > 0"
+        },
+    };
+
+    let decrement_result = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            decrement_sql,
+            vec![key.into(), expires_at.into(), now.into()],
+        ))
+        .await?;
+
+    Ok(decrement_result.rows_affected() > 0)
+}
+
+/// Convenience function to acquire semaphore using ConcurrencyConstraint
+pub async fn acquire_semaphore_with_constraint<C>(db: &C, constraint: &ConcurrencyConstraint) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    acquire_semaphore(db, constraint.key.clone(), constraint.limit, constraint.duration).await
 }
 
 pub async fn release_semaphore<C>(db: &C, key: String) -> Result<(), DbErr>

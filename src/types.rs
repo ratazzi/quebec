@@ -5,7 +5,7 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyTuple, PyType};
-use pyo3::types::{PyFloat, PyInt, PyList, PyString};
+
 
 // use pyo3_asyncio::tokio::future_into_py;
 use sea_orm::sea_query::TableCreateStatement;
@@ -28,6 +28,7 @@ use crate::core::Quebec;
 use crate::dispatcher::Dispatcher;
 use crate::entities::*;
 use crate::scheduler::Scheduler;
+
 use crate::worker::{Execution, Worker};
 
 use tracing::{debug, error, info, trace, warn};
@@ -165,7 +166,6 @@ pub struct PyQuebec {
     pub worker: Arc<Worker>,
     pub dispatcher: Arc<Dispatcher>,
     pub scheduler: Arc<Scheduler>,
-    pub job_classes: Arc<RwLock<HashMap<String, Py<PyAny>>>>,
     pub shutdown_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pub start_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
@@ -193,8 +193,8 @@ impl PyQuebec {
 
         let dsn = Url::parse(&url).unwrap();
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
-        let min_conns = if url.contains("sqlite") { 1 } else { 2 };
-        let max_conns = if url.contains("sqlite") { 1 } else { 30 };
+        let min_conns = if url.contains("sqlite") { 1 } else { 20 };
+        let max_conns = if url.contains("sqlite") { 1 } else { 300 };
         opt.min_connections(min_conns)
             .max_connections(max_conns)
             .acquire_timeout(Duration::from_secs(5))
@@ -233,9 +233,6 @@ impl PyQuebec {
         let worker = Arc::new(Worker::new(ctx.clone()));
         let dispatcher = Arc::new(Dispatcher::new(ctx.clone()));
         let scheduler = Arc::new(Scheduler::new(ctx.clone()));
-
-
-        let job_classes = Arc::new(RwLock::new(HashMap::<String, Py<PyAny>>::new()));
         let shutdown_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
@@ -248,7 +245,6 @@ impl PyQuebec {
             worker,
             dispatcher,
             scheduler,
-            job_classes,
             shutdown_handlers,
             start_handlers,
             stop_handlers,
@@ -503,7 +499,8 @@ impl PyQuebec {
         Ok(handler)
     }
 
-    fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
+        fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
+        // Register with worker (this will store in AppContext.runnables)
         let _ = self.worker.register_job_class(py, job_class).unwrap();
         Ok(())
     }
@@ -528,50 +525,50 @@ impl PyQuebec {
 
         let instance = bound.call0()?;
 
-        // if instance.hasattr("concurrency_key")? {
-        //     // let concurrency_key = klass.getattr("concurrency_key")?.extract::<String>()?;
-        //     // debug!("concurrency_key: {:?}", concurrency_key);
-        //     debug!("-------------- concurrency enabled: {}", class_name);
-        //     let func = instance.getattr("concurrency_key")?;
-        //     concurrency_key = Some(func.call(args, kwargs)?.extract::<String>().unwrap());
-        //     debug!("concurrency_key: {:?}", concurrency_key);
-        // }
+        // Check if this job class has concurrency control without needing GIL
+        let (concurrency_key, concurrency_limit) = if self.worker.ctx.has_concurrency_control(&class_name.to_string()) {
+            // If concurrency_info exists, concurrency control is definitely enabled
+            let runnable = self.worker.ctx.get_runnable(&class_name.to_string())
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get runnable: {:?}", e)))?;
 
-        let mut concurrency_key: Option<String> = None;
-        if instance.hasattr("limits_concurrency")? {
-            let strategy =
-                instance.getattr("limits_concurrency")?.extract::<ConcurrencyStrategy>()?;
-            debug!("limits_concurrency enabled: {}, {:?}", class_name, strategy);
+            let concurrency_constraint = runnable.get_concurrency_constraint(Some(args), kwargs)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get concurrency info: {:?}", e)))?;
 
-            let func = strategy.key.into_bound(py);
-            concurrency_key = Some(func.call(args, kwargs)?.extract::<String>().map_err(|e| {
-                PyErr::new::<CustomError, _>(format!("Failed to extract concurrency_key: {}", e))
-            })?);
-            debug!("concurrency_key: {:?}", concurrency_key);
-        }
+            if let Some(constraint) = concurrency_constraint {
+                (Some(constraint.key), Some(constraint.limit))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
-        // let args_json = py_to_json_value(py, &args);
-        // let kwargs_json = kwargs.map(|kwargs| py_to_json_value(py, &kwargs));
+        // Convert Python args and kwargs to JSON only for job arguments storage
+        let args_json = crate::utils::python_object(&args).into_json(py);
+        let kwargs_json = kwargs.map(|k| crate::utils::python_object(&k).into_json(py));
 
-        // let arguments = vec![args_json, kwargs_json.unwrap_or(Value::Null)];
-        // debug!("arguments: {:?}", arguments);
-        // let arguments = serde_json::to_string(&arguments).unwrap();
-        // // debug!("arguments: {:?}", arguments);
-
-        let mut args_json = py_to_json_value(py, &args);
-        if let Some(kwargs) = kwargs {
-            let kwargs_json = py_to_json_value(py, &kwargs);
-            if let Value::Array(ref mut args_array) = args_json {
+        // Merge args and kwargs for job arguments storage
+        let mut combined_args_json = args_json.clone();
+        if let Some(kwargs_json) = &kwargs_json {
+            if let Value::Array(ref mut args_array) = combined_args_json {
                 if let Value::Object(kwargs_map) = kwargs_json {
                     for (key, value) in kwargs_map {
                         args_array
-                            .push(Value::Object(serde_json::Map::from_iter(vec![(key, value)])));
+                            .push(Value::Object(serde_json::Map::from_iter(vec![(key.clone(), value.clone())])));
                     }
                 }
             }
         }
-        // debug!("args_json: {:?}", args_json);
-        let arguments = serde_json::to_string(&args_json).unwrap();
+
+        if let Some(ref key) = concurrency_key {
+            debug!("concurrency_key: {:?} for {}", key, class_name);
+        }
+        if let Some(limit) = concurrency_limit {
+            debug!("concurrency_limit: {:?}", limit);
+        }
+
+        // debug!("combined_args_json: {:?}", combined_args_json);
+        let arguments = serde_json::to_string(&combined_args_json).unwrap();
 
         let mut obj = instance.clone().extract::<ActiveJob>()?;
         obj.class_name = class_name.to_string();
@@ -580,22 +577,26 @@ impl PyQuebec {
         obj.queue_name = queue_name;
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;
+        obj.concurrency_limit = concurrency_limit;
 
         let start_time = Instant::now();
-        self.rt
-            .block_on(async {
-                let job = self.quebec.perform_later(klass, obj.clone()).await;
-                job
-            })
-            .map(|job| {
-                obj.id.replace(job.id);
-                debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
-                obj
-            })
-            .map_err(|e| {
-                error!("Error: {:?}", e);
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
-            })
+        // Release GIL during database operations to prevent blocking other Python threads
+        py.allow_threads(|| {
+            self.rt
+                .block_on(async {
+                    let job = self.quebec.perform_later(obj.clone()).await;
+                    job
+                })
+        })
+        .map(|job| {
+            obj.id.replace(job.id);
+            debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
+            obj
+        })
+        .map_err(|e| {
+            error!("Error: {:?}", e);
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
+        })
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -630,6 +631,8 @@ impl PyQuebec {
     fn print_classes(&self) {
         // debug!("runnables: {:?}", self.worker.runnables);
     }
+
+
 
     fn setup_signal_handler(&self, py: Python) -> PyResult<Py<PyAny>> {
         info!("Setting up signal handlers");
@@ -786,36 +789,7 @@ impl PyQuebec {
 //     }
 // }
 
-fn py_to_json_value(_py: Python, obj: &Bound<'_, PyAny>) -> Value {
-    if obj.is_instance_of::<PyInt>() {
-        Value::Number(obj.extract::<i64>().unwrap().into())
-    } else if obj.is_instance_of::<PyFloat>() {
-        Value::Number(serde_json::Number::from_f64(obj.extract::<f64>().unwrap()).unwrap())
-    } else if obj.is_instance_of::<PyString>() {
-        Value::String(obj.extract::<String>().unwrap())
-    } else if obj.is_instance_of::<PyDict>() {
-        let dict = obj.downcast::<PyDict>().unwrap();
-        let mut map = serde_json::Map::new();
-        for (key, value) in dict {
-            let key: String = key.extract().unwrap();
-            let value = py_to_json_value(_py, &value);
-            map.insert(key, value);
-        }
-        Value::Object(map)
-    } else if obj.is_instance_of::<PyList>() {
-        let list = obj.downcast::<PyList>().unwrap();
-        let vec: Vec<Value> = list.iter().map(|item| py_to_json_value(_py, &item)).collect();
-        Value::Array(vec)
-    } else if obj.is_instance_of::<PyTuple>() {
-        let tuple = obj.downcast::<PyTuple>().unwrap();
-        let vec: Vec<Value> = tuple.iter().map(|item| py_to_json_value(_py, &item)).collect();
-        Value::Array(vec)
-    } else if obj.is_none() {
-        Value::Null
-    } else {
-        panic!("Unsupported Python type")
-    }
-}
+
 
 #[pyclass(name = "ActiveJob", subclass)]
 #[derive(Debug, Clone)]
@@ -831,6 +805,7 @@ pub struct ActiveJob {
     pub scheduled_at: chrono::NaiveDateTime,
     pub finished_at: Option<chrono::NaiveDateTime>,
     pub concurrency_key: Option<String>,
+    pub concurrency_limit: Option<i32>,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
     // pub rescue_strategies: Vec<RescueStrategy>,
@@ -883,6 +858,7 @@ impl ActiveJob {
             scheduled_at: chrono::Utc::now().naive_utc(),
             finished_at: None,
             concurrency_key: None,
+            concurrency_limit: None,
             created_at: None,
             updated_at: None,
             // rescue_strategies: vec![],
