@@ -414,20 +414,18 @@ impl Runnable {
     }
 
     fn invoke(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
-        // Execute Python task with minimal GIL hold time
-        let execution_result = Python::with_gil(|py| {
-            self.execute_python_task(py, job)
-        });
-
-        match execution_result {
-            Ok(_) => Ok(job.clone()),
-            Err(error) => {
-                // Handle execution error - this may also need GIL but keep it separate
-                Python::with_gil(|py| {
+        // Execute Python task and handle any errors in a single GIL acquisition
+        Python::with_gil(|py| {
+            // Execute Python task within the same GIL session
+            match self.execute_python_task(py, job) {
+                Ok(_) => Ok(job.clone()),
+                Err(error) => {
+                    // Handle execution error within the same GIL session
+                    // This prevents other threads from acquiring GIL between task execution and error handling
                     self.handle_execution_error(py, job, &error)
-                })
+                }
             }
-        }
+        })
     }
 
     /// Execute Python task (parameter parsing + invocation)
