@@ -1,19 +1,18 @@
-## /// script
-## requires-python = ">=3.13"
-## dependencies = [
-##     "quebec",
-## ]
-##
-## [tool.uv.sources]
-## quebec = { git = "https://github.com/ratazzi/quebec.git", rev = "master" }
-## ///
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "quebec",
+# ]
+#
+# [tool.uv.sources]
+# quebec = { git = "https://github.com/ratazzi/quebec.git", rev = "master" }
+# ///
 import sys
 import time
 import queue
 import logging
 import threading
 from pathlib import Path
-import maturin_import_hook; maturin_import_hook.install() # NOQA
 
 FORMAT = '%(asctime)s %(levelname)s [%(name)s:%(filename)s:%(lineno)d]: %(message)s'
 logging.basicConfig(stream=sys.stdout, format=FORMAT, level=logging.DEBUG)
@@ -64,11 +63,8 @@ class FakeJob(quebec.BaseClass):
 
 
 if __name__ == "__main__":
-    queued = FakeJob.perform_later(qc, 3466, foo='bar')
+    job = FakeJob.perform_later(qc, 3466, foo='bar')
 
-    # qc.spawn_dispatcher()
-    # qc.spawn_scheduler()
-    # qc.spawn_job_claim_poller()
     qc.start_control_plane('127.0.0.1:5006')
     qc.spawn_all()
 
