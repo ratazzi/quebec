@@ -440,7 +440,7 @@ impl Runnable {
         instance.setattr("failed_attempts", job.failed_attempts)?;
 
         let func = instance.getattr("perform")?;
-        func.call((&args,), Some(kwargs.bind(py)))?;
+        func.call(&args, Some(kwargs.bind(py)))?;
 
         Ok(())
     }
