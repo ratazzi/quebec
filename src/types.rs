@@ -207,7 +207,26 @@ impl PyQuebec {
         // Pre-create a connection for all database types
         // This connection will be wrapped in Arc and used when needed
         // For high concurrency operations, new connections will be obtained through get_connection method
-        let db = rt.block_on(async { Database::connect(opt.clone()).await.unwrap() });
+        let db = rt.block_on(async {
+            // Try to connect with retries instead of panicking on failure
+            let mut retry_count = 0;
+            const MAX_RETRIES: usize = 3;
+
+            loop {
+                match Database::connect(opt.clone()).await {
+                    Ok(db) => return db,
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count >= MAX_RETRIES {
+                            error!("Failed to connect to database after {} retries: {}", MAX_RETRIES, e);
+                            panic!("Database connection failed: {}", e);
+                        }
+                        warn!("Database connection attempt {} failed, retrying: {}", retry_count, e);
+                        tokio::time::sleep(std::time::Duration::from_millis(1000 * retry_count as u64)).await;
+                    }
+                }
+            }
+        });
         let db_option = Some(Arc::new(db));
 
         // Convert kwargs to HashMap<String, PyObject>
