@@ -74,10 +74,13 @@ pub trait ProcessTrait {
         if is_running_in_pyo3() {
             let mut thread_id: u64 = 0;
             Python::with_gil(|py| {
-                let threading = PyModule::import(py, "threading").unwrap();
-                let bound = threading.getattr("get_ident").unwrap();
-                let ident = bound.call0().unwrap();
-                thread_id = ident.extract::<u64>().unwrap();
+                if let Ok(threading) = PyModule::import(py, "threading") {
+                    if let Ok(bound) = threading.getattr("get_ident") {
+                        if let Ok(ident) = bound.call0() {
+                            thread_id = ident.extract::<u64>().unwrap_or(0);
+                        }
+                    }
+                }
             });
 
             tid = format!("{}", thread_id);

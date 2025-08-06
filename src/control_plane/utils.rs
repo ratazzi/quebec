@@ -350,7 +350,13 @@ impl ControlPlane {
             return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
         }
 
-        let tera = tera_read_result.unwrap();
+        let tera = match tera_read_result {
+            Ok(t) => t,
+            Err(e) => {
+                error!("Failed to acquire read lock: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
+            }
+        };
         let templates = tera.get_template_names().collect::<Vec<_>>();
         debug!("Available templates: {:?}", templates);
 

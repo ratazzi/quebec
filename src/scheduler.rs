@@ -204,10 +204,11 @@ where
 
     let job = job.try_into_model()?;
 
+    let task_key = entry.key.ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
     let _recurring_execution = solid_queue_recurring_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
-        task_key: ActiveValue::Set(entry.key.unwrap()),
+        task_key: ActiveValue::Set(task_key),
         run_at: ActiveValue::Set(scheduled_at),
         created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
     }
@@ -219,7 +220,7 @@ where
         use crate::semaphore::acquire_semaphore_with_constraint;
 
         // Try to acquire the semaphore using the constraint
-        if acquire_semaphore_with_constraint(db, constraint).await.unwrap() {
+        if acquire_semaphore_with_constraint(db, constraint).await? {
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
 
             // Create ready execution - job can run immediately
@@ -292,7 +293,7 @@ impl Scheduler {
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
 
         let _delta = chrono::Duration::seconds(
-            self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap(),
+            self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap_or(1),
         );
         let mut scheduled = Vec::<ScheduledEntry>::new();
         let schedule: Vec<HashMap<String, ScheduledEntry>> = match std::fs::read_to_string("schedule.yml") {
@@ -350,10 +351,21 @@ impl Scheduler {
             let handle = tokio::spawn(async move {
 
 
-                let cron = entry.as_cron();
-                let cron = cron.unwrap();
+                let cron = match entry.as_cron() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to parse cron expression for task {}: {}", task_key, e);
+                        return;
+                    }
+                };
                 let time = chrono::Local::now();
-                let mut last = cron.find_next_occurrence(&time, false).unwrap();
+                let mut last = match cron.find_next_occurrence(&time, false) {
+                    Ok(occurrence) => occurrence,
+                    Err(e) => {
+                        error!("Failed to find next occurrence for task {}: {}", task_key, e);
+                        return;
+                    }
+                };
                 info!("Starting scheduled task: {}", task_key);
 
                 loop {
@@ -363,7 +375,13 @@ impl Scheduler {
                     }
 
                     let now = chrono::Local::now();
-                    let next = cron.find_next_occurrence(&now, false).unwrap();
+                    let next = match cron.find_next_occurrence(&now, false) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!("No next occurrence found for task {}: {}", task_key, e);
+                            break;
+                        }
+                    };
                     let scheduled_at = next.naive_utc();
                     let delta = next - now;
 

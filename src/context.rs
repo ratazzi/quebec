@@ -192,7 +192,7 @@ impl AppContext {
         options: Option<HashMap<String, PyObject>>
     ) -> Self {
         let mut ctx = Self {
-            cwd: std::env::current_dir().unwrap(),
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             dsn,
             db,
             connect_options,
@@ -384,7 +384,8 @@ impl AppContext {
 
     /// Get a runnable by class name
     pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable, anyhow::Error> {
-        let runnables = self.runnables.read().unwrap();
+        let runnables = self.runnables.read()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire read lock: {}", e))?;
         let runnable = runnables.get(class_name)
             .ok_or_else(|| anyhow::anyhow!("Runnable not found for class: {}", class_name))?;
 
@@ -396,19 +397,23 @@ impl AppContext {
 
     /// Get all registered runnable class names
     pub fn get_runnable_names(&self) -> Vec<String> {
-        self.runnables.read().unwrap().keys().cloned().collect()
+        self.runnables.read()
+            .map(|r| r.keys().cloned().collect())
+            .unwrap_or_else(|_| Vec::new())
     }
 
     /// Check if a job class has concurrency control enabled
     pub fn has_concurrency_control(&self, class_name: &str) -> bool {
-        let concurrency_enabled = self.concurrency_enabled.read().unwrap();
-        concurrency_enabled.contains(class_name)
+        self.concurrency_enabled.read()
+            .map(|c| c.contains(class_name))
+            .unwrap_or(false)
     }
 
     /// Enable concurrency control for a job class
     pub fn enable_concurrency_control(&self, class_name: String) {
-        let mut concurrency_enabled = self.concurrency_enabled.write().unwrap();
-        concurrency_enabled.insert(class_name);
+        if let Ok(mut concurrency_enabled) = self.concurrency_enabled.write() {
+            concurrency_enabled.insert(class_name);
+        }
     }
 }
 

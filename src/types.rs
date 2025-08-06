@@ -180,7 +180,7 @@ static INSTANCE_MAP: GILOnceCell<RwLock<HashMap<String, Py<PyQuebec>>>> = GILOnc
 impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
-    fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> Self {
+    fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         info!("PyQuebec<{}>", url);
 
         let rt = Arc::new(
@@ -188,10 +188,10 @@ impl PyQuebec {
                 .worker_threads(16)
                 .enable_all()
                 .build()
-                .unwrap(),
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build runtime: {}", e)))?,
         );
 
-        let dsn = Url::parse(&url).unwrap();
+        let dsn = Url::parse(&url).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e)))?;
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
         let min_conns = if url.contains("sqlite") { 1 } else { 20 };
         let max_conns = if url.contains("sqlite") { 1 } else { 300 };
@@ -232,13 +232,16 @@ impl PyQuebec {
         // Convert kwargs to HashMap<String, PyObject>
         let options = if let Some(kwargs) = kwargs {
             let mut options_map = HashMap::new();
-            kwargs.iter().for_each(|(k, v)| {
-                let key = k.extract::<String>().unwrap();
+            for (k, v) in kwargs.iter() {
+                let key = k.extract::<String>()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid option key: {}", e)))?;
                 // Use Python::with_gil to get GIL
-                Python::with_gil(|py| {
-                    options_map.insert(key, v.into_pyobject(py).unwrap().into());
-                });
-            });
+                Python::with_gil(|py| -> PyResult<()> {
+                    let obj = v.into_pyobject(py)?;
+                    options_map.insert(key.clone(), obj.into());
+                    Ok(())
+                })?;
+            }
             Some(options_map)
         } else {
             None
@@ -256,7 +259,7 @@ impl PyQuebec {
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
 
-        PyQuebec {
+        Ok(PyQuebec {
             ctx,
             rt,
             url,
@@ -269,7 +272,7 @@ impl PyQuebec {
             stop_handlers,
             pyqueue_mode: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
-        }
+        })
     }
 
     // #[staticmethod]
@@ -290,14 +293,15 @@ impl PyQuebec {
     fn get_instance(py: Python<'_>, url: String) -> PyResult<Py<PyQuebec>> {
         let instance_map = INSTANCE_MAP.get_or_init(py, || RwLock::new(HashMap::new()));
 
-        let mut map = instance_map.write().unwrap();
+        let mut map = instance_map.write().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
         if let Some(instance) = map.get(&url) {
             return Ok(instance.clone());
         }
 
-        let instance = Py::new(py, PyQuebec::new(url.clone(), None))?;
-        map.insert(url, instance.clone().extract(py).unwrap());
-        Ok(instance.extract(py).unwrap())
+        let instance = Py::new(py, PyQuebec::new(url.clone(), None)?)?;
+        let cloned = instance.clone();
+        map.insert(url, cloned);
+        Ok(instance)
     }
 
     fn runner(&self) -> PyResult<()> {
@@ -306,7 +310,9 @@ impl PyQuebec {
             let _ = worker.run().await;
         });
 
-        self.handles.lock().unwrap().push(handle);
+        self.handles.lock()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+            .push(handle);
         Ok(())
     }
 
@@ -315,7 +321,7 @@ impl PyQuebec {
 
         py.allow_threads(|| {
             let ret = self.rt.block_on(async move { worker.pick_job().await });
-            Ok(ret.unwrap())
+            ret.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to pick job: {}", e)))
         })
 
 
@@ -347,16 +353,29 @@ impl PyQuebec {
                 Python::with_gil(|py| {
                     let queue = queue.bind(py);
                     // Check queue type and choose appropriate method
-                    if queue.hasattr("put_nowait").unwrap() {
-                        // Handle asyncio.Queue
-                        let put_method = queue.getattr("put_nowait").unwrap();
-                        let _ = put_method.call1((result.unwrap(),));
-                    } else if queue.hasattr("put").unwrap() {
-                        // Handle queue.Queue, multiprocessing.Queue
-                        let put_method = queue.getattr("put").unwrap();
-                        let _ = put_method.call1((result.unwrap(),));
-                    } else {
-                        error!("Unsupported queue type");
+                    match result {
+                        Ok(res) => {
+                            if queue.hasattr("put_nowait").unwrap_or(false) {
+                                // Handle asyncio.Queue
+                                if let Ok(put_method) = queue.getattr("put_nowait") {
+                                    if let Err(e) = put_method.call1((res,)) {
+                                        error!("Failed to put job to asyncio queue: {}", e);
+                                    }
+                                }
+                            } else if queue.hasattr("put").unwrap_or(false) {
+                                // Handle queue.Queue, multiprocessing.Queue
+                                if let Ok(put_method) = queue.getattr("put") {
+                                    if let Err(e) = put_method.call1((res,)) {
+                                        error!("Failed to put job to queue: {}", e);
+                                    }
+                                }
+                            } else {
+                                error!("Unsupported queue type");
+                            }
+                        },
+                        Err(e) => {
+                            debug!("No job available: {}", e);
+                        }
                     }
                 });
             }
@@ -368,15 +387,21 @@ impl PyQuebec {
                     Python::with_gil(|py| {
                         let queue = queue1.bind(py);
                         // Check queue type and choose appropriate method
-                        if queue.hasattr("close").unwrap() {
+                        if queue.hasattr("close").unwrap_or(false) {
                             // Handle asyncio.Queue
-                            let close_method = queue.getattr("close").unwrap();
-                            let _ = close_method.call0();
-                            info!("<asyncio.Queue> shutdown");
-                        } else if queue.hasattr("join").unwrap() {
+                            if let Ok(close_method) = queue.getattr("close") {
+                                if let Err(e) = close_method.call0() {
+                                    error!("Failed to close asyncio queue: {}", e);
+                                }
+                                info!("<asyncio.Queue> shutdown");
+                            }
+                        } else if queue.hasattr("join").unwrap_or(false) {
                             // Handle queue.Queue
-                            let join_method = queue.getattr("join").unwrap();
-                            let _ = join_method.call0();
+                            if let Ok(join_method) = queue.getattr("join") {
+                                if let Err(e) = join_method.call0() {
+                                    error!("Failed to join queue: {}", e);
+                                }
+                            }
                         } else {
                             error!("Unsupported queue type");
                         }
@@ -386,7 +411,9 @@ impl PyQuebec {
 
             // info!("sink job poller shutdown");
         });
-        self.handles.lock().unwrap().push(handle);
+        self.handles.lock()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+            .push(handle);
 
         Ok(())
     }
@@ -397,8 +424,10 @@ impl PyQuebec {
     //     let handle = self.rt.spawn(async move {
     //         let _ = dispatcher.post_job(job).await;
     //     });
-
-    //     self.handles.lock().unwrap().push(handle);
+    //
+    //     self.handles.lock()
+    //         .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+    //         .push(handle);
     //     Ok(())
     // }
 
@@ -487,7 +516,9 @@ impl PyQuebec {
         }
 
         {
-            self.start_handlers.write().unwrap().push(handler.clone_ref(py));
+            let mut handlers = self.start_handlers.write()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for start handlers"))?;
+            handlers.push(handler.clone_ref(py));
             trace!("Start handler registered");
         }
 
@@ -501,7 +532,9 @@ impl PyQuebec {
         }
 
         {
-            self.stop_handlers.write().unwrap().push(handler.clone_ref(py));
+            let mut handlers = self.stop_handlers.write()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for stop handlers"))?;
+            handlers.push(handler.clone_ref(py));
             trace!("Stop handler registered");
         }
 
@@ -518,9 +551,9 @@ impl PyQuebec {
         Ok(handler)
     }
 
-        fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
+    fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
         // Register with worker (this will store in AppContext.runnables)
-        let _ = self.worker.register_job_class(py, job_class).unwrap();
+        self.worker.register_job_class(py, job_class)?;
         Ok(())
     }
 
@@ -530,7 +563,7 @@ impl PyQuebec {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         let bound = klass;
-        let class_name = bound.downcast::<PyType>().unwrap().qualname().unwrap();
+        let class_name = bound.downcast::<PyType>()?.qualname()?;
 
         let mut queue_name = "default".to_string();
         if bound.hasattr("queue_as")? {
@@ -563,8 +596,8 @@ impl PyQuebec {
         };
 
         // Convert Python args and kwargs to JSON only for job arguments storage
-        let args_json = crate::utils::python_object(&args).into_json(py);
-        let kwargs_json = kwargs.map(|k| crate::utils::python_object(&k).into_json(py));
+        let args_json = crate::utils::python_object(&args).into_json(py)?;
+        let kwargs_json = kwargs.map(|k| crate::utils::python_object(&k).into_json(py)).transpose()?;
 
         // Merge args and kwargs for job arguments storage
         let mut combined_args_json = args_json.clone();
@@ -587,7 +620,8 @@ impl PyQuebec {
         }
 
         // debug!("combined_args_json: {:?}", combined_args_json);
-        let arguments = serde_json::to_string(&combined_args_json).unwrap();
+        let arguments = serde_json::to_string(&combined_args_json)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize arguments: {}", e)))?;
 
         let mut obj = instance.clone().extract::<ActiveJob>()?;
         obj.class_name = class_name.to_string();
@@ -659,7 +693,7 @@ impl PyQuebec {
 
         let handler_func = wrap_pyfunction!(signal_handler)(py)?;
         let functools = py.import("functools")?;
-        let quebec_obj: Py<PyAny> = self.clone().into_pyobject(py).unwrap().into();
+        let quebec_obj: Py<PyAny> = self.clone().into_pyobject(py)?.into();
 
         let kwargs = PyDict::new(py);
         kwargs.set_item("quebec", quebec_obj)?;
@@ -674,7 +708,7 @@ impl PyQuebec {
         signal.call_method1("signal", (signal.getattr("SIGQUIT")?, wrapped_handler.clone()))?;
 
         info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
-        Ok(wrapped_handler.into_pyobject(py).unwrap().into())
+        Ok(wrapped_handler.into_pyobject(py)?.into())
     }
 
     fn spawn_all(&mut self) -> PyResult<()> {
@@ -700,7 +734,7 @@ impl PyQuebec {
         }
 
         // Then call shutdown handlers
-        let handlers = self.shutdown_handlers.read().unwrap();
+        let handlers = self.shutdown_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
         for handler in handlers.iter() {
             debug!("Invoke shutdown handler: {:?}", handler);
             // Call the handler and log any errors, but continue to the next handler
@@ -715,7 +749,8 @@ impl PyQuebec {
         let timeout = self.ctx.shutdown_timeout;
         let quit = self.ctx.force_quit.clone();
         let handles = self.handles.clone();
-        let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let rt = Arc::new(tokio::runtime::Runtime::new()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create runtime: {}", e)))?);
 
         // Temporarily release GIL
         py.allow_threads(|| {
@@ -723,7 +758,7 @@ impl PyQuebec {
             rt.block_on(async move {
                 let result = tokio::time::timeout(timeout, async {
                     let handles = {
-                        let mut handles = handles.lock().unwrap();
+                        let mut handles = handles.lock().expect("Failed to lock handles");
                         debug!("Waiting for {} tasks to exit gracefully", handles.len());
                         handles.drain(..).collect::<Vec<_>>()
                     };
@@ -750,7 +785,7 @@ impl PyQuebec {
 
     pub fn invoke_start_handlers(&self) -> PyResult<()> {
         Python::with_gil(|py| {
-            let handlers = self.start_handlers.read().unwrap();
+            let handlers = self.start_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
             for handler in handlers.iter() {
                 if let Err(e) = handler.bind(py).call0() {
                     error!("Error calling start handler: {:?}", e);
@@ -762,7 +797,7 @@ impl PyQuebec {
 
     pub fn invoke_stop_handlers(&self) -> PyResult<()> {
         Python::with_gil(|py| {
-            let handlers = self.stop_handlers.read().unwrap();
+            let handlers = self.stop_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
             for handler in handlers.iter() {
                 if let Err(e) = handler.bind(py).call0() {
                     error!("Error calling stop handler: {:?}", e);
@@ -779,7 +814,9 @@ impl PyQuebec {
         }
 
         {
-            self.shutdown_handlers.write().unwrap().push(handler.clone_ref(py));
+            let mut handlers = self.shutdown_handlers.write()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for shutdown handlers"))?;
+            handlers.push(handler.clone_ref(py));
             debug!("Shutdown handler: {:?} registered", handler);
         }
 
@@ -796,7 +833,9 @@ impl PyQuebec {
                 Err(e) => error!("Control plane server task failed: {}", e),
             }
         });
-        self.handles.lock().unwrap().push(handle);
+        self.handles.lock()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+            .push(handle);
         Ok(())
     }
 }
@@ -960,10 +999,11 @@ impl ActiveJob {
     // }
 
     #[classmethod]
-    pub fn register_rescue_strategy(cls: &Bound<'_, PyType>, py: Python<'_>, strategy: Py<PyAny>) {
-        let strategy = strategy.extract::<RescueStrategy>(py).unwrap();
-        let rescue_strategies = cls.getattr("rescue_strategies").unwrap();
-        rescue_strategies.call_method1("append", (strategy.clone(),)).unwrap();
+    pub fn register_rescue_strategy(cls: &Bound<'_, PyType>, py: Python<'_>, strategy: Py<PyAny>) -> PyResult<()> {
+        let strategy = strategy.extract::<RescueStrategy>(py)?;
+        let rescue_strategies = cls.getattr("rescue_strategies")?;
+        rescue_strategies.call_method1("append", (strategy.clone(),))?;
+        Ok(())
         // debug!("register_rescue_strategy: {:?}", rescue_strategies);
         // debug!("register_rescue_strategy: {:?}", strategy);
     }
@@ -1016,7 +1056,7 @@ impl ActiveJob {
         cls: &Bound<'_, PyType>, py: Python<'_>, args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
-        let quebec = cls.getattr("quebec").unwrap().extract::<PyQuebec>().unwrap();
+        let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;
         // debug!("------------ {:?}", quebec);
         quebec.perform_later(py, cls, args, kwargs)
     }
