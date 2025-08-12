@@ -3,6 +3,7 @@ mod control_plane;
 mod core;
 mod dispatcher;
 mod entities;
+mod error;
 mod notify;
 mod process;
 mod scheduler;
@@ -13,6 +14,7 @@ mod utils;
 mod worker;
 
 pub use control_plane::ControlPlaneExt;
+pub use error::{QuebecError, Result};
 use context::*;
 use entities::solid_queue_claimed_executions;
 use entities::solid_queue_jobs;

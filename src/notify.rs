@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_channel_name_generation() {
-        let dsn = Url::parse("postgres://user:pass@localhost/test").unwrap();
+        let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
         let ctx = Arc::new(AppContext::new(dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
         let manager = NotifyManager::new(ctx, "default");
         assert_eq!(manager.get_channel_name(), "solid_queue_default");
@@ -204,11 +204,11 @@ mod tests {
 
     #[test]
     fn test_is_postgres_detection() {
-        let postgres_dsn = Url::parse("postgres://user:pass@localhost/test").unwrap();
+        let postgres_dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid postgres test URL");
         let postgres_ctx = Arc::new(AppContext::new(postgres_dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
         assert!(postgres_ctx.is_postgres());
 
-        let sqlite_dsn = Url::parse("sqlite://test.db").unwrap();
+        let sqlite_dsn = Url::parse("sqlite://test.db").expect("Valid sqlite test URL");
         let sqlite_ctx = Arc::new(AppContext::new(sqlite_dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
         assert!(!sqlite_ctx.is_postgres());
     }

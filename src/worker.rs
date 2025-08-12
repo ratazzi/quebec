@@ -27,39 +27,36 @@ use crate::notify::NotifyManager;
 
 
 
-fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyObject {
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
-        serde_json::Value::String(s) => s.into_pyobject(py).unwrap().into(),
+        serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into()),
         serde_json::Value::Number(n) => {
-            if n.is_i64() {
-                let val: i64 = n.as_i64().unwrap();
-                val.into_pyobject(py).unwrap().into()
-            } else if n.is_u64() {
-                let val: u64 = n.as_u64().unwrap();
-                val.into_pyobject(py).unwrap().into()
-            } else if n.is_f64() {
-                let val: f64 = n.as_f64().unwrap();
-                val.into_pyobject(py).unwrap().into()
+            if let Some(val) = n.as_i64() {
+                Ok(val.into_pyobject(py)?.into())
+            } else if let Some(val) = n.as_u64() {
+                Ok(val.into_pyobject(py)?.into())
+            } else if let Some(val) = n.as_f64() {
+                Ok(val.into_pyobject(py)?.into())
             } else {
-                py.None()
+                Ok(py.None())
             }
         }
-        serde_json::Value::Bool(b) => PyBool::new(py, *b).as_ref().into_pyobject(py).unwrap().into(),
+        serde_json::Value::Bool(b) => Ok(PyBool::new(py, *b).as_ref().into_pyobject(py)?.into()),
         serde_json::Value::Array(arr) => {
             let py_list = PyList::empty(py);
             for item in arr {
-                py_list.append(json_to_py(py, item)).unwrap();
+                py_list.append(json_to_py(py, item)?)?;
             }
-            py_list.into_pyobject(py).unwrap().into()
+            Ok(py_list.into_pyobject(py)?.into())
         }
         serde_json::Value::Object(obj) => {
             let py_dict = PyDict::new(py);
             for (key, value) in obj {
-                py_dict.set_item(key, json_to_py(py, value)).unwrap();
+                py_dict.set_item(key, json_to_py(py, value)?)?;
             }
-            py_dict.into_pyobject(py).unwrap().into()
+            Ok(py_dict.into_pyobject(py)?.into())
         }
-        serde_json::Value::Null => py.None(),
+        serde_json::Value::Null => Ok(py.None()),
     }
 }
 
@@ -75,10 +72,13 @@ async fn runner(
     if true {
         let mut thread_id: u64 = 0;
         Python::with_gil(|py| {
-            let threading = PyModule::import(py, "threading").unwrap();
-            let bound = threading.getattr("get_ident").unwrap();
-            let ident = bound.call0().unwrap();
-            thread_id = ident.extract::<u64>().unwrap();
+            if let Ok(threading) = PyModule::import(py, "threading") {
+                if let Ok(bound) = threading.getattr("get_ident") {
+                    if let Ok(ident) = bound.call0() {
+                        thread_id = ident.extract::<u64>().unwrap_or(0);
+                    }
+                }
+            }
         });
 
         tid = format!("{}", thread_id);
@@ -97,7 +97,10 @@ async fn runner(
               if execution.is_none() {
                   continue;
               }
-              let mut execution = execution.unwrap();
+              let mut execution = match execution {
+                  Some(exec) => exec,
+                  None => continue,
+              };
               execution.tid = tid.clone();
               let _job_id = execution.claimed.job_id;
 
@@ -462,7 +465,7 @@ impl Runnable {
             }
         }
 
-        let binding = json_to_py(py, &v);
+        let binding = json_to_py(py, &v)?;
         let args = binding.downcast_bound::<pyo3::types::PyList>(py)
             .map_err(|e| PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e)))?;
 
@@ -520,7 +523,7 @@ impl Runnable {
         warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
         let delay = strategy.wait;
-        let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).unwrap();
+        let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
         let failed_attempts = job.failed_attempts + 1;
 
         // Set retry information to runnable
@@ -727,7 +730,10 @@ impl Execution {
                         updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                     };
                     let saved_job = retry_job.save(txn).await?;
-                    let new_job_id = saved_job.id.clone().unwrap();
+                    let new_job_id = match saved_job.id.clone() {
+                        ActiveValue::Set(id) => id,
+                        _ => return Err(DbErr::Custom("Failed to get job ID after save".into())),
+                    };
 
                     // Create scheduled_execution record
                     let scheduled_execution = solid_queue_scheduled_executions::ActiveModel {
@@ -752,7 +758,7 @@ impl Execution {
                     let failed_execution = solid_queue_failed_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         job_id: ActiveValue::Set(job_id),
-                        error: ActiveValue::Set(Some(err.unwrap().to_string())),
+                        error: ActiveValue::Set(err.map(|e| e.to_string())),
                         created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                     };
                     failed_execution.save(txn).await?;
@@ -783,12 +789,12 @@ impl Execution {
         .await
         .map(|job| {
             let duration = self.timer.elapsed();
-            let job_model = job.try_into_model().unwrap();
-
-            if job_model.finished_at.is_none() {
-                error!("Job `{}' processed in: {:?}", class_name, duration);
-            } else {
-                debug!("Job `{}' processed in: {:?}", class_name, duration)
+            if let Ok(job_model) = job.try_into_model() {
+                if job_model.finished_at.is_none() {
+                    error!("Job `{}' processed in: {:?}", class_name, duration);
+                } else {
+                    debug!("Job `{}' processed in: {:?}", class_name, duration)
+                }
             }
         })
         .map_err(|e| {
@@ -837,7 +843,7 @@ impl Execution {
     }
 
     fn perform(&mut self) -> PyResult<()> {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create runtime: {}", e)))?;
         let ret = rt.block_on(async { self.invoke().await });
 
         if let Err(e) = ret {
@@ -850,7 +856,13 @@ impl Execution {
 
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
         let result = if exc.is_instance_of::<PyException>() {
-            let e = exc.downcast::<PyException>().unwrap();
+            let e = match exc.downcast::<PyException>() {
+                Ok(ex) => ex,
+                Err(_) => {
+                    error!("Failed to downcast exception");
+                    return;
+                }
+            };
             error!("error: {:?}", e);
             debug!("is PyException: {:?}", e.is_instance_of::<PyException>());
             // debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
@@ -862,23 +874,23 @@ impl Execution {
             //     backtrace = tb.format().unwrap().to_string().lines().map(String::from).collect();
             // }
 
-            error!("error_type: {}", e.get_type().str().unwrap().to_string());
+            error!("error_type: {}", e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string()));
             error!("error_description: {}", e.to_string());
 
             let error_payload = serde_json::json!({
-                "exception_class": e.get_type().str().unwrap().to_string(),
+                "exception_class": e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string()),
                 "message": e.to_string(),
                 "backtrace": backtrace,
             });
 
-            Err(anyhow::anyhow!(serde_json::to_string(&error_payload).unwrap()))
+            Err(anyhow::anyhow!(serde_json::to_string(&error_payload).unwrap_or_else(|_| "Error serialization failed".to_string())))
         } else {
             // info!("Job done");
             Ok(self.job.clone())
         };
 
         py.allow_threads(|| {
-            let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+            let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create runtime"));
             rt.block_on(async move {
                 let ret = self.after_executed(result).await;
                 debug!("Job result post: {:?}", ret);
@@ -892,9 +904,10 @@ impl Execution {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
         let args: serde_json::Value =
-            serde_json::from_str(job.arguments.unwrap().as_str()).unwrap();
-        let e = exc.downcast::<PyException>().unwrap();
-        let error_type = e.get_type().qualname().unwrap().to_string();
+            serde_json::from_str(job.arguments.as_ref().ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Job arguments missing"))?.as_str())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid job arguments: {}", e)))?;
+        let e = exc.downcast::<PyException>()?;
+        let error_type = e.get_type().qualname().map(|q| q.to_string()).unwrap_or_else(|_| "Unknown".to_string());
 
         let params = serde_json::json!({
             "job_class": job.class_name,
@@ -922,7 +935,7 @@ impl Execution {
         }
 
         py.allow_threads(|| {
-            let rt = Arc::new(tokio::runtime::Runtime::new().unwrap());
+            let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create runtime"));
             let span = span.clone();
             let job = rt.block_on(
                 async {
@@ -945,7 +958,7 @@ impl Execution {
                                 arguments: ActiveValue::Set(Some(params.to_string())),
                                 priority: ActiveValue::Set(job.priority),
                                 failed_attempts: ActiveValue::Set(job.failed_attempts + 1),
-                                active_job_id: ActiveValue::Set(Some(job.active_job_id.unwrap())),
+                                active_job_id: ActiveValue::Set(job.active_job_id.clone()),
                                 scheduled_at: ActiveValue::Set(Some(scheduled_at)),
                                 finished_at: ActiveValue::Set(None),
                                 concurrency_key: ActiveValue::Set(Some(concurrency_key.clone())),
@@ -955,13 +968,22 @@ impl Execution {
                             .save(txn)
                             .await?;
 
-                            let job_id = job.id.clone().unwrap();
+                            let job_id = match job.id.clone() {
+                                ActiveValue::Set(id) => id,
+                                _ => return Err(DbErr::Custom("Failed to get job ID".into())),
+                            };
                             let _scheduled_execution =
                                 solid_queue_scheduled_executions::ActiveModel {
                                     id: ActiveValue::not_set(),
                                     job_id: ActiveValue::Set(job_id),
-                                    queue_name: ActiveValue::Set(job.queue_name.clone().unwrap()),
-                                    priority: ActiveValue::Set(job.priority.clone().unwrap()),
+                                    queue_name: match job.queue_name.clone() {
+                                        ActiveValue::Set(q) => ActiveValue::Set(q),
+                                        _ => return Err(DbErr::Custom("Queue name missing".into())),
+                                    },
+                                    priority: match job.priority.clone() {
+                                        ActiveValue::Set(p) => ActiveValue::Set(p),
+                                        _ => return Err(DbErr::Custom("Priority missing".into())),
+                                    },
                                     scheduled_at: ActiveValue::Set(scheduled_at),
                                     created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                                 }
@@ -979,7 +1001,7 @@ impl Execution {
 
             // debug!("scheduled: {:?}", job);
             if job.is_err() {
-                error!("Job `{}' failed to schedule", job.err().unwrap());
+                error!("Job failed to schedule: {:?}", job.err());
             }
         });
 
@@ -1035,7 +1057,9 @@ impl Worker {
         }
 
         {
-            self.start_handlers.write().unwrap().push(handler.clone_ref(py));
+            if let Ok(mut handlers) = self.start_handlers.write() {
+                handlers.push(handler.clone_ref(py));
+            }
             debug!("Worker start handler: {:?} registered", handler);
         }
 
@@ -1049,7 +1073,9 @@ impl Worker {
         }
 
         {
-            self.stop_handlers.write().unwrap().push(handler.clone_ref(py));
+            if let Ok(mut handlers) = self.stop_handlers.write() {
+                handlers.push(handler.clone_ref(py));
+            }
             debug!("Worker stop handler: {:?} registered", handler);
         }
 
@@ -1068,32 +1094,32 @@ impl Worker {
     // }
 
     pub fn register_job_class(&self, _py: Python, klass: Py<PyAny>) -> PyResult<()> {
-        Python::with_gil(|py| {
+        Python::with_gil(|py| -> PyResult<()> {
             let bound = klass.bind(py);
-            let class_name = bound.downcast::<PyType>().unwrap().qualname().unwrap();
+            let class_name = bound.downcast::<PyType>()?.qualname()?;
             debug!("Registered job class: {:?}", class_name);
 
             let mut queue_name = "default".to_string();
-            if bound.hasattr("queue_as").unwrap() {
-                queue_name = bound.getattr("queue_as").unwrap().extract::<String>().unwrap();
+            if bound.hasattr("queue_as")? {
+                queue_name = bound.getattr("queue_as")?.extract::<String>()?;
             }
 
             let mut concurrency_limit: Option<i32> = None;
             let mut concurrency_duration: Option<i32> = None;
 
             // Extract concurrency_limit if exists
-            if bound.hasattr("concurrency_limit").unwrap() {
-                concurrency_limit = Some(bound.getattr("concurrency_limit").unwrap().extract::<i32>().unwrap());
+            if bound.hasattr("concurrency_limit")? {
+                concurrency_limit = Some(bound.getattr("concurrency_limit")?.extract::<i32>()?);
             }
 
             // Extract concurrency_duration if exists (convert to seconds)
-            if bound.hasattr("concurrency_duration").unwrap() {
-                concurrency_duration = Some(bound.getattr("concurrency_duration").unwrap().extract::<i32>().unwrap());
+            if bound.hasattr("concurrency_duration")? {
+                concurrency_duration = Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
             }
 
             // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)
-            let has_concurrency_control = if bound.hasattr("concurrency_key").unwrap() {
-                let concurrency_key_attr = bound.getattr("concurrency_key").unwrap();
+            let has_concurrency_control = if bound.hasattr("concurrency_key")? {
+                let concurrency_key_attr = bound.getattr("concurrency_key")?;
                 if concurrency_key_attr.is_none() {
                     false
                 } else if concurrency_key_attr.is_callable() {
@@ -1121,14 +1147,16 @@ impl Worker {
             };
             info!("Registered job: {:?}", runnable);
 
-            self.ctx.runnables.write().unwrap().insert(class_name.to_string(), runnable);
+            if let Ok(mut runnables) = self.ctx.runnables.write() {
+                runnables.insert(class_name.to_string(), runnable);
+            }
 
             // Only store concurrency info if concurrency control is actually enabled
             if has_concurrency_control {
                 self.ctx.enable_concurrency_control(class_name.to_string());
             }
-        });
-        Ok(())
+            Ok(())
+        })
     }
 
     pub async fn claim_job(&self) -> Result<solid_queue_claimed_executions::Model, anyhow::Error> {
@@ -1170,9 +1198,9 @@ impl Worker {
                         }
                         .save(txn)
                         .await
-                        .unwrap();
+                        ?;
 
-                        execution.delete(txn).await.unwrap();
+                        execution.delete(txn).await?;
                         Ok(claimed)
                     } else {
                         Err(DbErr::Custom("No job found".into()))
@@ -1274,7 +1302,7 @@ impl Worker {
                         }
                         .save(txn)
                         .await
-                        .unwrap();
+                        ?;
 
                         execution.delete(txn).await?;
                         claimed_jobs.push(claimed);
@@ -1291,7 +1319,7 @@ impl Worker {
     }
 
     pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
-        // 不在这里获取长期连接，而是在每次需要时获取
+        // Don't acquire long-term connections here, get them when needed
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         let worker_threads = self.ctx.worker_threads;
@@ -1330,7 +1358,7 @@ impl Worker {
 
         // Call worker start handlers before starting the main loop
         Python::with_gil(|py| {
-            let handlers = self.start_handlers.read().unwrap();
+            let handlers = self.start_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker start handler executed successfully in main loop"),
@@ -1351,7 +1379,7 @@ impl Worker {
 
                     // Call worker stop handlers before exiting
                     Python::with_gil(|py| {
-                        let handlers = self.stop_handlers.read().unwrap();
+                        let handlers = self.stop_handlers.read().expect("Lock poisoned");
                         for handler in handlers.iter() {
                             match handler.bind(py).call0() {
                                 Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
@@ -1378,7 +1406,10 @@ impl Worker {
                     if notify_msg.is_some() {
                         // Simple batching: consume additional immediate messages
                         let mut total_notifies = 1;
-                        while let Ok(_) = notify_rx.as_mut().unwrap().try_recv() {
+                        while let Some(rx) = notify_rx.as_mut() {
+                            if rx.try_recv().is_err() {
+                                break;
+                            }
                             total_notifies += 1;
                         }
 
@@ -1424,7 +1455,10 @@ impl Worker {
             return;
         }
 
-        let claimed = claimed.unwrap();
+        let claimed = match claimed {
+            Ok(c) => c,
+            Err(_) => return,
+        };
         if claimed.is_empty() {
             // debug!("[{}] no jobs available", source);
             return;
@@ -1471,7 +1505,10 @@ impl Worker {
                 continue;
             }
 
-            let execution = Execution::new(ctx.clone(), row, job, runnable.unwrap());
+            let execution = match runnable {
+                Ok(r) => Execution::new(ctx.clone(), row, job, r),
+                Err(_) => continue,
+            };
 
             // Send execution to worker thread - this may block but no database connections are held
             if let Err(e) = tx.lock().await.send(execution).await {
@@ -1489,7 +1526,7 @@ impl Worker {
 
         // Call worker start handlers
         Python::with_gil(|py| {
-            let handlers = self.start_handlers.read().unwrap();
+            let handlers = self.start_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker start handler executed successfully"),
@@ -1504,7 +1541,7 @@ impl Worker {
 
         // Call worker stop handlers
         Python::with_gil(|py| {
-            let handlers = self.stop_handlers.read().unwrap();
+            let handlers = self.stop_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker stop handler executed successfully"),
@@ -1523,7 +1560,7 @@ impl Worker {
         if execution.is_none() {
             return Err(anyhow::Error::msg("No job found"));
         }
-        let execution = execution.unwrap();
+        let execution = execution.ok_or_else(|| anyhow::Error::msg("No job found"))?;
         Ok(execution)
     }
 

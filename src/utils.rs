@@ -40,34 +40,42 @@ pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResu
 }
 
 /// Convert Python object to JSON value
-pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> Value {
+pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyInt>() {
-        Value::Number(obj.extract::<i64>().unwrap().into())
+        Ok(Value::Number(obj.extract::<i64>()?.into()))
     } else if obj.is_instance_of::<PyFloat>() {
-        Value::Number(serde_json::Number::from_f64(obj.extract::<f64>().unwrap()).unwrap())
+        let f = obj.extract::<f64>()?;
+        Ok(Value::Number(serde_json::Number::from_f64(f)
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid float value"))?))
     } else if obj.is_instance_of::<PyString>() {
-        Value::String(obj.extract::<String>().unwrap())
-            } else if obj.is_instance_of::<PyDict>() {
-            let dict = obj.downcast::<PyDict>().unwrap();
-            let mut map = serde_json::Map::new();
-            for (key, value) in dict {
-                let key: String = key.extract().unwrap();
-                let value = python_to_json_value(py, &value);
-                map.insert(key, value);
-            }
-            Value::Object(map)
-        } else if obj.is_instance_of::<PyList>() {
-            let list = obj.downcast::<PyList>().unwrap();
-            let vec: Vec<Value> = list.iter().map(|item| python_to_json_value(py, &item)).collect();
-            Value::Array(vec)
-        } else if obj.is_instance_of::<PyTuple>() {
-            let tuple = obj.downcast::<PyTuple>().unwrap();
-            let vec: Vec<Value> = tuple.iter().map(|item| python_to_json_value(py, &item)).collect();
-            Value::Array(vec)
+        Ok(Value::String(obj.extract::<String>()?))
+    } else if obj.is_instance_of::<PyDict>() {
+        let dict = obj.downcast::<PyDict>()?;
+        let mut map = serde_json::Map::new();
+        for (key, value) in dict {
+            let key: String = key.extract()?;
+            let value = python_to_json_value(py, &value)?;
+            map.insert(key, value);
+        }
+        Ok(Value::Object(map))
+    } else if obj.is_instance_of::<PyList>() {
+        let list = obj.downcast::<PyList>()?;
+        let mut vec = Vec::new();
+        for item in list.iter() {
+            vec.push(python_to_json_value(py, &item)?);
+        }
+        Ok(Value::Array(vec))
+    } else if obj.is_instance_of::<PyTuple>() {
+        let tuple = obj.downcast::<PyTuple>()?;
+        let mut vec = Vec::new();
+        for item in tuple.iter() {
+            vec.push(python_to_json_value(py, &item)?);
+        }
+        Ok(Value::Array(vec))
     } else if obj.is_none() {
-        Value::Null
+        Ok(Value::Null)
     } else {
-        panic!("Unsupported Python type")
+        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("Unsupported Python type"))
     }
 }
 
@@ -185,7 +193,7 @@ impl<'a> PythonObject<'a> {
     /// Convert Python object to JSON value using idiomatic Rust pattern
     ///
     /// This method provides a more ergonomic API compared to the standalone function
-    pub fn into_json(self, py: Python) -> Value {
+    pub fn into_json(self, py: Python) -> PyResult<Value> {
         python_to_json_value(py, self.0)
     }
 }

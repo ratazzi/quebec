@@ -94,7 +94,7 @@ pub fn list_templates() -> Vec<String> {
             .filter_map(|path| {
                 let path_str = path.as_ref();
                 if path_str.starts_with("templates/") && path_str.ends_with(".html") {
-                    Some(path_str.strip_prefix("templates/").unwrap().to_string())
+                    path_str.strip_prefix("templates/").map(|s| s.to_string())
                 } else {
                     None
                 }

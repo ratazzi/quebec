@@ -98,7 +98,7 @@ impl Dispatcher {
                                   .one(txn)
                                   .await?;
 
-                                                            if let Some(execution) = blocked_execution {
+                              if let Some(execution) = blocked_execution {
                                   // Get the job to access concurrency information (like original Solid Queue)
                                   let job = solid_queue_jobs::Entity::find_by_id(execution.job_id)
                                       .one(txn)
@@ -107,7 +107,13 @@ impl Dispatcher {
                                   if let Some(job) = job {
                                       // Get concurrency_limit from registered runnable
                                       let concurrency_limit = {
-                                          let runnables = ctx.runnables.read().unwrap();
+                                          let runnables = match ctx.runnables.read() {
+                                              Ok(r) => r,
+                                              Err(e) => {
+                                                  warn!("Failed to acquire read lock: {}", e);
+                                                  continue;
+                                              }
+                                          };
                                           runnables.get(&job.class_name)
                                               .and_then(|runnable| runnable.concurrency_limit)
                                               .unwrap_or(1) // Default to 1 if not found
@@ -160,7 +166,7 @@ impl Dispatcher {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
                               return Ok(());
                           }
-                          let scheduled_executions = scheduled_executions.unwrap();
+                          let scheduled_executions = scheduled_executions?;
                           let size = scheduled_executions.len();
 
                           for scheduled_execution in scheduled_executions {
