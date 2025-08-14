@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -182,6 +183,7 @@ pub struct AppContext {
     pub force_quit: CancellationToken,
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
+    pub runtime_handle: Option<Handle>,
 }
 
 impl AppContext {
@@ -213,6 +215,7 @@ impl AppContext {
             force_quit: CancellationToken::new(),
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
+            runtime_handle: None,
         };
 
         // Override default configuration if options are provided
@@ -330,6 +333,14 @@ impl AppContext {
         }
 
         ctx
+    }
+
+    pub fn set_runtime_handle(&mut self, handle: Handle) {
+        self.runtime_handle = Some(handle);
+    }
+
+    pub fn get_runtime_handle(&self) -> Option<Handle> {
+        self.runtime_handle.clone()
     }
 
     // New method that returns Result type, allowing callers to handle errors
