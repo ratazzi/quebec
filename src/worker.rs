@@ -821,6 +821,11 @@ impl Execution {
     }
 
     #[getter]
+    fn get_jid(&self) -> i64 {
+        self.job.id
+    }
+
+    #[getter]
     fn get_tid(&self) -> String {
         self.tid.clone()
     }
