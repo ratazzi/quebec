@@ -374,37 +374,43 @@ impl Scheduler {
                         break;
                     }
 
-                    let now = chrono::Local::now();
-                    let next = match cron.find_next_occurrence(&now, false) {
+                    // Capture both time domains: wall clock for cron and monotonic for sleeping
+                    let now_monotonic = tokio::time::Instant::now();
+                    let now_wall = chrono::Local::now();
+
+                    let next_wall = match cron.find_next_occurrence(&now_wall, false) {
                         Ok(n) => n,
                         Err(e) => {
                             warn!("No next occurrence found for task {}: {}", task_key, e);
                             break;
                         }
                     };
-                    let scheduled_at = next.naive_utc();
-                    let delta = next - now;
+                    let scheduled_at = next_wall.naive_utc();
 
-                    if next == last {
+                    if next_wall == last {
                         continue;
                     } else {
-                        last = next;
+                        last = next_wall;
                     }
 
-                    trace!("next: {:?}", next);
+                    trace!("next_wall: {:?}", next_wall);
 
-                    // If delta is zero, set a minimum sleep time
-                    let sleep_duration = if delta.num_seconds() <= 0 {
-                        tokio::time::Duration::from_secs(2)
-                    } else {
-                        tokio::time::Duration::from_millis(delta.num_milliseconds() as u64)
-                    };
+                    // Compute a fixed deadline on the monotonic clock to avoid drift
+                    let delay = (next_wall - now_wall).to_std().unwrap_or_else(|_| {
+                        warn!(
+                            r"Could not convert negative duration to std::time::Duration for task {}. \
+                             This can happen due to system time changes (e.g., NTP sync, DST). \
+                             Falling back to a 2-second delay.",
+                            task_key
+                        );
+                        std::time::Duration::from_secs(2)
+                    });
+                    let deadline = now_monotonic + delay;
 
-                    trace!("Job({:?}) next tick: {:?}", &task_key, next);
+                    trace!("Job({:?}) next tick at: {:?}", &task_key, next_wall);
 
                     tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {
-                        }
+                        _ = tokio::time::sleep_until(deadline) => { }
                         _ = graceful_shutdown.cancelled() => {
                             info!("Scheduler task for {} cancelled during sleep", task_key);
                             return;
