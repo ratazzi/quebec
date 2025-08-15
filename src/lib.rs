@@ -41,10 +41,18 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
 
+        // Check for QUEBEC_COLOR environment variable to override ANSI detection
+        let use_ansi = match std::env::var("QUEBEC_COLOR").as_deref() {
+            Ok("always") => true,
+            Ok("never") => false,
+            _ => atty::is(atty::Stream::Stdout), // default behavior
+        };
+
         let subscriber = tracing_subscriber::FmtSubscriber::builder()
             .with_max_level(tracing::Level::DEBUG)
             .with_env_filter(env_filter)
             .with_line_number(true)
+            .with_ansi(use_ansi)
             .finish();
 
         tracing::subscriber::set_global_default(subscriber)
