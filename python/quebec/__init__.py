@@ -4,8 +4,9 @@ import time
 import queue
 import threading
 from functools import wraps
-from typing import Callable, List, Tuple, Type, Any
+from typing import Callable, List, Tuple, Type, Any, Optional
 import dataclasses
+from .logger import job_id_var
 
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
@@ -53,16 +54,16 @@ class ThreadedRunner:
                 self.queue.task_done()
                 self.execution.tid = str(threading.get_ident())
 
-                # 错误处理现在完全在 Rust 层面进行
+                # Inject job_id into the context before execution, clean up after execution.
+                token = job_id_var.set(str(self.execution.jid))
                 self.execution.perform()
                 logger.debug(self.execution.metric)
-
+                job_id_var.reset(token)
             except queue.Empty:
                 time.sleep(0.1)
             except (queue.ShutDown, KeyboardInterrupt) as e:
                 break
             except Exception as e:
-                # 所有异常都应该在 Rust 层面处理，这里只记录未预期的错误
                 logger.error(f"Unexpected exception in ThreadedRunner: {e}", exc_info=True)
             finally:
                 self.cleanup()
