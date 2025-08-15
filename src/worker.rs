@@ -843,8 +843,10 @@ impl Execution {
     }
 
     fn perform(&mut self) -> PyResult<()> {
-        let rt = tokio::runtime::Runtime::new().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create runtime: {}", e)))?;
-        let ret = rt.block_on(async { self.invoke().await });
+        // Reuse the shared runtime handle when blocking on async work
+        let handle = self.ctx.get_runtime_handle()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Tokio runtime handle not initialized"))?;
+        let ret = handle.block_on(async { self.invoke().await });
 
         if let Err(e) = ret {
             return Err(e.into());
@@ -890,11 +892,15 @@ impl Execution {
         };
 
         py.allow_threads(|| {
-            let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create runtime"));
-            rt.block_on(async move {
-                let ret = self.after_executed(result).await;
-                debug!("Job result post: {:?}", ret);
-            });
+            // Use the shared runtime to run the async post handler
+            if let Some(handle) = self.ctx.get_runtime_handle() {
+                handle.block_on(async move {
+                    let ret = self.after_executed(result).await;
+                    debug!("Job result post: {:?}", ret);
+                });
+            } else {
+                error!("Tokio runtime handle not initialized; cannot post job result");
+            }
         });
     }
 
@@ -935,10 +941,9 @@ impl Execution {
         }
 
         py.allow_threads(|| {
-            let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to create runtime"));
             let span = span.clone();
-            let job = rt.block_on(
-                async {
+            let job = self.ctx.get_runtime_handle()
+                .map(|h| h.block_on(async {
                     warn!(
                         "Attempt {} scheduled due to `{}' on {:?}",
                         format!("#{}", job.failed_attempts + 1).bright_purple(),
@@ -996,8 +1001,8 @@ impl Execution {
                     })
                     .await
                 }
-                .instrument(span),
-            );
+                .instrument(span)))
+                .unwrap_or_else(|| Err(sea_orm::TransactionError::Connection(DbErr::Custom("Runtime handle unavailable".into()))));
 
             // debug!("scheduled: {:?}", job);
             if job.is_err() {

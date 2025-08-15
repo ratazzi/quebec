@@ -248,8 +248,10 @@ impl PyQuebec {
         };
 
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
-        // All parameters have been processed in AppContext.new
+        // Bind the runtime handle so other parts can reuse the single runtime
+        _ctx.set_runtime_handle(rt.handle().clone());
 
+        // All parameters have been processed in AppContext.new
         let ctx = Arc::new(_ctx);
         let quebec = Arc::new(Quebec::new(ctx.clone()));
         let worker = Arc::new(Worker::new(ctx.clone()));
@@ -749,8 +751,7 @@ impl PyQuebec {
         let timeout = self.ctx.shutdown_timeout;
         let quit = self.ctx.force_quit.clone();
         let handles = self.handles.clone();
-        let rt = Arc::new(tokio::runtime::Runtime::new()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create runtime: {}", e)))?);
+        let rt = self.rt.clone();
 
         // Temporarily release GIL
         py.allow_threads(|| {
