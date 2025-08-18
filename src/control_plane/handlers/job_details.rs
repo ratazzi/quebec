@@ -33,7 +33,6 @@ impl ControlPlane {
                     j.created_at,
                     j.finished_at,
                     j.arguments,
-                    j.solid_queue_job_metadata,
                     CASE
                         WHEN j.finished_at IS NOT NULL THEN 'finished'
                         WHEN c.id IS NOT NULL THEN 'processing'
@@ -70,7 +69,7 @@ impl ControlPlane {
             let status: String = row.try_get("", "status").unwrap_or_default();
             let arguments: Option<String> = row.try_get("", "arguments").ok();
             let error: Option<String> = row.try_get("", "error_message").ok();
-            let context: Option<String> = row.try_get("", "solid_queue_job_metadata").ok();
+            let context: Option<String> = None; // No metadata field in current schema
 
             // Parse creation time
             let created_at = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));

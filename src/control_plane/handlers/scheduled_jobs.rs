@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, Statement, DbBackend, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
 use tracing::{debug, info, error};
 
-use crate::entities::{solid_queue_jobs, solid_queue_scheduled_executions};
+use crate::entities::{quebec_jobs, quebec_scheduled_executions};
 use crate::control_plane::{ControlPlane, models::{Pagination, ScheduledJobInfo}};
 
 impl ControlPlane {
@@ -156,26 +156,26 @@ impl ControlPlane {
         let txn_result = db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find scheduled execution record to cancel
-                let scheduled_execution = solid_queue_scheduled_executions::Entity::find_by_id(id)
+                let scheduled_execution = quebec_scheduled_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?;
 
                 if let Some(execution) = scheduled_execution {
                     // First mark job as completed
-                    let job_result = solid_queue_jobs::Entity::find_by_id(execution.job_id)
+                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
                         .one(txn)
                         .await?;
 
                     if let Some(job) = job_result {
                         // Update job status to completed
-                        let mut job_model: solid_queue_jobs::ActiveModel = job.into();
+                        let mut job_model: quebec_jobs::ActiveModel = job.into();
                         job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
                     // Delete scheduled_execution record
-                    solid_queue_scheduled_executions::Entity::delete_by_id(id)
+                    quebec_scheduled_executions::Entity::delete_by_id(id)
                         .exec(txn)
                         .await?;
 

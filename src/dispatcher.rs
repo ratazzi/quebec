@@ -59,9 +59,9 @@ impl Dispatcher {
                     let _ = polling_db.transaction::<_, (), DbErr>(|txn| {
                         Box::pin(async move {
                           // Clean up expired semaphores
-                          let expired_semaphores_result = solid_queue_semaphores::Entity::delete_many()
+                          let expired_semaphores_result = quebec_semaphores::Entity::delete_many()
                               .filter(
-                                  solid_queue_semaphores::Column::ExpiresAt.lt(chrono::Utc::now().naive_utc())
+                                  quebec_semaphores::Column::ExpiresAt.lt(chrono::Utc::now().naive_utc())
                               )
                               .exec(txn)
                               .await?;
@@ -89,7 +89,7 @@ impl Dispatcher {
                               let concurrency_key = row.try_get::<String>("", "concurrency_key")
                                   .map_err(|e| DbErr::Custom(format!("Failed to get concurrency_key: {}", e)))?;
 
-                              let blocked_execution = solid_queue_blocked_executions::Entity::find()
+                              let blocked_execution = quebec_blocked_executions::Entity::find()
                                   .from_raw_sql(Statement::from_sql_and_values(
                                       txn.get_database_backend(),
                                       r#"SELECT * FROM "solid_queue_blocked_executions" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#,
@@ -100,7 +100,7 @@ impl Dispatcher {
 
                               if let Some(execution) = blocked_execution {
                                   // Get the job to access concurrency information (like original Solid Queue)
-                                  let job = solid_queue_jobs::Entity::find_by_id(execution.job_id)
+                                  let job = quebec_jobs::Entity::find_by_id(execution.job_id)
                                       .one(txn)
                                       .await?;
 
@@ -125,7 +125,7 @@ impl Dispatcher {
                                               info!("Semaphore acquired for key: {}", concurrency_key);
 
                                               // Move blocked execution to ready execution
-                                              let ready_execution = solid_queue_ready_executions::ActiveModel {
+                                              let ready_execution = quebec_ready_executions::ActiveModel {
                                                   id: ActiveValue::NotSet,
                                                   queue_name: ActiveValue::Set("default".to_string()),
                                                   job_id: ActiveValue::Set(execution.job_id),
@@ -136,7 +136,7 @@ impl Dispatcher {
                                               ready_execution.save(txn).await?;
 
                                               // Remove from blocked executions
-                                              solid_queue_blocked_executions::Entity::delete_by_id(execution.id)
+                                              quebec_blocked_executions::Entity::delete_by_id(execution.id)
                                                   .exec(txn)
                                                   .await?;
 
@@ -157,8 +157,8 @@ impl Dispatcher {
 
                           // Dispatch scheduled jobs
                           let now = chrono::Utc::now().naive_utc();
-                          let scheduled_executions = solid_queue_scheduled_executions::Entity::find()
-                              .filter(solid_queue_scheduled_executions::Column::ScheduledAt.lt(now))
+                          let scheduled_executions = quebec_scheduled_executions::Entity::find()
+                              .filter(quebec_scheduled_executions::Column::ScheduledAt.lt(now))
                               .all(txn)
                               .await;
 
@@ -170,7 +170,7 @@ impl Dispatcher {
                           let size = scheduled_executions.len();
 
                           for scheduled_execution in scheduled_executions {
-                              let _ = solid_queue_ready_executions::ActiveModel {
+                              let _ = quebec_ready_executions::ActiveModel {
                                   id: ActiveValue::NotSet,
                                   queue_name: ActiveValue::Set("default".to_string()),
                                   job_id: ActiveValue::Set(scheduled_execution.job_id),
@@ -180,7 +180,7 @@ impl Dispatcher {
                               .save(txn)
                               .await?;
 
-                              solid_queue_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
+                              quebec_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
                                   .exec(txn)
                                   .await?;
                           }

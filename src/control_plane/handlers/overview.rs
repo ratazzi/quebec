@@ -10,7 +10,7 @@ use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, ConnectionTrait, Statement,
 use chrono::NaiveDateTime;
 use tracing::{debug, instrument};
 
-use crate::entities::{solid_queue_jobs, solid_queue_processes, solid_queue_failed_executions, solid_queue_pauses};
+use crate::entities::{quebec_jobs, quebec_processes, quebec_failed_executions, quebec_pauses};
 use crate::control_plane::ControlPlane;
 
 impl ControlPlane {
@@ -34,18 +34,18 @@ impl ControlPlane {
         let previous_period_start = period_start - chrono::Duration::hours(hours);
 
         // Get total number of completed jobs in current period
-        let total_jobs_processed = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
-            .filter(solid_queue_jobs::Column::FinishedAt.gt(period_start))
+        let total_jobs_processed = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
+            .filter(quebec_jobs::Column::FinishedAt.gt(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get total number of completed jobs in previous period for calculating change rate
-        let previous_jobs_processed = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
-            .filter(solid_queue_jobs::Column::FinishedAt.gt(previous_period_start))
-            .filter(solid_queue_jobs::Column::FinishedAt.lte(period_start))
+        let previous_jobs_processed = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
+            .filter(quebec_jobs::Column::FinishedAt.gt(previous_period_start))
+            .filter(quebec_jobs::Column::FinishedAt.lte(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -113,8 +113,8 @@ impl ControlPlane {
         };
 
         // Get number of active workers
-        let active_workers = solid_queue_processes::Entity::find()
-            .filter(solid_queue_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)))
+        let active_workers = quebec_processes::Entity::find()
+            .filter(quebec_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -126,14 +126,14 @@ impl ControlPlane {
         let active_workers_change = active_workers as i32 - prev_active_workers as i32;
 
         // Calculate failure rate
-        let failed_jobs = solid_queue_failed_executions::Entity::find()
-            .filter(solid_queue_failed_executions::Column::CreatedAt.gt(period_start))
+        let failed_jobs = quebec_failed_executions::Entity::find()
+            .filter(quebec_failed_executions::Column::CreatedAt.gt(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let total_jobs = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::CreatedAt.gt(period_start))
+        let total_jobs = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::CreatedAt.gt(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -145,16 +145,16 @@ impl ControlPlane {
         };
 
         // Get failure rate of previous period
-        let prev_failed_jobs = solid_queue_failed_executions::Entity::find()
-            .filter(solid_queue_failed_executions::Column::CreatedAt.gt(previous_period_start))
-            .filter(solid_queue_failed_executions::Column::CreatedAt.lte(period_start))
+        let prev_failed_jobs = quebec_failed_executions::Entity::find()
+            .filter(quebec_failed_executions::Column::CreatedAt.gt(previous_period_start))
+            .filter(quebec_failed_executions::Column::CreatedAt.lte(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let prev_total_jobs = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::CreatedAt.gt(previous_period_start))
-            .filter(solid_queue_jobs::Column::CreatedAt.lte(period_start))
+        let prev_total_jobs = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::CreatedAt.gt(previous_period_start))
+            .filter(quebec_jobs::Column::CreatedAt.lte(period_start))
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -188,10 +188,10 @@ impl ControlPlane {
             time_labels.push(end_time.format(format_string).to_string());
 
             // Query number of jobs completed in this time period
-            let period_jobs = solid_queue_jobs::Entity::find()
-                .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
-                .filter(solid_queue_jobs::Column::FinishedAt.gt(start_time))
-                .filter(solid_queue_jobs::Column::FinishedAt.lte(end_time))
+            let period_jobs = quebec_jobs::Entity::find()
+                .filter(quebec_jobs::Column::FinishedAt.is_not_null())
+                .filter(quebec_jobs::Column::FinishedAt.gt(start_time))
+                .filter(quebec_jobs::Column::FinishedAt.lte(end_time))
                 .count(db)
                 .await
                 .unwrap_or(0);
@@ -252,7 +252,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get paused queues
-        let paused_queues = solid_queue_pauses::Entity::find()
+        let paused_queues = quebec_pauses::Entity::find()
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

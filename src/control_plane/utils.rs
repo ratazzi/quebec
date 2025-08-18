@@ -6,7 +6,7 @@ use tera::Context;
 use tracing::{error, debug, info};
 use axum::http::StatusCode;
 
-use crate::entities::{solid_queue_jobs, solid_queue_pauses, solid_queue_processes};
+use crate::entities::{quebec_jobs, quebec_pauses, quebec_processes};
 
 use super::templates;
 use super::ControlPlane;
@@ -62,11 +62,11 @@ impl ControlPlane {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
         
-        let queue_names: Vec<String> = solid_queue_jobs::Entity::find()
+        let queue_names: Vec<String> = quebec_jobs::Entity::find()
             .select_only()
-            .column(solid_queue_jobs::Column::QueueName)
+            .column(quebec_jobs::Column::QueueName)
             .distinct()
-            .order_by(solid_queue_jobs::Column::QueueName, Order::Asc)
+            .order_by(quebec_jobs::Column::QueueName, Order::Asc)
             .into_tuple()
             .all(db)
             .await?;
@@ -79,11 +79,11 @@ impl ControlPlane {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
         
-        let class_names: Vec<String> = solid_queue_jobs::Entity::find()
+        let class_names: Vec<String> = quebec_jobs::Entity::find()
             .select_only()
-            .column(solid_queue_jobs::Column::ClassName)
+            .column(quebec_jobs::Column::ClassName)
             .distinct()
-            .order_by(solid_queue_jobs::Column::ClassName, Order::Asc)
+            .order_by(quebec_jobs::Column::ClassName, Order::Asc)
             .into_tuple()
             .all(db)
             .await?;
@@ -97,7 +97,7 @@ impl ControlPlane {
         let db = db.as_ref();
         
         // Count total jobs
-        let total_jobs = solid_queue_jobs::Entity::find()
+        let total_jobs = quebec_jobs::Entity::find()
             .count(db)
             .await?;
         
@@ -154,7 +154,7 @@ impl ControlPlane {
             .unwrap_or(0);
         
         // Count active workers
-        let active_workers = solid_queue_processes::Entity::find()
+        let active_workers = quebec_processes::Entity::find()
             .count(db)
             .await?;
         
@@ -183,8 +183,8 @@ impl ControlPlane {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
         
-        let pause = solid_queue_pauses::Entity::find()
-            .filter(solid_queue_pauses::Column::QueueName.eq(queue_name))
+        let pause = quebec_pauses::Entity::find()
+            .filter(quebec_pauses::Column::QueueName.eq(queue_name))
             .one(db)
             .await?;
         

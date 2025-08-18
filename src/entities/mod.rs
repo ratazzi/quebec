@@ -2,14 +2,14 @@
 
 pub mod prelude;
 
-pub mod solid_queue_blocked_executions;
-pub mod solid_queue_claimed_executions;
-pub mod solid_queue_failed_executions;
-pub mod solid_queue_jobs;
-pub mod solid_queue_pauses;
-pub mod solid_queue_processes;
-pub mod solid_queue_ready_executions;
-pub mod solid_queue_recurring_executions;
-pub mod solid_queue_recurring_tasks;
-pub mod solid_queue_scheduled_executions;
-pub mod solid_queue_semaphores;
+pub mod quebec_blocked_executions;
+pub mod quebec_claimed_executions;
+pub mod quebec_failed_executions;
+pub mod quebec_jobs;
+pub mod quebec_pauses;
+pub mod quebec_processes;
+pub mod quebec_ready_executions;
+pub mod quebec_recurring_executions;
+pub mod quebec_recurring_tasks;
+pub mod quebec_scheduled_executions;
+pub mod quebec_semaphores;

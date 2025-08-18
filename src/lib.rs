@@ -16,8 +16,8 @@ mod worker;
 pub use control_plane::ControlPlaneExt;
 pub use error::{QuebecError, Result};
 use context::*;
-use entities::solid_queue_claimed_executions;
-use entities::solid_queue_jobs;
+use entities::quebec_claimed_executions;
+use entities::quebec_jobs;
 
 use types::*;
 use worker::{Execution, Runnable};
@@ -68,8 +68,8 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RescueStrategy>()?;
     m.add_class::<RetryStrategy>()?;
     m.add_class::<DiscardStrategy>()?;
-    m.add_class::<solid_queue_jobs::Model>()?;
-    m.add_class::<solid_queue_claimed_executions::Model>()?;
+    m.add_class::<quebec_jobs::Model>()?;
+    m.add_class::<quebec_claimed_executions::Model>()?;
     m.add_class::<Runnable>()?;
     m.add_class::<Execution>()?;
     // m.add_class::<Metric>()?;

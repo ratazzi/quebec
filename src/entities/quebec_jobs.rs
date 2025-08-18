@@ -25,51 +25,51 @@ pub struct Model {
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
-    #[sea_orm(has_one = "super::solid_queue_blocked_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_blocked_executions::Entity")]
     SolidQueueBlockedExecutions,
-    #[sea_orm(has_one = "super::solid_queue_claimed_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_claimed_executions::Entity")]
     SolidQueueClaimedExecutions,
-    #[sea_orm(has_one = "super::solid_queue_failed_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_failed_executions::Entity")]
     SolidQueueFailedExecutions,
-    #[sea_orm(has_one = "super::solid_queue_ready_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_ready_executions::Entity")]
     SolidQueueReadyExecutions,
-    #[sea_orm(has_one = "super::solid_queue_recurring_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_recurring_executions::Entity")]
     SolidQueueRecurringExecutions,
-    #[sea_orm(has_one = "super::solid_queue_scheduled_executions::Entity")]
+    #[sea_orm(has_one = "super::quebec_scheduled_executions::Entity")]
     SolidQueueScheduledExecutions,
 }
 
-impl Related<super::solid_queue_blocked_executions::Entity> for Entity {
+impl Related<super::quebec_blocked_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueBlockedExecutions.def()
     }
 }
 
-impl Related<super::solid_queue_claimed_executions::Entity> for Entity {
+impl Related<super::quebec_claimed_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueClaimedExecutions.def()
     }
 }
 
-impl Related<super::solid_queue_failed_executions::Entity> for Entity {
+impl Related<super::quebec_failed_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueFailedExecutions.def()
     }
 }
 
-impl Related<super::solid_queue_ready_executions::Entity> for Entity {
+impl Related<super::quebec_ready_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueReadyExecutions.def()
     }
 }
 
-impl Related<super::solid_queue_recurring_executions::Entity> for Entity {
+impl Related<super::quebec_recurring_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueRecurringExecutions.def()
     }
 }
 
-impl Related<super::solid_queue_scheduled_executions::Entity> for Entity {
+impl Related<super::quebec_scheduled_executions::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueScheduledExecutions.def()
     }

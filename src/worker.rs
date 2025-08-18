@@ -376,8 +376,8 @@ impl Runnable {
 
     /// Handle discard - directly mark task as completed without recording failure information
     fn handle_discard(
-        &self, py: Python, strategy: &DiscardStrategy, error: &PyErr, job: solid_queue_jobs::Model,
-    ) -> Result<solid_queue_jobs::Model> {
+        &self, py: Python, strategy: &DiscardStrategy, error: &PyErr, job: quebec_jobs::Model,
+    ) -> Result<quebec_jobs::Model> {
         // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
             if let Err(handler_error) = handler.call1(py, (error.value(py),)) {
@@ -416,7 +416,7 @@ impl Runnable {
         serde_json::to_string(&error_payload).unwrap_or_else(|_| "Failed to serialize error".to_string())
     }
 
-    fn invoke(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
+    fn invoke(&mut self, job: &mut quebec_jobs::Model) -> Result<quebec_jobs::Model> {
         // Execute Python task and handle any errors in a single GIL acquisition
         Python::with_gil(|py| {
             // Execute Python task within the same GIL session
@@ -432,7 +432,7 @@ impl Runnable {
     }
 
     /// Execute Python task (parameter parsing + invocation)
-    fn execute_python_task(&self, py: Python, job: &solid_queue_jobs::Model) -> PyResult<()> {
+    fn execute_python_task(&self, py: Python, job: &quebec_jobs::Model) -> PyResult<()> {
         // Parse task parameters
         let (args, kwargs) = self.parse_job_arguments(py, job)?;
 
@@ -449,7 +449,7 @@ impl Runnable {
     }
 
     /// Parse task parameters
-    fn parse_job_arguments(&self, py: Python, job: &solid_queue_jobs::Model) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
+    fn parse_job_arguments(&self, py: Python, job: &quebec_jobs::Model) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
         // Deserialize JSON parameters
         let mut v = serde_json::Value::Array(vec![]);
         if let Some(arguments) = job.arguments.as_ref() {
@@ -491,7 +491,7 @@ impl Runnable {
     }
 
     /// Handle execution error
-    fn handle_execution_error(&mut self, py: Python, job: &mut solid_queue_jobs::Model, error: &PyErr) -> Result<solid_queue_jobs::Model> {
+    fn handle_execution_error(&mut self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr) -> Result<quebec_jobs::Model> {
         error!("Job execution error: {:?}", error);
 
         let bound = self.handler.bind(py);
@@ -519,7 +519,7 @@ impl Runnable {
     }
 
     /// Apply retry strategy
-    fn apply_retry_strategy(&mut self, job: &solid_queue_jobs::Model, strategy: RetryStrategy) -> Result<solid_queue_jobs::Model> {
+    fn apply_retry_strategy(&mut self, job: &quebec_jobs::Model, strategy: RetryStrategy) -> Result<quebec_jobs::Model> {
         warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
         let delay = strategy.wait;
@@ -536,7 +536,7 @@ impl Runnable {
     }
 
     /// Apply rescue strategy
-    fn apply_rescue_strategy(&self, py: Python, job: &mut solid_queue_jobs::Model, strategy: &RescueStrategy, error: &PyErr) -> Result<solid_queue_jobs::Model> {
+    fn apply_rescue_strategy(&self, py: Python, job: &mut quebec_jobs::Model, strategy: &RescueStrategy, error: &PyErr) -> Result<quebec_jobs::Model> {
         match strategy.handler.call1(py, (error.value(py),)) {
             Ok(_) => {
                 info!("Job rescued from error");
@@ -551,7 +551,7 @@ impl Runnable {
     }
 
     /// Handle task failure
-    fn handle_job_failure(&self, py: Python, job: &mut solid_queue_jobs::Model, error: &PyErr) -> Result<solid_queue_jobs::Model> {
+    fn handle_job_failure(&self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr) -> Result<quebec_jobs::Model> {
         job.failed_attempts += 1;
         let error_payload = self.create_error_payload(py, error);
         Err(anyhow::anyhow!(error_payload))
@@ -565,7 +565,7 @@ impl Runnable {
         self.handler.clone()
     }
 
-    fn perform(&mut self, job: &mut solid_queue_jobs::Model) -> Result<solid_queue_jobs::Model> {
+    fn perform(&mut self, job: &mut quebec_jobs::Model) -> Result<quebec_jobs::Model> {
         self.invoke(job)
     }
 
@@ -603,18 +603,18 @@ pub struct Execution {
     ctx: Arc<AppContext>,
     timer: Instant,
     tid: String,
-    claimed: solid_queue_claimed_executions::Model,
-    job: solid_queue_jobs::Model,
+    claimed: quebec_claimed_executions::Model,
+    job: quebec_jobs::Model,
     runnable: Runnable,
     metric: Option<Metric>,
-    result: Option<Result<solid_queue_jobs::Model>>,
+    result: Option<Result<quebec_jobs::Model>>,
     retry_info: Option<RetryInfo>,
 }
 
 impl Execution {
     pub fn new(
-        ctx: Arc<AppContext>, claimed: solid_queue_claimed_executions::Model,
-        job: solid_queue_jobs::Model, runnable: Runnable,
+        ctx: Arc<AppContext>, claimed: quebec_claimed_executions::Model,
+        job: quebec_jobs::Model, runnable: Runnable,
     ) -> Self {
         // Get current thread's ThreadId
         let thread_id = std::thread::current().id();
@@ -641,11 +641,11 @@ impl Execution {
         }
     }
 
-    fn post_result(&mut self, result: Result<solid_queue_jobs::Model>) {
+    fn post_result(&mut self, result: Result<quebec_jobs::Model>) {
         self.result = Some(result);
     }
 
-    async fn invoke(&mut self) -> Result<solid_queue_jobs::Model> {
+    async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
         self.timer = Instant::now();
         let mut job = self.job.clone();
         let job_id = self.claimed.job_id;
@@ -671,8 +671,8 @@ impl Execution {
     }
 
     async fn after_executed(
-        &mut self, result: Result<solid_queue_jobs::Model>,
-    ) -> Result<solid_queue_jobs::Model> {
+        &mut self, result: Result<quebec_jobs::Model>,
+    ) -> Result<quebec_jobs::Model> {
         let class_name = self.runnable.class_name.clone();
 
         let claimed = self.claimed.clone();
@@ -708,14 +708,14 @@ impl Execution {
             None
         };
 
-        db.transaction::<_, solid_queue_jobs::Model, DbErr>(|txn| {
+        db.transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
 
             Box::pin(async move {
                 let claimed_id = claimed.id;
 
                 // Handle retry logic
                 if let Some((scheduled_at, failed_attempts)) = retry_job_data {
-                    let retry_job = solid_queue_jobs::ActiveModel {
+                    let retry_job = quebec_jobs::ActiveModel {
                         id: ActiveValue::NotSet,
                         queue_name: ActiveValue::Set(job.queue_name.clone()),
                         class_name: ActiveValue::Set(job.class_name.clone()),
@@ -736,7 +736,7 @@ impl Execution {
                     };
 
                     // Create scheduled_execution record
-                    let scheduled_execution = solid_queue_scheduled_executions::ActiveModel {
+                    let scheduled_execution = quebec_scheduled_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         job_id: ActiveValue::Set(new_job_id),
                         queue_name: ActiveValue::Set(job.queue_name.clone()),
@@ -755,7 +755,7 @@ impl Execution {
                     // My strategy: increase failed_attempts field, stop execution if attempts exceed limit
 
                     // Write to failed_executions table
-                    let failed_execution = solid_queue_failed_executions::ActiveModel {
+                    let failed_execution = quebec_failed_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         job_id: ActiveValue::Set(job_id),
                         error: ActiveValue::Set(err.map(|e| e.to_string())),
@@ -768,14 +768,14 @@ impl Execution {
                 }
 
                 // Update jobs table
-                let mut job: solid_queue_jobs::ActiveModel = job.clone().into();
+                let mut job: quebec_jobs::ActiveModel = job.clone().into();
                 job.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                 job.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                 let updated = job.update(txn).await?;
 
                 // Directly delete record from claimed_executions table
-                let delete_result = solid_queue_claimed_executions::Entity::delete_many()
-                    .filter(solid_queue_claimed_executions::Column::Id.eq(claimed_id))
+                let delete_result = quebec_claimed_executions::Entity::delete_many()
+                    .filter(quebec_claimed_executions::Column::Id.eq(claimed_id))
                     .exec(txn)
                     .await?;
 
@@ -816,7 +816,7 @@ impl Execution {
     }
 
     #[getter]
-    fn get_job(&self) -> solid_queue_jobs::Model {
+    fn get_job(&self) -> quebec_jobs::Model {
         self.job.clone()
     }
 
@@ -957,11 +957,11 @@ impl Execution {
                     );
 
                     let db = self.ctx.get_db().await;
-                    db.transaction::<_, solid_queue_jobs::ActiveModel, DbErr>(|txn| {
+                    db.transaction::<_, quebec_jobs::ActiveModel, DbErr>(|txn| {
                         Box::pin(async move {
                             let concurrency_key =
                                 job.concurrency_key.clone().unwrap_or("".to_string());
-                            let job = solid_queue_jobs::ActiveModel {
+                            let job = quebec_jobs::ActiveModel {
                                 id: ActiveValue::NotSet,
                                 queue_name: ActiveValue::Set(job.queue_name),
                                 class_name: ActiveValue::Set(job.class_name),
@@ -983,7 +983,7 @@ impl Execution {
                                 _ => return Err(DbErr::Custom("Failed to get job ID".into())),
                             };
                             let _scheduled_execution =
-                                solid_queue_scheduled_executions::ActiveModel {
+                                quebec_scheduled_executions::ActiveModel {
                                     id: ActiveValue::not_set(),
                                     job_id: ActiveValue::Set(job_id),
                                     queue_name: match job.queue_name.clone() {
@@ -1169,7 +1169,7 @@ impl Worker {
         })
     }
 
-    pub async fn claim_job(&self) -> Result<solid_queue_claimed_executions::Model, anyhow::Error> {
+    pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
         let _opts = self.ctx.connect_options.clone();
         // if self.ctx.silence_polling {
         //     opts.sqlx_logging(false); //.sqlx_logging_level(log::LevelFilter::Error);
@@ -1178,7 +1178,7 @@ impl Worker {
         let db = self.ctx.get_db().await;
 
         let job = db
-            .transaction::<_, solid_queue_claimed_executions::ActiveModel, DbErr>(|txn| {
+            .transaction::<_, quebec_claimed_executions::ActiveModel, DbErr>(|txn| {
                 Box::pin(async move {
                     // Get an unlocked task
                     // let record: Option<solid_queue_ready_executions::Model> = solid_queue_ready_executions::Entity::find()
@@ -1190,9 +1190,9 @@ impl Worker {
                     //     .one(txn)
                     //     .await?;
 
-                    let record = solid_queue_ready_executions::Entity::find()
-                        .order_by_asc(solid_queue_ready_executions::Column::Priority)
-                        .order_by_asc(solid_queue_ready_executions::Column::JobId)
+                    let record = quebec_ready_executions::Entity::find()
+                        .order_by_asc(quebec_ready_executions::Column::Priority)
+                        .order_by_asc(quebec_ready_executions::Column::JobId)
                         .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
                         .limit(1)
                         .one(txn)
@@ -1200,7 +1200,7 @@ impl Worker {
 
                     if let Some(execution) = record {
                         // debug!("---------- execution: {:?}", execution);
-                        let claimed = solid_queue_claimed_executions::ActiveModel {
+                        let claimed = quebec_claimed_executions::ActiveModel {
                             id: ActiveValue::NotSet,
                             job_id: ActiveValue::Set(execution.job_id),
                             process_id: ActiveValue::NotSet,
@@ -1225,18 +1225,18 @@ impl Worker {
     // #[tracing::instrument]
     pub async fn claim_jobs(
         &self, batch_size: u64,
-    ) -> Result<Vec<solid_queue_claimed_executions::Model>, anyhow::Error> {
+    ) -> Result<Vec<quebec_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
         let _use_skip_locked = self.ctx.use_skip_locked;
 
         let jobs = db
-            .transaction::<_, Vec<solid_queue_claimed_executions::ActiveModel>, DbErr>(|txn| {
+            .transaction::<_, Vec<quebec_claimed_executions::ActiveModel>, DbErr>(|txn| {
                 Box::pin(async move {
                     // Get list of paused queues
-                    let paused_queues: Vec<String> = solid_queue_pauses::Entity::find()
+                    let paused_queues: Vec<String> = quebec_pauses::Entity::find()
                         .select_only()
-                        .column(solid_queue_pauses::Column::QueueName)
+                        .column(quebec_pauses::Column::QueueName)
                         .into_tuple()
                         .all(txn)
                         .await?;
@@ -1247,10 +1247,10 @@ impl Worker {
 
                     // Get jobs from non-paused queues
                     let db_backend = txn.get_database_backend();
-                    let records: Vec<solid_queue_ready_executions::Model> = match db_backend {
+                    let records: Vec<quebec_ready_executions::Model> = match db_backend {
                         DbBackend::Sqlite => {
                             // For SQLite, filter out paused queues in application code
-                            let mut records = solid_queue_ready_executions::Entity::find()
+                            let mut records = quebec_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     DbBackend::Sqlite,
                                     "SELECT * FROM solid_queue_ready_executions ORDER BY priority ASC, job_id ASC LIMIT ?",
@@ -1276,7 +1276,7 @@ impl Worker {
                             let mut values: Vec<Value> = vec![batch_size.into()];
                             values.extend(paused_queues.iter().map(|q| q.clone().into()));
 
-                            solid_queue_ready_executions::Entity::find()
+                            quebec_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     db_backend,
                                     &stmt,
@@ -1304,7 +1304,7 @@ impl Worker {
                     let mut claimed_jobs = Vec::new();
 
                     for execution in records {
-                        let claimed = solid_queue_claimed_executions::ActiveModel {
+                        let claimed = quebec_claimed_executions::ActiveModel {
                             id: ActiveValue::NotSet,
                             job_id: ActiveValue::Set(execution.job_id),
                             process_id: ActiveValue::NotSet,
@@ -1322,7 +1322,7 @@ impl Worker {
             })
             .await?;
 
-        let claimed_models: Result<Vec<solid_queue_claimed_executions::Model>, _> =
+        let claimed_models: Result<Vec<quebec_claimed_executions::Model>, _> =
             jobs.into_iter().map(|job| job.try_into_model()).collect();
         trace!("elpased: {:?}", timer.elapsed());
         claimed_models.map_err(|e| anyhow::Error::new(e))
@@ -1482,11 +1482,11 @@ impl Worker {
         let job_data = {
             let processing_db = ctx.get_db().await;
             // Use a single quick transaction to fetch all job data
-            let jobs_result = processing_db.transaction::<_, Vec<solid_queue_jobs::Model>, DbErr>(|txn| {
+            let jobs_result = processing_db.transaction::<_, Vec<quebec_jobs::Model>, DbErr>(|txn| {
                 Box::pin(async move {
                     let mut jobs = Vec::new();
                     for job_id in job_ids {
-                        if let Some(job) = solid_queue_jobs::Entity::find_by_id(job_id).one(txn).await? {
+                        if let Some(job) = quebec_jobs::Entity::find_by_id(job_id).one(txn).await? {
                             jobs.push(job);
                         }
                     }

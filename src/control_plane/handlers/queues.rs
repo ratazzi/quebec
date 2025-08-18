@@ -9,7 +9,7 @@ use axum::{
 use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, ActiveModelTrait, ActiveValue, Statement, DbBackend, ConnectionTrait, QueryOrder, Order, PaginatorTrait, QuerySelect};
 use tracing::{debug, error};
 
-use crate::entities::{solid_queue_jobs, solid_queue_pauses};
+use crate::entities::{quebec_jobs, quebec_pauses};
 use crate::control_plane::{ControlPlane, models::{Pagination, QueueInfo}};
 
 impl ControlPlane {
@@ -62,7 +62,7 @@ impl ControlPlane {
 
         let start = Instant::now();
         // Get paused queues
-        let paused_queues = solid_queue_pauses::Entity::find()
+        let paused_queues = quebec_pauses::Entity::find()
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -108,7 +108,7 @@ impl ControlPlane {
         let db = db.as_ref();
 
         // Create a new pause record
-        let pause = solid_queue_pauses::ActiveModel {
+        let pause = quebec_pauses::ActiveModel {
             id: ActiveValue::NotSet,
             queue_name: ActiveValue::Set(queue_name.clone()),
             created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
@@ -130,8 +130,8 @@ impl ControlPlane {
         let db = db.as_ref();
 
         // Delete the pause record for this queue
-        solid_queue_pauses::Entity::delete_many()
-            .filter(solid_queue_pauses::Column::QueueName.eq(queue_name.clone()))
+        quebec_pauses::Entity::delete_many()
+            .filter(quebec_pauses::Column::QueueName.eq(queue_name.clone()))
             .exec(db)
             .await
             .map(|_| StatusCode::OK)
@@ -159,18 +159,18 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         
         // Get total job count for this queue
-        let total_jobs = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::QueueName.eq(&queue_name))
-            .filter(solid_queue_jobs::Column::FinishedAt.is_null())
+        let total_jobs = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::QueueName.eq(&queue_name))
+            .filter(quebec_jobs::Column::FinishedAt.is_null())
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         
         // Get jobs for this queue with pagination
-        let jobs = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::QueueName.eq(&queue_name))
-            .filter(solid_queue_jobs::Column::FinishedAt.is_null())
-            .order_by(solid_queue_jobs::Column::CreatedAt, Order::Desc)
+        let jobs = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::QueueName.eq(&queue_name))
+            .filter(quebec_jobs::Column::FinishedAt.is_null())
+            .order_by(quebec_jobs::Column::CreatedAt, Order::Desc)
             .limit(state.page_size)
             .offset(offset)
             .all(db)

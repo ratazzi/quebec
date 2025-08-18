@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, QueryOrder, Order};
 use tracing::debug;
 
-use crate::entities::solid_queue_processes;
+use crate::entities::quebec_processes;
 use crate::control_plane::{ControlPlane, models::WorkerInfo};
 
 impl ControlPlane {
@@ -21,8 +21,8 @@ impl ControlPlane {
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         // Query all worker processes
-        let workers = solid_queue_processes::Entity::find()
-            .order_by(solid_queue_processes::Column::LastHeartbeatAt, Order::Desc)
+        let workers = quebec_processes::Entity::find()
+            .order_by(quebec_processes::Column::LastHeartbeatAt, Order::Desc)
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

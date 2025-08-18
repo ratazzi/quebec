@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, PaginatorTrait, QuerySelect, ConnectionTrait};
 use tracing::{debug, info, error, instrument};
 
-use crate::entities::{solid_queue_jobs, solid_queue_claimed_executions, solid_queue_processes};
+use crate::entities::{quebec_jobs, quebec_claimed_executions, quebec_processes};
 use crate::control_plane::{ControlPlane, models::{Pagination, InProgressJobInfo}};
 
 impl ControlPlane {
@@ -28,7 +28,7 @@ impl ControlPlane {
         let offset = (pagination.page - 1) * page_size;
 
         // Get claimed (in-progress) jobs
-        let claimed_executions = solid_queue_claimed_executions::Entity::find()
+        let claimed_executions = quebec_claimed_executions::Entity::find()
             .offset(offset)
             .limit(page_size)
             .all(db)
@@ -36,7 +36,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get process information
-        let processes = solid_queue_processes::Entity::find()
+        let processes = quebec_processes::Entity::find()
             .all(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -49,7 +49,7 @@ impl ControlPlane {
 
         // Get job information for each in-progress execution
         for execution in claimed_executions {
-            if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
+            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id).one(db).await {
                 // Find process information
                 let worker_id = match execution.process_id {
                     Some(pid) => {
@@ -90,7 +90,7 @@ impl ControlPlane {
         // Get total number of in-progress jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = solid_queue_claimed_executions::Entity::find()
+        let total_count: u64 = quebec_claimed_executions::Entity::find()
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -142,26 +142,26 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find execution record to cancel
-                let claimed_execution = solid_queue_claimed_executions::Entity::find_by_id(id)
+                let claimed_execution = quebec_claimed_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?;
 
                 if let Some(execution) = claimed_execution {
                     // First mark job as completed
-                    let job_result = solid_queue_jobs::Entity::find_by_id(execution.job_id)
+                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
                         .one(txn)
                         .await?;
 
                     if let Some(job) = job_result {
                         // Update job status to completed
-                        let mut job_model: solid_queue_jobs::ActiveModel = job.into();
+                        let mut job_model: quebec_jobs::ActiveModel = job.into();
                         job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
                     // Delete claimed_execution record
-                    solid_queue_claimed_executions::Entity::delete_by_id(id)
+                    quebec_claimed_executions::Entity::delete_by_id(id)
                         .exec(txn)
                         .await?;
 
@@ -194,7 +194,7 @@ impl ControlPlane {
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
                 // Get all in-progress jobs
-                let claimed_executions = solid_queue_claimed_executions::Entity::find()
+                let claimed_executions = quebec_claimed_executions::Entity::find()
                     .all(txn)
                     .await?;
 
@@ -225,7 +225,7 @@ impl ControlPlane {
                 txn.execute(stmt).await?;
 
                 // Delete all claimed_execution records
-                let delete_result = solid_queue_claimed_executions::Entity::delete_many()
+                let delete_result = quebec_claimed_executions::Entity::delete_many()
                     .exec(txn)
                     .await?;
 

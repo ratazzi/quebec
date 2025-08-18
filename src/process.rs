@@ -23,16 +23,16 @@ pub fn is_running_in_pyo3() -> bool {
 pub trait ProcessTrait {
     async fn on_start(
         &self, db: &DatabaseConnection, kind: String, name: String,
-    ) -> Result<solid_queue_processes::Model, Error> {
+    ) -> Result<quebec_processes::Model, Error> {
         let process = db
-            .transaction::<_, solid_queue_processes::ActiveModel, DbErr>(|txn| {
+            .transaction::<_, quebec_processes::ActiveModel, DbErr>(|txn| {
                 let hostname = Self::get_hostname();
                 let pid = Self::get_pid();
                 let supervisor_id = Self::get_supervisor_id();
                 let metadata = Self::get_metadata();
 
                 Box::pin(async move {
-                    let process = solid_queue_processes::ActiveModel {
+                    let process = quebec_processes::ActiveModel {
                         id: ActiveValue::NotSet,
                         kind: ActiveValue::Set(kind),
                         name: ActiveValue::Set(name),
@@ -99,7 +99,7 @@ pub trait ProcessTrait {
     }
 
     async fn heartbeat(
-        &self, db: &DatabaseConnection, process: &solid_queue_processes::Model,
+        &self, db: &DatabaseConnection, process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let mut process = process.clone().into_active_model();
         process.last_heartbeat_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
@@ -109,7 +109,7 @@ pub trait ProcessTrait {
     }
 
     async fn on_stop(
-        &self, db: &DatabaseConnection, process: &solid_queue_processes::Model,
+        &self, db: &DatabaseConnection, process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let process_name = process.name.clone();
         let process_pid = process.pid;

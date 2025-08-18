@@ -185,7 +185,7 @@ where
         None
     };
 
-    let job = solid_queue_jobs::ActiveModel {
+    let job = quebec_jobs::ActiveModel {
         id: ActiveValue::NotSet,
         queue_name: ActiveValue::Set(queue_name.to_string()),
         class_name: ActiveValue::Set(entry.class),
@@ -205,7 +205,7 @@ where
     let job = job.try_into_model()?;
 
     let task_key = entry.key.ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
-    let _recurring_execution = solid_queue_recurring_executions::ActiveModel {
+    let _recurring_execution = quebec_recurring_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
         task_key: ActiveValue::Set(task_key),
@@ -224,7 +224,7 @@ where
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
 
             // Create ready execution - job can run immediately
-            let _ready_execution = solid_queue_ready_executions::ActiveModel {
+            let _ready_execution = quebec_ready_executions::ActiveModel {
                 id: ActiveValue::not_set(),
                 job_id: ActiveValue::Set(job.id),
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
@@ -241,7 +241,7 @@ where
             let duration = ctx.default_concurrency_control_period;
             let expires_at = now + duration;
 
-            let _blocked_execution = solid_queue_blocked_executions::ActiveModel {
+            let _blocked_execution = quebec_blocked_executions::ActiveModel {
                 id: ActiveValue::NotSet,
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
                 job_id: ActiveValue::Set(job.id),
@@ -255,7 +255,7 @@ where
         }
     } else {
         // No concurrency control - create ready execution immediately
-        let _ready_execution = solid_queue_ready_executions::ActiveModel {
+        let _ready_execution = quebec_ready_executions::ActiveModel {
             id: ActiveValue::not_set(),
             job_id: ActiveValue::Set(job.id),
             queue_name: ActiveValue::Set(job.queue_name.clone()),
