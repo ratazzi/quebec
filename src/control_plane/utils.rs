@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::error::Error;
 use chrono::{NaiveDateTime, Utc};
-use sea_orm::{DbErr, EntityTrait, QueryFilter, ColumnTrait, QuerySelect, Order, QueryOrder, ConnectionTrait, PaginatorTrait};
+use sea_orm::{DbErr, EntityTrait, EntityName, QueryFilter, ColumnTrait, QuerySelect, Order, QueryOrder, PaginatorTrait};
 use tera::Context;
 use tracing::{error, debug, info};
 use axum::http::StatusCode;
 
-use crate::entities::{quebec_jobs, quebec_pauses, quebec_processes};
+use crate::entities::{quebec_jobs, quebec_pauses, quebec_processes, quebec_scheduled_executions, quebec_claimed_executions, quebec_failed_executions, quebec_blocked_executions};
 
 use super::templates;
 use super::ControlPlane;
@@ -102,56 +102,24 @@ impl ControlPlane {
             .await?;
         
         // Count scheduled jobs
-        let scheduled_count = db
-            .query_one(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Postgres,
-                r#"
-                SELECT COUNT(*) as count 
-                FROM solid_queue_scheduled_executions
-                "#.to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "count").ok())
-            .unwrap_or(0);
+        let scheduled_count = quebec_scheduled_executions::Entity::find()
+            .count(db)
+            .await? as i64;
         
         // Count in-progress jobs
-        let in_progress_count = db
-            .query_one(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Postgres,
-                r#"
-                SELECT COUNT(*) as count 
-                FROM solid_queue_claimed_executions
-                "#.to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "count").ok())
-            .unwrap_or(0);
+        let in_progress_count = quebec_claimed_executions::Entity::find()
+            .count(db)
+            .await? as i64;
         
         // Count failed jobs
-        let failed_count = db
-            .query_one(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Postgres,
-                r#"
-                SELECT COUNT(*) as count 
-                FROM solid_queue_failed_executions
-                "#.to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "count").ok())
-            .unwrap_or(0);
+        let failed_count = quebec_failed_executions::Entity::find()
+            .count(db)
+            .await? as i64;
         
         // Count blocked jobs
-        let blocked_count = db
-            .query_one(sea_orm::Statement::from_string(
-                sea_orm::DbBackend::Postgres,
-                r#"
-                SELECT COUNT(*) as count 
-                FROM solid_queue_blocked_executions
-                "#.to_string(),
-            ))
-            .await?
-            .and_then(|row| row.try_get::<i64>("", "count").ok())
-            .unwrap_or(0);
+        let blocked_count = quebec_blocked_executions::Entity::find()
+            .count(db)
+            .await? as i64;
         
         // Count active workers
         let active_workers = quebec_processes::Entity::find()

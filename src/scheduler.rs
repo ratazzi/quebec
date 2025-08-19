@@ -16,7 +16,7 @@ use std::time::Instant;
 use tracing::{error, info, trace, warn};
 
 // ```sql
-// INSERT INTO "solid_queue_recurring_tasks" (
+// INSERT INTO "quebec_recurring_tasks" (
 //     "key",
 //     "schedule",
 //     "command",
@@ -44,15 +44,15 @@ use tracing::{error, info, trace, warn};
 //     "updated_at" = (
 //         CASE
 //             WHEN (
-//                 "solid_queue_recurring_tasks"."schedule" IS NOT DISTINCT FROM excluded."schedule"
-//                 AND "solid_queue_recurring_tasks"."command" IS NOT DISTINCT FROM excluded."command"
-//                 AND "solid_queue_recurring_tasks"."class_name" IS NOT DISTINCT FROM excluded."class_name"
-//                 AND "solid_queue_recurring_tasks"."arguments" IS NOT DISTINCT FROM excluded."arguments"
-//                 AND "solid_queue_recurring_tasks"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
-//                 AND "solid_queue_recurring_tasks"."priority" IS NOT DISTINCT FROM excluded."priority"
-//                 AND "solid_queue_recurring_tasks"."static" IS NOT DISTINCT FROM excluded."static"
-//                 AND "solid_queue_recurring_tasks"."description" IS NOT DISTINCT FROM excluded."description"
-//             ) THEN "solid_queue_recurring_tasks".updated_at
+//                 "quebec_recurring_tasks"."schedule" IS NOT DISTINCT FROM excluded."schedule"
+//                 AND "quebec_recurring_tasks"."command" IS NOT DISTINCT FROM excluded."command"
+//                 AND "quebec_recurring_tasks"."class_name" IS NOT DISTINCT FROM excluded."class_name"
+//                 AND "quebec_recurring_tasks"."arguments" IS NOT DISTINCT FROM excluded."arguments"
+//                 AND "quebec_recurring_tasks"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
+//                 AND "quebec_recurring_tasks"."priority" IS NOT DISTINCT FROM excluded."priority"
+//                 AND "quebec_recurring_tasks"."static" IS NOT DISTINCT FROM excluded."static"
+//                 AND "quebec_recurring_tasks"."description" IS NOT DISTINCT FROM excluded."description"
+//             ) THEN "quebec_recurring_tasks".updated_at
 //             ELSE CURRENT_TIMESTAMP
 //         END
 //     ),
@@ -66,11 +66,11 @@ use tracing::{error, info, trace, warn};
 //     "description" = excluded."description"
 // RETURNING "id"
 // ```
-pub async fn upsert_task<C>(db: &C, entry: ScheduledEntry) -> Result<ExecResult, DbErr>
+pub async fn upsert_task<C>(db: &C, table_config: &crate::context::TableConfig, entry: ScheduledEntry) -> Result<ExecResult, DbErr>
 where
     C: ConnectionTrait,
 {
-    let sql = r#"INSERT INTO "solid_queue_recurring_tasks" (
+    let sql = format!(r#"INSERT INTO "{}" (
         "key",
         "schedule",
         "command",
@@ -98,15 +98,15 @@ where
             "updated_at" = (
                 CASE
                     WHEN (
-                        "solid_queue_recurring_tasks"."schedule" = excluded."schedule"
-                        AND "solid_queue_recurring_tasks"."command" = excluded."command"
-                        AND "solid_queue_recurring_tasks"."class_name" = excluded."class_name"
-                        AND "solid_queue_recurring_tasks"."arguments" = excluded."arguments"
-                        AND "solid_queue_recurring_tasks"."queue_name" = excluded."queue_name"
-                        AND "solid_queue_recurring_tasks"."priority" = excluded."priority"
-                        AND "solid_queue_recurring_tasks"."static" = excluded."static"
-                        AND "solid_queue_recurring_tasks"."description" = excluded."description"
-                    ) THEN "solid_queue_recurring_tasks"."updated_at"
+                        "{}"."schedule" = excluded."schedule"
+                        AND "{}"."command" = excluded."command"
+                        AND "{}"."class_name" = excluded."class_name"
+                        AND "{}"."arguments" = excluded."arguments"
+                        AND "{}"."queue_name" = excluded."queue_name"
+                        AND "{}"."priority" = excluded."priority"
+                        AND "{}"."static" = excluded."static"
+                        AND "{}"."description" = excluded."description"
+                    ) THEN "{}"."updated_at"
                     ELSE CURRENT_TIMESTAMP
                 END
             ),
@@ -118,7 +118,11 @@ where
             "priority" = excluded."priority",
             "static" = excluded."static",
             "description" = excluded."description"
-        RETURNING "id""#;
+        RETURNING "id""#,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks,
+        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks,
+        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks);
 
     let cleaned_sql = sql.lines().map(str::trim).collect::<Vec<&str>>().join(" ");
 
@@ -220,7 +224,7 @@ where
         use crate::semaphore::acquire_semaphore_with_constraint;
 
         // Try to acquire the semaphore using the constraint
-        if acquire_semaphore_with_constraint(db, constraint).await? {
+        if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
 
             // Create ready execution - job can run immediately
@@ -328,9 +332,10 @@ impl Scheduler {
                 value.key = Some(key.clone());
                 scheduled.push(value.clone());
 
+                let table_config = self.ctx.table_config.clone();
                 let ret = db
                     .transaction::<_, ExecResult, DbErr>(|txn| {
-                        Box::pin(async move { upsert_task(txn, value.clone()).await })
+                        Box::pin(async move { upsert_task(txn, &table_config, value.clone()).await })
                     })
                     .await?;
 

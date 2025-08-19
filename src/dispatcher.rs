@@ -71,7 +71,7 @@ impl Dispatcher {
                           }
 
                           // Unblock jobs with expired concurrency keys
-                          let sql = "SELECT DISTINCT concurrency_key FROM solid_queue_blocked_executions WHERE expires_at < $1 LIMIT $2";
+                          let sql = format!("SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < $1 LIMIT $2", ctx.table_config.blocked_executions);
                           let now = chrono::Utc::now().naive_utc();
                           let expired_keys_result = txn.query_all(Statement::from_sql_and_values(
                               txn.get_database_backend(),
@@ -89,10 +89,11 @@ impl Dispatcher {
                               let concurrency_key = row.try_get::<String>("", "concurrency_key")
                                   .map_err(|e| DbErr::Custom(format!("Failed to get concurrency_key: {}", e)))?;
 
+                              let sql = format!(r#"SELECT * FROM "{}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#, ctx.table_config.blocked_executions);
                               let blocked_execution = quebec_blocked_executions::Entity::find()
                                   .from_raw_sql(Statement::from_sql_and_values(
                                       txn.get_database_backend(),
-                                      r#"SELECT * FROM "solid_queue_blocked_executions" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#,
+                                      &sql,
                                       [concurrency_key.clone().into(), 1.into()],
                                   ))
                                   .one(txn)
@@ -120,7 +121,7 @@ impl Dispatcher {
                                       };
 
                                       // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
-                                      match acquire_semaphore(txn, concurrency_key.clone(), concurrency_limit, None).await {
+                                      match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
                                           Ok(true) => {
                                               info!("Semaphore acquired for key: {}", concurrency_key);
 

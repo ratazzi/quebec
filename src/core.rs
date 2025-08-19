@@ -24,6 +24,7 @@ impl Quebec {
         let db = self.ctx.get_db().await;
         let _ = db.ping().await?;
         let duration = self.ctx.default_concurrency_control_period;
+        let ctx = self.ctx.clone(); // Clone ctx for the async closure
         trace!("job: {:?}", job);
 
         let job = db
@@ -76,7 +77,7 @@ impl Quebec {
                         // Try to acquire the semaphore
                         let now = chrono::Utc::now().naive_utc();
                         let expires_at = now + duration;
-                        if acquire_semaphore(txn, concurrency_key.clone(), concurrency_limit, None).await? {
+                        if acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await? {
                             info!("Semaphore acquired for key: {}", concurrency_key);
                         } else {
                             info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);

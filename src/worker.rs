@@ -4,7 +4,7 @@ use crate::process::ProcessTrait;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use sea_query::LockBehavior;
+use sea_query::{LockBehavior, Query, Expr, Asterisk, Alias, SqliteQueryBuilder, PostgresQueryBuilder, MysqlQueryBuilder};
 use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;
@@ -24,8 +24,6 @@ use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
 
 use crate::notify::NotifyManager;
-
-
 
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     match value {
@@ -763,7 +761,7 @@ impl Execution {
                     };
                     failed_execution.save(txn).await?;
 
-                    // let job = solid_queue_jobs::Entity::find_by_id(job_id).one(txn).await.unwrap();
+                    // let job = quebec_jobs::Entity::find_by_id(job_id).one(txn).await.unwrap();
                     // return Ok(job.unwrap().into());
                 }
 
@@ -1181,10 +1179,10 @@ impl Worker {
             .transaction::<_, quebec_claimed_executions::ActiveModel, DbErr>(|txn| {
                 Box::pin(async move {
                     // Get an unlocked task
-                    // let record: Option<solid_queue_ready_executions::Model> = solid_queue_ready_executions::Entity::find()
+                    // let record: Option<quebec_ready_executions::Model> = quebec_ready_executions::Entity::find()
                     //     .from_raw_sql(Statement::from_sql_and_values(
                     //         DbBackend::Postgres,
-                    //         r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
+                    //         r#"SELECT * FROM "quebec_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
                     //         [1.into()],
                     //     ))
                     //     .one(txn)
@@ -1229,6 +1227,7 @@ impl Worker {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
         let _use_skip_locked = self.ctx.use_skip_locked;
+        let table_config = self.ctx.table_config.clone();
 
         let jobs = db
             .transaction::<_, Vec<quebec_claimed_executions::ActiveModel>, DbErr>(|txn| {
@@ -1249,37 +1248,60 @@ impl Worker {
                     let db_backend = txn.get_database_backend();
                     let records: Vec<quebec_ready_executions::Model> = match db_backend {
                         DbBackend::Sqlite => {
-                            // For SQLite, filter out paused queues in application code
+                            // For SQLite, use sea-query to build the SQL dynamically
+                            let table_name = &table_config.ready_executions;
+                            let table_alias = Alias::new(table_name);
+                            let query = Query::select()
+                                .column(Asterisk)
+                                .from(table_alias)
+                                .order_by("priority", sea_query::Order::Asc)
+                                .order_by("job_id", sea_query::Order::Asc)
+                                .limit(batch_size)
+                                .to_owned();
+
+                            let (sql, values) = query.build(SqliteQueryBuilder);
+
                             let mut records = quebec_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     DbBackend::Sqlite,
-                                    "SELECT * FROM solid_queue_ready_executions ORDER BY priority ASC, job_id ASC LIMIT ?",
-                                    [batch_size.into()],
+                                    &sql,
+                                    values,
                                 ))
                                 .all(txn)
                                 .await?;
 
+                            // Filter out paused queues in application code for SQLite
                             records.retain(|record| !paused_queues.contains(&record.queue_name));
                             records
                         },
                         _ => {
-                            // For PostgreSQL and MySQL, filter in SQL
-                            let mut stmt = format!(
-                                r#"SELECT * FROM "solid_queue_ready_executions" WHERE "queue_name" NOT IN ({}) ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
-                                paused_queues.iter().enumerate().map(|(i, _)| format!("${}", i + 2)).collect::<Vec<_>>().join(",")
-                            );
+                            // For PostgreSQL and MySQL, use sea-query to build dynamic SQL
+                            let table_name = &table_config.ready_executions;
+                            let table_alias = Alias::new(table_name);
+                            let mut query = Query::select()
+                                .column(Asterisk)
+                                .from(table_alias)
+                                .order_by("priority", sea_query::Order::Asc)
+                                .order_by("job_id", sea_query::Order::Asc)
+                                .limit(batch_size)
+                                .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                                .to_owned();
 
-                            if paused_queues.is_empty() {
-                                stmt = r#"SELECT * FROM "solid_queue_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#.to_string();
+                            // Add WHERE clause for paused queues if any exist
+                            if !paused_queues.is_empty() {
+                                query = query.and_where(Expr::col("queue_name").is_not_in(paused_queues.clone())).to_owned();
                             }
 
-                            let mut values: Vec<Value> = vec![batch_size.into()];
-                            values.extend(paused_queues.iter().map(|q| q.clone().into()));
+                            let (sql, values) = match db_backend {
+                                DbBackend::Postgres => query.build(PostgresQueryBuilder),
+                                DbBackend::MySql => query.build(MysqlQueryBuilder),
+                                _ => query.build(PostgresQueryBuilder), // fallback
+                            };
 
                             quebec_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     db_backend,
-                                    &stmt,
+                                    &sql,
                                     values,
                                 ))
                                 .all(txn)
@@ -1287,12 +1309,12 @@ impl Worker {
                         }
                     };
 
-                    // let records: Vec<solid_queue_ready_executions::Model> =
-                    // solid_queue_ready_executions::Entity::find()
+                    // let records: Vec<quebec_ready_executions::Model> =
+                    // quebec_ready_executions::Entity::find()
                     //     // .select_only()
-                    //     // .column(solid_queue_ready_executions::Column::JobId)
-                    //     .order_by_asc(solid_queue_ready_executions::Column::Priority)
-                    //     .order_by_asc(solid_queue_ready_executions::Column::JobId)
+                    //     // .column(quebec_ready_executions::Column::JobId)
+                    //     .order_by_asc(quebec_ready_executions::Column::Priority)
+                    //     .order_by_asc(quebec_ready_executions::Column::JobId)
                     //     .lock_with_behavior(
                     //         sea_query::LockType::Update,
                     //         LockBehavior::SkipLocked,
