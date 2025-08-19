@@ -5,7 +5,7 @@ use axum::{
     response::Html,
     http::StatusCode,
 };
-use sea_orm::{Statement, DbBackend, Value, ConnectionTrait};
+use sea_orm::{Statement, Value, ConnectionTrait};
 use tracing::debug;
 
 use crate::control_plane::{ControlPlane, models::JobDetailsInfo};
@@ -22,40 +22,50 @@ impl ControlPlane {
 
         let start = Instant::now();
 
-        // Get job basic information
+        // Get job basic information using dynamic table names
+        let table_config = &state.ctx.table_config;
+        let job_details_sql = format!(
+            "SELECT
+                j.id,
+                j.queue_name,
+                j.class_name,
+                j.created_at,
+                j.finished_at,
+                j.arguments,
+                CASE
+                    WHEN j.finished_at IS NOT NULL THEN 'finished'
+                    WHEN c.id IS NOT NULL THEN 'processing'
+                    WHEN f.id IS NOT NULL THEN 'failed'
+                    WHEN s.id IS NOT NULL THEN 'scheduled'
+                    WHEN b.id IS NOT NULL THEN 'blocked'
+                    ELSE 'pending'
+                END AS status,
+                c.id as claimed_id,
+                f.id as failed_id,
+                s.id as scheduled_id,
+                b.id as blocked_id,
+                f.error as error_message,
+                s.scheduled_at,
+                b.concurrency_key,
+                b.expires_at,
+                c.process_id
+            FROM {} j
+            LEFT JOIN {} c ON j.id = c.job_id
+            LEFT JOIN {} f ON j.id = f.job_id
+            LEFT JOIN {} s ON j.id = s.job_id
+            LEFT JOIN {} b ON j.id = b.job_id
+            WHERE j.id = $1",
+            table_config.jobs,
+            table_config.claimed_executions,
+            table_config.failed_executions,
+            table_config.scheduled_executions,
+            table_config.blocked_executions
+        );
+        
         let job_result = db
             .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT
-                    j.id,
-                    j.queue_name,
-                    j.class_name,
-                    j.created_at,
-                    j.finished_at,
-                    j.arguments,
-                    CASE
-                        WHEN j.finished_at IS NOT NULL THEN 'finished'
-                        WHEN c.id IS NOT NULL THEN 'processing'
-                        WHEN f.id IS NOT NULL THEN 'failed'
-                        WHEN s.id IS NOT NULL THEN 'scheduled'
-                        WHEN b.id IS NOT NULL THEN 'blocked'
-                        ELSE 'pending'
-                    END AS status,
-                    c.id as claimed_id,
-                    f.id as failed_id,
-                    s.id as scheduled_id,
-                    b.id as blocked_id,
-                    f.error as error_message,
-                    s.scheduled_at,
-                    b.concurrency_key,
-                    b.expires_at,
-                    c.process_id
-                FROM solid_queue_jobs j
-                LEFT JOIN solid_queue_claimed_executions c ON j.id = c.job_id
-                LEFT JOIN solid_queue_failed_executions f ON j.id = f.job_id
-                LEFT JOIN solid_queue_scheduled_executions s ON j.id = s.job_id
-                LEFT JOIN solid_queue_blocked_executions b ON j.id = b.job_id
-                WHERE j.id = $1",
+                db.get_database_backend(),
+                &job_details_sql,
                 [Value::from(id)]
             ))
             .await
@@ -124,10 +134,15 @@ impl ControlPlane {
                     job_details.execution_id = Some(failed_id);
 
                     // Get failure information
+                    let failed_details_sql = format!(
+                        "SELECT error, created_at as failed_at FROM {} WHERE id = $1",
+                        table_config.failed_executions
+                    );
+                    
                     if let Ok(failed_info) = db
                         .query_one(Statement::from_sql_and_values(
-                            DbBackend::Postgres,
-                            "SELECT error, created_at as failed_at FROM solid_queue_failed_executions WHERE id = $1",
+                            db.get_database_backend(),
+                            &failed_details_sql,
                             [Value::from(failed_id)]
                         ))
                         .await
@@ -192,10 +207,15 @@ impl ControlPlane {
                     // Get processing information
                     if let Ok(process_id) = row.try_get::<i64>("", "process_id") {
                         // Get worker process information
+                        let worker_details_sql = format!(
+                            "SELECT name, hostname FROM {} WHERE id = $1",
+                            table_config.processes
+                        );
+                        
                         if let Ok(worker_info) = db
                             .query_one(Statement::from_sql_and_values(
-                                DbBackend::Postgres,
-                                "SELECT name, hostname FROM solid_queue_processes WHERE id = $1",
+                                db.get_database_backend(),
+                                &worker_details_sql,
                                 [Value::from(process_id)]
                             ))
                             .await
@@ -215,10 +235,15 @@ impl ControlPlane {
                     }
 
                     // Get start time and runtime
+                    let claimed_details_sql = format!(
+                        "SELECT created_at FROM {} WHERE id = $1",
+                        table_config.claimed_executions
+                    );
+                    
                     if let Ok(claimed_info) = db
                         .query_one(Statement::from_sql_and_values(
-                            DbBackend::Postgres,
-                            "SELECT created_at FROM solid_queue_claimed_executions WHERE id = $1",
+                            db.get_database_backend(),
+                            &claimed_details_sql,
                             [Value::from(claimed_id)]
                         ))
                         .await
@@ -238,31 +263,38 @@ impl ControlPlane {
                 _ => {}
             }
 
-            // Get execution history
+            // Get execution history using dynamic table names
+            let history_sql = format!(
+                "SELECT 
+                    'failed' as event_type,
+                    created_at as timestamp,
+                    error
+                 FROM {}
+                 WHERE job_id = $1
+                 UNION ALL
+                 SELECT 
+                    'scheduled' as event_type,
+                    created_at as timestamp,
+                    NULL as error
+                 FROM {}
+                 WHERE job_id = $1
+                 UNION ALL
+                 SELECT 
+                    'claimed' as event_type,
+                    created_at as timestamp,
+                    NULL as error
+                 FROM {}
+                 WHERE job_id = $1
+                 ORDER BY timestamp DESC",
+                table_config.failed_executions,
+                table_config.scheduled_executions,
+                table_config.claimed_executions
+            );
+            
             let history_result = db
                 .query_all(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "SELECT 
-                        'failed' as event_type,
-                        created_at as timestamp,
-                        error
-                     FROM solid_queue_failed_executions
-                     WHERE job_id = $1
-                     UNION ALL
-                     SELECT 
-                        'scheduled' as event_type,
-                        created_at as timestamp,
-                        NULL as error
-                     FROM solid_queue_scheduled_executions
-                     WHERE job_id = $1
-                     UNION ALL
-                     SELECT 
-                        'claimed' as event_type,
-                        created_at as timestamp,
-                        NULL as error
-                     FROM solid_queue_claimed_executions
-                     WHERE job_id = $1
-                     ORDER BY timestamp DESC",
+                    db.get_database_backend(),
+                    &history_sql,
                     [Value::from(id)]
                 ))
                 .await

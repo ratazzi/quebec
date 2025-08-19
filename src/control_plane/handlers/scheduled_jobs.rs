@@ -5,7 +5,7 @@ use axum::{
     response::{Html, IntoResponse},
     http::StatusCode,
 };
-use sea_orm::{EntityTrait, Statement, DbBackend, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
+use sea_orm::{EntityTrait, Statement, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
 use tracing::{debug, info, error};
 
 use crate::entities::{quebec_jobs, quebec_scheduled_executions};
@@ -27,22 +27,29 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get scheduled jobs with related information
+        // Get scheduled jobs with related information using dynamic table names
+        let table_config = &state.ctx.table_config;
+        let scheduled_jobs_sql = format!(
+            "SELECT
+                s.id as execution_id,
+                s.job_id,
+                s.scheduled_at,
+                j.class_name,
+                j.queue_name,
+                j.created_at
+            FROM {} s
+            JOIN {} j ON s.job_id = j.id
+            WHERE j.finished_at IS NULL
+            ORDER BY s.scheduled_at ASC
+            LIMIT $1 OFFSET $2",
+            table_config.scheduled_executions,
+            table_config.jobs
+        );
+        
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT
-                    s.id as execution_id,
-                    s.job_id,
-                    s.scheduled_at,
-                    j.class_name,
-                    j.queue_name,
-                    j.created_at
-                FROM solid_queue_scheduled_executions s
-                JOIN solid_queue_jobs j ON s.job_id = j.id
-                WHERE j.finished_at IS NULL
-                ORDER BY s.scheduled_at ASC
-                LIMIT $1 OFFSET $2",
+                db.get_database_backend(),
+                &scheduled_jobs_sql,
                 [
                     Value::from(page_size as i32),
                     Value::from(offset as i32)
@@ -100,13 +107,19 @@ impl ControlPlane {
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
         // Get total number of scheduled jobs for pagination
+        let count_sql = format!(
+            "SELECT COUNT(*) AS count
+             FROM {} s
+             JOIN {} j ON s.job_id = j.id
+             WHERE j.finished_at IS NULL",
+            table_config.scheduled_executions,
+            table_config.jobs
+        );
+        
         let total_count = db
             .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT COUNT(*) AS count
-                 FROM solid_queue_scheduled_executions s
-                 JOIN solid_queue_jobs j ON s.job_id = j.id
-                 WHERE j.finished_at IS NULL",
+                db.get_database_backend(),
+                &count_sql,
                 []
             ))
             .await

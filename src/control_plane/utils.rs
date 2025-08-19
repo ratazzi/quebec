@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use chrono::{NaiveDateTime, Utc};
-use sea_orm::{DbErr, EntityTrait, EntityName, QueryFilter, ColumnTrait, QuerySelect, Order, QueryOrder, PaginatorTrait};
+use sea_orm::{DbErr, EntityTrait, QueryFilter, ColumnTrait, QuerySelect, Order, QueryOrder, PaginatorTrait};
 use tera::Context;
 use tracing::{error, debug, info};
 use axum::http::StatusCode;

@@ -7,6 +7,7 @@ use axum::{
     http::StatusCode,
 };
 use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, ActiveModelTrait, ActiveValue, Statement, DbBackend, ConnectionTrait, QueryOrder, Order, PaginatorTrait, QuerySelect};
+use sea_orm::sea_query::{Query as SeaQuery, Expr, Alias, PostgresQueryBuilder, SqliteQueryBuilder, MysqlQueryBuilder};
 use tracing::{debug, error};
 
 use crate::entities::{quebec_jobs, quebec_pauses};
@@ -30,13 +31,27 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+        let table_config = &state.ctx.table_config;
+        let jobs_table = Alias::new(&table_config.jobs);
+        
+        let query = SeaQuery::select()
+            .column(Alias::new("queue_name"))
+            .expr_as(Expr::col(Alias::new("queue_name")).count(), Alias::new("count"))
+            .from(jobs_table)
+            .and_where(Expr::col(Alias::new("finished_at")).is_null())
+            .group_by_col(Alias::new("queue_name"))
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+
         let stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT queue_name, COUNT(*) as count
-             FROM solid_queue_jobs
-             WHERE finished_at IS NULL
-             GROUP BY queue_name",
-            []
+            db.get_database_backend(),
+            &sql,
+            values
         );
 
         // Get queue counts with unfinished jobs
@@ -181,10 +196,24 @@ impl ControlPlane {
         let job_ids: Vec<i64> = jobs.iter().map(|j| j.id).collect();
         
         // Check for failed executions
+        let failed_table = Alias::new(&state.ctx.table_config.failed_executions);
+        
+        let failed_query = SeaQuery::select()
+            .column(Alias::new("job_id"))
+            .from(failed_table)
+            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
+            .to_owned();
+
+        let (failed_sql, failed_values) = match db.get_database_backend() {
+            DbBackend::Postgres => failed_query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => failed_query.build(SqliteQueryBuilder), 
+            DbBackend::MySql => failed_query.build(MysqlQueryBuilder),
+        };
+
         let failed_executions_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"SELECT job_id FROM solid_queue_failed_executions WHERE job_id = ANY($1)"#,
-            [job_ids.clone().into()]
+            db.get_database_backend(),
+            &failed_sql,
+            failed_values
         );
         
         let failed_job_ids: Vec<i64> = db
@@ -196,10 +225,24 @@ impl ControlPlane {
             .collect();
         
         // Check for claimed executions (in progress)
+        let claimed_table = Alias::new(&state.ctx.table_config.claimed_executions);
+        
+        let claimed_query = SeaQuery::select()
+            .columns([Alias::new("id"), Alias::new("job_id")])
+            .from(claimed_table)
+            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
+            .to_owned();
+
+        let (claimed_sql, claimed_values) = match db.get_database_backend() {
+            DbBackend::Postgres => claimed_query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => claimed_query.build(SqliteQueryBuilder),
+            DbBackend::MySql => claimed_query.build(MysqlQueryBuilder),
+        };
+
         let claimed_executions_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"SELECT id, job_id FROM solid_queue_claimed_executions WHERE job_id = ANY($1)"#,
-            [job_ids.clone().into()]
+            db.get_database_backend(),
+            &claimed_sql,
+            claimed_values
         );
         
         let claimed_map: HashMap<i64, i64> = db
@@ -215,10 +258,24 @@ impl ControlPlane {
             .collect();
         
         // Check for scheduled executions
+        let scheduled_table = Alias::new(&state.ctx.table_config.scheduled_executions);
+        
+        let scheduled_query = SeaQuery::select()
+            .columns([Alias::new("id"), Alias::new("job_id")])
+            .from(scheduled_table)
+            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
+            .to_owned();
+
+        let (scheduled_sql, scheduled_values) = match db.get_database_backend() {
+            DbBackend::Postgres => scheduled_query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => scheduled_query.build(SqliteQueryBuilder),
+            DbBackend::MySql => scheduled_query.build(MysqlQueryBuilder),
+        };
+
         let scheduled_executions_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"SELECT id, job_id FROM solid_queue_scheduled_executions WHERE job_id = ANY($1)"#,
-            [job_ids.clone().into()]
+            db.get_database_backend(),
+            &scheduled_sql,
+            scheduled_values
         );
         
         let scheduled_map: HashMap<i64, i64> = db
@@ -234,10 +291,24 @@ impl ControlPlane {
             .collect();
         
         // Check for blocked executions
+        let blocked_table = Alias::new(&state.ctx.table_config.blocked_executions);
+        
+        let blocked_query = SeaQuery::select()
+            .columns([Alias::new("id"), Alias::new("job_id")])
+            .from(blocked_table)
+            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids))
+            .to_owned();
+
+        let (blocked_sql, blocked_values) = match db.get_database_backend() {
+            DbBackend::Postgres => blocked_query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => blocked_query.build(SqliteQueryBuilder),
+            DbBackend::MySql => blocked_query.build(MysqlQueryBuilder),
+        };
+
         let blocked_executions_stmt = Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"SELECT id, job_id FROM solid_queue_blocked_executions WHERE job_id = ANY($1)"#,
-            [job_ids.into()]
+            db.get_database_backend(),
+            &blocked_sql,
+            blocked_values
         );
         
         let blocked_map: HashMap<i64, i64> = db

@@ -209,12 +209,12 @@ impl ControlPlane {
                 // Update all related jobs to completed status
                 let now = chrono::Utc::now().naive_utc();
 
-                // Use batch update
-                let update_sql = r#"
-                    UPDATE solid_queue_jobs
-                    SET finished_at = $1, updated_at = $1
-                    WHERE id = ANY($2)
-                "#;
+                // Use batch update with dynamic table name
+                let table_config = &state.ctx.table_config;
+                let update_sql = format!(
+                    "UPDATE {} SET finished_at = $1, updated_at = $1 WHERE id = ANY($2)",
+                    table_config.jobs
+                );
 
                 let stmt = sea_orm::Statement::from_sql_and_values(
                     sea_orm::DbBackend::Postgres,
