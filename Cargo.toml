@@ -35,7 +35,7 @@ sea-orm = { version = "1.1.0", features = [
   "sqlx-sqlite",
   "sqlx-mysql",
   "macros",
-  "runtime-tokio-native-tls",
+  "runtime-tokio-rustls",
   "debug-print",
   "mock",
 ] }
