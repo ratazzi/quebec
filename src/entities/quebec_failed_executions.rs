@@ -3,7 +3,7 @@
 use sea_orm::entity::prelude::*;
 use sea_orm::{DatabaseTransaction, DbErr, ActiveValue};
 use tracing::info;
-use super::solid_queue_ready_executions;
+use super::quebec_ready_executions;
 
 
 // Define the Retryable trait
@@ -39,16 +39,16 @@ pub struct Model {
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::solid_queue_jobs::Entity",
+        belongs_to = "super::quebec_jobs::Entity",
         from = "Column::JobId",
-        to = "super::solid_queue_jobs::Column::Id",
+        to = "super::quebec_jobs::Column::Id",
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
     SolidQueueJobs,
 }
 
-impl Related<super::solid_queue_jobs::Entity> for Entity {
+impl Related<super::quebec_jobs::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueJobs.def()
     }
@@ -60,13 +60,13 @@ impl ActiveModelBehavior for ActiveModel {}
 impl Retryable for Model {
     async fn retry(&self, txn: &DatabaseTransaction) -> Result<(), DbErr> {
         // 1. Find failed job record
-        let job_result = super::solid_queue_jobs::Entity::find_by_id(self.job_id)
+        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id)
             .one(txn)
             .await?;
 
         if let Some(job) = job_result {
             // 2. Add job to ready_executions table
-            let ready_execution = solid_queue_ready_executions::ActiveModel {
+            let ready_execution = quebec_ready_executions::ActiveModel {
                 id: ActiveValue::NotSet,
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
                 job_id: ActiveValue::Set(job.id),
@@ -103,14 +103,14 @@ impl Retryable for Model {
             .collect();
 
         // 2. Get all related job information
-        let jobs = super::solid_queue_jobs::Entity::find()
-            .filter(super::solid_queue_jobs::Column::Id.is_in(job_ids.clone()))
+        let jobs = super::quebec_jobs::Entity::find()
+            .filter(super::quebec_jobs::Column::Id.is_in(job_ids.clone()))
             .all(txn)
             .await?;
 
         // 3. Add all jobs to ready_executions table
         for job in &jobs {
-            let ready_execution = solid_queue_ready_executions::ActiveModel {
+            let ready_execution = quebec_ready_executions::ActiveModel {
                 id: ActiveValue::NotSet,
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
                 job_id: ActiveValue::Set(job.id),
@@ -136,13 +136,13 @@ impl Retryable for Model {
 impl Discardable for Model {
     async fn discard(&self, txn: &DatabaseTransaction) -> Result<(), DbErr> {
         // 1. Find job record
-        let job_result = super::solid_queue_jobs::Entity::find_by_id(self.job_id)
+        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id)
             .one(txn)
             .await?;
 
         if let Some(job) = job_result {
             // 2. Update job status to completed
-            let mut job_model: super::solid_queue_jobs::ActiveModel = job.into();
+            let mut job_model: super::quebec_jobs::ActiveModel = job.into();
             job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
             job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
             job_model.update(txn).await?;
@@ -178,12 +178,12 @@ impl Discardable for Model {
 
         // 2. Update all related jobs to completed status
         for job_id in &job_ids {
-            let job_result = super::solid_queue_jobs::Entity::find_by_id(*job_id)
+            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id)
                 .one(txn)
                 .await?;
 
             if let Some(job) = job_result {
-                let mut job_model: super::solid_queue_jobs::ActiveModel = job.into();
+                let mut job_model: super::quebec_jobs::ActiveModel = job.into();
                 job_model.finished_at = ActiveValue::Set(Some(now));
                 job_model.updated_at = ActiveValue::Set(now);
                 job_model.update(txn).await?;
@@ -224,14 +224,14 @@ impl Retryable for Entity {
             .collect();
 
         // 2. Get all related job information
-        let jobs = super::solid_queue_jobs::Entity::find()
-            .filter(super::solid_queue_jobs::Column::Id.is_in(job_ids.clone()))
+        let jobs = super::quebec_jobs::Entity::find()
+            .filter(super::quebec_jobs::Column::Id.is_in(job_ids.clone()))
             .all(txn)
             .await?;
 
         // 3. Add all jobs to ready_executions table
         for job in &jobs {
-            let ready_execution = solid_queue_ready_executions::ActiveModel {
+            let ready_execution = quebec_ready_executions::ActiveModel {
                 id: ActiveValue::NotSet,
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
                 job_id: ActiveValue::Set(job.id),
@@ -278,12 +278,12 @@ impl Discardable for Entity {
 
         // 2. Update all related jobs to completed status
         for job_id in &job_ids {
-            let job_result = super::solid_queue_jobs::Entity::find_by_id(*job_id)
+            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id)
                 .one(txn)
                 .await?;
 
             if let Some(job) = job_result {
-                let mut job_model: super::solid_queue_jobs::ActiveModel = job.into();
+                let mut job_model: super::quebec_jobs::ActiveModel = job.into();
                 job_model.finished_at = ActiveValue::Set(Some(now));
                 job_model.updated_at = ActiveValue::Set(now);
                 job_model.update(txn).await?;

@@ -5,10 +5,10 @@ use axum::{
     response::{Html, IntoResponse},
     http::StatusCode,
 };
-use sea_orm::{EntityTrait, Statement, DbBackend, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
+use sea_orm::{EntityTrait, Statement, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
 use tracing::{debug, info, error};
 
-use crate::entities::{solid_queue_jobs, solid_queue_scheduled_executions};
+use crate::entities::{quebec_jobs, quebec_scheduled_executions};
 use crate::control_plane::{ControlPlane, models::{Pagination, ScheduledJobInfo}};
 
 impl ControlPlane {
@@ -27,22 +27,29 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get scheduled jobs with related information
+        // Get scheduled jobs with related information using dynamic table names
+        let table_config = &state.ctx.table_config;
+        let scheduled_jobs_sql = format!(
+            "SELECT
+                s.id as execution_id,
+                s.job_id,
+                s.scheduled_at,
+                j.class_name,
+                j.queue_name,
+                j.created_at
+            FROM {} s
+            JOIN {} j ON s.job_id = j.id
+            WHERE j.finished_at IS NULL
+            ORDER BY s.scheduled_at ASC
+            LIMIT $1 OFFSET $2",
+            table_config.scheduled_executions,
+            table_config.jobs
+        );
+        
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT
-                    s.id as execution_id,
-                    s.job_id,
-                    s.scheduled_at,
-                    j.class_name,
-                    j.queue_name,
-                    j.created_at
-                FROM solid_queue_scheduled_executions s
-                JOIN solid_queue_jobs j ON s.job_id = j.id
-                WHERE j.finished_at IS NULL
-                ORDER BY s.scheduled_at ASC
-                LIMIT $1 OFFSET $2",
+                db.get_database_backend(),
+                &scheduled_jobs_sql,
                 [
                     Value::from(page_size as i32),
                     Value::from(offset as i32)
@@ -100,13 +107,19 @@ impl ControlPlane {
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
         // Get total number of scheduled jobs for pagination
+        let count_sql = format!(
+            "SELECT COUNT(*) AS count
+             FROM {} s
+             JOIN {} j ON s.job_id = j.id
+             WHERE j.finished_at IS NULL",
+            table_config.scheduled_executions,
+            table_config.jobs
+        );
+        
         let total_count = db
             .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT COUNT(*) AS count
-                 FROM solid_queue_scheduled_executions s
-                 JOIN solid_queue_jobs j ON s.job_id = j.id
-                 WHERE j.finished_at IS NULL",
+                db.get_database_backend(),
+                &count_sql,
                 []
             ))
             .await
@@ -156,26 +169,26 @@ impl ControlPlane {
         let txn_result = db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find scheduled execution record to cancel
-                let scheduled_execution = solid_queue_scheduled_executions::Entity::find_by_id(id)
+                let scheduled_execution = quebec_scheduled_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?;
 
                 if let Some(execution) = scheduled_execution {
                     // First mark job as completed
-                    let job_result = solid_queue_jobs::Entity::find_by_id(execution.job_id)
+                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
                         .one(txn)
                         .await?;
 
                     if let Some(job) = job_result {
                         // Update job status to completed
-                        let mut job_model: solid_queue_jobs::ActiveModel = job.into();
+                        let mut job_model: quebec_jobs::ActiveModel = job.into();
                         job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
                     // Delete scheduled_execution record
-                    solid_queue_scheduled_executions::Entity::delete_by_id(id)
+                    quebec_scheduled_executions::Entity::delete_by_id(id)
                         .exec(txn)
                         .await?;
 

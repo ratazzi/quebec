@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, DbErr, TransactionTrait, PaginatorTrait, QuerySelect};
 use tracing::{debug, info, error, instrument};
 
-use crate::entities::{solid_queue_jobs, solid_queue_blocked_executions};
+use crate::entities::{quebec_jobs, quebec_blocked_executions};
 use crate::control_plane::{ControlPlane, models::{Pagination, BlockedJobInfo}};
 
 impl ControlPlane {
@@ -28,7 +28,7 @@ impl ControlPlane {
         let offset = (pagination.page - 1) * page_size;
 
         // Get blocked jobs
-        let blocked_executions = solid_queue_blocked_executions::Entity::find()
+        let blocked_executions = quebec_blocked_executions::Entity::find()
             .offset(offset)
             .limit(page_size)
             .all(db)
@@ -43,7 +43,7 @@ impl ControlPlane {
 
         // Get job information for each blocked execution
         for execution in blocked_executions {
-            if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
+            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id).one(db).await {
                 // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
@@ -76,7 +76,7 @@ impl ControlPlane {
         // Get total number of blocked jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = solid_queue_blocked_executions::Entity::find()
+        let total_count: u64 = quebec_blocked_executions::Entity::find()
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -128,13 +128,13 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find blocked execution
-                let _blocked_execution = solid_queue_blocked_executions::Entity::find_by_id(id)
+                let _blocked_execution = quebec_blocked_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?
                     .ok_or_else(|| DbErr::Custom(format!("Blocked execution with ID {} not found", id)))?;
 
                 // Delete blocked execution
-                solid_queue_blocked_executions::Entity::delete_by_id(id)
+                quebec_blocked_executions::Entity::delete_by_id(id)
                     .exec(txn)
                     .await?;
 
@@ -168,7 +168,7 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find blocked execution
-                let blocked_execution = solid_queue_blocked_executions::Entity::find_by_id(id)
+                let blocked_execution = quebec_blocked_executions::Entity::find_by_id(id)
                     .one(txn)
                     .await?
                     .ok_or_else(|| DbErr::Custom(format!("Blocked execution with ID {} not found", id)))?;
@@ -176,12 +176,12 @@ impl ControlPlane {
                 let job_id = blocked_execution.job_id;
 
                 // Delete blocked execution
-                solid_queue_blocked_executions::Entity::delete_by_id(id)
+                quebec_blocked_executions::Entity::delete_by_id(id)
                     .exec(txn)
                     .await?;
 
                 // Delete related job
-                solid_queue_jobs::Entity::delete_by_id(job_id)
+                quebec_jobs::Entity::delete_by_id(job_id)
                     .exec(txn)
                     .await?;
 
@@ -212,7 +212,7 @@ impl ControlPlane {
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
                 // Delete all blocked executions
-                let result = solid_queue_blocked_executions::Entity::delete_many()
+                let result = quebec_blocked_executions::Entity::delete_many()
                     .exec(txn)
                     .await?;
 

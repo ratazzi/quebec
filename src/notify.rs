@@ -15,7 +15,7 @@ pub struct NotifyManager {
 
 impl NotifyManager {
     pub fn new(ctx: Arc<AppContext>, queue_name: &str) -> Self {
-        let channel_name = format!("solid_queue_{}", queue_name);
+        let channel_name = format!("quebec_{}", queue_name);
         Self {
             ctx,
             channel_name,
@@ -145,7 +145,7 @@ impl NotifyManager {
     where
         C: ConnectionTrait,
     {
-        let channel_name = format!("solid_queue_{}", queue_name);
+        let channel_name = format!("quebec_{}", queue_name);
         Self::send_notify_with_db(db, &channel_name, message).await
     }
 
@@ -199,7 +199,7 @@ mod tests {
         let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
         let ctx = Arc::new(AppContext::new(dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
         let manager = NotifyManager::new(ctx, "default");
-        assert_eq!(manager.get_channel_name(), "solid_queue_default");
+        assert_eq!(manager.get_channel_name(), "quebec_default");
     }
 
     #[test]

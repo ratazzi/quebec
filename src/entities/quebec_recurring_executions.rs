@@ -3,32 +3,30 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
-#[sea_orm(table_name = "solid_queue_blocked_executions")]
+#[sea_orm(table_name = "solid_queue_recurring_executions")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     #[sea_orm(unique)]
     pub job_id: i64,
-    pub queue_name: String,
-    pub priority: i32,
-    pub concurrency_key: String,
-    pub expires_at: DateTime,
+    pub task_key: String,
+    pub run_at: DateTime,
     pub created_at: DateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
     #[sea_orm(
-        belongs_to = "super::solid_queue_jobs::Entity",
+        belongs_to = "super::quebec_jobs::Entity",
         from = "Column::JobId",
-        to = "super::solid_queue_jobs::Column::Id",
+        to = "super::quebec_jobs::Column::Id",
         on_update = "NoAction",
         on_delete = "Cascade"
     )]
     SolidQueueJobs,
 }
 
-impl Related<super::solid_queue_jobs::Entity> for Entity {
+impl Related<super::quebec_jobs::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::SolidQueueJobs.def()
     }

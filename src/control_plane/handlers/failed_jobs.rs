@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, DbErr, TransactionTrait, PaginatorTrait, QuerySelect};
 use tracing::{debug, info, error, instrument};
 
-use crate::entities::{solid_queue_jobs, solid_queue_failed_executions};
+use crate::entities::{quebec_jobs, quebec_failed_executions};
 use crate::control_plane::{ControlPlane, models::{Pagination, FailedJobInfo}};
 
 impl ControlPlane {
@@ -28,7 +28,7 @@ impl ControlPlane {
         let offset = (pagination.page - 1) * page_size;
 
         // Get failed execution records
-        let failed_executions = solid_queue_failed_executions::Entity::find()
+        let failed_executions = quebec_failed_executions::Entity::find()
             .offset(offset)
             .limit(page_size)
             .all(db)
@@ -40,7 +40,7 @@ impl ControlPlane {
 
         // Get job information for each failed execution
         for execution in failed_executions {
-            if let Ok(Some(job)) = solid_queue_jobs::Entity::find_by_id(execution.job_id).one(db).await {
+            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id).one(db).await {
                 failed_jobs.push(FailedJobInfo {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
@@ -58,7 +58,7 @@ impl ControlPlane {
         let start = Instant::now();
 
         // Execute SQL count query directly
-        let total_count: u64 = solid_queue_failed_executions::Entity::find()
+        let total_count: u64 = quebec_failed_executions::Entity::find()
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -93,7 +93,7 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Retryable};
+        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Retryable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -103,7 +103,7 @@ impl ControlPlane {
             Box::pin(async move {
                 // First get failed execution record
                 let failed_execution = FailedExecutionEntity::find()
-                    .filter(solid_queue_failed_executions::Column::JobId.eq(id))
+                    .filter(quebec_failed_executions::Column::JobId.eq(id))
                     .one(txn)
                     .await?;
 
@@ -135,7 +135,7 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Discardable};
+        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Discardable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -145,7 +145,7 @@ impl ControlPlane {
             Box::pin(async move {
                 // First get failed execution record
                 let failed_execution = FailedExecutionEntity::find()
-                    .filter(solid_queue_failed_executions::Column::JobId.eq(id))
+                    .filter(quebec_failed_executions::Column::JobId.eq(id))
                     .one(txn)
                     .await?;
 
@@ -176,7 +176,7 @@ impl ControlPlane {
     pub async fn retry_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Retryable};
+        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Retryable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -204,7 +204,7 @@ impl ControlPlane {
     pub async fn discard_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
     ) -> impl IntoResponse {
-        use crate::entities::solid_queue_failed_executions::{Entity as FailedExecutionEntity, Discardable};
+        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Discardable};
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();

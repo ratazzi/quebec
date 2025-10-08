@@ -20,14 +20,15 @@ impl Quebec {
         Self { ctx }
     }
 
-    pub async fn perform_later(&self, job: ActiveJob) -> Result<solid_queue_jobs::Model> {
+    pub async fn perform_later(&self, job: ActiveJob) -> Result<quebec_jobs::Model> {
         let db = self.ctx.get_db().await;
         let _ = db.ping().await?;
         let duration = self.ctx.default_concurrency_control_period;
+        let ctx = self.ctx.clone(); // Clone ctx for the async closure
         trace!("job: {:?}", job);
 
         let job = db
-            .transaction::<_, solid_queue_jobs::Model, DbErr>(|txn| {
+            .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
                 Box::pin(async move {
                     let args: serde_json::Value = serde_json::from_str(job.arguments.as_str())
                         .map_err(|e| DbErr::Custom(format!("Serialization error: {}", e)))?;
@@ -50,7 +51,7 @@ impl Quebec {
                     let concurrency_limit = job.concurrency_limit.unwrap_or(1);
                     
                     // Insert job and get the model with generated ID
-                    let job_model = solid_queue_jobs::ActiveModel {
+                    let job_model = quebec_jobs::ActiveModel {
                         id: ActiveValue::NotSet,
                         queue_name: ActiveValue::Set(job.queue_name),
                         class_name: ActiveValue::Set(job.class_name),
@@ -76,12 +77,12 @@ impl Quebec {
                         // Try to acquire the semaphore
                         let now = chrono::Utc::now().naive_utc();
                         let expires_at = now + duration;
-                        if acquire_semaphore(txn, concurrency_key.clone(), concurrency_limit, None).await? {
+                        if acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await? {
                             info!("Semaphore acquired for key: {}", concurrency_key);
                         } else {
                             info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
 
-                            let _blocked_execution = solid_queue_blocked_executions::ActiveModel {
+                            let _blocked_execution = quebec_blocked_executions::ActiveModel {
                                 id: ActiveValue::NotSet,
                                 queue_name: ActiveValue::Set("default".to_string()),
                                 job_id: ActiveValue::Set(job_id),
@@ -98,7 +99,7 @@ impl Quebec {
                         }
                     }
 
-                    let _ready_execution = solid_queue_ready_executions::ActiveModel {
+                    let _ready_execution = quebec_ready_executions::ActiveModel {
                         id: ActiveValue::NotSet,
                         queue_name: ActiveValue::Set("default".to_string()),
                         job_id: ActiveValue::Set(job_id),

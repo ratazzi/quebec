@@ -1,7 +1,7 @@
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
-use crate::context::ConcurrencyConstraint;
+use crate::context::{ConcurrencyConstraint, TableConfig};
 
-pub async fn acquire_semaphore<C>(db: &C, key: String, concurrency_limit: i32, duration: Option<chrono::Duration>) -> Result<bool, DbErr>
+pub async fn acquire_semaphore<C>(db: &C, table_config: &TableConfig, key: String, concurrency_limit: i32, duration: Option<chrono::Duration>) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -11,17 +11,17 @@ where
     // First, try to create a new semaphore (attempt_creation)
     let create_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres => {
-            "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
+            format!("INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (key) DO NOTHING"
+             ON CONFLICT (key) DO NOTHING", table_config.semaphores)
         },
         DatabaseBackend::Sqlite => {
-            "INSERT OR IGNORE INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5)"
+            format!("INSERT OR IGNORE INTO {} (key, value, expires_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5)", table_config.semaphores)
         },
         DatabaseBackend::MySql => {
-            "INSERT IGNORE INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)"
+            format!("INSERT IGNORE INTO {} (key, value, expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?)", table_config.semaphores)
         },
     };
 
@@ -46,18 +46,18 @@ where
 
     let decrement_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
-            "UPDATE solid_queue_semaphores SET \
+            format!("UPDATE {} SET \
              value = value - 1, \
              expires_at = $2, \
              updated_at = $3 \
-             WHERE key = $1 AND value > 0"
+             WHERE key = $1 AND value > 0", table_config.semaphores)
         },
         DatabaseBackend::MySql => {
-            "UPDATE solid_queue_semaphores SET \
+            format!("UPDATE {} SET \
              value = value - 1, \
              expires_at = ?, \
              updated_at = ? \
-             WHERE key = ? AND value > 0"
+             WHERE key = ? AND value > 0", table_config.semaphores)
         },
     };
 
@@ -73,14 +73,14 @@ where
 }
 
 /// Convenience function to acquire semaphore using ConcurrencyConstraint
-pub async fn acquire_semaphore_with_constraint<C>(db: &C, constraint: &ConcurrencyConstraint) -> Result<bool, DbErr>
+pub async fn acquire_semaphore_with_constraint<C>(db: &C, table_config: &TableConfig, constraint: &ConcurrencyConstraint) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
-    acquire_semaphore(db, constraint.key.clone(), constraint.limit, constraint.duration).await
+    acquire_semaphore(db, table_config, constraint.key.clone(), constraint.limit, constraint.duration).await
 }
 
-pub async fn release_semaphore<C>(db: &C, key: String) -> Result<(), DbErr>
+pub async fn release_semaphore<C>(db: &C, table_config: &TableConfig, key: String) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
 {
@@ -88,18 +88,18 @@ where
 
     let sql = match db.get_database_backend() {
         DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
-            "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
+            format!("INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (key) DO UPDATE SET \
-             value = solid_queue_semaphores.value + 1, \
-             updated_at = EXCLUDED.updated_at"
+             value = {}.value + 1, \
+             updated_at = EXCLUDED.updated_at", table_config.semaphores, table_config.semaphores)
         }
         DatabaseBackend::MySql => {
-            "INSERT INTO solid_queue_semaphores (key, value, expires_at, created_at, updated_at) \
+            format!("INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE \
              value = value + 1, \
-             updated_at = VALUES(updated_at)"
+             updated_at = VALUES(updated_at)", table_config.semaphores)
         }
     };
 

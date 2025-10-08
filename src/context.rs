@@ -23,6 +23,57 @@ pub struct ConcurrencyConstraint {
     pub duration: Option<chrono::Duration>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TableConfig {
+    pub jobs: String,
+    pub ready_executions: String,
+    pub claimed_executions: String,
+    pub scheduled_executions: String,
+    pub failed_executions: String,
+    pub blocked_executions: String,
+    pub recurring_executions: String,
+    pub recurring_tasks: String,
+    pub pauses: String,
+    pub processes: String,
+    pub semaphores: String,
+}
+
+impl Default for TableConfig {
+    fn default() -> Self {
+        Self {
+            jobs: "solid_queue_jobs".to_string(),
+            ready_executions: "solid_queue_ready_executions".to_string(),
+            claimed_executions: "solid_queue_claimed_executions".to_string(),
+            scheduled_executions: "solid_queue_scheduled_executions".to_string(),
+            failed_executions: "solid_queue_failed_executions".to_string(),
+            blocked_executions: "solid_queue_blocked_executions".to_string(),
+            recurring_executions: "solid_queue_recurring_executions".to_string(),
+            recurring_tasks: "solid_queue_recurring_tasks".to_string(),
+            pauses: "solid_queue_pauses".to_string(),
+            processes: "solid_queue_processes".to_string(),
+            semaphores: "solid_queue_semaphores".to_string(),
+        }
+    }
+}
+
+impl TableConfig {
+    pub fn with_prefix(prefix: &str) -> Self {
+        Self {
+            jobs: format!("{}_jobs", prefix),
+            ready_executions: format!("{}_ready_executions", prefix),
+            claimed_executions: format!("{}_claimed_executions", prefix),
+            scheduled_executions: format!("{}_scheduled_executions", prefix),
+            failed_executions: format!("{}_failed_executions", prefix),
+            blocked_executions: format!("{}_blocked_executions", prefix),
+            recurring_executions: format!("{}_recurring_executions", prefix),
+            recurring_tasks: format!("{}_recurring_tasks", prefix),
+            pauses: format!("{}_pauses", prefix),
+            processes: format!("{}_processes", prefix),
+            semaphores: format!("{}_semaphores", prefix),
+        }
+    }
+}
+
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct ConcurrencyStrategy {
@@ -184,6 +235,7 @@ pub struct AppContext {
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
     pub runtime_handle: Option<Handle>,
+    pub table_config: TableConfig, // Dynamic table name configuration
 }
 
 impl AppContext {
@@ -216,6 +268,7 @@ impl AppContext {
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
             runtime_handle: None,
+            table_config: TableConfig::default(),
         };
 
         // Override default configuration if options are provided
@@ -327,6 +380,15 @@ impl AppContext {
                 if let Some(val) = options.get("worker_threads") {
                     if let Ok(value) = val.extract::<u64>(py) {
                         ctx.worker_threads = value;
+                    }
+                }
+
+                // Handle table_name_prefix for dynamic table naming
+                if let Some(val) = options.get("table_name_prefix") {
+                    if let Ok(prefix) = val.extract::<String>(py) {
+                        if !prefix.is_empty() {
+                            ctx.table_config = TableConfig::with_prefix(&prefix);
+                        }
                     }
                 }
             });

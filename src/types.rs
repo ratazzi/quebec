@@ -37,67 +37,67 @@ trait EntityTrait {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement;
 }
 
-impl EntityTrait for solid_queue_blocked_executions::Entity {
+impl EntityTrait for quebec_blocked_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_claimed_executions::Entity {
+impl EntityTrait for quebec_claimed_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_failed_executions::Entity {
+impl EntityTrait for quebec_failed_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_jobs::Entity {
+impl EntityTrait for quebec_jobs::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_pauses::Entity {
+impl EntityTrait for quebec_pauses::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_processes::Entity {
+impl EntityTrait for quebec_processes::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_ready_executions::Entity {
+impl EntityTrait for quebec_ready_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_recurring_executions::Entity {
+impl EntityTrait for quebec_recurring_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_recurring_tasks::Entity {
+impl EntityTrait for quebec_recurring_tasks::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_scheduled_executions::Entity {
+impl EntityTrait for quebec_scheduled_executions::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
 }
 
-impl EntityTrait for solid_queue_semaphores::Entity {
+impl EntityTrait for quebec_semaphores::Entity {
     fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
         schema.create_table_from_entity(*self)
     }
@@ -485,17 +485,17 @@ impl PyQuebec {
             let schema = Schema::new(db.get_database_backend());
 
             let tables: Vec<Box<dyn EntityTrait>> = vec![
-                Box::new(solid_queue_blocked_executions::Entity),
-                Box::new(solid_queue_claimed_executions::Entity),
-                Box::new(solid_queue_failed_executions::Entity),
-                Box::new(solid_queue_jobs::Entity),
-                Box::new(solid_queue_pauses::Entity),
-                Box::new(solid_queue_processes::Entity),
-                Box::new(solid_queue_ready_executions::Entity),
-                Box::new(solid_queue_recurring_executions::Entity),
-                Box::new(solid_queue_recurring_tasks::Entity),
-                Box::new(solid_queue_scheduled_executions::Entity),
-                Box::new(solid_queue_semaphores::Entity),
+                Box::new(quebec_blocked_executions::Entity),
+                Box::new(quebec_claimed_executions::Entity),
+                Box::new(quebec_failed_executions::Entity),
+                Box::new(quebec_jobs::Entity),
+                Box::new(quebec_pauses::Entity),
+                Box::new(quebec_processes::Entity),
+                Box::new(quebec_ready_executions::Entity),
+                Box::new(quebec_recurring_executions::Entity),
+                Box::new(quebec_recurring_tasks::Entity),
+                Box::new(quebec_scheduled_executions::Entity),
+                Box::new(quebec_semaphores::Entity),
             ];
 
             for table in tables {

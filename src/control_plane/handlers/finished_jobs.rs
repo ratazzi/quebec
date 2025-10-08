@@ -8,7 +8,7 @@ use axum::{
 use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QueryOrder, PaginatorTrait, QuerySelect};
 use tracing::{debug, info};
 
-use crate::entities::solid_queue_jobs;
+use crate::entities::quebec_jobs;
 use crate::control_plane::{ControlPlane, models::{Pagination, FinishedJobInfo}};
 
 impl ControlPlane {
@@ -28,9 +28,9 @@ impl ControlPlane {
         let offset = (pagination.page - 1) * page_size;
 
         // Get completed jobs
-        let finished_jobs_query = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
-            .order_by_desc(solid_queue_jobs::Column::FinishedAt)
+        let finished_jobs_query = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
+            .order_by_desc(quebec_jobs::Column::FinishedAt)
             .offset(offset)
             .limit(page_size);
 
@@ -75,8 +75,8 @@ impl ControlPlane {
         // Get total number of completed jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = solid_queue_jobs::Entity::find()
-            .filter(solid_queue_jobs::Column::FinishedAt.is_not_null())
+        let total_count: u64 = quebec_jobs::Entity::find()
+            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
