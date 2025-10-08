@@ -6,7 +6,30 @@ classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: Implementation :: CPython",
   "Programming Language :: Python :: Implementation :: PyPy",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Operating System :: MacOS",
 ]
+description = "Quebec is a simple background task queue for processing asynchronous tasks."
+readme = "README.md"
+license = "MIT"
+authors = [{name = "ratazzi", email = "ratazzi.potts@gmail.com"}]
+keywords = ["solid_queue", "postgresql", "mysql", "sqlite", "queue"]
+
+[project.urls]
+Documentation = "https://github.com/ratazzi/quebec/REDME.md"
+Homepage = "https://github.com/ratazzi/quebec"
+Repository = "https://github.com/ratazzi/quebec"
 
 [project.optional-dependencies]
 test = ["pytest < 5.0.0", "pytest-cov[all]"]
