@@ -136,8 +136,8 @@ where
                 Value::from(Some("")),
                 Value::from(entry.class),
                 Value::from(json!(entry.args)),
-                Value::from(Some("")),
-                Value::from(0),
+                Value::from(entry.queue.or(Some("".to_string()))),
+                Value::from(entry.priority.unwrap_or(0)),
                 Value::from(true),
                 Value::from(""),
             ],
@@ -155,13 +155,15 @@ pub async fn enqueue_job<C>(
 where
     C: ConnectionTrait,
 {
-    let queue_name = "default";
+    let queue_name = entry.queue.as_deref().unwrap_or("default");
+    let priority = entry.priority.unwrap_or(0);
+
     let params = serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
         "provider_job_id": "",
         "queue_name": queue_name,
-        "priority": 0,
+        "priority": priority,
         "arguments": entry.args,
         "executions": 0,
         "exception_executions": {},
@@ -194,7 +196,7 @@ where
         queue_name: ActiveValue::Set(queue_name.to_string()),
         class_name: ActiveValue::Set(entry.class),
         arguments: ActiveValue::Set(Some(params.to_string())),
-        priority: ActiveValue::Set(0),
+        priority: ActiveValue::Set(priority),
         failed_attempts: ActiveValue::Set(0),
         active_job_id: ActiveValue::Set(Some("".to_string())),
         scheduled_at: ActiveValue::Set(Some(scheduled_at)),

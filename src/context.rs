@@ -498,6 +498,8 @@ pub struct ScheduledEntry {
     pub schedule: String,
     pub args: Option<Vec<serde_yaml::Value>>,
     pub key: Option<String>,
+    pub queue: Option<String>,
+    pub priority: Option<i32>,
 }
 
 impl ScheduledEntry {

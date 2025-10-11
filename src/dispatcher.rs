@@ -190,19 +190,28 @@ impl Dispatcher {
                           let size = scheduled_executions.len();
 
                           for scheduled_execution in scheduled_executions {
-                              let _ = quebec_ready_executions::ActiveModel {
-                                  id: ActiveValue::NotSet,
-                                  queue_name: ActiveValue::Set("default".to_string()),
-                                  job_id: ActiveValue::Set(scheduled_execution.job_id),
-                                  priority: ActiveValue::Set(0),
-                                  created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                              }
-                              .save(txn)
-                              .await?;
-
-                              quebec_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
-                                  .exec(txn)
+                              // Get job details to retrieve queue_name and priority
+                              let job = quebec_jobs::Entity::find_by_id(scheduled_execution.job_id)
+                                  .one(txn)
                                   .await?;
+
+                              if let Some(job) = job {
+                                  let _ = quebec_ready_executions::ActiveModel {
+                                      id: ActiveValue::NotSet,
+                                      queue_name: ActiveValue::Set(job.queue_name),
+                                      job_id: ActiveValue::Set(scheduled_execution.job_id),
+                                      priority: ActiveValue::Set(job.priority),
+                                      created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                  }
+                                  .save(txn)
+                                  .await?;
+
+                                  quebec_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
+                                      .exec(txn)
+                                      .await?;
+                              } else {
+                                  warn!("Job {} not found for scheduled execution {}", scheduled_execution.job_id, scheduled_execution.id);
+                              }
                           }
 
                           if size > 0 {
