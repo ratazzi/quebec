@@ -647,7 +647,7 @@ impl Execution {
         self.timer = Instant::now();
         let mut job = self.job.clone();
         let job_id = self.claimed.job_id;
-        let span = tracing::info_span!("runner", queue=self.runnable.queue_as, jid = job_id, tid = self.tid.clone());
+        let span = tracing::info_span!("runner", queue=job.queue_name, jid = job_id, tid = self.tid.clone());
         // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
         let result = async {
             let invoke_result = self.runnable.invoke(&mut job);
@@ -935,7 +935,7 @@ impl Execution {
             "enqueued_at": scheduled_at,
         });
 
-        let span = tracing::info_span!("runner", queue=self.runnable.queue_as, jid = job.id, tid = self.tid.clone());
+        let span = tracing::info_span!("runner", queue=job.queue_name, jid = job.id, tid = self.tid.clone());
         let _enter = span.enter();
 
         if (job.failed_attempts as i64) >= strategy.attempts {
