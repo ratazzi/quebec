@@ -158,10 +158,29 @@ impl Dispatcher {
 
                           // Dispatch scheduled jobs
                           let now = chrono::Utc::now().naive_utc();
-                          let scheduled_executions = quebec_scheduled_executions::Entity::find()
-                              .filter(quebec_scheduled_executions::Column::ScheduledAt.lt(now))
-                              .all(txn)
-                              .await;
+
+                          // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
+                          // This matches Solid Queue's implementation
+                          let scheduled_executions = if ctx.use_skip_locked {
+                              quebec_scheduled_executions::Entity::find()
+                                  .filter(quebec_scheduled_executions::Column::ScheduledAt.lte(now))
+                                  .order_by_asc(quebec_scheduled_executions::Column::ScheduledAt)
+                                  .order_by_asc(quebec_scheduled_executions::Column::Priority)
+                                  .order_by_asc(quebec_scheduled_executions::Column::JobId)
+                                  .limit(batch_size)
+                                  .lock_with_behavior(sea_query::LockType::Update, sea_query::LockBehavior::SkipLocked)
+                                  .all(txn)
+                                  .await
+                          } else {
+                              quebec_scheduled_executions::Entity::find()
+                                  .filter(quebec_scheduled_executions::Column::ScheduledAt.lte(now))
+                                  .order_by_asc(quebec_scheduled_executions::Column::ScheduledAt)
+                                  .order_by_asc(quebec_scheduled_executions::Column::Priority)
+                                  .order_by_asc(quebec_scheduled_executions::Column::JobId)
+                                  .limit(batch_size)
+                                  .all(txn)
+                                  .await
+                          };
 
                           if scheduled_executions.is_err() {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
