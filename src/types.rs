@@ -247,9 +247,99 @@ impl PyQuebec {
             None
         };
 
+        // Try to load configuration file BEFORE creating AppContext
+        // This allows code parameters to override config file values
+        // Priority: code parameters > QUEBEC_ENV env var > defaults
+        let env = kwargs
+            .and_then(|kw| kw.get_item("env").ok().flatten())
+            .and_then(|v| v.extract::<String>().ok())
+            .or_else(|| std::env::var("QUEBEC_ENV").ok());
+
+        let config = match crate::config::QueueConfig::find(env.as_deref()) {
+            Ok(config) => {
+                info!("Loaded configuration successfully");
+                Some(config)
+            }
+            Err(e) => {
+                info!("No configuration file found, using defaults: {}", e);
+                None
+            }
+        };
+
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
         // Bind the runtime handle so other parts can reuse the single runtime
         _ctx.set_runtime_handle(rt.handle().clone());
+
+        // Apply config file values ONLY if not already set by code parameters
+        // Check if values are still at their defaults before overriding
+        if let Some(config) = config {
+            // Apply worker configuration
+            if let Some(workers) = config.workers {
+                // Warn if multiple workers are configured (not supported yet)
+                if workers.len() > 1 {
+                    warn!(
+                        "Multiple worker configurations detected ({} workers). Quebec currently only supports a single worker configuration. Only the first worker configuration will be used. \
+                        To run multiple workers, use separate config files or environments and start independent processes. \
+                        Example: QUEBEC_ENV=realtime python worker1.py & QUEBEC_ENV=background python worker2.py",
+                        workers.len()
+                    );
+                }
+
+                if let Some(worker) = workers.first() {
+                    // Only apply if still at default value
+                    if let Some(threads) = worker.threads {
+                        if _ctx.worker_threads == 3 {  // default value
+                            _ctx.worker_threads = threads as u64;
+                        }
+                    }
+                    if let Some(polling_interval) = worker.polling_interval {
+                        if _ctx.worker_polling_interval == Duration::from_millis(100) {  // default value
+                            _ctx.worker_polling_interval = Duration::from_secs_f64(polling_interval);
+                        }
+                    }
+                    // Apply queue configuration (always apply from config if present, as there's no code parameter for this)
+                    if worker.queues.is_some() {
+                        _ctx.worker_queues = worker.queues.clone();
+                    }
+                    if let Some(ref queues) = _ctx.worker_queues {
+                        info!("Worker queues configured: {:?}", queues.to_list());
+                    } else {
+                        info!("Worker queues: None (will process all queues)");
+                    }
+                }
+            }
+
+            // Apply dispatcher configuration
+            if let Some(dispatchers) = config.dispatchers {
+                // Warn if multiple dispatchers are configured (not supported yet)
+                if dispatchers.len() > 1 {
+                    warn!(
+                        "Multiple dispatcher configurations detected ({} dispatchers). Quebec currently only supports a single dispatcher configuration. Only the first dispatcher configuration will be used. \
+                        To run multiple dispatchers, use separate config files or environments and start independent processes. \
+                        Example: QUEBEC_CONFIG=config/queue_dispatcher1.yml python dispatcher1.py & QUEBEC_CONFIG=config/queue_dispatcher2.yml python dispatcher2.py",
+                        dispatchers.len()
+                    );
+                }
+
+                if let Some(dispatcher) = dispatchers.first() {
+                    if let Some(polling_interval) = dispatcher.polling_interval {
+                        if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {  // default value
+                            _ctx.dispatcher_polling_interval = Duration::from_secs_f64(polling_interval);
+                        }
+                    }
+                    if let Some(batch_size) = dispatcher.batch_size {
+                        if _ctx.dispatcher_batch_size == 500 {  // default value
+                            _ctx.dispatcher_batch_size = batch_size;
+                        }
+                    }
+                    if let Some(interval) = dispatcher.concurrency_maintenance_interval {
+                        if _ctx.dispatcher_concurrency_maintenance_interval == Duration::from_secs(600) {  // default value
+                            _ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
+                        }
+                    }
+                }
+            }
+        }
 
         // All parameters have been processed in AppContext.new
         let ctx = Arc::new(_ctx);

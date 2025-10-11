@@ -230,6 +230,7 @@ pub struct AppContext {
     pub dispatcher_concurrency_maintenance_interval: Duration,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
+    pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
@@ -263,6 +264,7 @@ impl AppContext {
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
+            worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
             runnables: Arc::new(RwLock::new(HashMap::new())),

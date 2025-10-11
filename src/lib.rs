@@ -1,3 +1,4 @@
+mod config;
 mod context;
 mod control_plane;
 mod core;
@@ -72,9 +73,14 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<quebec_claimed_executions::Model>()?;
     m.add_class::<Runnable>()?;
     m.add_class::<Execution>()?;
-    // m.add_class::<Metric>()?;
 
-    // m.add("CustomError", py.get_type_bound::<CustomError>())?;
+    // Configuration classes
+    m.add_class::<config::QueueConfig>()?;
+    m.add_class::<config::WorkerConfig>()?;
+    m.add_class::<config::DispatcherConfig>()?;
+    m.add_class::<config::DatabaseConfig>()?;
+
+    // Configuration functions
 
     Ok(())
 }

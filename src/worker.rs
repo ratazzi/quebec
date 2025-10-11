@@ -1174,27 +1174,65 @@ impl Worker {
         //                               // warn!("-------------------- opts: {:?}", opts);
         // }
         let db = self.ctx.get_db().await;
+        let queue_selector = self.ctx.worker_queues.clone();
 
         let job = db
             .transaction::<_, quebec_claimed_executions::ActiveModel, DbErr>(|txn| {
                 Box::pin(async move {
-                    // Get an unlocked task
-                    // let record: Option<quebec_ready_executions::Model> = quebec_ready_executions::Entity::find()
-                    //     .from_raw_sql(Statement::from_sql_and_values(
-                    //         DbBackend::Postgres,
-                    //         r#"SELECT * FROM "quebec_ready_executions" ORDER BY "priority" ASC, "job_id" ASC LIMIT $1 FOR UPDATE SKIP LOCKED"#,
-                    //         [1.into()],
-                    //     ))
-                    //     .one(txn)
-                    //     .await?;
+                    // Get an unlocked task with queue filtering
+                    let record: Option<quebec_ready_executions::Model> = if let Some(ref queues) = queue_selector {
+                        if queues.is_all() {
+                            // All queues - no filter
+                            quebec_ready_executions::Entity::find()
+                                .order_by_asc(quebec_ready_executions::Column::Priority)
+                                .order_by_asc(quebec_ready_executions::Column::JobId)
+                                .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                                .limit(1)
+                                .one(txn)
+                                .await?
+                        } else {
+                            // Specific queues or wildcards - need to filter
+                            let exact = queues.exact_names();
+                            let wildcards = queues.wildcard_prefixes();
 
-                    let record = quebec_ready_executions::Entity::find()
-                        .order_by_asc(quebec_ready_executions::Column::Priority)
-                        .order_by_asc(quebec_ready_executions::Column::JobId)
-                        .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
-                        .limit(1)
-                        .one(txn)
-                        .await?;
+                            let mut select = quebec_ready_executions::Entity::find();
+
+                            if !exact.is_empty() || !wildcards.is_empty() {
+                                let mut condition = sea_orm::Condition::any();
+
+                                // Add exact matches
+                                if !exact.is_empty() {
+                                    condition = condition.add(quebec_ready_executions::Column::QueueName.is_in(exact));
+                                }
+
+                                // Add wildcard patterns
+                                for prefix in wildcards {
+                                    condition = condition.add(
+                                        quebec_ready_executions::Column::QueueName.like(format!("{}%", prefix))
+                                    );
+                                }
+
+                                select = select.filter(condition);
+                            }
+
+                            select
+                                .order_by_asc(quebec_ready_executions::Column::Priority)
+                                .order_by_asc(quebec_ready_executions::Column::JobId)
+                                .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                                .limit(1)
+                                .one(txn)
+                                .await?
+                        }
+                    } else {
+                        // No queue config - default to all queues
+                        quebec_ready_executions::Entity::find()
+                            .order_by_asc(quebec_ready_executions::Column::Priority)
+                            .order_by_asc(quebec_ready_executions::Column::JobId)
+                            .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                            .limit(1)
+                            .one(txn)
+                            .await?
+                    };
 
                     if let Some(execution) = record {
                         // debug!("---------- execution: {:?}", execution);
@@ -1228,6 +1266,7 @@ impl Worker {
         let db = self.ctx.get_db().await;
         let _use_skip_locked = self.ctx.use_skip_locked;
         let table_config = self.ctx.table_config.clone();
+        let queue_selector = self.ctx.worker_queues.clone();
 
         let jobs = db
             .transaction::<_, Vec<quebec_claimed_executions::ActiveModel>, DbErr>(|txn| {
@@ -1251,7 +1290,7 @@ impl Worker {
                             // For SQLite, use sea-query to build the SQL dynamically
                             let table_name = &table_config.ready_executions;
                             let table_alias = Alias::new(table_name);
-                            let query = Query::select()
+                            let mut query = Query::select()
                                 .column(Asterisk)
                                 .from(table_alias)
                                 .order_by("priority", sea_query::Order::Asc)
@@ -1259,20 +1298,36 @@ impl Worker {
                                 .limit(batch_size)
                                 .to_owned();
 
+                            // Add queue filtering
+                            if let Some(ref queues) = queue_selector {
+                                if !queues.is_all() {
+                                    let exact = queues.exact_names();
+                                    let wildcards = queues.wildcard_prefixes();
+
+                                    if !exact.is_empty() {
+                                        query = query.and_where(Expr::col("queue_name").is_in(exact)).to_owned();
+                                    }
+                                    for prefix in wildcards {
+                                        query = query.and_where(Expr::col("queue_name").like(format!("{}%", prefix))).to_owned();
+                                    }
+                                }
+                            }
+
+                            // Add paused queues filter
+                            if !paused_queues.is_empty() {
+                                query = query.and_where(Expr::col("queue_name").is_not_in(paused_queues.clone())).to_owned();
+                            }
+
                             let (sql, values) = query.build(SqliteQueryBuilder);
 
-                            let mut records = quebec_ready_executions::Entity::find()
+                            quebec_ready_executions::Entity::find()
                                 .from_raw_sql(Statement::from_sql_and_values(
                                     DbBackend::Sqlite,
                                     &sql,
                                     values,
                                 ))
                                 .all(txn)
-                                .await?;
-
-                            // Filter out paused queues in application code for SQLite
-                            records.retain(|record| !paused_queues.contains(&record.queue_name));
-                            records
+                                .await?
                         },
                         _ => {
                             // For PostgreSQL and MySQL, use sea-query to build dynamic SQL
@@ -1286,6 +1341,21 @@ impl Worker {
                                 .limit(batch_size)
                                 .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
                                 .to_owned();
+
+                            // Add queue filtering
+                            if let Some(ref queues) = queue_selector {
+                                if !queues.is_all() {
+                                    let exact = queues.exact_names();
+                                    let wildcards = queues.wildcard_prefixes();
+
+                                    if !exact.is_empty() {
+                                        query = query.and_where(Expr::col("queue_name").is_in(exact)).to_owned();
+                                    }
+                                    for prefix in wildcards {
+                                        query = query.and_where(Expr::col("queue_name").like(format!("{}%", prefix))).to_owned();
+                                    }
+                                }
+                            }
 
                             // Add WHERE clause for paused queues if any exist
                             if !paused_queues.is_empty() {

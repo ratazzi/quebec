@@ -291,6 +291,21 @@ impl Scheduler {
         Self { ctx, schedule: Vec::new() }
     }
 
+    fn parse_schedule_file(contents: &str) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+        // Parse as multi-environment config (Solid Queue format)
+        // Format: { development: { task1: {...}, task2: {...} }, production: {...} }
+        let env_config = serde_yaml::from_str::<HashMap<String, HashMap<String, ScheduledEntry>>>(contents)
+            .map_err(|e| {
+                error!("Failed to parse schedule file: {}", e);
+                anyhow::anyhow!("Failed to parse schedule file: {}", e)
+            })?;
+
+        // Use shared environment config parser
+        let tasks = crate::utils::parse_env_config_cloneable(env_config)?;
+        info!("Loaded {} scheduled tasks", tasks.len());
+        Ok(vec![tasks])
+    }
+
     pub async fn run(&self) -> Result<(), anyhow::Error> {
         let db = self.ctx.get_db().await;
         let mut interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
@@ -300,26 +315,42 @@ impl Scheduler {
             self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap_or(1),
         );
         let mut scheduled = Vec::<ScheduledEntry>::new();
-        let schedule: Vec<HashMap<String, ScheduledEntry>> = match std::fs::read_to_string("schedule.yml") {
-            Ok(contents) => match serde_yaml::from_str(&contents) {
-                Ok(parsed) => {
-                    info!("Schedule loaded successfully");
-                    parsed
-                },
-                Err(e) => {
-                    error!("Failed to parse schedule.yml: {}", e);
-                    return Err(anyhow::anyhow!("Failed to parse schedule.yml: {}", e));
+
+        // Find schedule file with priority:
+        // 1. SOLID_QUEUE_RECURRING_SCHEDULE env var (for Solid Queue compatibility)
+        // 2. QUEBEC_RECURRING_SCHEDULE env var
+        // 3. recurring.yml (current directory)
+        // 4. config/recurring.yml (Solid Queue compatible)
+        let schedule_path = std::env::var("SOLID_QUEUE_RECURRING_SCHEDULE")
+            .or_else(|_| std::env::var("QUEBEC_RECURRING_SCHEDULE"))
+            .ok()
+            .or_else(|| {
+                if std::path::Path::new("recurring.yml").exists() {
+                    Some("recurring.yml".to_string())
+                } else if std::path::Path::new("config/recurring.yml").exists() {
+                    Some("config/recurring.yml".to_string())
+                } else {
+                    None
                 }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                info!("No schedule.yml found, running without scheduled tasks");
+            });
+
+        let schedule: Vec<HashMap<String, ScheduledEntry>> = match schedule_path {
+            None => {
+                info!("No schedule file found, running without scheduled tasks");
                 Vec::new()
-            },
-            Err(e) => {
-                error!("Failed to read schedule.yml: {}", e);
-                return Err(anyhow::anyhow!("Failed to read schedule.yml: {}", e));
+            }
+            Some(path) => {
+                info!("Loading schedule from: {}", path);
+                let contents = std::fs::read_to_string(&path)
+                    .map_err(|e| {
+                        error!("Failed to read schedule file {}: {}", path, e);
+                        anyhow::anyhow!("Failed to read schedule file: {}", e)
+                    })?;
+
+                Self::parse_schedule_file(&contents)?
             }
         };
+
         trace!("Schedule: {:?}", schedule);
 
         let kind = "Scheduler".to_string();

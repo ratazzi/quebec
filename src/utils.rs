@@ -322,3 +322,77 @@ pub fn json_value(value: &Value) -> JsonValue<'_> {
 pub fn python_object<'a>(obj: &'a Bound<'a, PyAny>) -> PythonObject<'a> {
     PythonObject(obj)
 }
+
+/// Parse environment-specific configuration from a HashMap with fallback behavior
+///
+/// This is a generic helper for parsing environment-based YAML configs like:
+/// ```yaml
+/// production:
+///   task1: {...}
+///   task2: {...}
+/// development:
+///   task1: {...}
+/// ```
+///
+/// Returns the config for the specified environment, falling back to the first
+/// available environment if the specified one isn't found.
+pub fn parse_env_config_cloneable<T>(
+    env_config: std::collections::HashMap<String, T>,
+) -> anyhow::Result<T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    use tracing::{info, warn};
+
+    let env = std::env::var("QUEBEC_ENV").unwrap_or_else(|_| "development".to_string());
+    info!("Using environment: {}", env);
+
+    if let Some(config) = env_config.get(&env) {
+        info!("Loaded configuration from environment '{}'", env);
+        return Ok(config.clone());
+    }
+
+    warn!("Environment '{}' not found in config, using first environment", env);
+
+    if let Some((first_env, config)) = env_config.iter().next() {
+        info!("Using environment '{}' instead", first_env);
+        return Ok(config.clone());
+    }
+
+    warn!("No environments found in configuration");
+    Err(anyhow::anyhow!("No environments found in configuration"))
+}
+
+/// Parse environment-specific configuration from a HashMap (strict mode)
+///
+/// This version returns an error if the specified environment is not found.
+/// Used when you want to enforce that the environment must exist.
+pub fn parse_env_config_strict<T>(
+    env_config: std::collections::HashMap<String, T>,
+    env: Option<&str>,
+) -> anyhow::Result<T>
+where
+    T: Clone + std::fmt::Debug,
+{
+    use tracing::info;
+
+    let environment = env
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("QUEBEC_ENV").ok())
+        .unwrap_or_else(|| "development".to_string());
+
+    info!("Using environment: {}", environment);
+
+    if let Some(config) = env_config.get(&environment) {
+        info!("Loaded configuration from environment '{}'", environment);
+        return Ok(config.clone());
+    }
+
+    // Environment not found, return error with available environments
+    let available: Vec<String> = env_config.keys().cloned().collect();
+    anyhow::bail!(
+        "Environment '{}' not found in config. Available environments: {:?}",
+        environment,
+        available
+    )
+}
