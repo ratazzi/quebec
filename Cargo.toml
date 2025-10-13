@@ -78,6 +78,7 @@ tower-http = { version = "0.5", features = ["trace", "fs"] }
 rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] }
 atty = "0.2.14"
 regex = "1.10"
+proctitle = "0.1.1"
 
 [lints.rust]
 dead_code = "warn"

@@ -10,7 +10,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, trace};
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -491,6 +491,23 @@ impl AppContext {
         if let Ok(mut concurrency_enabled) = self.concurrency_enabled.write() {
             concurrency_enabled.insert(class_name);
         }
+    }
+
+    /// Set process title for better visibility in system tools (htop, ps, etc.)
+    /// Format: quebec-app_name [process_type:details]
+    /// Examples:
+    /// - quebec-myapp [worker:3]
+    /// - quebec-myapp [dispatcher]
+    /// - quebec-myapp [scheduler]
+    pub fn set_proc_title(&self, process_type: &str, details: Option<&str>) {
+        let title = if let Some(details) = details {
+            format!("quebec-{} [{}:{}]", self.name, process_type, details)
+        } else {
+            format!("quebec-{} [{}]", self.name, process_type)
+        };
+
+        proctitle::set_title(&title);
+        trace!("Set process title: {}", title);
     }
 }
 

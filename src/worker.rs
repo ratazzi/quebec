@@ -1434,6 +1434,9 @@ impl Worker {
 
         let quit = self.ctx.graceful_shutdown.clone();
 
+        // Set process title for visibility in htop/ps
+        self.ctx.set_proc_title("worker", Some(&format!("{}", worker_threads)));
+
         // Initialize process record
         let init_db = self.ctx.get_db().await;
         let process = self.on_start(&init_db, "Worker".to_string(), "worker".to_string()).await?;
