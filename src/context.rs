@@ -217,6 +217,7 @@ pub struct AppContext {
     pub dsn: Url,
     pub db: Option<Arc<DatabaseConnection>>, // Use shared connection for SQLite
     pub connect_options: ConnectOptions, // For creating new connections
+    pub name: String, // Application name for NOTIFY channel (default: "quebec")
     pub use_skip_locked: bool,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
@@ -251,6 +252,7 @@ impl AppContext {
             dsn,
             db,
             connect_options,
+            name: std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string()),
             use_skip_locked: true,
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),

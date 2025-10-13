@@ -273,6 +273,14 @@ impl PyQuebec {
         // Apply config file values ONLY if not already set by code parameters
         // Check if values are still at their defaults before overriding
         if let Some(config) = config {
+            // Apply name if configured
+            if let Some(name) = config.name {
+                // Override with config file name (environment variable takes precedence in AppContext::new)
+                if std::env::var("QUEBEC_NAME").is_err() {
+                    _ctx.name = name;
+                }
+            }
+
             // Apply worker configuration
             if let Some(workers) = config.workers {
                 // Warn if multiple workers are configured (not supported yet)

@@ -11,11 +11,18 @@ pub struct NotifyManager {
     channel_name: String,
 }
 
-
+/// Notification message structure
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct NotifyMessage {
+    pub queue: String,
+    pub event: String,
+}
 
 impl NotifyManager {
-    pub fn new(ctx: Arc<AppContext>, queue_name: &str) -> Self {
-        let channel_name = format!("quebec_{}", queue_name);
+    /// Create a new NotifyManager for the global jobs channel
+    /// Channel name format: {app_name}_jobs (e.g., "quebec_jobs" or "myapp_jobs")
+    pub fn new(ctx: Arc<AppContext>) -> Self {
+        let channel_name = format!("{}_jobs", ctx.name);
         Self {
             ctx,
             channel_name,
@@ -128,25 +135,35 @@ impl NotifyManager {
         Ok(())
     }
 
-    /// Send a NOTIFY message (used by the job enqueue process)
-    pub async fn notify(&self, message: &str) -> Result<(), anyhow::Error> {
+    /// Send a NOTIFY message for a specific queue
+    pub async fn notify(&self, queue_name: &str, event: &str) -> Result<(), anyhow::Error> {
         if !self.ctx.is_postgres() {
             trace!("Skipping NOTIFY - not using PostgreSQL");
             return Ok(());
         }
 
         let db = self.ctx.get_db().await;
-        Self::send_notify_with_db(&*db, &self.channel_name, message).await
+        Self::send_notify(&*db, queue_name, event).await
     }
 
     /// Static method to send NOTIFY using existing database connection
     /// This is more efficient for one-off notifications
-    pub async fn send_notify<C>(db: &C, queue_name: &str, message: &str) -> Result<(), anyhow::Error>
+    pub async fn send_notify<C>(db: &C, queue_name: &str, event: &str) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
     {
-        let channel_name = format!("quebec_{}", queue_name);
-        Self::send_notify_with_db(db, &channel_name, message).await
+        let message = NotifyMessage {
+            queue: queue_name.to_string(),
+            event: event.to_string(),
+        };
+        let message_json = serde_json::to_string(&message)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize notify message: {}", e))?;
+
+        // Get app name from environment or use default
+        let app_name = std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string());
+        let channel_name = format!("{}_jobs", app_name);
+
+        Self::send_notify_with_db(db, &channel_name, &message_json).await
     }
 
     /// Internal helper to send NOTIFY with database connection and channel name
@@ -184,9 +201,9 @@ impl NotifyManager {
     }
 }
 
-/// Helper function to create a NotifyManager for a specific queue
-pub fn create_notify_manager(ctx: Arc<AppContext>, queue_name: &str) -> NotifyManager {
-    NotifyManager::new(ctx, queue_name)
+/// Helper function to create a NotifyManager
+pub fn create_notify_manager(ctx: Arc<AppContext>) -> NotifyManager {
+    NotifyManager::new(ctx)
 }
 
 #[cfg(test)]
@@ -198,8 +215,8 @@ mod tests {
     fn test_channel_name_generation() {
         let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
         let ctx = Arc::new(AppContext::new(dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
-        let manager = NotifyManager::new(ctx, "default");
-        assert_eq!(manager.get_channel_name(), "quebec_default");
+        let manager = NotifyManager::new(ctx);
+        assert_eq!(manager.get_channel_name(), "quebec_jobs");
     }
 
     #[test]

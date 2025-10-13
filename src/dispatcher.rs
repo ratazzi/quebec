@@ -56,7 +56,7 @@ impl Dispatcher {
                 _ = polling_interval.tick() => {
                     let polling_db = self.ctx.get_db().await;
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
-                    let _ = polling_db.transaction::<_, (), DbErr>(|txn| {
+                    let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
                         Box::pin(async move {
                           // Clean up expired semaphores
                           let expired_semaphores_result = quebec_semaphores::Entity::delete_many()
@@ -184,10 +184,13 @@ impl Dispatcher {
 
                           if scheduled_executions.is_err() {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
-                              return Ok(());
+                              return Ok(std::collections::HashSet::new());
                           }
                           let scheduled_executions = scheduled_executions?;
                           let size = scheduled_executions.len();
+
+                          // Collect queue names for NOTIFY
+                          let mut notified_queues = std::collections::HashSet::new();
 
                           for scheduled_execution in scheduled_executions {
                               // Get job details to retrieve queue_name and priority
@@ -196,6 +199,8 @@ impl Dispatcher {
                                   .await?;
 
                               if let Some(job) = job {
+                                  let queue_name = job.queue_name.clone();
+
                                   let _ = quebec_ready_executions::ActiveModel {
                                       id: ActiveValue::NotSet,
                                       queue_name: ActiveValue::Set(job.queue_name),
@@ -209,6 +214,8 @@ impl Dispatcher {
                                   quebec_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
                                       .exec(txn)
                                       .await?;
+
+                                  notified_queues.insert(queue_name);
                               } else {
                                   warn!("Job {} not found for scheduled execution {}", scheduled_execution.job_id, scheduled_execution.id);
                               }
@@ -218,11 +225,22 @@ impl Dispatcher {
                               info!("Dispatch scheduled jobs size: {}", size);
                           }
 
-                          Ok(())
+                          Ok(notified_queues)
                         })
                     })
                     .instrument(tracing::info_span!("dispatcher",))
                     .await;
+
+                    // Send NOTIFY for each unique queue after transaction commits
+                    if let Ok(queues) = transaction_result {
+                        for queue_name in queues {
+                            if self.ctx.is_postgres() {
+                                if let Err(e) = crate::notify::NotifyManager::send_notify(&*polling_db, &queue_name, "new_job").await {
+                                    warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

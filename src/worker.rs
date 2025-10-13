@@ -1444,11 +1444,12 @@ impl Worker {
         let mut notify_rx = None;
         if self.ctx.is_postgres() {
             info!("PostgreSQL detected, enabling LISTEN/NOTIFY for immediate job processing");
-            let notify_manager = NotifyManager::new(self.ctx.clone(), "default");
+
+            let notify_manager = NotifyManager::new(self.ctx.clone());
             match notify_manager.start_listener().await {
                 Ok(rx) => {
                     notify_rx = Some(rx);
-                    info!("LISTEN started - jobs will be processed immediately when notified");
+                    info!("LISTEN started on '{}_jobs' channel - jobs will be processed immediately when notified", self.ctx.name);
                 }
                 Err(e) => {
                     warn!("Failed to start real LISTEN, falling back to polling only: {}", e);
@@ -1505,30 +1506,62 @@ impl Worker {
                         std::future::pending().await
                     }
                 } => {
-                    if notify_msg.is_some() {
-                        // Simple batching: consume additional immediate messages
-                        let mut total_notifies = 1;
-                        while let Some(rx) = notify_rx.as_mut() {
-                            if rx.try_recv().is_err() {
-                                break;
-                            }
-                            total_notifies += 1;
-                        }
+                    if let Some(msg) = notify_msg {
+                        // Parse the notification message
+                        let should_process = match serde_json::from_str::<crate::notify::NotifyMessage>(&msg) {
+                            Ok(notify_msg) => {
+                                trace!("Received NOTIFY for queue: {}", notify_msg.queue);
 
-                        async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("listener", consumed=total_notifies)).await;
-                        trace!("Received {} NOTIFY message(s), processing jobs immediately", total_notifies);
+                                // Check if this worker should process this queue
+                                if let Some(ref queues) = self.ctx.worker_queues {
+                                    queues.is_all() || {
+                                        let exact = queues.exact_names();
+                                        let wildcards = queues.wildcard_prefixes();
 
-                        // Process jobs with timeout protection to prevent blocking main loop
-                        let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
-                        let timeout_duration = tokio::time::Duration::from_millis(100); // 100ms max
+                                        // Check exact match
+                                        exact.contains(&notify_msg.queue) ||
+                                        // Check wildcard match
+                                        wildcards.iter().any(|prefix| notify_msg.queue.starts_with(prefix))
+                                    }
+                                } else {
+                                    // No queue config, process all queues
+                                    true
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse NOTIFY message '{}': {}", msg, e);
+                                // If we can't parse, process anyway to be safe
+                                true
+                            }
+                        };
 
-                        match tokio::time::timeout(timeout_duration, process_future).await {
-                            Ok(_) => {
-                                trace!("NOTIFY job processing completed within timeout");
+                        if should_process {
+                            // Simple batching: consume additional immediate messages
+                            let mut total_notifies = 1;
+                            while let Some(rx) = notify_rx.as_mut() {
+                                if rx.try_recv().is_err() {
+                                    break;
+                                }
+                                total_notifies += 1;
                             }
-                            Err(_) => {
-                                warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
+
+                            async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("listener", consumed=total_notifies)).await;
+                            trace!("Received {} NOTIFY message(s), processing jobs immediately", total_notifies);
+
+                            // Process jobs with timeout protection to prevent blocking main loop
+                            let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
+                            let timeout_duration = tokio::time::Duration::from_millis(100); // 100ms max
+
+                            match tokio::time::timeout(timeout_duration, process_future).await {
+                                Ok(_) => {
+                                    trace!("NOTIFY job processing completed within timeout");
+                                }
+                                Err(_) => {
+                                    warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
+                                }
                             }
+                        } else {
+                            trace!("Ignoring NOTIFY for queue not in worker config");
                         }
                     }
                 }

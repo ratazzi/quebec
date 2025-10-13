@@ -216,6 +216,10 @@ impl DatabaseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[pyclass]
 pub struct QueueConfig {
+    /// Application name for NOTIFY channel isolation (default: "quebec")
+    #[pyo3(get)]
+    pub name: Option<String>,
+
     /// Database configuration
     #[pyo3(get)]
     pub database: Option<DatabaseConfig>,
@@ -357,7 +361,8 @@ impl QueueConfig {
 impl QueueConfig {
     fn __repr__(&self) -> String {
         format!(
-            "QueueConfig(database={}, workers={}, dispatchers={})",
+            "QueueConfig(name={}, database={}, workers={}, dispatchers={})",
+            self.name.as_deref().unwrap_or("quebec"),
             if self.database.is_some() { "configured" } else { "None" },
             self.workers.as_ref().map_or(0, |w| w.len()),
             self.dispatchers.as_ref().map_or(0, |d| d.len())
