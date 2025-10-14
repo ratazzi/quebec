@@ -7,6 +7,7 @@ mod entities;
 mod error;
 mod notify;
 mod process;
+mod proctitle_macos;
 mod scheduler;
 mod semaphore;
 mod supervisor;
@@ -29,11 +30,25 @@ use pyo3::prelude::*;
 
 // pyo3::create_exception!(quebec, CustomError, PyException);
 
+// Initialize macOS process title system early
+#[cfg(target_os = "macos")]
+fn init_proctitle() {
+    crate::proctitle_macos::init();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn init_proctitle() {
+    // No initialization needed for other platforms
+}
+
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
 #[pymodule]
 fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize process title system early
+    init_proctitle();
+
     // pyo3_log::init(); // Can cause mysterious deadlocks
 
     // Use tracing

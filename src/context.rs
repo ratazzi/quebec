@@ -506,7 +506,16 @@ impl AppContext {
             format!("quebec-{} [{}]", self.name, process_type)
         };
 
-        proctitle::set_title(&title);
+        #[cfg(target_os = "macos")]
+        {
+            crate::proctitle_macos::set_title(&title);
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            proctitle::set_title(&title);
+        }
+
         trace!("Set process title: {}", title);
     }
 }

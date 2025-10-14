@@ -359,6 +359,8 @@ impl PyQuebec {
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
 
+        ctx.set_proc_title("worker", Some(&ctx.worker_threads.to_string()));
+
         Ok(PyQuebec {
             ctx,
             rt,
@@ -935,6 +937,19 @@ impl PyQuebec {
         self.handles.lock()
             .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
             .push(handle);
+        Ok(())
+    }
+
+    /// Set process title for better visibility in system tools (htop, ps, etc.)
+    /// This should be called from Python's main thread
+    /// Format: quebec-app_name [process_type:details]
+    /// Examples:
+    /// - quebec.set_proc_title("worker", "3")
+    /// - quebec.set_proc_title("dispatcher", None)
+    /// - quebec.set_proc_title("scheduler", None)
+    #[pyo3(signature = (process_type, details=None))]
+    fn set_proc_title(&self, process_type: &str, details: Option<String>) -> PyResult<()> {
+        self.ctx.set_proc_title(process_type, details.as_deref());
         Ok(())
     }
 }
