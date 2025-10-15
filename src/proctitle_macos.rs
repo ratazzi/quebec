@@ -2,6 +2,8 @@
 //! This provides a way to set the process title on macOS without external dependencies
 
 use std::ffi::CStr;
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Mutex;
@@ -10,16 +12,24 @@ static PROCTITLE_STATE: Mutex<Option<ProcTitleState>> = Mutex::new(None);
 
 struct ProcTitleState {
     argv_start: *mut c_char,
-    argv_end: *mut c_char,
     argv_len: usize,
+    #[cfg(target_os = "macos")]
+    _environ_copy: Option<EnvironCopy>,
 }
 
 unsafe impl Send for ProcTitleState {}
 
 #[cfg(target_os = "macos")]
+struct EnvironCopy {
+    _strings: Vec<CString>,
+    _pointers: Box<[*mut c_char]>,
+}
+
+#[cfg(target_os = "macos")]
 extern "C" {
     fn _NSGetArgc() -> *const isize;
-    fn _NSGetArgv() -> *const *const *const c_char;
+    fn _NSGetArgv() -> *mut *mut *mut c_char;
+    fn _NSGetEnviron() -> *mut *mut *mut c_char;
 }
 
 /// Initialize the process title system
@@ -47,13 +57,23 @@ pub fn init() {
 
 /// Initialize with specific argc and argv values
 /// This is the core initialization logic
-unsafe fn init_with_args(argc: isize, argv: *const *const c_char) {
+#[cfg(target_os = "macos")]
+unsafe fn init_with_args(argc: isize, argv: *mut *mut c_char) {
     if argc <= 0 || argv.is_null() {
         return;
     }
 
-    // Find the end of the argv array
-    let mut argv_end = *argv.offset(0);
+    let mut state_guard = PROCTITLE_STATE.lock().unwrap();
+    if state_guard.is_some() {
+        return;
+    }
+
+    let argv_start_ptr = *argv.offset(0);
+    if argv_start_ptr.is_null() {
+        return;
+    }
+
+    let mut area_end = argv_start_ptr;
 
     // Calculate the end of the last argument
     for i in 0..argc {
@@ -63,18 +83,30 @@ unsafe fn init_with_args(argc: isize, argv: *const *const c_char) {
         }
         let len = CStr::from_ptr(arg).to_bytes().len();
         let arg_end = arg.add(len + 1); // +1 for null terminator
-        if arg_end > argv_end {
-            argv_end = arg_end as *mut c_char;
+        if arg_end > area_end {
+            area_end = arg_end;
         }
     }
 
-    let argv_start = *argv.offset(0) as *mut c_char;
-    let argv_len = argv_end as usize - argv_start as usize;
+    let argv_start = argv_start_ptr as *mut c_char;
+    let mut argv_len = area_end as usize - argv_start as usize;
 
-    *PROCTITLE_STATE.lock().unwrap() = Some(ProcTitleState {
+    if argv_len == 0 {
+        return;
+    }
+
+    let (environ_copy, area_end) = match detach_and_copy_environ(area_end as *mut c_char) {
+        Some((copy, new_end)) => (Some(copy), new_end),
+        None => (None, area_end as *mut c_char),
+    };
+
+    argv_len = area_end as usize - argv_start as usize;
+
+    *state_guard = Some(ProcTitleState {
         argv_start,
-        argv_end: argv_end as *mut c_char,
         argv_len,
+        #[cfg(target_os = "macos")]
+        _environ_copy: environ_copy,
     });
 }
 
@@ -83,41 +115,19 @@ unsafe fn init_with_args(argc: isize, argv: *const *const c_char) {
 pub fn set_title(title: &str) {
     #[cfg(target_os = "macos")]
     {
-        unsafe {
-            // Get state data without holding the lock
-            let (argv_start, argv_len) = {
-                let state_guard = PROCTITLE_STATE.lock().unwrap();
-                match state_guard.as_ref() {
-                    Some(state) => (state.argv_start, state.argv_len),
-                    None => {
-                        // Initialize and try again
-                        std::mem::drop(state_guard);
-                        init();
-                        let state_guard = PROCTITLE_STATE.lock().unwrap();
-                        match state_guard.as_ref() {
-                            Some(state) => (state.argv_start, state.argv_len),
-                            None => {
-                                eprintln!("Failed to initialize proctitle system");
-                                return;
-                            }
-                        }
-                    }
-                }
-            };
+        let mut state_guard = PROCTITLE_STATE.lock().unwrap();
+        if state_guard.is_none() {
+            drop(state_guard);
+            init();
+            state_guard = PROCTITLE_STATE.lock().unwrap();
+        }
 
-            let title_bytes = title.as_bytes();
-            let max_len = argv_len.saturating_sub(1); // -1 for null terminator
-
-            // Clear the entire argv area
-            ptr::write_bytes(argv_start, 0, argv_len);
-
-            // Copy the new title
-            let copy_len = title_bytes.len().min(max_len);
-            ptr::copy_nonoverlapping(
-                title_bytes.as_ptr(),
-                argv_start as *mut u8,
-                copy_len,
-            );
+        if let Some(state) = state_guard.as_mut() {
+            unsafe {
+                state.write_title(title);
+            }
+        } else {
+            eprintln!("Failed to initialize proctitle system");
         }
     }
 
@@ -148,6 +158,76 @@ pub fn get_title() -> Option<String> {
         // Not implemented for other platforms
         None
     }
+}
+
+impl ProcTitleState {
+    /// Write the supplied title into the reserved argv buffer.
+    unsafe fn write_title(&mut self, title: &str) {
+        if self.argv_start.is_null() || self.argv_len == 0 {
+            return;
+        }
+
+        let title_bytes = title.as_bytes();
+        let max_len = self.argv_len.saturating_sub(1);
+        let copy_len = title_bytes.len().min(max_len);
+
+        ptr::write_bytes(self.argv_start, 0, self.argv_len);
+
+        if copy_len > 0 {
+            ptr::copy_nonoverlapping(title_bytes.as_ptr(), self.argv_start as *mut u8, copy_len);
+        }
+    }
+}
+
+/// Copy the environment onto the heap and detach it from the argv arena so that
+/// we can safely reuse the original contiguous memory when updating argv[0].
+#[cfg(target_os = "macos")]
+unsafe fn detach_and_copy_environ(mut area_end: *mut c_char) -> Option<(EnvironCopy, *mut c_char)> {
+    let environ_ptr_ptr = _NSGetEnviron();
+    if environ_ptr_ptr.is_null() {
+        return None;
+    }
+
+    let environ_ptr = *environ_ptr_ptr;
+    if environ_ptr.is_null() {
+        return None;
+    }
+
+    const MAX_ENV_VARS: usize = 65536;
+
+    let mut env_count = 0usize;
+    let mut env_iter = environ_ptr;
+
+    while !(*env_iter).is_null() && env_count < MAX_ENV_VARS {
+        let env_str = *env_iter;
+        let len = CStr::from_ptr(env_str).to_bytes().len();
+
+        if area_end.add(1) == env_str {
+            area_end = env_str.add(len + 1);
+        }
+
+        env_count += 1;
+        env_iter = env_iter.add(1);
+    }
+
+    if env_count == 0 || env_count >= MAX_ENV_VARS {
+        return None;
+    }
+
+    let mut strings = Vec::with_capacity(env_count);
+    for idx in 0..env_count {
+        let env_str = *environ_ptr.add(idx);
+        strings.push(CStr::from_ptr(env_str).to_owned());
+    }
+
+    let mut pointers: Vec<*mut c_char> =
+        strings.iter().map(|s| s.as_ptr() as *mut c_char).collect();
+    pointers.push(ptr::null_mut());
+
+    let mut pointer_box = pointers.into_boxed_slice();
+    *environ_ptr_ptr = pointer_box.as_mut_ptr();
+
+    Some((EnvironCopy { _strings: strings, _pointers: pointer_box }, area_end))
 }
 
 #[cfg(test)]

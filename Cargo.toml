@@ -79,6 +79,7 @@ rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] 
 atty = "0.2.14"
 regex = "1.10"
 proctitle = "0.1.1"
+libc = "0.2"
 
 [lints.rust]
 dead_code = "warn"

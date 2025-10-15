@@ -8,6 +8,7 @@ mod error;
 mod notify;
 mod process;
 mod proctitle_macos;
+mod proctitle_unix;
 mod scheduler;
 mod semaphore;
 mod supervisor;
@@ -30,13 +31,18 @@ use pyo3::prelude::*;
 
 // pyo3::create_exception!(quebec, CustomError, PyException);
 
-// Initialize macOS process title system early
+// Initialize process title system early based on platform
 #[cfg(target_os = "macos")]
 fn init_proctitle() {
     crate::proctitle_macos::init();
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+fn init_proctitle() {
+    crate::proctitle_unix::init();
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
 fn init_proctitle() {
     // No initialization needed for other platforms
 }
