@@ -235,7 +235,7 @@ impl Dispatcher {
                     if let Ok(queues) = transaction_result {
                         for queue_name in queues {
                             if self.ctx.is_postgres() {
-                                if let Err(e) = crate::notify::NotifyManager::send_notify(&*polling_db, &queue_name, "new_job").await {
+                                if let Err(e) = crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name, "new_job").await {
                                     warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e);
                                 }
                             }

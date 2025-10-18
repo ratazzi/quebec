@@ -143,12 +143,11 @@ impl NotifyManager {
         }
 
         let db = self.ctx.get_db().await;
-        Self::send_notify(&*db, queue_name, event).await
+        Self::send_notify(&self.ctx.name, &*db, queue_name, event).await
     }
 
     /// Static method to send NOTIFY using existing database connection
-    /// This is more efficient for one-off notifications
-    pub async fn send_notify<C>(db: &C, queue_name: &str, event: &str) -> Result<(), anyhow::Error>
+    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str, event: &str) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
     {
@@ -159,10 +158,8 @@ impl NotifyManager {
         let message_json = serde_json::to_string(&message)
             .map_err(|e| anyhow::anyhow!("Failed to serialize notify message: {}", e))?;
 
-        // Get app name from environment or use default
-        let app_name = std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string());
+        // Use the same naming convention as LISTEN
         let channel_name = format!("{}_jobs", app_name);
-
         Self::send_notify_with_db(db, &channel_name, &message_json).await
     }
 

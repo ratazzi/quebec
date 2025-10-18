@@ -274,7 +274,7 @@ where
 
     // Send PostgreSQL NOTIFY after scheduled job is created
     if ctx.is_postgres() {
-        if let Err(e) = NotifyManager::send_notify(db, &job.queue_name, "new_job").await {
+        if let Err(e) = NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job").await {
             warn!("Failed to send NOTIFY for scheduled job: {}", e);
         }
     }

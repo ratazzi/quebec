@@ -120,7 +120,7 @@ impl Quebec {
 
         // Send PostgreSQL NOTIFY after job is successfully created
         if self.ctx.is_postgres() {
-            if let Err(e) = NotifyManager::send_notify(&*db, &job_model.queue_name, "new_job").await {
+            if let Err(e) = NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job").await {
                 warn!("Failed to send NOTIFY: {}", e);
             }
         }
