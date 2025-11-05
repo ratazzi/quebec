@@ -51,7 +51,7 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         Ok(Value::String(obj.extract::<String>()?))
     } else if obj.is_instance_of::<PyDict>() {
         let dict = obj.downcast::<PyDict>()?;
-        let mut map = serde_json::Map::new();
+        let mut map = serde_json::Map::with_capacity(dict.len());
         for (key, value) in dict {
             let key: String = key.extract()?;
             let value = python_to_json_value(py, &value)?;
@@ -60,14 +60,14 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         Ok(Value::Object(map))
     } else if obj.is_instance_of::<PyList>() {
         let list = obj.downcast::<PyList>()?;
-        let mut vec = Vec::new();
+        let mut vec = Vec::with_capacity(list.len());
         for item in list.iter() {
             vec.push(python_to_json_value(py, &item)?);
         }
         Ok(Value::Array(vec))
     } else if obj.is_instance_of::<PyTuple>() {
         let tuple = obj.downcast::<PyTuple>()?;
-        let mut vec = Vec::new();
+        let mut vec = Vec::with_capacity(tuple.len());
         for item in tuple.iter() {
             vec.push(python_to_json_value(py, &item)?);
         }
