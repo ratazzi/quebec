@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use colored::*;
 use tracing::{info_span, Instrument};
 
-use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyList, PyModule, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
 
 use crate::notify::NotifyManager;
@@ -58,6 +58,16 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     }
 }
 
+fn python_thread_ident() -> Option<u64> {
+    Python::with_gil(|py| -> PyResult<u64> {
+        let threading = PyModule::import(py, "threading")?;
+        let get_ident = threading.getattr("get_ident")?;
+        let ident = get_ident.call0()?;
+        ident.extract::<u64>()
+    })
+    .ok()
+}
+
 async fn runner(
     ctx: Arc<AppContext>, _thread_id: String, _state: Arc<Mutex<i32>>,
     rx: Arc<Mutex<Receiver<Execution>>>,
@@ -65,22 +75,9 @@ async fn runner(
     let mut tid = format!("{:?}", std::thread::current().id());
     let graceful_shutdown = ctx.graceful_shutdown.clone();
     let force_quit = ctx.force_quit.clone();
-
-
-    if true {
-        let mut thread_id: u64 = 0;
-        Python::with_gil(|py| {
-            if let Ok(threading) = PyModule::import(py, "threading") {
-                if let Ok(bound) = threading.getattr("get_ident") {
-                    if let Ok(ident) = bound.call0() {
-                        thread_id = ident.extract::<u64>().unwrap_or(0);
-                    }
-                }
-            }
-        });
-
-        tid = format!("{}", thread_id);
-        trace!("python thread_id: {:?}", tid)
+    if let Some(thread_id) = python_thread_ident() {
+        tid = thread_id.to_string();
+        trace!("python thread_id: {:?}", tid);
     }
 
     loop {
