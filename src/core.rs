@@ -30,26 +30,28 @@ impl Quebec {
         let job = db
             .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
                 Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
                     let args: serde_json::Value = serde_json::from_str(job.arguments.as_str())
                         .map_err(|e| DbErr::Custom(format!("Serialization error: {}", e)))?;
-                let params = serde_json::json!({
-                    "job_class": job.class_name.clone(),
-                    "job_id": null,
-                    "provider_job_id": "",
-                    "queue_name": "default",
-                    "priority": job.priority,
-                    "arguments": args,
-                    "executions": 0,
-                    "exception_executions": {},
-                    "locale": "en",
-                    "timezone": "UTC",
-                    "scheduled_at": null,
-                    "enqueued_at": chrono::Utc::now().naive_utc(),
-                });
+
+                    let params = serde_json::json!({
+                        "job_class": job.class_name.clone(),
+                        "job_id": null,
+                        "provider_job_id": "",
+                        "queue_name": "default",
+                        "priority": job.priority,
+                        "arguments": args,
+                        "executions": 0,
+                        "exception_executions": {},
+                        "locale": "en",
+                        "timezone": "UTC",
+                        "scheduled_at": null,
+                        "enqueued_at": now,
+                    });
 
                     let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
                     let concurrency_limit = job.concurrency_limit.unwrap_or(1);
-                    
+
                     // Insert job and get the model with generated ID
                     let job_model = quebec_jobs::ActiveModel {
                         id: ActiveValue::NotSet,
@@ -62,12 +64,12 @@ impl Quebec {
                         scheduled_at: ActiveValue::Set(Some(job.scheduled_at)),
                         finished_at: ActiveValue::Set(None),
                         concurrency_key: ActiveValue::Set(Some(concurrency_key.clone())),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                        updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                        created_at: ActiveValue::Set(now),
+                        updated_at: ActiveValue::Set(now),
                     }
                     .save(txn)
                     .await?;
-                    
+
                     // Convert ActiveModel to Model
                     let job_model = job_model.try_into_model()?;
                     let job_id = job_model.id;
@@ -75,7 +77,6 @@ impl Quebec {
 
                     if !concurrency_key.is_empty() {
                         // Try to acquire the semaphore
-                        let now = chrono::Utc::now().naive_utc();
                         let expires_at = now + duration;
                         if acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await? {
                             info!("Semaphore acquired for key: {}", concurrency_key);
@@ -89,7 +90,7 @@ impl Quebec {
                                 priority: ActiveValue::Set(job_priority),
                                 concurrency_key: ActiveValue::Set(concurrency_key.clone()),
                                 expires_at: ActiveValue::Set(expires_at),
-                                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                created_at: ActiveValue::Set(now),
                             }
                             .save(txn)
                             .await?;
@@ -104,7 +105,7 @@ impl Quebec {
                         queue_name: ActiveValue::Set("default".to_string()),
                         job_id: ActiveValue::Set(job_id),
                         priority: ActiveValue::Set(job_priority),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                        created_at: ActiveValue::Set(now),
                     }
                     .save(txn)
                     .await?;

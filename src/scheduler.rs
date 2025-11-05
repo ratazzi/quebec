@@ -158,6 +158,7 @@ where
     let queue_name = entry.queue.as_deref().unwrap_or("default");
     let priority = entry.priority.unwrap_or(0);
 
+    let now = chrono::Utc::now().naive_utc();
     let params = serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
@@ -170,7 +171,7 @@ where
         "locale": "en",
         "timezone": "UTC",
         "scheduled_at": scheduled_at,
-        "enqueued_at": chrono::Utc::now().naive_utc(),
+        "enqueued_at": now,
     });
 
     // Get concurrency constraint using runnable
@@ -202,8 +203,8 @@ where
         scheduled_at: ActiveValue::Set(Some(scheduled_at)),
         finished_at: ActiveValue::Set(None),
         concurrency_key: ActiveValue::Set(concurrency_constraint.as_ref().map(|c| c.key.clone())),
-        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-        updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+        created_at: ActiveValue::Set(now),
+        updated_at: ActiveValue::Set(now),
     }
     .save(db)
     .await?;
@@ -216,7 +217,7 @@ where
         job_id: ActiveValue::Set(job.id),
         task_key: ActiveValue::Set(task_key),
         run_at: ActiveValue::Set(scheduled_at),
-        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+        created_at: ActiveValue::Set(now),
     }
     .save(db)
     .await?;
@@ -230,12 +231,13 @@ where
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
 
             // Create ready execution - job can run immediately
+            let ready_created_at = chrono::Utc::now().naive_utc();
             let _ready_execution = quebec_ready_executions::ActiveModel {
                 id: ActiveValue::not_set(),
                 job_id: ActiveValue::Set(job.id),
                 queue_name: ActiveValue::Set(job.queue_name.clone()),
                 priority: ActiveValue::Set(job.priority),
-                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                created_at: ActiveValue::Set(ready_created_at),
             }
             .save(db)
             .await?;
@@ -243,9 +245,9 @@ where
             warn!("Scheduler: Failed to acquire semaphore for key: {}", constraint.key);
 
             // Create blocked execution - job must wait
-            let now = chrono::Utc::now().naive_utc();
+            let block_now = chrono::Utc::now().naive_utc();
             let duration = ctx.default_concurrency_control_period;
-            let expires_at = now + duration;
+            let expires_at = block_now + duration;
 
             let _blocked_execution = quebec_blocked_executions::ActiveModel {
                 id: ActiveValue::NotSet,
@@ -254,19 +256,20 @@ where
                 priority: ActiveValue::Set(job.priority),
                 concurrency_key: ActiveValue::Set(constraint.key.clone()),
                 expires_at: ActiveValue::Set(expires_at),
-                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                created_at: ActiveValue::Set(block_now),
             }
             .save(db)
             .await?;
         }
     } else {
         // No concurrency control - create ready execution immediately
+        let ready_created_at = chrono::Utc::now().naive_utc();
         let _ready_execution = quebec_ready_executions::ActiveModel {
             id: ActiveValue::not_set(),
             job_id: ActiveValue::Set(job.id),
             queue_name: ActiveValue::Set(job.queue_name.clone()),
             priority: ActiveValue::Set(job.priority),
-            created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+            created_at: ActiveValue::Set(ready_created_at),
         }
         .save(db)
         .await?;
