@@ -72,13 +72,14 @@ async fn runner(
     ctx: Arc<AppContext>, _thread_id: String, _state: Arc<Mutex<i32>>,
     rx: Arc<Mutex<Receiver<Execution>>>,
 ) -> Result<()> {
-    let mut tid = format!("{:?}", std::thread::current().id());
+    let tid = python_thread_ident()
+        .map(|thread_id| {
+            trace!("python thread_id: {:?}", thread_id);
+            thread_id.to_string()
+        })
+        .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
     let graceful_shutdown = ctx.graceful_shutdown.clone();
     let force_quit = ctx.force_quit.clone();
-    if let Some(thread_id) = python_thread_ident() {
-        tid = thread_id.to_string();
-        trace!("python thread_id: {:?}", tid);
-    }
 
     loop {
         let mut receiver = rx.lock().await;
@@ -89,13 +90,7 @@ async fn runner(
           }
           execution = receiver.recv() => {
               drop(receiver);
-              if execution.is_none() {
-                  continue;
-              }
-              let mut execution = match execution {
-                  Some(exec) => exec,
-                  None => continue,
-              };
+              let Some(mut execution) = execution else { continue };
               execution.tid = tid.clone();
               let _job_id = execution.claimed.job_id;
 
@@ -159,15 +154,15 @@ pub struct Runnable {
     pub handler: Py<PyAny>,
     pub queue_as: String,
     pub priority: i64,
-    pub retry_info: Option<RetryInfo>,
+    pub(crate) retry_info: Option<RetryInfo>,
     pub concurrency_limit: Option<i32>,
     pub concurrency_duration: Option<i32>, // in seconds
 }
 
 #[derive(Debug, Clone)]
-struct RetryInfo {
-    scheduled_at: chrono::NaiveDateTime,
-    failed_attempts: i32,
+pub(crate) struct RetryInfo {
+    pub(crate) scheduled_at: chrono::NaiveDateTime,
+    pub(crate) failed_attempts: i32,
 }
 
 impl Runnable {
@@ -617,12 +612,12 @@ impl Execution {
         // Convert ThreadId to string
         let thread_id_str = format!("{:?}", thread_id);
 
-        // Extract numeric part
+        // Extract numeric part (fallback to 0 if parsing fails)
         let thread_id_num: u64 = thread_id_str
             .trim_start_matches("ThreadId(")
             .trim_end_matches(")")
             .parse()
-            .expect("Failed to parse ThreadId");
+            .unwrap_or(0);
         Self {
             ctx,
             timer: Instant::now(),
@@ -697,11 +692,9 @@ impl Execution {
         let err = result.as_ref().err().map(|e| e.to_string());
 
         // Check if retry is needed (determined by execution.retry_info)
-        let retry_job_data = if let Some(ref retry_info) = self.retry_info {
-            Some((retry_info.scheduled_at, retry_info.failed_attempts))
-        } else {
-            None
-        };
+        let retry_job_data = self.retry_info
+            .as_ref()
+            .map(|info| (info.scheduled_at, info.failed_attempts));
 
         db.transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
 

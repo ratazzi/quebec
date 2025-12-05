@@ -20,10 +20,10 @@ pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResu
         serde_yaml::Value::String(s) => Ok(s.into_pyobject(py)?.as_any().clone().unbind()),
         serde_yaml::Value::Sequence(seq) => {
             let py_list = pyo3::types::PyList::empty(py);
-            for item in seq {
-                let py_item = yaml_value_to_python(py, item)?;
-                py_list.append(py_item)?;
-            }
+            seq.iter().try_for_each(|item| -> PyResult<()> {
+                py_list.append(yaml_value_to_python(py, item)?)?;
+                Ok(())
+            })?;
             Ok(py_list.as_any().clone().unbind())
         }
         serde_yaml::Value::Mapping(map) => {
@@ -60,17 +60,17 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         Ok(Value::Object(map))
     } else if obj.is_instance_of::<PyList>() {
         let list = obj.downcast::<PyList>()?;
-        let mut vec = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            vec.push(python_to_json_value(py, &item)?);
-        }
+        let vec = list
+            .iter()
+            .map(|item| python_to_json_value(py, &item))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_instance_of::<PyTuple>() {
         let tuple = obj.downcast::<PyTuple>()?;
-        let mut vec = Vec::with_capacity(tuple.len());
-        for item in tuple.iter() {
-            vec.push(python_to_json_value(py, &item)?);
-        }
+        let vec = tuple
+            .iter()
+            .map(|item| python_to_json_value(py, &item))
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_none() {
         Ok(Value::Null)
@@ -96,10 +96,10 @@ pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject>
         Value::String(s) => Ok(s.into_pyobject(py)?.as_any().clone().unbind()),
         Value::Array(arr) => {
             let py_list = pyo3::types::PyList::empty(py);
-            for item in arr {
-                let py_item = json_value_to_python(py, item)?;
-                py_list.append(py_item)?;
-            }
+            arr.iter().try_for_each(|item| -> PyResult<()> {
+                py_list.append(json_value_to_python(py, item)?)?;
+                Ok(())
+            })?;
             Ok(py_list.as_any().clone().unbind())
         }
         Value::Object(obj) => {
