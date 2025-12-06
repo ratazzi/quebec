@@ -1,6 +1,6 @@
 use crate::context::*;
 use crate::entities::*;
-use crate::process::ProcessTrait;
+use crate::process::{ProcessInfo, ProcessTrait};
 use crate::semaphore::acquire_semaphore;
 
 use anyhow::Result;
@@ -28,11 +28,8 @@ impl Dispatcher {
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         let batch_size = self.ctx.dispatcher_batch_size;
 
-        let kind = "Dispatcher".to_string();
-        let name = "dispatcher".to_string();
-
         let init_db = self.ctx.get_db().await;
-        let process = self.on_start(&init_db, kind, name).await?;
+        let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
 
         let quit = self.ctx.graceful_shutdown.clone();
@@ -248,4 +245,12 @@ impl Dispatcher {
 }
 
 #[async_trait]
-impl ProcessTrait for Dispatcher {}
+impl ProcessTrait for Dispatcher {
+    fn ctx(&self) -> &Arc<AppContext> {
+        &self.ctx
+    }
+
+    fn process_info(&self) -> ProcessInfo {
+        ProcessInfo::new("Dispatcher", "dispatcher")
+    }
+}

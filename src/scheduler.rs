@@ -1,7 +1,7 @@
 use crate::context::{AppContext, ScheduledEntry};
 use crate::entities::*;
 use crate::notify::NotifyManager;
-use crate::process::ProcessTrait;
+use crate::process::{ProcessInfo, ProcessTrait};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
@@ -358,9 +358,7 @@ impl Scheduler {
 
         trace!("Schedule: {:?}", schedule);
 
-        let kind = "Scheduler".to_string();
-        let name = "scheduler".to_string();
-        let process = self.on_start(&db, kind, name).await?;
+        let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
 
         for entry in schedule {
@@ -519,4 +517,12 @@ impl Scheduler {
 }
 
 #[async_trait]
-impl ProcessTrait for Scheduler {}
+impl ProcessTrait for Scheduler {
+    fn ctx(&self) -> &Arc<AppContext> {
+        &self.ctx
+    }
+
+    fn process_info(&self) -> ProcessInfo {
+        ProcessInfo::new("Scheduler", "scheduler")
+    }
+}

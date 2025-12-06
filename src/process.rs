@@ -1,9 +1,11 @@
+use crate::context::AppContext;
 use crate::entities::*;
 use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
 use sea_orm::TransactionTrait;
 use sea_orm::*;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 
@@ -19,17 +21,53 @@ pub fn is_running_in_pyo3() -> bool {
     result.unwrap_or(false) // Return false if panic occurs
 }
 
+/// Process information for registration
+#[derive(Debug, Clone)]
+pub struct ProcessInfo {
+    /// Process kind (e.g., "Worker", "Dispatcher", "Scheduler")
+    pub kind: String,
+    /// Process name (e.g., "worker", "dispatcher", "scheduler")
+    pub name: String,
+}
+
+impl ProcessInfo {
+    pub fn new(kind: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Trait for background processes with lifecycle management
+///
+/// Implementors should provide:
+/// - `ctx()`: Access to the application context
+/// - `process_info()`: Process identification info
+///
+/// Default implementations are provided for:
+/// - `on_start()`: Register process in database
+/// - `heartbeat()`: Update process heartbeat
+/// - `on_stop()`: Deregister process from database
 #[async_trait]
-pub trait ProcessTrait {
-    async fn on_start(
-        &self, db: &DatabaseConnection, kind: String, name: String,
-    ) -> Result<quebec_processes::Model, Error> {
+pub trait ProcessTrait: Send + Sync {
+    /// Get the application context
+    fn ctx(&self) -> &Arc<AppContext>;
+
+    /// Get process identification info
+    fn process_info(&self) -> ProcessInfo;
+
+    /// Called when process starts - registers in database
+    async fn on_start(&self, db: &DatabaseConnection) -> Result<quebec_processes::Model, Error> {
+        let info = self.process_info();
         let process = db
             .transaction::<_, quebec_processes::ActiveModel, DbErr>(|txn| {
                 let hostname = Self::get_hostname();
                 let pid = Self::get_pid();
                 let supervisor_id = Self::get_supervisor_id();
                 let metadata = Self::get_metadata();
+                let kind = info.kind.clone();
+                let name = info.name.clone();
 
                 Box::pin(async move {
                     let process = quebec_processes::ActiveModel {

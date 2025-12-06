@@ -1,6 +1,6 @@
 use crate::context::*;
 use crate::entities::*;
-use crate::process::ProcessTrait;
+use crate::process::{ProcessInfo, ProcessTrait};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -1429,7 +1429,7 @@ impl Worker {
 
         // Initialize process record
         let init_db = self.ctx.get_db().await;
-        let process = self.on_start(&init_db, "Worker".to_string(), "worker".to_string()).await?;
+        let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
 
         // Set up PostgreSQL LISTEN if available
@@ -1698,4 +1698,12 @@ impl Worker {
 }
 
 #[async_trait]
-impl ProcessTrait for Worker {}
+impl ProcessTrait for Worker {
+    fn ctx(&self) -> &Arc<AppContext> {
+        &self.ctx
+    }
+
+    fn process_info(&self) -> ProcessInfo {
+        ProcessInfo::new("Worker", "worker")
+    }
+}
