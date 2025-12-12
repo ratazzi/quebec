@@ -32,10 +32,7 @@ pub struct ProcessInfo {
 
 impl ProcessInfo {
     pub fn new(kind: impl Into<String>, name: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            name: name.into(),
-        }
+        Self { kind: kind.into(), name: name.into() }
     }
 }
 

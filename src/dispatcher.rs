@@ -9,9 +9,9 @@ use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::sync::Arc;
 
-use tracing::Instrument;
-use tracing::{trace, info, warn};
 use sea_orm::{DbErr, Statement};
+use tracing::Instrument;
+use tracing::{info, trace, warn};
 
 #[derive(Debug)]
 pub struct Dispatcher {

@@ -28,13 +28,11 @@ pub fn get_template_content(template_name: &str) -> Option<String> {
         // In production mode, read from embedded resources
         let asset_path = format!("templates/{}", template_name);
         match Templates::get(&asset_path) {
-            Some(content) => {
-                match std::str::from_utf8(content.data.as_ref()) {
-                    Ok(s) => Some(s.to_string()),
-                    Err(e) => {
-                        error!("Failed to decode template {}: {}", template_name, e);
-                        None
-                    }
+            Some(content) => match std::str::from_utf8(content.data.as_ref()) {
+                Ok(s) => Some(s.to_string()),
+                Err(e) => {
+                    error!("Failed to decode template {}: {}", template_name, e);
+                    None
                 }
             },
             None => {
@@ -79,7 +77,7 @@ pub fn list_templates() -> Vec<String> {
                 });
 
                 templates
-            },
+            }
             Err(e) => {
                 error!("Failed to read templates directory: {}", e);
                 Vec::new()

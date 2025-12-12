@@ -1,12 +1,17 @@
+use axum::http::StatusCode;
+use chrono::{NaiveDateTime, Utc};
+use sea_orm::{
+    ColumnTrait, DbErr, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+};
 use std::collections::HashMap;
 use std::error::Error;
-use chrono::{NaiveDateTime, Utc};
-use sea_orm::{DbErr, EntityTrait, QueryFilter, ColumnTrait, QuerySelect, Order, QueryOrder, PaginatorTrait};
 use tera::Context;
-use tracing::{error, debug, info};
-use axum::http::StatusCode;
+use tracing::{debug, error, info};
 
-use crate::entities::{quebec_jobs, quebec_pauses, quebec_processes, quebec_scheduled_executions, quebec_claimed_executions, quebec_failed_executions, quebec_blocked_executions};
+use crate::entities::{
+    quebec_blocked_executions, quebec_claimed_executions, quebec_failed_executions, quebec_jobs,
+    quebec_pauses, quebec_processes, quebec_scheduled_executions,
+};
 
 use super::templates;
 use super::ControlPlane;
@@ -45,7 +50,7 @@ impl ControlPlane {
     pub fn calculate_time_diff(from: NaiveDateTime) -> String {
         let duration = Utc::now().naive_utc() - from;
         let seconds = duration.num_seconds();
-        
+
         if seconds < 60 {
             format!("{}s", seconds)
         } else if seconds < 3600 {
@@ -61,7 +66,7 @@ impl ControlPlane {
     pub async fn get_queue_names(&self) -> Result<Vec<String>, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
-        
+
         let queue_names: Vec<String> = quebec_jobs::Entity::find()
             .select_only()
             .column(quebec_jobs::Column::QueueName)
@@ -70,7 +75,7 @@ impl ControlPlane {
             .into_tuple()
             .all(db)
             .await?;
-        
+
         Ok(queue_names)
     }
 
@@ -78,7 +83,7 @@ impl ControlPlane {
     pub async fn get_job_classes(&self) -> Result<Vec<String>, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
-        
+
         let class_names: Vec<String> = quebec_jobs::Entity::find()
             .select_only()
             .column(quebec_jobs::Column::ClassName)
@@ -87,7 +92,7 @@ impl ControlPlane {
             .into_tuple()
             .all(db)
             .await?;
-        
+
         Ok(class_names)
     }
 
@@ -95,54 +100,43 @@ impl ControlPlane {
     pub async fn populate_nav_stats(&self, context: &mut Context) -> Result<(), DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
-        
+
         // Count total jobs
-        let total_jobs = quebec_jobs::Entity::find()
-            .count(db)
-            .await?;
-        
+        let total_jobs = quebec_jobs::Entity::find().count(db).await?;
+
         // Count scheduled jobs
-        let scheduled_count = quebec_scheduled_executions::Entity::find()
-            .count(db)
-            .await? as i64;
-        
+        let scheduled_count = quebec_scheduled_executions::Entity::find().count(db).await? as i64;
+
         // Count in-progress jobs
-        let in_progress_count = quebec_claimed_executions::Entity::find()
-            .count(db)
-            .await? as i64;
-        
+        let in_progress_count = quebec_claimed_executions::Entity::find().count(db).await? as i64;
+
         // Count failed jobs
-        let failed_count = quebec_failed_executions::Entity::find()
-            .count(db)
-            .await? as i64;
-        
+        let failed_count = quebec_failed_executions::Entity::find().count(db).await? as i64;
+
         // Count blocked jobs
-        let blocked_count = quebec_blocked_executions::Entity::find()
-            .count(db)
-            .await? as i64;
-        
+        let blocked_count = quebec_blocked_executions::Entity::find().count(db).await? as i64;
+
         // Count active workers
-        let active_workers = quebec_processes::Entity::find()
-            .count(db)
-            .await?;
-        
+        let active_workers = quebec_processes::Entity::find().count(db).await?;
+
         context.insert("nav_total_jobs", &total_jobs);
         context.insert("nav_scheduled_jobs", &scheduled_count);
         context.insert("nav_in_progress_jobs", &in_progress_count);
         context.insert("nav_failed_jobs", &failed_count);
         context.insert("nav_blocked_jobs", &blocked_count);
         context.insert("nav_active_workers", &active_workers);
-        
+
         // Add template variables for stats.html (without nav_ prefix)
         context.insert("failed_jobs_count", &failed_count);
         context.insert("in_progress_jobs_count", &in_progress_count);
         context.insert("blocked_jobs_count", &blocked_count);
         context.insert("scheduled_jobs_count", &scheduled_count);
-        
+
         // Calculate finished jobs count (total jobs minus active executions)
-        let finished_count = total_jobs as i64 - scheduled_count - in_progress_count - failed_count - blocked_count;
+        let finished_count =
+            total_jobs as i64 - scheduled_count - in_progress_count - failed_count - blocked_count;
         context.insert("finished_jobs_count", &finished_count);
-        
+
         Ok(())
     }
 
@@ -150,12 +144,12 @@ impl ControlPlane {
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
-        
+
         let pause = quebec_pauses::Entity::find()
             .filter(quebec_pauses::Column::QueueName.eq(queue_name))
             .one(db)
             .await?;
-        
+
         Ok(pause.is_some())
     }
 
@@ -163,7 +157,7 @@ impl ControlPlane {
     pub fn get_pagination_params(&self, page: u64, total_items: u64) -> HashMap<&'static str, u64> {
         let total_pages = (total_items as f64 / self.page_size as f64).ceil() as u64;
         let total_pages = total_pages.max(1);
-        
+
         let mut pagination = HashMap::new();
         pagination.insert("current_page", page);
         pagination.insert("total_pages", total_pages);
@@ -173,14 +167,16 @@ impl ControlPlane {
         pagination.insert("has_next", if page < total_pages { 1 } else { 0 });
         pagination.insert("prev_page", if page > 1 { page - 1 } else { 1 });
         pagination.insert("next_page", if page < total_pages { page + 1 } else { total_pages });
-        
+
         pagination
     }
 
     /// Parse JSON arguments safely
     pub fn parse_arguments(arguments: &str) -> String {
         match serde_json::from_str::<serde_json::Value>(arguments) {
-            Ok(json) => serde_json::to_string_pretty(&json).unwrap_or_else(|_| arguments.to_string()),
+            Ok(json) => {
+                serde_json::to_string_pretty(&json).unwrap_or_else(|_| arguments.to_string())
+            }
             Err(_) => arguments.to_string(),
         }
     }
@@ -196,7 +192,9 @@ impl ControlPlane {
     }
 
     /// Render template with context
-    pub async fn render_template(&self, template_name: &str, context: &mut Context) -> Result<String, (StatusCode, String)> {
+    pub async fn render_template(
+        &self, template_name: &str, context: &mut Context,
+    ) -> Result<String, (StatusCode, String)> {
         // In debug compilation mode, reload templates
         #[cfg(debug_assertions)]
         {
@@ -209,11 +207,11 @@ impl ControlPlane {
                             *tera = new_tera;
                             tera.autoescape_on(vec!["html"]);
                             debug!("Templates reloaded successfully");
-                        },
-                        Err(e) => error!("Failed to acquire write lock: {}", e)
+                        }
+                        Err(e) => error!("Failed to acquire write lock: {}", e),
                     }
-                },
-                Err(e) => error!("Error reloading templates: {}", e)
+                }
+                Err(e) => error!("Error reloading templates: {}", e),
             }
         }
 
@@ -315,14 +313,20 @@ impl ControlPlane {
         let tera_read_result = self.tera.read();
         if let Err(e) = tera_read_result {
             error!("Failed to acquire read lock: {}", e);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to acquire template lock: {}", e),
+            ));
         }
 
         let tera = match tera_read_result {
             Ok(t) => t,
             Err(e) => {
                 error!("Failed to acquire read lock: {}", e);
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to acquire template lock: {}", e)));
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to acquire template lock: {}", e),
+                ));
             }
         };
         let templates = tera.get_template_names().collect::<Vec<_>>();
@@ -352,9 +356,11 @@ impl ControlPlane {
                 let template_path = format!("src/templates/{}", template_name);
                 match std::fs::read_to_string(&template_path) {
                     Ok(content) => {
-                        info!("Template content preview (first 100 chars): {}",
-                             content.chars().take(100).collect::<String>());
-                    },
+                        info!(
+                            "Template content preview (first 100 chars): {}",
+                            content.chars().take(100).collect::<String>()
+                        );
+                    }
                     Err(e) => error!("Could not read template file {}: {}", template_path, e),
                 }
 

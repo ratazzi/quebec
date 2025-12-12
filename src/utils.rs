@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyTuple, PyInt, PyFloat, PyString};
+use pyo3::types::{PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
 use serde_yaml;
 
@@ -45,8 +45,9 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         Ok(Value::Number(obj.extract::<i64>()?.into()))
     } else if obj.is_instance_of::<PyFloat>() {
         let f = obj.extract::<f64>()?;
-        Ok(Value::Number(serde_json::Number::from_f64(f)
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid float value"))?))
+        Ok(Value::Number(serde_json::Number::from_f64(f).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid float value")
+        })?))
     } else if obj.is_instance_of::<PyString>() {
         Ok(Value::String(obj.extract::<String>()?))
     } else if obj.is_instance_of::<PyDict>() {
@@ -368,8 +369,7 @@ where
 /// This version returns an error if the specified environment is not found.
 /// Used when you want to enforce that the environment must exist.
 pub fn parse_env_config_strict<T>(
-    env_config: std::collections::HashMap<String, T>,
-    env: Option<&str>,
+    env_config: std::collections::HashMap<String, T>, env: Option<&str>,
 ) -> anyhow::Result<T>
 where
     T: Clone + std::fmt::Debug,

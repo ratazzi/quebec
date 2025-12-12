@@ -1,20 +1,25 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
+    QuerySelect, TransactionTrait,
+};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Query, Path},
-    response::{Html, IntoResponse},
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, PaginatorTrait, QuerySelect, ConnectionTrait};
-use tracing::{debug, info, error, instrument};
+use tracing::{debug, error, info, instrument};
 
-use crate::entities::{quebec_jobs, quebec_claimed_executions, quebec_processes};
-use crate::control_plane::{ControlPlane, models::{Pagination, InProgressJobInfo}};
+use crate::control_plane::{
+    models::{InProgressJobInfo, Pagination},
+    ControlPlane,
+};
+use crate::entities::{quebec_claimed_executions, quebec_jobs, quebec_processes};
 
 impl ControlPlane {
     pub async fn in_progress_jobs(
-        State(state): State<Arc<ControlPlane>>,
-        Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -42,7 +47,8 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store in-progress job information
-        let mut in_progress_jobs: Vec<InProgressJobInfo> = Vec::with_capacity(claimed_executions.len());
+        let mut in_progress_jobs: Vec<InProgressJobInfo> =
+            Vec::with_capacity(claimed_executions.len());
 
         // Get current time, for calculating runtime
         let now = chrono::Utc::now().naive_utc();
@@ -55,7 +61,7 @@ impl ControlPlane {
                     Some(pid) => {
                         let process = processes.iter().find(|p| p.id == pid);
                         process.map_or(pid, |p| p.id)
-                    },
+                    }
                     None => 0,
                 };
 
@@ -63,13 +69,13 @@ impl ControlPlane {
                 let runtime = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
-                    },
+                    }
                     duration if duration.num_minutes() >= 1 => {
                         format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
-                    },
+                    }
                     duration => {
                         format!("{}s", duration.num_seconds())
-                    },
+                    }
                 };
 
                 in_progress_jobs.push(InProgressJobInfo {
@@ -106,11 +112,13 @@ impl ControlPlane {
         debug!("Fetched count in {:?}", start.elapsed());
 
         // Use abstract method to get all queue names and job classes
-        let queue_names = state.get_queue_names()
+        let queue_names = state
+            .get_queue_names()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let job_classes = state.get_job_classes()
+        let job_classes = state
+            .get_job_classes()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -132,8 +140,7 @@ impl ControlPlane {
     // Implement method to cancel a single in-progress job
     #[instrument(skip(state), fields(path = "/in-progress-jobs/:id/cancel"))]
     pub async fn cancel_in_progress_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -142,28 +149,25 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find execution record to cancel
-                let claimed_execution = quebec_claimed_executions::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?;
+                let claimed_execution =
+                    quebec_claimed_executions::Entity::find_by_id(id).one(txn).await?;
 
                 if let Some(execution) = claimed_execution {
                     // First mark job as completed
-                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
-                        .one(txn)
-                        .await?;
+                    let job_result =
+                        quebec_jobs::Entity::find_by_id(execution.job_id).one(txn).await?;
 
                     if let Some(job) = job_result {
                         // Update job status to completed
                         let mut job_model: quebec_jobs::ActiveModel = job.into();
-                        job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
+                        job_model.finished_at =
+                            ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
                         job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
                         job_model.update(txn).await?;
                     }
 
                     // Delete claimed_execution record
-                    quebec_claimed_executions::Entity::delete_by_id(id)
-                        .exec(txn)
-                        .await?;
+                    quebec_claimed_executions::Entity::delete_by_id(id).exec(txn).await?;
 
                     info!("Cancelled in-progress job ID: {}", id);
                 } else {
@@ -194,17 +198,14 @@ impl ControlPlane {
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
                 // Get all in-progress jobs
-                let claimed_executions = quebec_claimed_executions::Entity::find()
-                    .all(txn)
-                    .await?;
+                let claimed_executions = quebec_claimed_executions::Entity::find().all(txn).await?;
 
                 if claimed_executions.is_empty() {
                     return Ok(0);
                 }
 
-                let job_ids: Vec<i64> = claimed_executions.iter()
-                    .map(|execution| execution.job_id)
-                    .collect();
+                let job_ids: Vec<i64> =
+                    claimed_executions.iter().map(|execution| execution.job_id).collect();
 
                 // Update all related jobs to completed status
                 let now = chrono::Utc::now().naive_utc();
@@ -219,15 +220,14 @@ impl ControlPlane {
                 let stmt = sea_orm::Statement::from_sql_and_values(
                     sea_orm::DbBackend::Postgres,
                     update_sql,
-                    [now.into(), job_ids.into()]
+                    [now.into(), job_ids.into()],
                 );
 
                 txn.execute(stmt).await?;
 
                 // Delete all claimed_execution records
-                let delete_result = quebec_claimed_executions::Entity::delete_many()
-                    .exec(txn)
-                    .await?;
+                let delete_result =
+                    quebec_claimed_executions::Entity::delete_many().exec(txn).await?;
 
                 let count = delete_result.rows_affected;
                 info!("Cancelled all {} in-progress jobs", count);

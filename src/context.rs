@@ -10,7 +10,7 @@ use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use tracing::{debug, error, warn, trace};
+use tracing::{debug, error, trace, warn};
 
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -239,16 +239,12 @@ impl DiscardStrategy {
     }
 }
 
-
-
-
-
 #[derive(Debug)]
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
     pub dsn: Url,
     pub db: Option<Arc<DatabaseConnection>>, // Use shared connection for SQLite
-    pub connect_options: ConnectOptions, // For creating new connections
+    pub connect_options: ConnectOptions,     // For creating new connections
     pub name: String, // Application name for NOTIFY channel (default: "quebec")
     pub use_skip_locked: bool,
     pub process_heartbeat_interval: Duration,
@@ -274,10 +270,8 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        dsn: Url,
-        db: Option<Arc<DatabaseConnection>>,
-        connect_options: ConnectOptions,
-        options: Option<HashMap<String, PyObject>>
+        dsn: Url, db: Option<Arc<DatabaseConnection>>, connect_options: ConnectOptions,
+        options: Option<HashMap<String, PyObject>>,
     ) -> Self {
         let mut ctx = Self {
             cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -293,7 +287,7 @@ impl AppContext {
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
             default_concurrency_control_period: Duration::from_secs(60),    // 1 minute
-            dispatcher_polling_interval: Duration::from_secs(1),           // 1 seconds
+            dispatcher_polling_interval: Duration::from_secs(1),            // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
@@ -397,7 +391,8 @@ impl AppContext {
                     if let Ok(value) = val.extract::<Duration>(py) {
                         ctx.dispatcher_concurrency_maintenance_interval = value;
                     } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs(value);
+                        ctx.dispatcher_concurrency_maintenance_interval =
+                            Duration::from_secs(value);
                     }
                 }
 
@@ -408,7 +403,8 @@ impl AppContext {
                     } else if let Ok(value) = val.extract::<u64>(py) {
                         ctx.worker_polling_interval = Duration::from_secs(value);
                     } else if let Ok(value) = val.extract::<f64>(py) {
-                        ctx.worker_polling_interval = Duration::from_millis((value * 1000.0) as u64);
+                        ctx.worker_polling_interval =
+                            Duration::from_millis((value * 1000.0) as u64);
                     }
                 }
 
@@ -471,8 +467,15 @@ impl AppContext {
                 Err(e) => {
                     if retry < 2 {
                         // If there are retry attempts left, log error and wait before retrying
-                        warn!("Failed to get database connection, retrying ({}/3): {}", retry + 1, e);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * (retry + 1) as u64)).await;
+                        warn!(
+                            "Failed to get database connection, retrying ({}/3): {}",
+                            retry + 1,
+                            e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            100 * (retry + 1) as u64,
+                        ))
+                        .await;
                     } else {
                         // If all retries failed, log error and panic
                         error!("Failed to get database connection after 3 retries: {}", e);
@@ -493,29 +496,26 @@ impl AppContext {
 
     /// Get a runnable by class name
     pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable, anyhow::Error> {
-        let runnables = self.runnables.read()
+        let runnables = self
+            .runnables
+            .read()
             .map_err(|e| anyhow::anyhow!("Failed to acquire read lock: {}", e))?;
-        let runnable = runnables.get(class_name)
+        let runnable = runnables
+            .get(class_name)
             .ok_or_else(|| anyhow::anyhow!("Runnable not found for class: {}", class_name))?;
 
         // Clone with GIL since Runnable contains Py<PyAny>
-        Python::with_gil(|py| {
-            Ok(runnable.clone_with_gil(py))
-        })
+        Python::with_gil(|py| Ok(runnable.clone_with_gil(py)))
     }
 
     /// Get all registered runnable class names
     pub fn get_runnable_names(&self) -> Vec<String> {
-        self.runnables.read()
-            .map(|r| r.keys().cloned().collect())
-            .unwrap_or_else(|_| Vec::new())
+        self.runnables.read().map(|r| r.keys().cloned().collect()).unwrap_or_else(|_| Vec::new())
     }
 
     /// Check if a job class has concurrency control enabled
     pub fn has_concurrency_control(&self, class_name: &str) -> bool {
-        self.concurrency_enabled.read()
-            .map(|c| c.contains(class_name))
-            .unwrap_or(false)
+        self.concurrency_enabled.read().map(|c| c.contains(class_name)).unwrap_or(false)
     }
 
     /// Enable concurrency control for a job class

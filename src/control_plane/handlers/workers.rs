@@ -1,15 +1,15 @@
-use std::sync::Arc;
-use std::time::Instant;
 use axum::{
     extract::State,
-    response::{Html, IntoResponse},
     http::StatusCode,
+    response::{Html, IntoResponse},
 };
-use sea_orm::{EntityTrait, QueryOrder, Order};
+use sea_orm::{EntityTrait, Order, QueryOrder};
+use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
+use crate::control_plane::{models::WorkerInfo, ControlPlane};
 use crate::entities::quebec_processes;
-use crate::control_plane::{ControlPlane, models::WorkerInfo};
 
 impl ControlPlane {
     pub async fn workers(
@@ -28,32 +28,32 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Calculate time since last heartbeat for each worker
-        let workers_info: Vec<WorkerInfo> = workers.into_iter().map(|worker| {
-            let last_heartbeat = worker.last_heartbeat_at;
-            let now = chrono::Utc::now().naive_utc();
-            // Calculate time difference (seconds)
-            let duration = now.signed_duration_since(last_heartbeat);
-            let seconds_since_heartbeat = duration.num_seconds();
+        let workers_info: Vec<WorkerInfo> = workers
+            .into_iter()
+            .map(|worker| {
+                let last_heartbeat = worker.last_heartbeat_at;
+                let now = chrono::Utc::now().naive_utc();
+                // Calculate time difference (seconds)
+                let duration = now.signed_duration_since(last_heartbeat);
+                let seconds_since_heartbeat = duration.num_seconds();
 
-            // Use process_alive_threshold from context to determine worker status
-            let threshold_seconds = state.ctx.process_alive_threshold.as_secs() as i64;
-            let status = if seconds_since_heartbeat > threshold_seconds {
-                "dead"
-            } else {
-                "alive"
-            };
+                // Use process_alive_threshold from context to determine worker status
+                let threshold_seconds = state.ctx.process_alive_threshold.as_secs() as i64;
+                let status =
+                    if seconds_since_heartbeat > threshold_seconds { "dead" } else { "alive" };
 
-            WorkerInfo {
-                id: worker.id,
-                name: worker.name,
-                kind: worker.kind,
-                hostname: worker.hostname.unwrap_or_else(|| "unknown".to_string()),
-                pid: worker.pid,
-                last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
-                seconds_since_heartbeat,
-                status: status.to_string(),
-            }
-        }).collect();
+                WorkerInfo {
+                    id: worker.id,
+                    name: worker.name,
+                    kind: worker.kind,
+                    hostname: worker.hostname.unwrap_or_else(|| "unknown".to_string()),
+                    pid: worker.pid,
+                    last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
+                    seconds_since_heartbeat,
+                    status: status.to_string(),
+                }
+            })
+            .collect();
 
         let mut context = tera::Context::new();
         context.insert("workers", &workers_info);
@@ -65,13 +65,13 @@ impl ControlPlane {
     }
 
     pub async fn stats(
-        State(state): State<Arc<ControlPlane>>,
-        _req: axum::http::Request<axum::body::Body>,
+        State(state): State<Arc<ControlPlane>>, _req: axum::http::Request<axum::body::Body>,
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let mut context = tera::Context::new();
 
         // Use populate_nav_stats method to fill statistics
-        state.populate_nav_stats(&mut context)
+        state
+            .populate_nav_stats(&mut context)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

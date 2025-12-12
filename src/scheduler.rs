@@ -66,11 +66,14 @@ use tracing::{error, info, trace, warn};
 //     "description" = excluded."description"
 // RETURNING "id"
 // ```
-pub async fn upsert_task<C>(db: &C, table_config: &crate::context::TableConfig, entry: ScheduledEntry) -> Result<ExecResult, DbErr>
+pub async fn upsert_task<C>(
+    db: &C, table_config: &crate::context::TableConfig, entry: ScheduledEntry,
+) -> Result<ExecResult, DbErr>
 where
     C: ConnectionTrait,
 {
-    let sql = format!(r#"INSERT INTO "{}" (
+    let sql = format!(
+        r#"INSERT INTO "{}" (
         "key",
         "schedule",
         "command",
@@ -120,9 +123,16 @@ where
             "description" = excluded."description"
         RETURNING "id""#,
         table_config.recurring_tasks,
-        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks,
-        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks,
-        table_config.recurring_tasks, table_config.recurring_tasks, table_config.recurring_tasks);
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks,
+        table_config.recurring_tasks
+    );
 
     let cleaned_sql = sql.lines().map(str::trim).collect::<Vec<&str>>().join(" ");
 
@@ -181,9 +191,16 @@ where
         if let Ok(runnable) = ctx.get_runnable(&entry.class) {
             if let Some(args) = &entry.args {
                 // Assume args is a list of arguments, no kwargs for scheduled jobs
-                runnable.get_concurrency_constraint(Some(args), None::<&serde_yaml::Value>).unwrap_or(None)
+                runnable
+                    .get_concurrency_constraint(Some(args), None::<&serde_yaml::Value>)
+                    .unwrap_or(None)
             } else {
-                runnable.get_concurrency_constraint(None::<&serde_yaml::Value>, None::<&serde_yaml::Value>).unwrap_or(None)
+                runnable
+                    .get_concurrency_constraint(
+                        None::<&serde_yaml::Value>,
+                        None::<&serde_yaml::Value>,
+                    )
+                    .unwrap_or(None)
             }
         } else {
             None
@@ -277,7 +294,8 @@ where
 
     // Send PostgreSQL NOTIFY after scheduled job is created
     if ctx.is_postgres() {
-        if let Err(e) = NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job").await {
+        if let Err(e) = NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job").await
+        {
             warn!("Failed to send NOTIFY for scheduled job: {}", e);
         }
     }
@@ -296,14 +314,17 @@ impl Scheduler {
         Self { ctx, schedule: Vec::new() }
     }
 
-    fn parse_schedule_file(contents: &str) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+    fn parse_schedule_file(
+        contents: &str,
+    ) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
         // Parse as multi-environment config (Solid Queue format)
         // Format: { development: { task1: {...}, task2: {...} }, production: {...} }
-        let env_config = serde_yaml::from_str::<HashMap<String, HashMap<String, ScheduledEntry>>>(contents)
-            .map_err(|e| {
-                error!("Failed to parse schedule file: {}", e);
-                anyhow::anyhow!("Failed to parse schedule file: {}", e)
-            })?;
+        let env_config =
+            serde_yaml::from_str::<HashMap<String, HashMap<String, ScheduledEntry>>>(contents)
+                .map_err(|e| {
+                    error!("Failed to parse schedule file: {}", e);
+                    anyhow::anyhow!("Failed to parse schedule file: {}", e)
+                })?;
 
         // Use shared environment config parser
         let tasks = crate::utils::parse_env_config_cloneable(env_config)?;
@@ -346,11 +367,10 @@ impl Scheduler {
             }
             Some(path) => {
                 info!("Loading schedule from: {}", path);
-                let contents = std::fs::read_to_string(&path)
-                    .map_err(|e| {
-                        error!("Failed to read schedule file {}: {}", path, e);
-                        anyhow::anyhow!("Failed to read schedule file: {}", e)
-                    })?;
+                let contents = std::fs::read_to_string(&path).map_err(|e| {
+                    error!("Failed to read schedule file {}: {}", path, e);
+                    anyhow::anyhow!("Failed to read schedule file: {}", e)
+                })?;
 
                 Self::parse_schedule_file(&contents)?
             }
@@ -369,7 +389,9 @@ impl Scheduler {
                 let table_config = self.ctx.table_config.clone();
                 let ret = db
                     .transaction::<_, ExecResult, DbErr>(|txn| {
-                        Box::pin(async move { upsert_task(txn, &table_config, value.clone()).await })
+                        Box::pin(
+                            async move { upsert_task(txn, &table_config, value.clone()).await },
+                        )
                     })
                     .await?;
 
@@ -388,8 +410,6 @@ impl Scheduler {
 
             let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
             let handle = tokio::spawn(async move {
-
-
                 let cron = match entry.as_cron() {
                     Ok(c) => c,
                     Err(e) => {

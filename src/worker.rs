@@ -5,7 +5,10 @@ use crate::semaphore::release_semaphore;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use sea_query::{LockBehavior, Query, Expr, Asterisk, Alias, SqliteQueryBuilder, PostgresQueryBuilder, MysqlQueryBuilder};
+use sea_query::{
+    Alias, Asterisk, Expr, LockBehavior, MysqlQueryBuilder, PostgresQueryBuilder, Query,
+    SqliteQueryBuilder,
+};
 use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;
@@ -21,8 +24,8 @@ use tokio::sync::Mutex;
 use colored::*;
 use tracing::{info_span, Instrument};
 
-use pyo3::types::{PyBool, PyDict, PyList, PyModule, PyTuple, PyType};
 use pyo3::exceptions::PyTypeError;
+use pyo3::types::{PyBool, PyDict, PyList, PyModule, PyTuple, PyType};
 
 use crate::notify::NotifyManager;
 
@@ -176,7 +179,6 @@ impl Runnable {
             retry_info: None,
             concurrency_limit: None,
             concurrency_duration: None,
-
         }
     }
 
@@ -190,14 +192,15 @@ impl Runnable {
             retry_info: self.retry_info.clone(),
             concurrency_limit: self.concurrency_limit,
             concurrency_duration: self.concurrency_duration,
-
         }
     }
 
     /// Get the concurrency constraint for this job with given arguments
     /// Returns Some(ConcurrencyConstraint) if concurrency control is enabled, None otherwise
     /// Handles Python GIL internally and performs all checks once
-    pub fn get_concurrency_constraint<T, K>(&self, args: Option<T>, kwargs: Option<K>) -> Result<Option<ConcurrencyConstraint>>
+    pub fn get_concurrency_constraint<T, K>(
+        &self, args: Option<T>, kwargs: Option<K>,
+    ) -> Result<Option<ConcurrencyConstraint>>
     where
         T: crate::utils::IntoPython,
         K: crate::utils::IntoPython,
@@ -277,10 +280,12 @@ impl Runnable {
             let limit = self.concurrency_limit.unwrap_or(1);
 
             // Return duration (convert from seconds to chrono::Duration)
-            let duration = self.concurrency_duration.map(|seconds| chrono::Duration::seconds(seconds as i64));
+            let duration =
+                self.concurrency_duration.map(|seconds| chrono::Duration::seconds(seconds as i64));
 
             Ok(Some(ConcurrencyConstraint { key, limit, duration }))
-        }).map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
+        })
+        .map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
     }
 
     /// Check if should retry, return matching retry strategy
@@ -307,7 +312,9 @@ impl Runnable {
     }
 
     /// Check if should discard, return matching discard strategy
-    fn should_discard(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<DiscardStrategy>> {
+    fn should_discard(
+        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr,
+    ) -> PyResult<Option<DiscardStrategy>> {
         if !bound.hasattr("discard_on")? {
             return Ok(None);
         }
@@ -324,7 +331,9 @@ impl Runnable {
     }
 
     /// Check if has rescue handling, return matching rescue strategy
-    fn should_rescue(&self, py: Python, bound: &Bound<PyAny>, error: &PyErr) -> PyResult<Option<RescueStrategy>> {
+    fn should_rescue(
+        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr,
+    ) -> PyResult<Option<RescueStrategy>> {
         if !bound.hasattr("rescue_from")? {
             return Ok(None);
         }
@@ -341,14 +350,14 @@ impl Runnable {
     }
 
     /// Check if exception matches
-    fn is_exception_match(&self, py: Python, exceptions: &Py<PyAny>, error: &PyErr) -> PyResult<bool> {
+    fn is_exception_match(
+        &self, py: Python, exceptions: &Py<PyAny>, error: &PyErr,
+    ) -> PyResult<bool> {
         let exceptions_bound = exceptions.bind(py);
-
 
         if let Ok(exception_type) = exceptions_bound.downcast::<PyType>() {
             return Ok(error.is_instance(py, exception_type));
         }
-
 
         if let Ok(exception_tuple) = exceptions_bound.downcast::<PyTuple>() {
             for item in exception_tuple.iter() {
@@ -363,8 +372,6 @@ impl Runnable {
         Ok(false)
     }
 
-
-
     /// Handle discard - directly mark task as completed without recording failure information
     fn handle_discard(
         &self, py: Python, strategy: &DiscardStrategy, error: &PyErr, job: quebec_jobs::Model,
@@ -376,7 +383,9 @@ impl Runnable {
             }
         }
 
-        let error_name = error.get_type(py).name()
+        let error_name = error
+            .get_type(py)
+            .name()
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "unknown error".to_string());
         info!("Job discarded due to {}", error_name);
@@ -394,7 +403,9 @@ impl Runnable {
             }
         }
 
-        let exception_class = error.get_type(py).name()
+        let exception_class = error
+            .get_type(py)
+            .name()
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "UnknownError".to_string());
 
@@ -404,7 +415,8 @@ impl Runnable {
             "backtrace": backtrace,
         });
 
-        serde_json::to_string(&error_payload).unwrap_or_else(|_| "Failed to serialize error".to_string())
+        serde_json::to_string(&error_payload)
+            .unwrap_or_else(|_| "Failed to serialize error".to_string())
     }
 
     fn invoke(&mut self, job: &mut quebec_jobs::Model) -> Result<quebec_jobs::Model> {
@@ -440,7 +452,9 @@ impl Runnable {
     }
 
     /// Parse task parameters
-    fn parse_job_arguments(&self, py: Python, job: &quebec_jobs::Model) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
+    fn parse_job_arguments(
+        &self, py: Python, job: &quebec_jobs::Model,
+    ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
         // Deserialize JSON parameters
         let mut v = serde_json::Value::Array(vec![]);
         if let Some(arguments) = job.arguments.as_ref() {
@@ -457,8 +471,9 @@ impl Runnable {
         }
 
         let binding = json_to_py(py, &v)?;
-        let args = binding.downcast_bound::<pyo3::types::PyList>(py)
-            .map_err(|e| PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e)))?;
+        let args = binding.downcast_bound::<pyo3::types::PyList>(py).map_err(|e| {
+            PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
+        })?;
 
         // Initialize kwargs
         let kwargs = PyDict::new(py);
@@ -482,7 +497,9 @@ impl Runnable {
     }
 
     /// Handle execution error
-    fn handle_execution_error(&mut self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr) -> Result<quebec_jobs::Model> {
+    fn handle_execution_error(
+        &mut self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         error!("Job execution error: {:?}", error);
 
         let bound = self.handler.bind(py);
@@ -510,24 +527,27 @@ impl Runnable {
     }
 
     /// Apply retry strategy
-    fn apply_retry_strategy(&mut self, job: &quebec_jobs::Model, strategy: RetryStrategy) -> Result<quebec_jobs::Model> {
+    fn apply_retry_strategy(
+        &mut self, job: &quebec_jobs::Model, strategy: RetryStrategy,
+    ) -> Result<quebec_jobs::Model> {
         warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
         let delay = strategy.wait;
-        let scheduled_at = chrono::Utc::now().naive_utc() + chrono::Duration::from_std(delay).map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
+        let scheduled_at = chrono::Utc::now().naive_utc()
+            + chrono::Duration::from_std(delay)
+                .map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
         let failed_attempts = job.failed_attempts + 1;
 
         // Set retry information to runnable
-        self.retry_info = Some(RetryInfo {
-            scheduled_at,
-            failed_attempts,
-        });
+        self.retry_info = Some(RetryInfo { scheduled_at, failed_attempts });
 
         Ok(job.clone())
     }
 
     /// Apply rescue strategy
-    fn apply_rescue_strategy(&self, py: Python, job: &mut quebec_jobs::Model, strategy: &RescueStrategy, error: &PyErr) -> Result<quebec_jobs::Model> {
+    fn apply_rescue_strategy(
+        &self, py: Python, job: &mut quebec_jobs::Model, strategy: &RescueStrategy, error: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         match strategy.handler.call1(py, (error.value(py),)) {
             Ok(_) => {
                 info!("Job rescued from error");
@@ -542,7 +562,9 @@ impl Runnable {
     }
 
     /// Handle task failure
-    fn handle_job_failure(&self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr) -> Result<quebec_jobs::Model> {
+    fn handle_job_failure(
+        &self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         job.failed_attempts += 1;
         let error_payload = self.create_error_payload(py, error);
         Err(anyhow::anyhow!(error_payload))
@@ -604,8 +626,8 @@ pub struct Execution {
 
 impl Execution {
     pub fn new(
-        ctx: Arc<AppContext>, claimed: quebec_claimed_executions::Model,
-        job: quebec_jobs::Model, runnable: Runnable,
+        ctx: Arc<AppContext>, claimed: quebec_claimed_executions::Model, job: quebec_jobs::Model,
+        runnable: Runnable,
     ) -> Self {
         // Get current thread's ThreadId
         let thread_id = std::thread::current().id();
@@ -640,7 +662,12 @@ impl Execution {
         self.timer = Instant::now();
         let mut job = self.job.clone();
         let job_id = self.claimed.job_id;
-        let span = tracing::info_span!("runner", queue=job.queue_name, jid = job_id, tid = self.tid.clone());
+        let span = tracing::info_span!(
+            "runner",
+            queue = job.queue_name,
+            jid = job_id,
+            tid = self.tid.clone()
+        );
         // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
         let result = async {
             let invoke_result = self.runnable.invoke(&mut job);
@@ -649,7 +676,9 @@ impl Execution {
                 self.retry_info = Some(retry_info);
             }
             invoke_result
-        }.instrument(span.clone()).await;
+        }
+        .instrument(span.clone())
+        .await;
 
         let failed = result.is_err();
         let ret = self.after_executed(result).instrument(span).await;
@@ -693,18 +722,17 @@ impl Execution {
         let err = result.as_ref().err().map(|e| e.to_string());
 
         // Check if retry is needed (determined by execution.retry_info)
-        let retry_job_data = self.retry_info
-            .as_ref()
-            .map(|info| (info.scheduled_at, info.failed_attempts));
+        let retry_job_data =
+            self.retry_info.as_ref().map(|info| (info.scheduled_at, info.failed_attempts));
 
         // Capture concurrency info for semaphore release
         let concurrency_key = job.concurrency_key.clone();
         let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
-        let concurrency_duration = self.runnable.concurrency_duration.map(|s| chrono::Duration::seconds(s as i64));
+        let concurrency_duration =
+            self.runnable.concurrency_duration.map(|s| chrono::Duration::seconds(s as i64));
         let table_config = self.ctx.table_config.clone();
 
         db.transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
-
             Box::pin(async move {
                 let claimed_id = claimed.id;
 
@@ -782,7 +810,15 @@ impl Execution {
                 // This must happen AFTER job execution completes (ensure block in Solid Queue)
                 if let Some(ref key) = concurrency_key {
                     if !key.is_empty() {
-                        match release_semaphore(txn, &table_config, key.clone(), concurrency_limit, concurrency_duration).await {
+                        match release_semaphore(
+                            txn,
+                            &table_config,
+                            key.clone(),
+                            concurrency_limit,
+                            concurrency_duration,
+                        )
+                        .await
+                        {
                             Ok(released) => {
                                 if released {
                                     trace!("Released semaphore for key: {}", key);
@@ -814,7 +850,6 @@ impl Execution {
             error!("Job processing failed in {:?}: {:?}", duration, e)
         })
         .ok();
-
 
         result
     }
@@ -854,15 +889,16 @@ impl Execution {
 
     #[getter]
     fn get_runnable(&self) -> Runnable {
-        Python::with_gil(|py| {
-            self.runnable.clone_with_gil(py)
-        })
+        Python::with_gil(|py| self.runnable.clone_with_gil(py))
     }
 
     fn perform(&mut self) -> PyResult<()> {
         // Reuse the shared runtime handle when blocking on async work
-        let handle = self.ctx.get_runtime_handle()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Tokio runtime handle not initialized"))?;
+        let handle = self.ctx.get_runtime_handle().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Tokio runtime handle not initialized",
+            )
+        })?;
         let ret = handle.block_on(async { self.invoke().await });
 
         if let Err(e) = ret {
@@ -871,7 +907,6 @@ impl Execution {
 
         Ok(())
     }
-
 
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
         let result = if exc.is_instance_of::<PyException>() {
@@ -893,7 +928,10 @@ impl Execution {
             //     backtrace = tb.format().unwrap().to_string().lines().map(String::from).collect();
             // }
 
-            error!("error_type: {}", e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string()));
+            error!(
+                "error_type: {}",
+                e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string())
+            );
             error!("error_description: {}", e.to_string());
 
             let error_payload = serde_json::json!({
@@ -902,7 +940,8 @@ impl Execution {
                 "backtrace": backtrace,
             });
 
-            Err(anyhow::anyhow!(serde_json::to_string(&error_payload).unwrap_or_else(|_| "Error serialization failed".to_string())))
+            Err(anyhow::anyhow!(serde_json::to_string(&error_payload)
+                .unwrap_or_else(|_| "Error serialization failed".to_string())))
         } else {
             // info!("Job done");
             Ok(self.job.clone())
@@ -926,11 +965,23 @@ impl Execution {
     ) -> PyResult<()> {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-        let args: serde_json::Value =
-            serde_json::from_str(job.arguments.as_ref().ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>("Job arguments missing"))?.as_str())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid job arguments: {}", e)))?;
+        let args: serde_json::Value = serde_json::from_str(
+            job.arguments
+                .as_ref()
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>("Job arguments missing")
+                })?
+                .as_str(),
+        )
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid job arguments: {}", e))
+        })?;
         let e = exc.downcast::<PyException>()?;
-        let error_type = e.get_type().qualname().map(|q| q.to_string()).unwrap_or_else(|_| "Unknown".to_string());
+        let error_type = e
+            .get_type()
+            .qualname()
+            .map(|q| q.to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
 
         let params = serde_json::json!({
             "job_class": job.class_name,
@@ -949,7 +1000,12 @@ impl Execution {
             "enqueued_at": scheduled_at,
         });
 
-        let span = tracing::info_span!("runner", queue=job.queue_name, jid = job.id, tid = self.tid.clone());
+        let span = tracing::info_span!(
+            "runner",
+            queue = job.queue_name,
+            jid = job.id,
+            tid = self.tid.clone()
+        );
         let _enter = span.enter();
 
         if (job.failed_attempts as i64) >= strategy.attempts {
@@ -959,67 +1015,97 @@ impl Execution {
 
         py.allow_threads(|| {
             let span = span.clone();
-            let job = self.ctx.get_runtime_handle()
-                .map(|h| h.block_on(async {
-                    warn!(
-                        "Attempt {} scheduled due to `{}' on {:?}",
-                        format!("#{}", job.failed_attempts + 1).bright_purple(),
-                        error_type,
-                        scheduled_at
-                    );
+            let job = self
+                .ctx
+                .get_runtime_handle()
+                .map(|h| {
+                    h.block_on(
+                        async {
+                            warn!(
+                                "Attempt {} scheduled due to `{}' on {:?}",
+                                format!("#{}", job.failed_attempts + 1).bright_purple(),
+                                error_type,
+                                scheduled_at
+                            );
 
-                    let db = self.ctx.get_db().await;
-                    db.transaction::<_, quebec_jobs::ActiveModel, DbErr>(|txn| {
-                        Box::pin(async move {
-                            let concurrency_key =
-                                job.concurrency_key.clone().unwrap_or("".to_string());
-                            let job = quebec_jobs::ActiveModel {
-                                id: ActiveValue::NotSet,
-                                queue_name: ActiveValue::Set(job.queue_name),
-                                class_name: ActiveValue::Set(job.class_name),
-                                arguments: ActiveValue::Set(Some(params.to_string())),
-                                priority: ActiveValue::Set(job.priority),
-                                failed_attempts: ActiveValue::Set(job.failed_attempts + 1),
-                                active_job_id: ActiveValue::Set(job.active_job_id.clone()),
-                                scheduled_at: ActiveValue::Set(Some(scheduled_at)),
-                                finished_at: ActiveValue::Set(None),
-                                concurrency_key: ActiveValue::Set(Some(concurrency_key.clone())),
-                                created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                            }
-                            .save(txn)
-                            .await?;
+                            let db = self.ctx.get_db().await;
+                            db.transaction::<_, quebec_jobs::ActiveModel, DbErr>(|txn| {
+                                Box::pin(async move {
+                                    let concurrency_key =
+                                        job.concurrency_key.clone().unwrap_or("".to_string());
+                                    let job = quebec_jobs::ActiveModel {
+                                        id: ActiveValue::NotSet,
+                                        queue_name: ActiveValue::Set(job.queue_name),
+                                        class_name: ActiveValue::Set(job.class_name),
+                                        arguments: ActiveValue::Set(Some(params.to_string())),
+                                        priority: ActiveValue::Set(job.priority),
+                                        failed_attempts: ActiveValue::Set(job.failed_attempts + 1),
+                                        active_job_id: ActiveValue::Set(job.active_job_id.clone()),
+                                        scheduled_at: ActiveValue::Set(Some(scheduled_at)),
+                                        finished_at: ActiveValue::Set(None),
+                                        concurrency_key: ActiveValue::Set(Some(
+                                            concurrency_key.clone(),
+                                        )),
+                                        created_at: ActiveValue::Set(
+                                            chrono::Utc::now().naive_utc(),
+                                        ),
+                                        updated_at: ActiveValue::Set(
+                                            chrono::Utc::now().naive_utc(),
+                                        ),
+                                    }
+                                    .save(txn)
+                                    .await?;
 
-                            let job_id = match job.id.clone() {
-                                ActiveValue::Set(id) => id,
-                                _ => return Err(DbErr::Custom("Failed to get job ID".into())),
-                            };
-                            let _scheduled_execution =
-                                quebec_scheduled_executions::ActiveModel {
-                                    id: ActiveValue::not_set(),
-                                    job_id: ActiveValue::Set(job_id),
-                                    queue_name: match job.queue_name.clone() {
-                                        ActiveValue::Set(q) => ActiveValue::Set(q),
-                                        _ => return Err(DbErr::Custom("Queue name missing".into())),
-                                    },
-                                    priority: match job.priority.clone() {
-                                        ActiveValue::Set(p) => ActiveValue::Set(p),
-                                        _ => return Err(DbErr::Custom("Priority missing".into())),
-                                    },
-                                    scheduled_at: ActiveValue::Set(scheduled_at),
-                                    created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                }
-                                .save(txn)
-                                .await?;
+                                    let job_id = match job.id.clone() {
+                                        ActiveValue::Set(id) => id,
+                                        _ => {
+                                            return Err(DbErr::Custom(
+                                                "Failed to get job ID".into(),
+                                            ))
+                                        }
+                                    };
+                                    let _scheduled_execution =
+                                        quebec_scheduled_executions::ActiveModel {
+                                            id: ActiveValue::not_set(),
+                                            job_id: ActiveValue::Set(job_id),
+                                            queue_name: match job.queue_name.clone() {
+                                                ActiveValue::Set(q) => ActiveValue::Set(q),
+                                                _ => {
+                                                    return Err(DbErr::Custom(
+                                                        "Queue name missing".into(),
+                                                    ))
+                                                }
+                                            },
+                                            priority: match job.priority.clone() {
+                                                ActiveValue::Set(p) => ActiveValue::Set(p),
+                                                _ => {
+                                                    return Err(DbErr::Custom(
+                                                        "Priority missing".into(),
+                                                    ))
+                                                }
+                                            },
+                                            scheduled_at: ActiveValue::Set(scheduled_at),
+                                            created_at: ActiveValue::Set(
+                                                chrono::Utc::now().naive_utc(),
+                                            ),
+                                        }
+                                        .save(txn)
+                                        .await?;
 
-                            // debug!("{:?}", scheduled_execution);
-                            Ok(job)
-                        })
-                    })
-                    .await
-                }
-                .instrument(span)))
-                .unwrap_or_else(|| Err(sea_orm::TransactionError::Connection(DbErr::Custom("Runtime handle unavailable".into()))));
+                                    // debug!("{:?}", scheduled_execution);
+                                    Ok(job)
+                                })
+                            })
+                            .await
+                        }
+                        .instrument(span),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    Err(sea_orm::TransactionError::Connection(DbErr::Custom(
+                        "Runtime handle unavailable".into(),
+                    )))
+                });
 
             // debug!("scheduled: {:?}", job);
             if job.is_err() {
@@ -1075,7 +1161,9 @@ impl Worker {
     pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
-            return Err(PyTypeError::new_err("Expected a callable object for worker start handler"));
+            return Err(PyTypeError::new_err(
+                "Expected a callable object for worker start handler",
+            ));
         }
 
         {
@@ -1103,10 +1191,6 @@ impl Worker {
 
         Ok(())
     }
-
-
-
-
 
     // fn get_job_class(&self, class_name: &str) -> PyResult<Py<PyAny>> {
     //     let runnables = self.runnables.read().unwrap();
@@ -1136,7 +1220,8 @@ impl Worker {
 
             // Extract concurrency_duration if exists (convert to seconds)
             if bound.hasattr("concurrency_duration")? {
-                concurrency_duration = Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
+                concurrency_duration =
+                    Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
             }
 
             // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)
@@ -1151,7 +1236,7 @@ impl Worker {
                     // If it's a property, check if it's not empty string
                     match concurrency_key_attr.extract::<String>() {
                         Ok(key) => !key.is_empty(),
-                        Err(_) => false
+                        Err(_) => false,
                     }
                 }
             } else {
@@ -1213,15 +1298,19 @@ impl Worker {
                             // For wildcard patterns, first expand to get all matching queue names
                             // Then poll each concrete queue independently (Solid Queue semantics)
                             // Sort by queue_name to ensure deterministic order
-                            let matching_queues: Vec<String> = quebec_ready_executions::Entity::find()
-                                .select_only()
-                                .column(quebec_ready_executions::Column::QueueName)
-                                .filter(quebec_ready_executions::Column::QueueName.like(format!("{}%", pattern)))
-                                .group_by(quebec_ready_executions::Column::QueueName)
-                                .order_by_asc(quebec_ready_executions::Column::QueueName)
-                                .into_tuple()
-                                .all(txn)
-                                .await?;
+                            let matching_queues: Vec<String> =
+                                quebec_ready_executions::Entity::find()
+                                    .select_only()
+                                    .column(quebec_ready_executions::Column::QueueName)
+                                    .filter(
+                                        quebec_ready_executions::Column::QueueName
+                                            .like(format!("{}%", pattern)),
+                                    )
+                                    .group_by(quebec_ready_executions::Column::QueueName)
+                                    .order_by_asc(quebec_ready_executions::Column::QueueName)
+                                    .into_tuple()
+                                    .all(txn)
+                                    .await?;
 
                             // Poll each concrete queue in alphabetical order
                             for queue_name in matching_queues {
@@ -1231,10 +1320,15 @@ impl Worker {
                                 }
 
                                 let record = quebec_ready_executions::Entity::find()
-                                    .filter(quebec_ready_executions::Column::QueueName.eq(queue_name))
+                                    .filter(
+                                        quebec_ready_executions::Column::QueueName.eq(queue_name),
+                                    )
                                     .order_by_asc(quebec_ready_executions::Column::Priority)
                                     .order_by_asc(quebec_ready_executions::Column::JobId)
-                                    .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                                    .lock_with_behavior(
+                                        sea_query::LockType::Update,
+                                        LockBehavior::SkipLocked,
+                                    )
                                     .limit(1)
                                     .one(txn)
                                     .await?;
@@ -1244,7 +1338,9 @@ impl Worker {
                                         id: ActiveValue::NotSet,
                                         job_id: ActiveValue::Set(execution.job_id),
                                         process_id: ActiveValue::NotSet,
-                                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                        created_at: ActiveValue::Set(
+                                            chrono::Utc::now().naive_utc(),
+                                        ),
                                     }
                                     .save(txn)
                                     .await?;
@@ -1263,14 +1359,14 @@ impl Worker {
                                 if paused_queues.contains(&pattern) {
                                     continue;
                                 }
-                                select = select.filter(
-                                    quebec_ready_executions::Column::QueueName.eq(pattern)
-                                );
+                                select = select
+                                    .filter(quebec_ready_executions::Column::QueueName.eq(pattern));
                             } else {
                                 // For "*" (all queues), exclude paused queues
                                 if !paused_queues.is_empty() {
                                     select = select.filter(
-                                        quebec_ready_executions::Column::QueueName.is_not_in(paused_queues.clone())
+                                        quebec_ready_executions::Column::QueueName
+                                            .is_not_in(paused_queues.clone()),
                                     );
                                 }
                             }
@@ -1278,7 +1374,10 @@ impl Worker {
                             let record = select
                                 .order_by_asc(quebec_ready_executions::Column::Priority)
                                 .order_by_asc(quebec_ready_executions::Column::JobId)
-                                .lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked)
+                                .lock_with_behavior(
+                                    sea_query::LockType::Update,
+                                    LockBehavior::SkipLocked,
+                                )
                                 .limit(1)
                                 .one(txn)
                                 .await?;
@@ -1355,15 +1454,19 @@ impl Worker {
                             // For wildcard patterns, first expand to get all matching queue names
                             // Then poll each concrete queue independently (Solid Queue semantics)
                             // Sort by queue_name to ensure deterministic order
-                            let matching_queues: Vec<String> = quebec_ready_executions::Entity::find()
-                                .select_only()
-                                .column(quebec_ready_executions::Column::QueueName)
-                                .filter(quebec_ready_executions::Column::QueueName.like(format!("{}%", pattern)))
-                                .group_by(quebec_ready_executions::Column::QueueName)
-                                .order_by_asc(quebec_ready_executions::Column::QueueName)
-                                .into_tuple()
-                                .all(txn)
-                                .await?;
+                            let matching_queues: Vec<String> =
+                                quebec_ready_executions::Entity::find()
+                                    .select_only()
+                                    .column(quebec_ready_executions::Column::QueueName)
+                                    .filter(
+                                        quebec_ready_executions::Column::QueueName
+                                            .like(format!("{}%", pattern)),
+                                    )
+                                    .group_by(quebec_ready_executions::Column::QueueName)
+                                    .order_by_asc(quebec_ready_executions::Column::QueueName)
+                                    .into_tuple()
+                                    .all(txn)
+                                    .await?;
 
                             // Poll each concrete queue in alphabetical order
                             for queue_name in matching_queues {
@@ -1388,7 +1491,12 @@ impl Worker {
                                     .to_owned();
 
                                 if db_backend != DbBackend::Sqlite {
-                                    query = query.lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked).to_owned();
+                                    query = query
+                                        .lock_with_behavior(
+                                            sea_query::LockType::Update,
+                                            LockBehavior::SkipLocked,
+                                        )
+                                        .to_owned();
                                 }
 
                                 let (sql, values) = match db_backend {
@@ -1397,10 +1505,13 @@ impl Worker {
                                     DbBackend::MySql => query.build(MysqlQueryBuilder),
                                 };
 
-                                let records: Vec<quebec_ready_executions::Model> = quebec_ready_executions::Entity::find()
-                                    .from_raw_sql(Statement::from_sql_and_values(db_backend, &sql, values))
-                                    .all(txn)
-                                    .await?;
+                                let records: Vec<quebec_ready_executions::Model> =
+                                    quebec_ready_executions::Entity::find()
+                                        .from_raw_sql(Statement::from_sql_and_values(
+                                            db_backend, &sql, values,
+                                        ))
+                                        .all(txn)
+                                        .await?;
 
                                 // Claim the jobs from this queue
                                 for execution in records {
@@ -1408,7 +1519,9 @@ impl Worker {
                                         id: ActiveValue::NotSet,
                                         job_id: ActiveValue::Set(execution.job_id),
                                         process_id: ActiveValue::NotSet,
-                                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+                                        created_at: ActiveValue::Set(
+                                            chrono::Utc::now().naive_utc(),
+                                        ),
                                     }
                                     .save(txn)
                                     .await?;
@@ -1439,16 +1552,27 @@ impl Worker {
 
                             // Add queue filter if not "*"
                             if pattern != "*" {
-                                query = query.and_where(Expr::col("queue_name").eq(pattern)).to_owned();
+                                query =
+                                    query.and_where(Expr::col("queue_name").eq(pattern)).to_owned();
                             } else {
                                 // For "*" (all queues), exclude paused queues
                                 if !paused_queues.is_empty() {
-                                    query = query.and_where(Expr::col("queue_name").is_not_in(paused_queues.clone())).to_owned();
+                                    query = query
+                                        .and_where(
+                                            Expr::col("queue_name")
+                                                .is_not_in(paused_queues.clone()),
+                                        )
+                                        .to_owned();
                                 }
                             }
 
                             if db_backend != DbBackend::Sqlite {
-                                query = query.lock_with_behavior(sea_query::LockType::Update, LockBehavior::SkipLocked).to_owned();
+                                query = query
+                                    .lock_with_behavior(
+                                        sea_query::LockType::Update,
+                                        LockBehavior::SkipLocked,
+                                    )
+                                    .to_owned();
                             }
 
                             let (sql, values) = match db_backend {
@@ -1457,10 +1581,13 @@ impl Worker {
                                 DbBackend::MySql => query.build(MysqlQueryBuilder),
                             };
 
-                            let records: Vec<quebec_ready_executions::Model> = quebec_ready_executions::Entity::find()
-                                .from_raw_sql(Statement::from_sql_and_values(db_backend, &sql, values))
-                                .all(txn)
-                                .await?;
+                            let records: Vec<quebec_ready_executions::Model> =
+                                quebec_ready_executions::Entity::find()
+                                    .from_raw_sql(Statement::from_sql_and_values(
+                                        db_backend, &sql, values,
+                                    ))
+                                    .all(txn)
+                                    .await?;
 
                             // Claim the jobs from this queue
                             for execution in records {
@@ -1539,7 +1666,7 @@ impl Worker {
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker start handler executed successfully in main loop"),
-                    Err(e) => error!("Error calling worker start handler in main loop: {:?}", e)
+                    Err(e) => error!("Error calling worker start handler in main loop: {:?}", e),
                 }
             }
         });
@@ -1650,14 +1777,13 @@ impl Worker {
 
     /// Extract job processing logic to avoid duplication
     async fn process_available_jobs(
-        &self,
-        worker_threads: u64,
-        tx: &Arc<Mutex<Sender<Execution>>>,
-        ctx: &Arc<AppContext>,
-        thread_id: &str,
-        source: &str,
+        &self, worker_threads: u64, tx: &Arc<Mutex<Sender<Execution>>>, ctx: &Arc<AppContext>,
+        thread_id: &str, source: &str,
     ) {
-        let claimed = self.claim_jobs(worker_threads).instrument(tracing::info_span!("polling", tid=thread_id)).await;
+        let claimed = self
+            .claim_jobs(worker_threads)
+            .instrument(tracing::info_span!("polling", tid = thread_id))
+            .await;
 
         if let Err(e) = claimed {
             debug!("[{}] no job found: {:?}", source, e);
@@ -1673,7 +1799,11 @@ impl Worker {
             return;
         }
 
-        async { debug!("found {} job(s) to process", claimed.len()); }.instrument(tracing::info_span!("polling", tid=thread_id, source=source)).await;
+        async {
+            debug!("found {} job(s) to process", claimed.len());
+        }
+        .instrument(tracing::info_span!("polling", tid = thread_id, source = source))
+        .await;
 
         // Process claimed jobs without holding a long transaction
         // First collect all job data quickly, then create executions
@@ -1681,17 +1811,21 @@ impl Worker {
         let job_data = {
             let processing_db = ctx.get_db().await;
             // Use a single quick transaction to fetch all job data
-            let jobs_result = processing_db.transaction::<_, Vec<quebec_jobs::Model>, DbErr>(|txn| {
-                Box::pin(async move {
-                    let mut jobs = Vec::new();
-                    for job_id in job_ids {
-                        if let Some(job) = quebec_jobs::Entity::find_by_id(job_id).one(txn).await? {
-                            jobs.push(job);
+            let jobs_result = processing_db
+                .transaction::<_, Vec<quebec_jobs::Model>, DbErr>(|txn| {
+                    Box::pin(async move {
+                        let mut jobs = Vec::new();
+                        for job_id in job_ids {
+                            if let Some(job) =
+                                quebec_jobs::Entity::find_by_id(job_id).one(txn).await?
+                            {
+                                jobs.push(job);
+                            }
                         }
-                    }
-                    Ok(jobs)
+                        Ok(jobs)
+                    })
                 })
-            }).await;
+                .await;
 
             match jobs_result {
                 Ok(jobs) => jobs,
@@ -1705,9 +1839,7 @@ impl Worker {
         // Now create executions without holding any database connections
         for (row, job) in claimed.into_iter().zip(job_data.into_iter()) {
             // Get runnable with proper GIL handling
-            let runnable = Python::with_gil(|_py| {
-                self.ctx.get_runnable(&job.class_name)
-            });
+            let runnable = Python::with_gil(|_py| self.ctx.get_runnable(&job.class_name));
 
             if runnable.is_err() {
                 error!("Job handler not found: {:?}", &job.class_name);
@@ -1739,7 +1871,7 @@ impl Worker {
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker start handler executed successfully"),
-                    Err(e) => error!("Error calling worker start handler: {:?}", e)
+                    Err(e) => error!("Error calling worker start handler: {:?}", e),
                 }
             }
         });
@@ -1754,7 +1886,7 @@ impl Worker {
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
                     Ok(_) => debug!("Worker stop handler executed successfully"),
-                    Err(e) => error!("Error calling worker stop handler: {:?}", e)
+                    Err(e) => error!("Error calling worker stop handler: {:?}", e),
                 }
             }
         });

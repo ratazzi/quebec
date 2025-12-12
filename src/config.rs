@@ -119,26 +119,19 @@ impl QueueSelector {
             QueueSelector::All => vec![(false, "*".to_string())], // Special marker for all
             QueueSelector::Single(q) => {
                 let is_wildcard = q.ends_with('*');
-                let pattern = if is_wildcard {
-                    q.trim_end_matches('*').to_string()
-                } else {
-                    q.clone()
-                };
+                let pattern =
+                    if is_wildcard { q.trim_end_matches('*').to_string() } else { q.clone() };
                 vec![(is_wildcard, pattern)]
             }
-            QueueSelector::Multiple(qs) => {
-                qs.iter()
-                    .map(|q| {
-                        let is_wildcard = q.ends_with('*');
-                        let pattern = if is_wildcard {
-                            q.trim_end_matches('*').to_string()
-                        } else {
-                            q.clone()
-                        };
-                        (is_wildcard, pattern)
-                    })
-                    .collect()
-            }
+            QueueSelector::Multiple(qs) => qs
+                .iter()
+                .map(|q| {
+                    let is_wildcard = q.ends_with('*');
+                    let pattern =
+                        if is_wildcard { q.trim_end_matches('*').to_string() } else { q.clone() };
+                    (is_wildcard, pattern)
+                })
+                .collect(),
         }
     }
 }

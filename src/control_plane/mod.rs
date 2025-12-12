@@ -2,20 +2,20 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::{
-    Router,
     routing::{get, post},
+    Router,
 };
 use tera::Tera;
 use tower_http::trace::{self, TraceLayer};
-use tracing::{Level, Span, debug, info, error};
+use tracing::{debug, error, info, Level, Span};
 
 use crate::context::AppContext;
 
-pub mod models;
-pub mod handlers;
-pub mod utils;
 pub mod ext;
+pub mod handlers;
+pub mod models;
 pub mod templates;
+pub mod utils;
 
 pub use ext::ControlPlaneExt;
 
@@ -53,12 +53,7 @@ impl ControlPlane {
         // Save template path for hot reload
         let template_path = "src/templates/**/*".to_string();
 
-        Self {
-            ctx,
-            tera: RwLock::new(tera),
-            template_path,
-            page_size: 10,
-        }
+        Self { ctx, tera: RwLock::new(tera), template_path, page_size: 10 }
     }
 
     pub fn router(self) -> Router {
@@ -92,14 +87,12 @@ impl ControlPlane {
                     .on_request(|request: &axum::http::Request<_>, _span: &Span| {
                         debug!("Started {} {}", request.method(), request.uri());
                     })
-                    .on_response(|response: &axum::http::Response<_>, latency: Duration, _span: &Span| {
-                        info!(
-                            "Finished in {:?} with status {}",
-                            latency,
-                            response.status()
-                        );
-                    })
-                    .on_failure(trace::DefaultOnFailure::new().level(Level::ERROR))
+                    .on_response(
+                        |response: &axum::http::Response<_>, latency: Duration, _span: &Span| {
+                            info!("Finished in {:?} with status {}", latency, response.status());
+                        },
+                    )
+                    .on_failure(trace::DefaultOnFailure::new().level(Level::ERROR)),
             )
             .with_state(Arc::new(self))
     }

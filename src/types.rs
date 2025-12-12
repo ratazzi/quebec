@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-
 // use pyo3_asyncio::tokio::future_into_py;
 use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::*;
@@ -104,7 +103,9 @@ impl EntityTrait for quebec_semaphores::Entity {
 }
 
 #[pyfunction]
-fn signal_handler(py: Python<'_>, signum: i32, _frame: PyObject, quebec: Py<PyAny>) -> PyResult<()> {
+fn signal_handler(
+    py: Python<'_>, signum: i32, _frame: PyObject, quebec: Py<PyAny>,
+) -> PyResult<()> {
     info!("Received signal {}, initiating graceful shutdown", signum);
 
     if let Err(e) = quebec.bind(py).call_method0("graceful_shutdown") {
@@ -188,10 +189,17 @@ impl PyQuebec {
                 .worker_threads(16)
                 .enable_all()
                 .build()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to build runtime: {}", e)))?,
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to build runtime: {}",
+                        e
+                    ))
+                })?,
         );
 
-        let dsn = Url::parse(&url).map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e)))?;
+        let dsn = Url::parse(&url).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
+        })?;
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
         let min_conns = if url.contains("sqlite") { 1 } else { 20 };
         let max_conns = if url.contains("sqlite") { 1 } else { 300 };
@@ -218,11 +226,20 @@ impl PyQuebec {
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= MAX_RETRIES {
-                            error!("Failed to connect to database after {} retries: {}", MAX_RETRIES, e);
+                            error!(
+                                "Failed to connect to database after {} retries: {}",
+                                MAX_RETRIES, e
+                            );
                             panic!("Database connection failed: {}", e);
                         }
-                        warn!("Database connection attempt {} failed, retrying: {}", retry_count, e);
-                        tokio::time::sleep(std::time::Duration::from_millis(1000 * retry_count as u64)).await;
+                        warn!(
+                            "Database connection attempt {} failed, retrying: {}",
+                            retry_count, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            1000 * retry_count as u64,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -233,8 +250,12 @@ impl PyQuebec {
         let options = if let Some(kwargs) = kwargs {
             let mut options_map = HashMap::new();
             for (k, v) in kwargs.iter() {
-                let key = k.extract::<String>()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid option key: {}", e)))?;
+                let key = k.extract::<String>().map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Invalid option key: {}",
+                        e
+                    ))
+                })?;
                 // Use Python::with_gil to get GIL
                 Python::with_gil(|py| -> PyResult<()> {
                     let obj = v.into_pyobject(py)?;
@@ -296,13 +317,16 @@ impl PyQuebec {
                 if let Some(worker) = workers.first() {
                     // Only apply if still at default value
                     if let Some(threads) = worker.threads {
-                        if _ctx.worker_threads == 3 {  // default value
+                        if _ctx.worker_threads == 3 {
+                            // default value
                             _ctx.worker_threads = threads as u64;
                         }
                     }
                     if let Some(polling_interval) = worker.polling_interval {
-                        if _ctx.worker_polling_interval == Duration::from_millis(100) {  // default value
-                            _ctx.worker_polling_interval = Duration::from_secs_f64(polling_interval);
+                        if _ctx.worker_polling_interval == Duration::from_millis(100) {
+                            // default value
+                            _ctx.worker_polling_interval =
+                                Duration::from_secs_f64(polling_interval);
                         }
                     }
                     // Apply queue configuration (always apply from config if present, as there's no code parameter for this)
@@ -331,18 +355,25 @@ impl PyQuebec {
 
                 if let Some(dispatcher) = dispatchers.first() {
                     if let Some(polling_interval) = dispatcher.polling_interval {
-                        if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {  // default value
-                            _ctx.dispatcher_polling_interval = Duration::from_secs_f64(polling_interval);
+                        if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {
+                            // default value
+                            _ctx.dispatcher_polling_interval =
+                                Duration::from_secs_f64(polling_interval);
                         }
                     }
                     if let Some(batch_size) = dispatcher.batch_size {
-                        if _ctx.dispatcher_batch_size == 500 {  // default value
+                        if _ctx.dispatcher_batch_size == 500 {
+                            // default value
                             _ctx.dispatcher_batch_size = batch_size;
                         }
                     }
                     if let Some(interval) = dispatcher.concurrency_maintenance_interval {
-                        if _ctx.dispatcher_concurrency_maintenance_interval == Duration::from_secs(600) {  // default value
-                            _ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
+                        if _ctx.dispatcher_concurrency_maintenance_interval
+                            == Duration::from_secs(600)
+                        {
+                            // default value
+                            _ctx.dispatcher_concurrency_maintenance_interval =
+                                Duration::from_secs_f64(interval);
                         }
                     }
                 }
@@ -395,7 +426,9 @@ impl PyQuebec {
     fn get_instance(py: Python<'_>, url: String) -> PyResult<Py<PyQuebec>> {
         let instance_map = INSTANCE_MAP.get_or_init(py, || RwLock::new(HashMap::new()));
 
-        let mut map = instance_map.write().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
+        let mut map = instance_map
+            .write()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
         if let Some(instance) = map.get(&url) {
             return Ok(instance.clone());
         }
@@ -412,8 +445,13 @@ impl PyQuebec {
             let _ = worker.run().await;
         });
 
-        self.handles.lock()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
             .push(handle);
         Ok(())
     }
@@ -423,10 +461,13 @@ impl PyQuebec {
 
         py.allow_threads(|| {
             let ret = self.rt.block_on(async move { worker.pick_job().await });
-            ret.map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to pick job: {}", e)))
+            ret.map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to pick job: {}",
+                    e
+                ))
+            })
         })
-
-
     }
 
     async fn post_job(&self) -> Result<(), anyhow::Error> {
@@ -438,7 +479,6 @@ impl PyQuebec {
     }
 
     fn feed_jobs_to_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
-
         let worker = self.worker.clone();
         let queue = queue.clone_ref(py);
         let queue1 = queue.clone_ref(py);
@@ -474,7 +514,7 @@ impl PyQuebec {
                             } else {
                                 error!("Unsupported queue type");
                             }
-                        },
+                        }
                         Err(e) => {
                             debug!("No job available: {}", e);
                         }
@@ -513,8 +553,13 @@ impl PyQuebec {
 
             // info!("sink job poller shutdown");
         });
-        self.handles.lock()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
             .push(handle);
 
         Ok(())
@@ -618,8 +663,11 @@ impl PyQuebec {
         }
 
         {
-            let mut handlers = self.start_handlers.write()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for start handlers"))?;
+            let mut handlers = self.start_handlers.write().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for start handlers",
+                )
+            })?;
             handlers.push(handler.clone_ref(py));
             trace!("Start handler registered");
         }
@@ -634,8 +682,11 @@ impl PyQuebec {
         }
 
         {
-            let mut handlers = self.stop_handlers.write()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for stop handlers"))?;
+            let mut handlers = self.stop_handlers.write().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for stop handlers",
+                )
+            })?;
             handlers.push(handler.clone_ref(py));
             trace!("Stop handler registered");
         }
@@ -680,26 +731,38 @@ impl PyQuebec {
         let instance = bound.call0()?;
 
         // Check if this job class has concurrency control without needing GIL
-        let (concurrency_key, concurrency_limit) = if self.worker.ctx.has_concurrency_control(&class_name.to_string()) {
-            // If concurrency_info exists, concurrency control is definitely enabled
-            let runnable = self.worker.ctx.get_runnable(&class_name.to_string())
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get runnable: {:?}", e)))?;
+        let (concurrency_key, concurrency_limit) =
+            if self.worker.ctx.has_concurrency_control(&class_name.to_string()) {
+                // If concurrency_info exists, concurrency control is definitely enabled
+                let runnable =
+                    self.worker.ctx.get_runnable(&class_name.to_string()).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get runnable: {:?}",
+                            e
+                        ))
+                    })?;
 
-            let concurrency_constraint = runnable.get_concurrency_constraint(Some(args), kwargs)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get concurrency info: {:?}", e)))?;
+                let concurrency_constraint =
+                    runnable.get_concurrency_constraint(Some(args), kwargs).map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get concurrency info: {:?}",
+                            e
+                        ))
+                    })?;
 
-            if let Some(constraint) = concurrency_constraint {
-                (Some(constraint.key), Some(constraint.limit))
+                if let Some(constraint) = concurrency_constraint {
+                    (Some(constraint.key), Some(constraint.limit))
+                } else {
+                    (None, None)
+                }
             } else {
                 (None, None)
-            }
-        } else {
-            (None, None)
-        };
+            };
 
         // Convert Python args and kwargs to JSON only for job arguments storage
         let args_json = crate::utils::python_object(&args).into_json(py)?;
-        let kwargs_json = kwargs.map(|k| crate::utils::python_object(&k).into_json(py)).transpose()?;
+        let kwargs_json =
+            kwargs.map(|k| crate::utils::python_object(&k).into_json(py)).transpose()?;
 
         // Merge args and kwargs for job arguments storage
         let mut combined_args_json = args_json.clone();
@@ -707,8 +770,10 @@ impl PyQuebec {
             if let Value::Array(ref mut args_array) = combined_args_json {
                 if let Value::Object(kwargs_map) = kwargs_json {
                     for (key, value) in kwargs_map {
-                        args_array
-                            .push(Value::Object(serde_json::Map::from_iter(vec![(key.clone(), value.clone())])));
+                        args_array.push(Value::Object(serde_json::Map::from_iter(vec![(
+                            key.clone(),
+                            value.clone(),
+                        )])));
                     }
                 }
             }
@@ -722,8 +787,12 @@ impl PyQuebec {
         }
 
         // debug!("combined_args_json: {:?}", combined_args_json);
-        let arguments = serde_json::to_string(&combined_args_json)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Failed to serialize arguments: {}", e)))?;
+        let arguments = serde_json::to_string(&combined_args_json).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Failed to serialize arguments: {}",
+                e
+            ))
+        })?;
 
         let mut obj = instance.clone().extract::<ActiveJob>()?;
         obj.class_name = class_name.to_string();
@@ -737,11 +806,10 @@ impl PyQuebec {
         let start_time = Instant::now();
         // Release GIL during database operations to prevent blocking other Python threads
         py.allow_threads(|| {
-            self.rt
-                .block_on(async {
-                    let job = self.quebec.perform_later(obj.clone()).await;
-                    job
-                })
+            self.rt.block_on(async {
+                let job = self.quebec.perform_later(obj.clone()).await;
+                job
+            })
         })
         .map(|job| {
             obj.id.replace(job.id);
@@ -787,8 +855,6 @@ impl PyQuebec {
         // debug!("runnables: {:?}", self.worker.runnables);
     }
 
-
-
     fn setup_signal_handler(&self, py: Python) -> PyResult<Py<PyAny>> {
         info!("Setting up signal handlers");
         let signal = py.import("signal")?;
@@ -800,10 +866,7 @@ impl PyQuebec {
         let kwargs = PyDict::new(py);
         kwargs.set_item("quebec", quebec_obj)?;
 
-        let wrapped_handler = functools.getattr("partial")?.call(
-            (handler_func,),
-            Some(&kwargs)
-        )?;
+        let wrapped_handler = functools.getattr("partial")?.call((handler_func,), Some(&kwargs))?;
 
         signal.call_method1("signal", (signal.getattr("SIGINT")?, wrapped_handler.clone()))?;
         signal.call_method1("signal", (signal.getattr("SIGTERM")?, wrapped_handler.clone()))?;
@@ -836,7 +899,10 @@ impl PyQuebec {
         }
 
         // Then call shutdown handlers
-        let handlers = self.shutdown_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
+        let handlers = self
+            .shutdown_handlers
+            .read()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
         for handler in handlers.iter() {
             debug!("Invoke shutdown handler: {:?}", handler);
             // Call the handler and log any errors, but continue to the next handler
@@ -886,7 +952,10 @@ impl PyQuebec {
 
     pub fn invoke_start_handlers(&self) -> PyResult<()> {
         Python::with_gil(|py| {
-            let handlers = self.start_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
+            let handlers = self
+                .start_handlers
+                .read()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
             for handler in handlers.iter() {
                 if let Err(e) = handler.bind(py).call0() {
                     error!("Error calling start handler: {:?}", e);
@@ -898,7 +967,10 @@ impl PyQuebec {
 
     pub fn invoke_stop_handlers(&self) -> PyResult<()> {
         Python::with_gil(|py| {
-            let handlers = self.stop_handlers.read().map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
+            let handlers = self
+                .stop_handlers
+                .read()
+                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Lock poisoned"))?;
             for handler in handlers.iter() {
                 if let Err(e) = handler.bind(py).call0() {
                     error!("Error calling stop handler: {:?}", e);
@@ -915,8 +987,11 @@ impl PyQuebec {
         }
 
         {
-            let mut handlers = self.shutdown_handlers.write()
-                .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for shutdown handlers"))?;
+            let mut handlers = self.shutdown_handlers.write().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for shutdown handlers",
+                )
+            })?;
             handlers.push(handler.clone_ref(py));
             debug!("Shutdown handler: {:?} registered", handler);
         }
@@ -934,8 +1009,13 @@ impl PyQuebec {
                 Err(e) => error!("Control plane server task failed: {}", e),
             }
         });
-        self.handles.lock()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
             .push(handle);
         Ok(())
     }
@@ -955,13 +1035,11 @@ impl PyQuebec {
 }
 
 // impl PyQuebec {
-    //     // This method is private and won't be exposed to Python
+//     // This method is private and won't be exposed to Python
 //     fn internal_method(&self) {
 //         println!("This is an internal method");
 //     }
 // }
-
-
 
 #[pyclass(name = "ActiveJob", subclass)]
 #[derive(Debug, Clone)]
@@ -1125,7 +1203,9 @@ impl ActiveJob {
     // }
 
     #[classmethod]
-    pub fn register_rescue_strategy(cls: &Bound<'_, PyType>, py: Python<'_>, strategy: Py<PyAny>) -> PyResult<()> {
+    pub fn register_rescue_strategy(
+        cls: &Bound<'_, PyType>, py: Python<'_>, strategy: Py<PyAny>,
+    ) -> PyResult<()> {
         let strategy = strategy.extract::<RescueStrategy>(py)?;
         let rescue_strategies = cls.getattr("rescue_strategies")?;
         rescue_strategies.call_method1("append", (strategy.clone(),))?;

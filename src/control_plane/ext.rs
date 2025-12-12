@@ -1,9 +1,9 @@
+use super::ControlPlane;
+use crate::context::AppContext;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, debug, error, warn};
-use crate::context::AppContext;
-use super::ControlPlane;
+use tracing::{debug, error, info, warn};
 
 pub trait ControlPlaneExt {
     fn start_control_plane(&self, addr: String) -> tokio::task::JoinHandle<()>;
@@ -24,7 +24,7 @@ impl ControlPlaneExt for Arc<AppContext> {
                 Ok(l) => {
                     debug!("Control plane successfully bound to {}", addr);
                     l
-                },
+                }
                 Err(e) => {
                     error!("Failed to bind control plane to {}: {}", addr, e);
                     return;

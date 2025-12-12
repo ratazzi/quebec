@@ -16,18 +16,16 @@ mod types;
 mod utils;
 mod worker;
 
-pub use control_plane::ControlPlaneExt;
-pub use error::{QuebecError, Result};
 use context::*;
+pub use control_plane::ControlPlaneExt;
 use entities::quebec_claimed_executions;
 use entities::quebec_jobs;
+pub use error::{QuebecError, Result};
 
 use types::*;
 use worker::{Execution, Runnable};
 
 use pyo3::prelude::*;
-
-
 
 // pyo3::create_exception!(quebec, CustomError, PyException);
 
@@ -37,12 +35,23 @@ fn init_proctitle() {
     crate::proctitle_macos::init();
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
 fn init_proctitle() {
     crate::proctitle_unix::init();
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+)))]
 fn init_proctitle() {
     // No initialization needed for other platforms
 }

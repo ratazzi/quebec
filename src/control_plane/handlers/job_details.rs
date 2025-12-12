@@ -1,19 +1,18 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::Html,
+};
+use sea_orm::{ConnectionTrait, Statement, Value};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Path},
-    response::Html,
-    http::StatusCode,
-};
-use sea_orm::{Statement, Value, ConnectionTrait};
 use tracing::debug;
 
-use crate::control_plane::{ControlPlane, models::JobDetailsInfo};
+use crate::control_plane::{models::JobDetailsInfo, ControlPlane};
 
 impl ControlPlane {
     pub async fn job_details(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -61,12 +60,12 @@ impl ControlPlane {
             table_config.scheduled_executions,
             table_config.blocked_executions
         );
-        
+
         let job_result = db
             .query_one(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 &job_details_sql,
-                [Value::from(id)]
+                [Value::from(id)],
             ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -82,16 +81,20 @@ impl ControlPlane {
             let context: Option<String> = None; // No metadata field in current schema
 
             // Parse creation time
-            let created_at = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
+            let created_at =
+                Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
             // Get completion time (if any)
-            let finished_at = match row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at") {
+            let finished_at = match row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at")
+            {
                 Ok(dt_opt) => Self::format_optional_datetime(dt_opt),
                 _ => None,
             };
 
             // Calculate runtime (if completed)
-            let runtime = if let Some(finished) = row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at").ok().flatten() {
+            let runtime = if let Some(finished) =
+                row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at").ok().flatten()
+            {
                 if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                     let duration = finished.signed_duration_since(created);
                     Some(format!("{} seconds", duration.num_seconds()))
@@ -138,12 +141,12 @@ impl ControlPlane {
                         "SELECT error, created_at as failed_at FROM {} WHERE id = $1",
                         table_config.failed_executions
                     );
-                    
+
                     if let Ok(failed_info) = db
                         .query_one(Statement::from_sql_and_values(
                             db.get_database_backend(),
                             &failed_details_sql,
-                            [Value::from(failed_id)]
+                            [Value::from(failed_id)],
                         ))
                         .await
                     {
@@ -156,7 +159,7 @@ impl ControlPlane {
                             }
                         }
                     }
-                },
+                }
                 "scheduled" => {
                     let scheduled_id: i64 = row.try_get("", "scheduled_id").unwrap_or_default();
                     job_details.execution_id = Some(scheduled_id);
@@ -170,9 +173,17 @@ impl ControlPlane {
                         if dt > now {
                             let duration = dt.signed_duration_since(now);
                             let scheduled_in = if duration.num_hours() > 0 {
-                                format!("in {}h {}m", duration.num_hours(), duration.num_minutes() % 60)
+                                format!(
+                                    "in {}h {}m",
+                                    duration.num_hours(),
+                                    duration.num_minutes() % 60
+                                )
                             } else if duration.num_minutes() > 0 {
-                                format!("in {}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
+                                format!(
+                                    "in {}m {}s",
+                                    duration.num_minutes(),
+                                    duration.num_seconds() % 60
+                                )
                             } else {
                                 format!("in {}s", duration.num_seconds())
                             };
@@ -181,7 +192,7 @@ impl ControlPlane {
                             job_details.scheduled_in = Some("overdue".to_string());
                         }
                     }
-                },
+                }
                 "blocked" => {
                     let blocked_id: i64 = row.try_get("", "blocked_id").unwrap_or_default();
                     job_details.execution_id = Some(blocked_id);
@@ -194,12 +205,15 @@ impl ControlPlane {
                         job_details.expires_at = Some(Self::format_naive_datetime(dt));
 
                         // Calculate waiting time
-                        if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
-                            let duration = chrono::Utc::now().naive_utc().signed_duration_since(created);
-                            job_details.waiting_time = Some(format!("{} seconds", duration.num_seconds()));
+                        if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at")
+                        {
+                            let duration =
+                                chrono::Utc::now().naive_utc().signed_duration_since(created);
+                            job_details.waiting_time =
+                                Some(format!("{} seconds", duration.num_seconds()));
                         }
                     }
-                },
+                }
                 "processing" => {
                     let claimed_id: i64 = row.try_get("", "claimed_id").unwrap_or_default();
                     job_details.execution_id = Some(claimed_id);
@@ -211,19 +225,25 @@ impl ControlPlane {
                             "SELECT name, hostname FROM {} WHERE id = $1",
                             table_config.processes
                         );
-                        
+
                         if let Ok(worker_info) = db
                             .query_one(Statement::from_sql_and_values(
                                 db.get_database_backend(),
                                 &worker_details_sql,
-                                [Value::from(process_id)]
+                                [Value::from(process_id)],
                             ))
                             .await
                         {
                             if let Some(row) = worker_info {
                                 if let Ok(name) = row.try_get::<String>("", "name") {
-                                    if let Ok(hostname) = row.try_get::<Option<String>>("", "hostname") {
-                                        job_details.worker_id = Some(format!("{} ({})", name, hostname.unwrap_or_else(|| "unknown".to_string())));
+                                    if let Ok(hostname) =
+                                        row.try_get::<Option<String>>("", "hostname")
+                                    {
+                                        job_details.worker_id = Some(format!(
+                                            "{} ({})",
+                                            name,
+                                            hostname.unwrap_or_else(|| "unknown".to_string())
+                                        ));
                                     } else {
                                         job_details.worker_id = Some(name);
                                     }
@@ -239,12 +259,12 @@ impl ControlPlane {
                         "SELECT created_at FROM {} WHERE id = $1",
                         table_config.claimed_executions
                     );
-                    
+
                     if let Ok(claimed_info) = db
                         .query_one(Statement::from_sql_and_values(
                             db.get_database_backend(),
                             &claimed_details_sql,
-                            [Value::from(claimed_id)]
+                            [Value::from(claimed_id)],
                         ))
                         .await
                     {
@@ -255,11 +275,12 @@ impl ControlPlane {
                                 // Calculate current runtime
                                 let now = chrono::Utc::now().naive_utc();
                                 let duration = now.signed_duration_since(dt);
-                                job_details.runtime = Some(format!("{} seconds", duration.num_seconds()));
+                                job_details.runtime =
+                                    Some(format!("{} seconds", duration.num_seconds()));
                             }
                         }
                     }
-                },
+                }
                 _ => {}
             }
 
@@ -290,12 +311,12 @@ impl ControlPlane {
                 table_config.scheduled_executions,
                 table_config.claimed_executions
             );
-            
+
             let history_result = db
                 .query_all(Statement::from_sql_and_values(
                     db.get_database_backend(),
                     &history_sql,
-                    [Value::from(id)]
+                    [Value::from(id)],
                 ))
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -309,12 +330,14 @@ impl ControlPlane {
                 };
                 let error: Option<String> = row.try_get("", "error").ok();
 
-                job_details.execution_history.push(crate::control_plane::models::ExecutionHistoryItem {
-                    attempt,
-                    timestamp,
-                    status: event_type,
-                    error,
-                });
+                job_details.execution_history.push(
+                    crate::control_plane::models::ExecutionHistoryItem {
+                        attempt,
+                        timestamp,
+                        status: event_type,
+                        error,
+                    },
+                );
                 attempt += 1;
             }
 
@@ -323,14 +346,17 @@ impl ControlPlane {
 
             let mut context = tera::Context::new();
             context.insert("job", &job_details);
-            context.insert("active_page", match status.as_str() {
-                "failed" => "failed-jobs",
-                "scheduled" => "scheduled-jobs",
-                "blocked" => "blocked-jobs",
-                "processing" => "in-progress-jobs",
-                "finished" => "finished-jobs",
-                _ => "queues",
-            });
+            context.insert(
+                "active_page",
+                match status.as_str() {
+                    "failed" => "failed-jobs",
+                    "scheduled" => "scheduled-jobs",
+                    "blocked" => "blocked-jobs",
+                    "processing" => "in-progress-jobs",
+                    "finished" => "finished-jobs",
+                    _ => "queues",
+                },
+            );
 
             let html = state.render_template("job-details.html", &mut context).await?;
             debug!("Template rendering completed in {:?}", start.elapsed());

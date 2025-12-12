@@ -23,10 +23,7 @@ impl NotifyManager {
     /// Channel name format: {app_name}_jobs (e.g., "quebec_jobs" or "myapp_jobs")
     pub fn new(ctx: Arc<AppContext>) -> Self {
         let channel_name = format!("{}_jobs", ctx.name);
-        Self {
-            ctx,
-            channel_name,
-        }
+        Self { ctx, channel_name }
     }
 
     /// Start listening for PostgreSQL NOTIFY messages
@@ -59,7 +56,10 @@ impl NotifyManager {
                     }
                     Err(e) => {
                         retry_count += 1;
-                        error!("LISTEN error for {}: {} (attempt {}/{})", channel, e, retry_count, MAX_RETRIES);
+                        error!(
+                            "LISTEN error for {}: {} (attempt {}/{})",
+                            channel, e, retry_count, MAX_RETRIES
+                        );
 
                         if retry_count >= MAX_RETRIES {
                             error!("Max retries reached for LISTEN on {}, giving up", channel);
@@ -79,9 +79,7 @@ impl NotifyManager {
 
     /// LISTEN loop implementation using sqlx PgListener
     async fn listen_loop(
-        dsn: &str,
-        channel: &str,
-        tx: &mpsc::Sender<String>,
+        dsn: &str, channel: &str, tx: &mpsc::Sender<String>,
         graceful_shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<(), anyhow::Error> {
         // Create a dedicated connection for LISTEN with optimized settings
@@ -147,14 +145,13 @@ impl NotifyManager {
     }
 
     /// Static method to send NOTIFY using existing database connection
-    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str, event: &str) -> Result<(), anyhow::Error>
+    pub async fn send_notify<C>(
+        app_name: &str, db: &C, queue_name: &str, event: &str,
+    ) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
     {
-        let message = NotifyMessage {
-            queue: queue_name.to_string(),
-            event: event.to_string(),
-        };
+        let message = NotifyMessage { queue: queue_name.to_string(), event: event.to_string() };
         let message_json = serde_json::to_string(&message)
             .map_err(|e| anyhow::anyhow!("Failed to serialize notify message: {}", e))?;
 
@@ -164,7 +161,9 @@ impl NotifyManager {
     }
 
     /// Internal helper to send NOTIFY with database connection and channel name
-    async fn send_notify_with_db<C>(db: &C, channel_name: &str, message: &str) -> Result<(), anyhow::Error>
+    async fn send_notify_with_db<C>(
+        db: &C, channel_name: &str, message: &str,
+    ) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
     {
@@ -173,11 +172,7 @@ impl NotifyManager {
         let sql = format!("NOTIFY {}, '{}'", channel_name, escaped_message);
 
         let ret = db
-            .execute(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                sql,
-                vec![],
-            ))
+            .execute(Statement::from_sql_and_values(db.get_database_backend(), sql, vec![]))
             .await;
 
         match ret {
@@ -211,19 +206,35 @@ mod tests {
     #[test]
     fn test_channel_name_generation() {
         let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
-        let ctx = Arc::new(AppContext::new(dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
+        let ctx = Arc::new(AppContext::new(
+            dsn,
+            None,
+            sea_orm::ConnectOptions::new("test".to_string()),
+            None,
+        ));
         let manager = NotifyManager::new(ctx);
         assert_eq!(manager.get_channel_name(), "quebec_jobs");
     }
 
     #[test]
     fn test_is_postgres_detection() {
-        let postgres_dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid postgres test URL");
-        let postgres_ctx = Arc::new(AppContext::new(postgres_dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
+        let postgres_dsn =
+            Url::parse("postgres://user:pass@localhost/test").expect("Valid postgres test URL");
+        let postgres_ctx = Arc::new(AppContext::new(
+            postgres_dsn,
+            None,
+            sea_orm::ConnectOptions::new("test".to_string()),
+            None,
+        ));
         assert!(postgres_ctx.is_postgres());
 
         let sqlite_dsn = Url::parse("sqlite://test.db").expect("Valid sqlite test URL");
-        let sqlite_ctx = Arc::new(AppContext::new(sqlite_dsn, None, sea_orm::ConnectOptions::new("test".to_string()), None));
+        let sqlite_ctx = Arc::new(AppContext::new(
+            sqlite_dsn,
+            None,
+            sea_orm::ConnectOptions::new("test".to_string()),
+            None,
+        ));
         assert!(!sqlite_ctx.is_postgres());
     }
 }

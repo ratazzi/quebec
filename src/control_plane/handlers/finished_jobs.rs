@@ -1,20 +1,22 @@
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Html,
+};
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Query},
-    response::Html,
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, QueryOrder, PaginatorTrait, QuerySelect};
 use tracing::{debug, info};
 
+use crate::control_plane::{
+    models::{FinishedJobInfo, Pagination},
+    ControlPlane,
+};
 use crate::entities::quebec_jobs;
-use crate::control_plane::{ControlPlane, models::{Pagination, FinishedJobInfo}};
 
 impl ControlPlane {
     pub async fn finished_jobs(
-        State(state): State<Arc<ControlPlane>>,
-        Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -40,7 +42,8 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store completed job information
-        let mut finished_jobs: Vec<FinishedJobInfo> = Vec::with_capacity(finished_jobs_models.len());
+        let mut finished_jobs: Vec<FinishedJobInfo> =
+            Vec::with_capacity(finished_jobs_models.len());
 
         // Get information for each completed job
         for job in finished_jobs_models {
@@ -49,13 +52,13 @@ impl ControlPlane {
                 let runtime = match finished_at.signed_duration_since(job.created_at) {
                     duration if duration.num_hours() >= 1 => {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
-                    },
+                    }
                     duration if duration.num_minutes() >= 1 => {
                         format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
-                    },
+                    }
                     duration => {
                         format!("{}s", duration.num_seconds())
-                    },
+                    }
                 };
 
                 finished_jobs.push(FinishedJobInfo {
@@ -85,18 +88,20 @@ impl ControlPlane {
 
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);
-        
+
         if total_pages > 0 && pagination.page > total_pages {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
         // Use abstract method to get all queue names and job classes
-        let queue_names = state.get_queue_names()
+        let queue_names = state
+            .get_queue_names()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let job_classes = state.get_job_classes()
+        let job_classes = state
+            .get_job_classes()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

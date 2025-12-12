@@ -1,20 +1,25 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, Statement,
+    TransactionTrait, Value,
+};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Query, Path},
-    response::{Html, IntoResponse},
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, Statement, Value, DbErr, TransactionTrait, ActiveModelTrait, ActiveValue, ConnectionTrait};
-use tracing::{debug, info, error};
+use tracing::{debug, error, info};
 
+use crate::control_plane::{
+    models::{Pagination, ScheduledJobInfo},
+    ControlPlane,
+};
 use crate::entities::{quebec_jobs, quebec_scheduled_executions};
-use crate::control_plane::{ControlPlane, models::{Pagination, ScheduledJobInfo}};
 
 impl ControlPlane {
     pub async fn scheduled_jobs(
-        State(state): State<Arc<ControlPlane>>,
-        Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -42,18 +47,14 @@ impl ControlPlane {
             WHERE j.finished_at IS NULL
             ORDER BY s.scheduled_at ASC
             LIMIT $1 OFFSET $2",
-            table_config.scheduled_executions,
-            table_config.jobs
+            table_config.scheduled_executions, table_config.jobs
         );
-        
+
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 &scheduled_jobs_sql,
-                [
-                    Value::from(page_size as i32),
-                    Value::from(offset as i32)
-                ]
+                [Value::from(page_size as i32), Value::from(offset as i32)],
             ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -69,10 +70,13 @@ impl ControlPlane {
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
 
             // Parse creation time
-            let created_at_str = Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
+            let created_at_str =
+                Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
             // Parse scheduled execution time
-            let (scheduled_at_str, scheduled_in) = match row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
+            let (scheduled_at_str, scheduled_in) = match row
+                .try_get::<chrono::NaiveDateTime>("", "scheduled_at")
+            {
                 Ok(dt) => {
                     let now = chrono::Utc::now().naive_utc();
                     let scheduled_in = if dt > now {
@@ -80,7 +84,11 @@ impl ControlPlane {
                         if duration.num_hours() > 0 {
                             format!("in {}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                         } else if duration.num_minutes() > 0 {
-                            format!("in {}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
+                            format!(
+                                "in {}m {}s",
+                                duration.num_minutes(),
+                                duration.num_seconds() % 60
+                            )
                         } else {
                             format!("in {}s", duration.num_seconds())
                         }
@@ -89,7 +97,7 @@ impl ControlPlane {
                     };
 
                     (Self::format_naive_datetime(dt), scheduled_in)
-                },
+                }
                 Err(_) => ("Unknown time".to_string(), "Unknown".to_string()),
             };
 
@@ -112,16 +120,11 @@ impl ControlPlane {
              FROM {} s
              JOIN {} j ON s.job_id = j.id
              WHERE j.finished_at IS NULL",
-            table_config.scheduled_executions,
-            table_config.jobs
+            table_config.scheduled_executions, table_config.jobs
         );
-        
+
         let total_count = db
-            .query_one(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                &count_sql,
-                []
-            ))
+            .query_one(Statement::from_sql_and_values(db.get_database_backend(), &count_sql, []))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
@@ -129,17 +132,19 @@ impl ControlPlane {
 
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);
-        
+
         if total_pages > 0 && pagination.page > total_pages {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
 
         // Use abstract method to get all queue names and job classes
-        let queue_names = state.get_queue_names()
+        let queue_names = state
+            .get_queue_names()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let job_classes = state.get_job_classes()
+        let job_classes = state
+            .get_job_classes()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -159,47 +164,48 @@ impl ControlPlane {
     }
 
     pub async fn cancel_scheduled_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
         // Use transaction to operate
-        let txn_result = db.transaction::<_, (), DbErr>(|txn| {
-            Box::pin(async move {
-                // Find scheduled execution record to cancel
-                let scheduled_execution = quebec_scheduled_executions::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?;
+        let txn_result = db
+            .transaction::<_, (), DbErr>(|txn| {
+                Box::pin(async move {
+                    // Find scheduled execution record to cancel
+                    let scheduled_execution =
+                        quebec_scheduled_executions::Entity::find_by_id(id).one(txn).await?;
 
-                if let Some(execution) = scheduled_execution {
-                    // First mark job as completed
-                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
-                        .one(txn)
-                        .await?;
+                    if let Some(execution) = scheduled_execution {
+                        // First mark job as completed
+                        let job_result =
+                            quebec_jobs::Entity::find_by_id(execution.job_id).one(txn).await?;
 
-                    if let Some(job) = job_result {
-                        // Update job status to completed
-                        let mut job_model: quebec_jobs::ActiveModel = job.into();
-                        job_model.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
-                        job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-                        job_model.update(txn).await?;
+                        if let Some(job) = job_result {
+                            // Update job status to completed
+                            let mut job_model: quebec_jobs::ActiveModel = job.into();
+                            job_model.finished_at =
+                                ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
+                            job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
+                            job_model.update(txn).await?;
+                        }
+
+                        // Delete scheduled_execution record
+                        quebec_scheduled_executions::Entity::delete_by_id(id).exec(txn).await?;
+
+                        info!("Cancelled scheduled job ID: {}", id);
+                    } else {
+                        return Err(DbErr::Custom(format!(
+                            "Scheduled job with ID {} not found",
+                            id
+                        )));
                     }
 
-                    // Delete scheduled_execution record
-                    quebec_scheduled_executions::Entity::delete_by_id(id)
-                        .exec(txn)
-                        .await?;
-
-                    info!("Cancelled scheduled job ID: {}", id);
-                } else {
-                    return Err(DbErr::Custom(format!("Scheduled job with ID {} not found", id)));
-                }
-
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await;
+            .await;
 
         match txn_result {
             Ok(_) => (StatusCode::SEE_OTHER, "/scheduled-jobs".to_string()),

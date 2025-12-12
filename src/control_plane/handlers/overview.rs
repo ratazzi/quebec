@@ -1,25 +1,29 @@
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    response::Html,
+};
+use chrono::NaiveDateTime;
+use sea_orm::sea_query::{
+    Alias, Expr, Func, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery,
+    SqliteQueryBuilder,
+};
+use sea_orm::Order;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, Statement,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use std::collections::HashMap;
-use axum::{
-    extract::{State, Query},
-    response::Html,
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, ConnectionTrait, Statement, DbBackend, PaginatorTrait};
-use sea_orm::sea_query::{Query as SeaQuery, Expr, Alias, Func, PostgresQueryBuilder, SqliteQueryBuilder, MysqlQueryBuilder};
-use sea_orm::Order;
-use chrono::NaiveDateTime;
 use tracing::{debug, instrument};
 
-use crate::entities::{quebec_jobs, quebec_processes, quebec_failed_executions, quebec_pauses};
 use crate::control_plane::ControlPlane;
+use crate::entities::{quebec_failed_executions, quebec_jobs, quebec_pauses, quebec_processes};
 
 impl ControlPlane {
     #[instrument(skip(state), fields(path = "/"))]
     pub async fn overview(
-        State(state): State<Arc<ControlPlane>>,
-        Query(params): Query<HashMap<String, String>>,
+        State(state): State<Arc<ControlPlane>>, Query(params): Query<HashMap<String, String>>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -27,9 +31,7 @@ impl ControlPlane {
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         // Get time range parameter, default to 24 hours
-        let hours: i64 = params.get("hours")
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(24);
+        let hours: i64 = params.get("hours").and_then(|h| h.parse().ok()).unwrap_or(24);
 
         let now = chrono::Utc::now().naive_utc();
         let period_start = now - chrono::Duration::hours(hours);
@@ -54,7 +56,10 @@ impl ControlPlane {
 
         // Calculate change rate of job processing count
         let jobs_processed_change = if previous_jobs_processed > 0 {
-            ((total_jobs_processed as f64 - previous_jobs_processed as f64) / previous_jobs_processed as f64 * 100.0).round() as i32
+            ((total_jobs_processed as f64 - previous_jobs_processed as f64)
+                / previous_jobs_processed as f64
+                * 100.0)
+                .round() as i32
         } else {
             0
         };
@@ -62,11 +67,11 @@ impl ControlPlane {
         // Get average processing time of jobs in current period
         let table_config = &state.ctx.table_config;
         let jobs_table = Alias::new(&table_config.jobs);
-        
+
         let avg_duration_query = SeaQuery::select()
             .expr_as(
                 Func::avg(Expr::cust("EXTRACT(EPOCH FROM (finished_at - created_at))")),
-                Alias::new("avg_duration")
+                Alias::new("avg_duration"),
             )
             .from(jobs_table)
             .and_where(Expr::col(Alias::new("finished_at")).is_not_null())
@@ -82,7 +87,7 @@ impl ControlPlane {
         let avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &avg_duration_sql,
-            avg_duration_values
+            avg_duration_values,
         );
 
         let avg_duration: Option<f64> = db
@@ -95,7 +100,7 @@ impl ControlPlane {
         let prev_avg_duration_query = SeaQuery::select()
             .expr_as(
                 Func::avg(Expr::cust("EXTRACT(EPOCH FROM (finished_at - created_at))")),
-                Alias::new("avg_duration")
+                Alias::new("avg_duration"),
             )
             .from(Alias::new(&table_config.jobs))
             .and_where(Expr::col(Alias::new("finished_at")).is_not_null())
@@ -112,7 +117,7 @@ impl ControlPlane {
         let prev_avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &prev_avg_duration_sql,
-            prev_avg_duration_values
+            prev_avg_duration_values,
         );
 
         let prev_avg_duration: Option<f64> = db
@@ -123,29 +128,29 @@ impl ControlPlane {
 
         // Calculate change rate of average processing time
         let avg_duration_change = match (avg_duration, prev_avg_duration) {
-            (Some(curr), Some(prev)) if prev > 0.0 => {
-                ((curr - prev) / prev * 100.0).round() as i32
-            },
-            _ => 0
+            (Some(curr), Some(prev)) if prev > 0.0 => ((curr - prev) / prev * 100.0).round() as i32,
+            _ => 0,
         };
 
         // Format average processing time
         let avg_job_duration = match avg_duration {
             Some(secs) if secs >= 3600.0 => {
                 format!("{:.1}h", secs / 3600.0)
-            },
+            }
             Some(secs) if secs >= 60.0 => {
                 format!("{:.1}m", secs / 60.0)
-            },
+            }
             Some(secs) => {
                 format!("{:.1}s", secs)
-            },
-            None => "N/A".to_string()
+            }
+            None => "N/A".to_string(),
         };
 
         // Get number of active workers
         let active_workers = quebec_processes::Entity::find()
-            .filter(quebec_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)))
+            .filter(
+                quebec_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)),
+            )
             .count(db)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -205,7 +210,8 @@ impl ControlPlane {
         // Determine time interval based on selected time range
         let (interval_hours, format_string) = if hours <= 24 {
             (1, "%H:%M") // Every hour, display hour:minute
-        } else if hours <= 168 { // 7 days
+        } else if hours <= 168 {
+            // 7 days
             (6, "%m-%d %H:%M") // Every 6 hours, display month-day hour:minute
         } else {
             (24, "%m-%d") // Every day, display month-day
@@ -254,7 +260,7 @@ impl ControlPlane {
         let job_types_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &job_types_sql,
-            job_types_values
+            job_types_values,
         );
 
         let job_types_result = db
@@ -291,7 +297,7 @@ impl ControlPlane {
         let queue_performance_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &queue_performance_sql,
-            [period_start.into()]
+            [period_start.into()],
         );
 
         let queue_performance_result = db
@@ -305,9 +311,8 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let paused_queue_names: Vec<String> = paused_queues.iter()
-            .map(|p| p.queue_name.clone())
-            .collect();
+        let paused_queue_names: Vec<String> =
+            paused_queues.iter().map(|p| p.queue_name.clone()).collect();
 
         let mut queue_stats = Vec::new();
 
@@ -322,14 +327,14 @@ impl ControlPlane {
             let avg_duration_str = match avg_duration {
                 Some(secs) if secs >= 3600.0 => {
                     format!("{:.1}h", secs / 3600.0)
-                },
+                }
                 Some(secs) if secs >= 60.0 => {
                     format!("{:.1}m", secs / 60.0)
-                },
+                }
                 Some(secs) => {
                     format!("{:.1}s", secs)
-                },
-                None => "N/A".to_string()
+                }
+                None => "N/A".to_string(),
             };
 
             // Calculate failure rate
@@ -340,11 +345,7 @@ impl ControlPlane {
             };
 
             // Check queue status
-            let status = if paused_queue_names.contains(&queue_name) {
-                "paused"
-            } else {
-                "active"
-            };
+            let status = if paused_queue_names.contains(&queue_name) { "paused" } else { "active" };
 
             queue_stats.push(serde_json::json!({
                 "name": queue_name,
@@ -385,7 +386,7 @@ impl ControlPlane {
         let recent_failed_jobs_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &recent_failed_jobs_sql,
-            [period_start.into()]
+            [period_start.into()],
         );
 
         let recent_failed_jobs_result = db
@@ -402,8 +403,8 @@ impl ControlPlane {
             let failed_at: Option<NaiveDateTime> = row.try_get("", "failed_at").ok();
             let error: String = row.try_get("", "error").unwrap_or_default();
 
-            let formatted_failed_at = Self::format_optional_datetime(failed_at)
-                .unwrap_or_else(|| "N/A".to_string());
+            let formatted_failed_at =
+                Self::format_optional_datetime(failed_at).unwrap_or_else(|| "N/A".to_string());
 
             recent_failed_jobs.push(serde_json::json!({
                 "id": id,
@@ -415,10 +416,22 @@ impl ControlPlane {
         }
 
         // Serialize arrays to JSON strings
-        context.insert("time_labels", &serde_json::to_string(&time_labels).unwrap_or_else(|_| "[]".to_string()));
-        context.insert("jobs_processed_data", &serde_json::to_string(&jobs_processed_data).unwrap_or_else(|_| "[]".to_string()));
-        context.insert("job_types_labels", &serde_json::to_string(&job_types_labels).unwrap_or_else(|_| "[]".to_string()));
-        context.insert("job_types_data", &serde_json::to_string(&job_types_data).unwrap_or_else(|_| "[]".to_string()));
+        context.insert(
+            "time_labels",
+            &serde_json::to_string(&time_labels).unwrap_or_else(|_| "[]".to_string()),
+        );
+        context.insert(
+            "jobs_processed_data",
+            &serde_json::to_string(&jobs_processed_data).unwrap_or_else(|_| "[]".to_string()),
+        );
+        context.insert(
+            "job_types_labels",
+            &serde_json::to_string(&job_types_labels).unwrap_or_else(|_| "[]".to_string()),
+        );
+        context.insert(
+            "job_types_data",
+            &serde_json::to_string(&job_types_data).unwrap_or_else(|_| "[]".to_string()),
+        );
         context.insert("queue_stats", &queue_stats);
         context.insert("recent_failed_jobs", &recent_failed_jobs);
         context.insert("active_page", "overview");

@@ -1,20 +1,24 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+};
+use sea_orm::{
+    ColumnTrait, DbErr, EntityTrait, PaginatorTrait, QueryFilter, QuerySelect, TransactionTrait,
+};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Query, Path},
-    response::{Html, IntoResponse},
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, QueryFilter, ColumnTrait, DbErr, TransactionTrait, PaginatorTrait, QuerySelect};
-use tracing::{debug, info, error, instrument};
+use tracing::{debug, error, info, instrument};
 
-use crate::entities::{quebec_jobs, quebec_failed_executions};
-use crate::control_plane::{ControlPlane, models::{Pagination, FailedJobInfo}};
+use crate::control_plane::{
+    models::{FailedJobInfo, Pagination},
+    ControlPlane,
+};
+use crate::entities::{quebec_failed_executions, quebec_jobs};
 
 impl ControlPlane {
     pub async fn failed_jobs(
-        State(state): State<Arc<ControlPlane>>,
-        Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -67,7 +71,7 @@ impl ControlPlane {
 
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);
-        
+
         if total_pages > 0 && pagination.page > total_pages {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
@@ -90,10 +94,11 @@ impl ControlPlane {
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/retry"))]
     pub async fn retry_failed_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Retryable};
+        use crate::entities::quebec_failed_executions::{
+            Entity as FailedExecutionEntity, Retryable,
+        };
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -112,7 +117,7 @@ impl ControlPlane {
                         // Use Retryable trait's retry method
                         execution.retry(txn).await?;
                         Ok(())
-                    },
+                    }
                     None => {
                         Err(DbErr::Custom(format!("Failed execution for job {} not found", id)))
                     }
@@ -132,10 +137,11 @@ impl ControlPlane {
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/delete"))]
     pub async fn delete_failed_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Discardable};
+        use crate::entities::quebec_failed_executions::{
+            Discardable, Entity as FailedExecutionEntity,
+        };
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -154,7 +160,7 @@ impl ControlPlane {
                         // Use Discardable trait's discard method
                         execution.discard(txn).await?;
                         Ok(())
-                    },
+                    }
                     None => {
                         Err(DbErr::Custom(format!("Failed execution for job {} not found", id)))
                     }
@@ -176,7 +182,9 @@ impl ControlPlane {
     pub async fn retry_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
     ) -> impl IntoResponse {
-        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Retryable};
+        use crate::entities::quebec_failed_executions::{
+            Entity as FailedExecutionEntity, Retryable,
+        };
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -204,7 +212,9 @@ impl ControlPlane {
     pub async fn discard_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
     ) -> impl IntoResponse {
-        use crate::entities::quebec_failed_executions::{Entity as FailedExecutionEntity, Discardable};
+        use crate::entities::quebec_failed_executions::{
+            Discardable, Entity as FailedExecutionEntity,
+        };
 
         let db = state.ctx.get_db().await;
         let db = db.as_ref();

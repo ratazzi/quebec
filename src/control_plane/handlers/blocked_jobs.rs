@@ -1,20 +1,22 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+};
+use sea_orm::{DbErr, EntityTrait, PaginatorTrait, QuerySelect, TransactionTrait};
 use std::sync::Arc;
 use std::time::Instant;
-use axum::{
-    extract::{State, Query, Path},
-    response::{Html, IntoResponse},
-    http::StatusCode,
-};
-use sea_orm::{EntityTrait, DbErr, TransactionTrait, PaginatorTrait, QuerySelect};
-use tracing::{debug, info, error, instrument};
+use tracing::{debug, error, info, instrument};
 
-use crate::entities::{quebec_jobs, quebec_blocked_executions};
-use crate::control_plane::{ControlPlane, models::{Pagination, BlockedJobInfo}};
+use crate::control_plane::{
+    models::{BlockedJobInfo, Pagination},
+    ControlPlane,
+};
+use crate::entities::{quebec_blocked_executions, quebec_jobs};
 
 impl ControlPlane {
     pub async fn blocked_jobs(
-        State(state): State<Arc<ControlPlane>>,
-        Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -48,13 +50,13 @@ impl ControlPlane {
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
-                    },
+                    }
                     duration if duration.num_minutes() >= 1 => {
                         format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
-                    },
+                    }
                     duration => {
                         format!("{}s", duration.num_seconds())
-                    },
+                    }
                 };
 
                 blocked_jobs.push(BlockedJobInfo {
@@ -92,11 +94,13 @@ impl ControlPlane {
         debug!("Fetched count in {:?}", start.elapsed());
 
         // Use abstract method to get all queue names and job classes
-        let queue_names = state.get_queue_names()
+        let queue_names = state
+            .get_queue_names()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let job_classes = state.get_job_classes()
+        let job_classes = state
+            .get_job_classes()
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -118,8 +122,7 @@ impl ControlPlane {
     // Implement method to unblock a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/unblock"))]
     pub async fn unblock_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -128,29 +131,27 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find blocked execution
-                let _blocked_execution = quebec_blocked_executions::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| DbErr::Custom(format!("Blocked execution with ID {} not found", id)))?;
+                let _blocked_execution =
+                    quebec_blocked_executions::Entity::find_by_id(id).one(txn).await?.ok_or_else(
+                        || DbErr::Custom(format!("Blocked execution with ID {} not found", id)),
+                    )?;
 
                 // Delete blocked execution
-                quebec_blocked_executions::Entity::delete_by_id(id)
-                    .exec(txn)
-                    .await?;
+                quebec_blocked_executions::Entity::delete_by_id(id).exec(txn).await?;
 
                 info!("Unblocked job ID: {}", id);
                 Ok(())
             })
         })
         .await
-        .map(|_| {
-            (StatusCode::SEE_OTHER, "/blocked-jobs".to_string())
-        })
+        .map(|_| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
         .map_err(|e| {
             error!("Failed to unblock job {}: {}", id, e);
             match e.to_string() {
-                s if s.contains("not found") => (StatusCode::NOT_FOUND, "/blocked-jobs".to_string()),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "/blocked-jobs".to_string())
+                s if s.contains("not found") => {
+                    (StatusCode::NOT_FOUND, "/blocked-jobs".to_string())
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "/blocked-jobs".to_string()),
             }
         })
     }
@@ -158,8 +159,7 @@ impl ControlPlane {
     // Implement method to cancel a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/cancel"))]
     pub async fn cancel_blocked_job(
-        State(state): State<Arc<ControlPlane>>,
-        Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -168,43 +168,37 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find blocked execution
-                let blocked_execution = quebec_blocked_executions::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?
-                    .ok_or_else(|| DbErr::Custom(format!("Blocked execution with ID {} not found", id)))?;
+                let blocked_execution =
+                    quebec_blocked_executions::Entity::find_by_id(id).one(txn).await?.ok_or_else(
+                        || DbErr::Custom(format!("Blocked execution with ID {} not found", id)),
+                    )?;
 
                 let job_id = blocked_execution.job_id;
 
                 // Delete blocked execution
-                quebec_blocked_executions::Entity::delete_by_id(id)
-                    .exec(txn)
-                    .await?;
+                quebec_blocked_executions::Entity::delete_by_id(id).exec(txn).await?;
 
                 // Delete related job
-                quebec_jobs::Entity::delete_by_id(job_id)
-                    .exec(txn)
-                    .await?;
+                quebec_jobs::Entity::delete_by_id(job_id).exec(txn).await?;
 
                 info!("Cancelled blocked job ID: {}, job ID: {}", id, job_id);
                 Ok(())
             })
         })
         .await
-        .map(|_| {
-            (StatusCode::SEE_OTHER, "/blocked-jobs".to_string())
-        })
+        .map(|_| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
         .map_err(|e| {
             error!("Failed to cancel blocked job {}: {}", id, e);
             match e.to_string() {
-                s if s.contains("not found") => (StatusCode::NOT_FOUND, "/blocked-jobs".to_string()),
-                _ => (StatusCode::INTERNAL_SERVER_ERROR, "/blocked-jobs".to_string())
+                s if s.contains("not found") => {
+                    (StatusCode::NOT_FOUND, "/blocked-jobs".to_string())
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "/blocked-jobs".to_string()),
             }
         })
     }
 
-    pub async fn unblock_all_jobs(
-        State(state): State<Arc<ControlPlane>>,
-    ) -> impl IntoResponse {
+    pub async fn unblock_all_jobs(State(state): State<Arc<ControlPlane>>) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
 
@@ -212,9 +206,7 @@ impl ControlPlane {
         db.transaction::<_, u64, DbErr>(|txn| {
             Box::pin(async move {
                 // Delete all blocked executions
-                let result = quebec_blocked_executions::Entity::delete_many()
-                    .exec(txn)
-                    .await?;
+                let result = quebec_blocked_executions::Entity::delete_many().exec(txn).await?;
 
                 let count = result.rows_affected;
                 info!("Unblocked all {} blocked jobs", count);
@@ -222,9 +214,7 @@ impl ControlPlane {
             })
         })
         .await
-        .map(|_count| {
-            (StatusCode::SEE_OTHER, "/blocked-jobs".to_string())
-        })
+        .map(|_count| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
         .map_err(|e| {
             error!("Failed to unblock all jobs: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "/blocked-jobs".to_string())
