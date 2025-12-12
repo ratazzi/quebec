@@ -543,12 +543,23 @@ impl AppContext {
             crate::proctitle_macos::set_title(&title);
         }
 
-        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
         {
             crate::proctitle_unix::set_title(&title);
         }
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
         {
             // Fallback to proctitle crate for other platforms
             proctitle::set_title(&title);
