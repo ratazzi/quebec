@@ -39,8 +39,11 @@ impl ControlPlane {
 
                 // Use process_alive_threshold from context to determine worker status
                 let threshold_seconds = state.ctx.process_alive_threshold.as_secs() as i64;
-                let status =
-                    if seconds_since_heartbeat > threshold_seconds { "dead" } else { "alive" };
+                let status = if seconds_since_heartbeat > threshold_seconds {
+                    "dead"
+                } else {
+                    "alive"
+                };
 
                 WorkerInfo {
                     id: worker.id,
@@ -65,7 +68,8 @@ impl ControlPlane {
     }
 
     pub async fn stats(
-        State(state): State<Arc<ControlPlane>>, _req: axum::http::Request<axum::body::Body>,
+        State(state): State<Arc<ControlPlane>>,
+        _req: axum::http::Request<axum::body::Body>,
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let mut context = tera::Context::new();
 

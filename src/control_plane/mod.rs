@@ -53,7 +53,12 @@ impl ControlPlane {
         // Save template path for hot reload
         let template_path = "src/templates/**/*".to_string();
 
-        Self { ctx, tera: RwLock::new(tera), template_path, page_size: 10 }
+        Self {
+            ctx,
+            tera: RwLock::new(tera),
+            template_path,
+            page_size: 10,
+        }
     }
 
     pub fn router(self) -> Router {
@@ -67,16 +72,28 @@ impl ControlPlane {
             .route("/failed-jobs/:id/retry", post(Self::retry_failed_job))
             .route("/failed-jobs/:id/delete", post(Self::delete_failed_job))
             .route("/failed-jobs/all/retry", post(Self::retry_all_failed_jobs))
-            .route("/failed-jobs/all/delete", post(Self::discard_all_failed_jobs))
+            .route(
+                "/failed-jobs/all/delete",
+                post(Self::discard_all_failed_jobs),
+            )
             .route("/in-progress-jobs", get(Self::in_progress_jobs))
-            .route("/in-progress-jobs/:id/cancel", post(Self::cancel_in_progress_job))
-            .route("/in-progress-jobs/all/cancel", post(Self::cancel_all_in_progress_jobs))
+            .route(
+                "/in-progress-jobs/:id/cancel",
+                post(Self::cancel_in_progress_job),
+            )
+            .route(
+                "/in-progress-jobs/all/cancel",
+                post(Self::cancel_all_in_progress_jobs),
+            )
             .route("/blocked-jobs", get(Self::blocked_jobs))
             .route("/blocked-jobs/:id/unblock", post(Self::unblock_job))
             .route("/blocked-jobs/:id/cancel", post(Self::cancel_blocked_job))
             .route("/blocked-jobs/all/unblock", post(Self::unblock_all_jobs))
             .route("/scheduled-jobs", get(Self::scheduled_jobs))
-            .route("/scheduled-jobs/:id/cancel", post(Self::cancel_scheduled_job))
+            .route(
+                "/scheduled-jobs/:id/cancel",
+                post(Self::cancel_scheduled_job),
+            )
             .route("/finished-jobs", get(Self::finished_jobs))
             .route("/jobs/:id", get(Self::job_details))
             .route("/stats", get(Self::stats))
@@ -89,7 +106,11 @@ impl ControlPlane {
                     })
                     .on_response(
                         |response: &axum::http::Response<_>, latency: Duration, _span: &Span| {
-                            info!("Finished in {:?} with status {}", latency, response.status());
+                            info!(
+                                "Finished in {:?} with status {}",
+                                latency,
+                                response.status()
+                            );
                         },
                     )
                     .on_failure(trace::DefaultOnFailure::new().level(Level::ERROR)),

@@ -73,7 +73,9 @@ fn python_thread_ident() -> Option<u64> {
 }
 
 async fn runner(
-    ctx: Arc<AppContext>, _thread_id: String, _state: Arc<Mutex<i32>>,
+    ctx: Arc<AppContext>,
+    _thread_id: String,
+    _state: Arc<Mutex<i32>>,
     rx: Arc<Mutex<Receiver<Execution>>>,
 ) -> Result<()> {
     let tid = python_thread_ident()
@@ -199,7 +201,9 @@ impl Runnable {
     /// Returns Some(ConcurrencyConstraint) if concurrency control is enabled, None otherwise
     /// Handles Python GIL internally and performs all checks once
     pub fn get_concurrency_constraint<T, K>(
-        &self, args: Option<T>, kwargs: Option<K>,
+        &self,
+        args: Option<T>,
+        kwargs: Option<K>,
     ) -> Result<Option<ConcurrencyConstraint>>
     where
         T: crate::utils::IntoPython,
@@ -226,7 +230,10 @@ impl Runnable {
                 let args_bound = args_py.bind(py);
 
                 if args_bound.is_instance_of::<pyo3::types::PyTuple>() {
-                    args_bound.downcast::<pyo3::types::PyTuple>()?.clone().into()
+                    args_bound
+                        .downcast::<pyo3::types::PyTuple>()?
+                        .clone()
+                        .into()
                 } else if args_bound.is_instance_of::<pyo3::types::PyList>() {
                     let list = args_bound.downcast::<pyo3::types::PyList>()?;
                     pyo3::types::PyTuple::new(py, list)?.into()
@@ -244,7 +251,10 @@ impl Runnable {
                 let kwargs_bound = kwargs_py.bind(py);
 
                 if kwargs_bound.is_instance_of::<pyo3::types::PyDict>() {
-                    kwargs_bound.downcast::<pyo3::types::PyDict>()?.clone().into()
+                    kwargs_bound
+                        .downcast::<pyo3::types::PyDict>()?
+                        .clone()
+                        .into()
                 } else {
                     // If not a dict, create empty dict
                     pyo3::types::PyDict::new(py).into()
@@ -280,17 +290,26 @@ impl Runnable {
             let limit = self.concurrency_limit.unwrap_or(1);
 
             // Return duration (convert from seconds to chrono::Duration)
-            let duration =
-                self.concurrency_duration.map(|seconds| chrono::Duration::seconds(seconds as i64));
+            let duration = self
+                .concurrency_duration
+                .map(|seconds| chrono::Duration::seconds(seconds as i64));
 
-            Ok(Some(ConcurrencyConstraint { key, limit, duration }))
+            Ok(Some(ConcurrencyConstraint {
+                key,
+                limit,
+                duration,
+            }))
         })
         .map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
     }
 
     /// Check if should retry, return matching retry strategy
     fn should_retry(
-        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr, failed_attempts: i32,
+        &self,
+        py: Python,
+        bound: &Bound<PyAny>,
+        error: &PyErr,
+        failed_attempts: i32,
     ) -> PyResult<Option<RetryStrategy>> {
         if !bound.hasattr("retry_on")? {
             return Ok(None);
@@ -313,13 +332,18 @@ impl Runnable {
 
     /// Check if should discard, return matching discard strategy
     fn should_discard(
-        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr,
+        &self,
+        py: Python,
+        bound: &Bound<PyAny>,
+        error: &PyErr,
     ) -> PyResult<Option<DiscardStrategy>> {
         if !bound.hasattr("discard_on")? {
             return Ok(None);
         }
 
-        let discard_strategies = bound.getattr("discard_on")?.extract::<Vec<DiscardStrategy>>()?;
+        let discard_strategies = bound
+            .getattr("discard_on")?
+            .extract::<Vec<DiscardStrategy>>()?;
 
         for strategy in discard_strategies {
             if self.is_exception_match(py, &strategy.exceptions, error)? {
@@ -332,13 +356,18 @@ impl Runnable {
 
     /// Check if has rescue handling, return matching rescue strategy
     fn should_rescue(
-        &self, py: Python, bound: &Bound<PyAny>, error: &PyErr,
+        &self,
+        py: Python,
+        bound: &Bound<PyAny>,
+        error: &PyErr,
     ) -> PyResult<Option<RescueStrategy>> {
         if !bound.hasattr("rescue_from")? {
             return Ok(None);
         }
 
-        let rescue_strategies = bound.getattr("rescue_from")?.extract::<Vec<RescueStrategy>>()?;
+        let rescue_strategies = bound
+            .getattr("rescue_from")?
+            .extract::<Vec<RescueStrategy>>()?;
 
         for strategy in rescue_strategies {
             if self.is_exception_match(py, &strategy.exceptions, error)? {
@@ -351,7 +380,10 @@ impl Runnable {
 
     /// Check if exception matches
     fn is_exception_match(
-        &self, py: Python, exceptions: &Py<PyAny>, error: &PyErr,
+        &self,
+        py: Python,
+        exceptions: &Py<PyAny>,
+        error: &PyErr,
     ) -> PyResult<bool> {
         let exceptions_bound = exceptions.bind(py);
 
@@ -374,7 +406,11 @@ impl Runnable {
 
     /// Handle discard - directly mark task as completed without recording failure information
     fn handle_discard(
-        &self, py: Python, strategy: &DiscardStrategy, error: &PyErr, job: quebec_jobs::Model,
+        &self,
+        py: Python,
+        strategy: &DiscardStrategy,
+        error: &PyErr,
+        job: quebec_jobs::Model,
     ) -> Result<quebec_jobs::Model> {
         // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
@@ -453,7 +489,9 @@ impl Runnable {
 
     /// Parse task parameters
     fn parse_job_arguments(
-        &self, py: Python, job: &quebec_jobs::Model,
+        &self,
+        py: Python,
+        job: &quebec_jobs::Model,
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
         // Deserialize JSON parameters
         let mut v = serde_json::Value::Array(vec![]);
@@ -471,9 +509,11 @@ impl Runnable {
         }
 
         let binding = json_to_py(py, &v)?;
-        let args = binding.downcast_bound::<pyo3::types::PyList>(py).map_err(|e| {
-            PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
-        })?;
+        let args = binding
+            .downcast_bound::<pyo3::types::PyList>(py)
+            .map_err(|e| {
+                PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
+            })?;
 
         // Initialize kwargs
         let kwargs = PyDict::new(py);
@@ -498,7 +538,10 @@ impl Runnable {
 
     /// Handle execution error
     fn handle_execution_error(
-        &mut self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr,
+        &mut self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
         error!("Job execution error: {:?}", error);
 
@@ -528,7 +571,9 @@ impl Runnable {
 
     /// Apply retry strategy
     fn apply_retry_strategy(
-        &mut self, job: &quebec_jobs::Model, strategy: RetryStrategy,
+        &mut self,
+        job: &quebec_jobs::Model,
+        strategy: RetryStrategy,
     ) -> Result<quebec_jobs::Model> {
         warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
 
@@ -539,14 +584,21 @@ impl Runnable {
         let failed_attempts = job.failed_attempts + 1;
 
         // Set retry information to runnable
-        self.retry_info = Some(RetryInfo { scheduled_at, failed_attempts });
+        self.retry_info = Some(RetryInfo {
+            scheduled_at,
+            failed_attempts,
+        });
 
         Ok(job.clone())
     }
 
     /// Apply rescue strategy
     fn apply_rescue_strategy(
-        &self, py: Python, job: &mut quebec_jobs::Model, strategy: &RescueStrategy, error: &PyErr,
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        strategy: &RescueStrategy,
+        error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
         match strategy.handler.call1(py, (error.value(py),)) {
             Ok(_) => {
@@ -563,7 +615,10 @@ impl Runnable {
 
     /// Handle task failure
     fn handle_job_failure(
-        &self, py: Python, job: &mut quebec_jobs::Model, error: &PyErr,
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
         job.failed_attempts += 1;
         let error_payload = self.create_error_payload(py, error);
@@ -606,7 +661,10 @@ impl Metric {
     }
 
     fn __repr__(&self) -> String {
-        format!("Metric(id={}, success={}, duration={:?})", self.id, self.success, self.duration)
+        format!(
+            "Metric(id={}, success={}, duration={:?})",
+            self.id, self.success, self.duration
+        )
     }
 }
 
@@ -626,7 +684,9 @@ pub struct Execution {
 
 impl Execution {
     pub fn new(
-        ctx: Arc<AppContext>, claimed: quebec_claimed_executions::Model, job: quebec_jobs::Model,
+        ctx: Arc<AppContext>,
+        claimed: quebec_claimed_executions::Model,
+        job: quebec_jobs::Model,
         runnable: Runnable,
     ) -> Self {
         // Get current thread's ThreadId
@@ -691,7 +751,8 @@ impl Execution {
     }
 
     async fn after_executed(
-        &mut self, result: Result<quebec_jobs::Model>,
+        &mut self,
+        result: Result<quebec_jobs::Model>,
     ) -> Result<quebec_jobs::Model> {
         let class_name = self.runnable.class_name.clone();
 
@@ -708,10 +769,17 @@ impl Execution {
                     format!("{:?}", eplased).bright_purple(),
                 );
             } else {
-                error!("Job `{}' failed in: {:?}", self.runnable.class_name, eplased);
+                error!(
+                    "Job `{}' failed in: {:?}",
+                    self.runnable.class_name, eplased
+                );
             }
 
-            let metric = Metric { id: job_id, success: result.is_ok(), duration: eplased };
+            let metric = Metric {
+                id: job_id,
+                success: result.is_ok(),
+                duration: eplased,
+            };
             self.metric = Some(metric);
         }
         // .instrument(tracing::info_span!("runner", jid = job_id, tid = self.tid.clone()))
@@ -722,14 +790,18 @@ impl Execution {
         let err = result.as_ref().err().map(|e| e.to_string());
 
         // Check if retry is needed (determined by execution.retry_info)
-        let retry_job_data =
-            self.retry_info.as_ref().map(|info| (info.scheduled_at, info.failed_attempts));
+        let retry_job_data = self
+            .retry_info
+            .as_ref()
+            .map(|info| (info.scheduled_at, info.failed_attempts));
 
         // Capture concurrency info for semaphore release
         let concurrency_key = job.concurrency_key.clone();
         let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
-        let concurrency_duration =
-            self.runnable.concurrency_duration.map(|s| chrono::Duration::seconds(s as i64));
+        let concurrency_duration = self
+            .runnable
+            .concurrency_duration
+            .map(|s| chrono::Duration::seconds(s as i64));
         let table_config = self.ctx.table_config.clone();
 
         db.transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
@@ -930,7 +1002,10 @@ impl Execution {
 
             error!(
                 "error_type: {}",
-                e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string())
+                e.get_type()
+                    .str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| "Unknown".to_string())
             );
             error!("error_description: {}", e.to_string());
 
@@ -941,7 +1016,9 @@ impl Execution {
             });
 
             Err(anyhow::anyhow!(serde_json::to_string(&error_payload)
-                .unwrap_or_else(|_| "Error serialization failed".to_string())))
+                .unwrap_or_else(
+                    |_| "Error serialization failed".to_string()
+                )))
         } else {
             // info!("Job done");
             Ok(self.job.clone())
@@ -961,7 +1038,10 @@ impl Execution {
     }
 
     fn retry(
-        &mut self, py: Python, strategy: RetryStrategy, exc: &Bound<'_, PyAny>,
+        &mut self,
+        py: Python,
+        strategy: RetryStrategy,
+        exc: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
@@ -1009,7 +1089,10 @@ impl Execution {
         let _enter = span.enter();
 
         if (job.failed_attempts as i64) >= strategy.attempts {
-            error!("Job `{}' failed after {} attempts", job.class_name, job.failed_attempts);
+            error!(
+                "Job `{}' failed after {} attempts",
+                job.class_name, job.failed_attempts
+            );
             return Ok(());
         }
 
@@ -1179,7 +1262,9 @@ impl Worker {
     pub fn register_stop_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
-            return Err(PyTypeError::new_err("Expected a callable object for worker stop handler"));
+            return Err(PyTypeError::new_err(
+                "Expected a callable object for worker stop handler",
+            ));
         }
 
         {
@@ -1408,7 +1493,8 @@ impl Worker {
 
     // #[tracing::instrument]
     pub async fn claim_jobs(
-        &self, batch_size: u64,
+        &self,
+        batch_size: u64,
     ) -> Result<Vec<quebec_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
@@ -1552,8 +1638,9 @@ impl Worker {
 
                             // Add queue filter if not "*"
                             if pattern != "*" {
-                                query =
-                                    query.and_where(Expr::col("queue_name").eq(pattern)).to_owned();
+                                query = query
+                                    .and_where(Expr::col("queue_name").eq(pattern))
+                                    .to_owned();
                             } else {
                                 // For "*" (all queues), exclude paused queues
                                 if !paused_queues.is_empty() {
@@ -1633,7 +1720,8 @@ impl Worker {
         let quit = self.ctx.graceful_shutdown.clone();
 
         // Set process title for visibility in htop/ps
-        self.ctx.set_proc_title("worker", Some(&format!("{}", worker_threads)));
+        self.ctx
+            .set_proc_title("worker", Some(&format!("{}", worker_threads)));
 
         // Initialize process record
         let init_db = self.ctx.get_db().await;
@@ -1653,7 +1741,10 @@ impl Worker {
                     info!("LISTEN started on '{}_jobs' channel - jobs will be processed immediately when notified", self.ctx.name);
                 }
                 Err(e) => {
-                    warn!("Failed to start real LISTEN, falling back to polling only: {}", e);
+                    warn!(
+                        "Failed to start real LISTEN, falling back to polling only: {}",
+                        e
+                    );
                 }
             }
         } else {
@@ -1777,8 +1868,12 @@ impl Worker {
 
     /// Extract job processing logic to avoid duplication
     async fn process_available_jobs(
-        &self, worker_threads: u64, tx: &Arc<Mutex<Sender<Execution>>>, ctx: &Arc<AppContext>,
-        thread_id: &str, source: &str,
+        &self,
+        worker_threads: u64,
+        tx: &Arc<Mutex<Sender<Execution>>>,
+        ctx: &Arc<AppContext>,
+        thread_id: &str,
+        source: &str,
     ) {
         let claimed = self
             .claim_jobs(worker_threads)
@@ -1802,7 +1897,11 @@ impl Worker {
         async {
             debug!("found {} job(s) to process", claimed.len());
         }
-        .instrument(tracing::info_span!("polling", tid = thread_id, source = source))
+        .instrument(tracing::info_span!(
+            "polling",
+            tid = thread_id,
+            source = source
+        ))
         .await;
 
         // Process claimed jobs without holding a long transaction

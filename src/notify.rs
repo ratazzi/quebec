@@ -30,7 +30,9 @@ impl NotifyManager {
     /// Returns a receiver that will get notifications when new jobs are available
     pub async fn start_listener(&self) -> Result<mpsc::Receiver<String>, anyhow::Error> {
         if !self.ctx.is_postgres() {
-            return Err(anyhow::anyhow!("LISTEN/NOTIFY is only supported on PostgreSQL"));
+            return Err(anyhow::anyhow!(
+                "LISTEN/NOTIFY is only supported on PostgreSQL"
+            ));
         }
 
         let (tx, rx) = mpsc::channel::<String>(200);
@@ -79,7 +81,9 @@ impl NotifyManager {
 
     /// LISTEN loop implementation using sqlx PgListener
     async fn listen_loop(
-        dsn: &str, channel: &str, tx: &mpsc::Sender<String>,
+        dsn: &str,
+        channel: &str,
+        tx: &mpsc::Sender<String>,
         graceful_shutdown: &tokio_util::sync::CancellationToken,
     ) -> Result<(), anyhow::Error> {
         // Create a dedicated connection for LISTEN with optimized settings
@@ -88,7 +92,10 @@ impl NotifyManager {
 
         // Start listening on the channel
         listener.listen(channel).await?;
-        info!("Started LISTEN on channel: {} (dedicated connection)", channel);
+        info!(
+            "Started LISTEN on channel: {} (dedicated connection)",
+            channel
+        );
 
         loop {
             tokio::select! {
@@ -146,12 +153,18 @@ impl NotifyManager {
 
     /// Static method to send NOTIFY using existing database connection
     pub async fn send_notify<C>(
-        app_name: &str, db: &C, queue_name: &str, event: &str,
+        app_name: &str,
+        db: &C,
+        queue_name: &str,
+        event: &str,
     ) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
     {
-        let message = NotifyMessage { queue: queue_name.to_string(), event: event.to_string() };
+        let message = NotifyMessage {
+            queue: queue_name.to_string(),
+            event: event.to_string(),
+        };
         let message_json = serde_json::to_string(&message)
             .map_err(|e| anyhow::anyhow!("Failed to serialize notify message: {}", e))?;
 
@@ -162,7 +175,9 @@ impl NotifyManager {
 
     /// Internal helper to send NOTIFY with database connection and channel name
     async fn send_notify_with_db<C>(
-        db: &C, channel_name: &str, message: &str,
+        db: &C,
+        channel_name: &str,
+        message: &str,
     ) -> Result<(), anyhow::Error>
     where
         C: ConnectionTrait,
@@ -172,7 +187,11 @@ impl NotifyManager {
         let sql = format!("NOTIFY {}, '{}'", channel_name, escaped_message);
 
         let ret = db
-            .execute(Statement::from_sql_and_values(db.get_database_backend(), sql, vec![]))
+            .execute(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                sql,
+                vec![],
+            ))
             .await;
 
         match ret {

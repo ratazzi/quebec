@@ -18,7 +18,8 @@ use crate::entities::{quebec_failed_executions, quebec_jobs};
 
 impl ControlPlane {
     pub async fn failed_jobs(
-        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -44,7 +45,10 @@ impl ControlPlane {
 
         // Get job information for each failed execution
         for execution in failed_executions {
-            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id).one(db).await {
+            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id)
+                .one(db)
+                .await
+            {
                 failed_jobs.push(FailedJobInfo {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
@@ -85,7 +89,9 @@ impl ControlPlane {
         context.insert("active_page", "failed-jobs");
 
         // Use helper method to render template
-        let html = state.render_template("failed-jobs.html", &mut context).await?;
+        let html = state
+            .render_template("failed-jobs.html", &mut context)
+            .await?;
 
         debug!("Template rendering completed in {:?}", start.elapsed());
 
@@ -94,7 +100,8 @@ impl ControlPlane {
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/retry"))]
     pub async fn retry_failed_job(
-        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
     ) -> impl IntoResponse {
         use crate::entities::quebec_failed_executions::{
             Entity as FailedExecutionEntity, Retryable,
@@ -118,9 +125,10 @@ impl ControlPlane {
                         execution.retry(txn).await?;
                         Ok(())
                     }
-                    None => {
-                        Err(DbErr::Custom(format!("Failed execution for job {} not found", id)))
-                    }
+                    None => Err(DbErr::Custom(format!(
+                        "Failed execution for job {} not found",
+                        id
+                    ))),
                 }
             })
         })
@@ -131,13 +139,17 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to retry job {}: {}", id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/failed-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/failed-jobs")],
+            )
         })
     }
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/delete"))]
     pub async fn delete_failed_job(
-        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
     ) -> impl IntoResponse {
         use crate::entities::quebec_failed_executions::{
             Discardable, Entity as FailedExecutionEntity,
@@ -161,9 +173,10 @@ impl ControlPlane {
                         execution.discard(txn).await?;
                         Ok(())
                     }
-                    None => {
-                        Err(DbErr::Custom(format!("Failed execution for job {} not found", id)))
-                    }
+                    None => Err(DbErr::Custom(format!(
+                        "Failed execution for job {} not found",
+                        id
+                    ))),
                 }
             })
         })
@@ -174,7 +187,10 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to delete job {}: {}", id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/failed-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/failed-jobs")],
+            )
         })
     }
 
@@ -204,7 +220,10 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to retry all jobs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/failed-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/failed-jobs")],
+            )
         })
     }
 
@@ -234,7 +253,10 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to discard all jobs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/failed-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/failed-jobs")],
+            )
         })
     }
 }

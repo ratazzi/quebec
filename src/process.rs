@@ -32,7 +32,10 @@ pub struct ProcessInfo {
 
 impl ProcessInfo {
     pub fn new(kind: impl Into<String>, name: impl Into<String>) -> Self {
-        Self { kind: kind.into(), name: name.into() }
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+        }
     }
 }
 
@@ -96,7 +99,9 @@ pub trait ProcessTrait: Send + Sync {
     }
 
     fn get_hostname() -> Option<String> {
-        hostname::get().map(|h| h.to_string_lossy().to_string()).ok()
+        hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .ok()
     }
 
     fn get_pid() -> i32 {
@@ -134,7 +139,9 @@ pub trait ProcessTrait: Send + Sync {
     }
 
     async fn heartbeat(
-        &self, db: &DatabaseConnection, process: &quebec_processes::Model,
+        &self,
+        db: &DatabaseConnection,
+        process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let mut process = process.clone().into_active_model();
         process.last_heartbeat_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
@@ -144,7 +151,9 @@ pub trait ProcessTrait: Send + Sync {
     }
 
     async fn on_stop(
-        &self, db: &DatabaseConnection, process: &quebec_processes::Model,
+        &self,
+        db: &DatabaseConnection,
+        process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let process_name = process.name.clone();
         let process_pid = process.pid;

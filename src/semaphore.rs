@@ -2,7 +2,10 @@ use crate::context::{ConcurrencyConstraint, TableConfig};
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
 pub async fn acquire_semaphore<C>(
-    db: &C, table_config: &TableConfig, key: String, concurrency_limit: i32,
+    db: &C,
+    table_config: &TableConfig,
+    key: String,
+    concurrency_limit: i32,
     duration: Option<chrono::Duration>,
 ) -> Result<bool, DbErr>
 where
@@ -98,7 +101,9 @@ where
 
 /// Convenience function to acquire semaphore using ConcurrencyConstraint
 pub async fn acquire_semaphore_with_constraint<C>(
-    db: &C, table_config: &TableConfig, constraint: &ConcurrencyConstraint,
+    db: &C,
+    table_config: &TableConfig,
+    constraint: &ConcurrencyConstraint,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
@@ -124,7 +129,11 @@ where
 /// - Acquire: decrement value (if value > 0)
 /// - Release: increment value (if value < limit), or just update expires_at
 pub async fn release_semaphore<C>(
-    db: &C, table_config: &TableConfig, key: String, limit: i32, duration: Option<chrono::Duration>,
+    db: &C,
+    table_config: &TableConfig,
+    key: String,
+    limit: i32,
+    duration: Option<chrono::Duration>,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
@@ -162,7 +171,12 @@ where
         .execute(Statement::from_sql_and_values(
             db.get_database_backend(),
             increment_sql,
-            vec![key.clone().into(), expires_at.into(), now.into(), limit.into()],
+            vec![
+                key.clone().into(),
+                expires_at.into(),
+                now.into(),
+                limit.into(),
+            ],
         ))
         .await?;
 
@@ -209,7 +223,9 @@ where
 
 /// Convenience function to release semaphore using ConcurrencyConstraint
 pub async fn release_semaphore_with_constraint<C>(
-    db: &C, table_config: &TableConfig, constraint: &ConcurrencyConstraint,
+    db: &C,
+    table_config: &TableConfig,
+    constraint: &ConcurrencyConstraint,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,

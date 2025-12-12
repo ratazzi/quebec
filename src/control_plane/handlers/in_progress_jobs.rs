@@ -19,7 +19,8 @@ use crate::entities::{quebec_claimed_executions, quebec_jobs, quebec_processes};
 
 impl ControlPlane {
     pub async fn in_progress_jobs(
-        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -55,7 +56,10 @@ impl ControlPlane {
 
         // Get job information for each in-progress execution
         for execution in claimed_executions {
-            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id).one(db).await {
+            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id)
+                .one(db)
+                .await
+            {
                 // Find process information
                 let worker_id = match execution.process_id {
                     Some(pid) => {
@@ -71,7 +75,11 @@ impl ControlPlane {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                     }
                     duration if duration.num_minutes() >= 1 => {
-                        format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
+                        format!(
+                            "{}m {}s",
+                            duration.num_minutes(),
+                            duration.num_seconds() % 60
+                        )
                     }
                     duration => {
                         format!("{}s", duration.num_seconds())
@@ -131,7 +139,9 @@ impl ControlPlane {
         context.insert("queue_names", &queue_names);
         context.insert("job_classes", &job_classes);
 
-        let html = state.render_template("in-progress-jobs.html", &mut context).await?;
+        let html = state
+            .render_template("in-progress-jobs.html", &mut context)
+            .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
         Ok(Html(html))
@@ -140,7 +150,8 @@ impl ControlPlane {
     // Implement method to cancel a single in-progress job
     #[instrument(skip(state), fields(path = "/in-progress-jobs/:id/cancel"))]
     pub async fn cancel_in_progress_job(
-        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -149,13 +160,15 @@ impl ControlPlane {
         db.transaction::<_, (), DbErr>(|txn| {
             Box::pin(async move {
                 // Find execution record to cancel
-                let claimed_execution =
-                    quebec_claimed_executions::Entity::find_by_id(id).one(txn).await?;
+                let claimed_execution = quebec_claimed_executions::Entity::find_by_id(id)
+                    .one(txn)
+                    .await?;
 
                 if let Some(execution) = claimed_execution {
                     // First mark job as completed
-                    let job_result =
-                        quebec_jobs::Entity::find_by_id(execution.job_id).one(txn).await?;
+                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
+                        .one(txn)
+                        .await?;
 
                     if let Some(job) = job_result {
                         // Update job status to completed
@@ -167,11 +180,16 @@ impl ControlPlane {
                     }
 
                     // Delete claimed_execution record
-                    quebec_claimed_executions::Entity::delete_by_id(id).exec(txn).await?;
+                    quebec_claimed_executions::Entity::delete_by_id(id)
+                        .exec(txn)
+                        .await?;
 
                     info!("Cancelled in-progress job ID: {}", id);
                 } else {
-                    return Err(DbErr::Custom(format!("In-progress job with ID {} not found", id)));
+                    return Err(DbErr::Custom(format!(
+                        "In-progress job with ID {} not found",
+                        id
+                    )));
                 }
 
                 Ok(())
@@ -184,7 +202,10 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to cancel in-progress job {}: {}", id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/in-progress-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/in-progress-jobs")],
+            )
         })
     }
 
@@ -204,8 +225,10 @@ impl ControlPlane {
                     return Ok(0);
                 }
 
-                let job_ids: Vec<i64> =
-                    claimed_executions.iter().map(|execution| execution.job_id).collect();
+                let job_ids: Vec<i64> = claimed_executions
+                    .iter()
+                    .map(|execution| execution.job_id)
+                    .collect();
 
                 // Update all related jobs to completed status
                 let now = chrono::Utc::now().naive_utc();
@@ -226,8 +249,9 @@ impl ControlPlane {
                 txn.execute(stmt).await?;
 
                 // Delete all claimed_execution records
-                let delete_result =
-                    quebec_claimed_executions::Entity::delete_many().exec(txn).await?;
+                let delete_result = quebec_claimed_executions::Entity::delete_many()
+                    .exec(txn)
+                    .await?;
 
                 let count = delete_result.rows_affected;
                 info!("Cancelled all {} in-progress jobs", count);
@@ -241,7 +265,10 @@ impl ControlPlane {
         })
         .map_err(|e| {
             error!("Failed to cancel all in-progress jobs: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, [("Location", "/in-progress-jobs")])
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("Location", "/in-progress-jobs")],
+            )
         })
     }
 }

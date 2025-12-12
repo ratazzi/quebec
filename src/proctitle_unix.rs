@@ -54,7 +54,10 @@ unsafe fn init_state() -> Option<ProcTitleState> {
 
     let arg_start = (*fields.get(45)?).parse::<usize>().ok()?;
     let arg_end = (*fields.get(46)?).parse::<usize>().ok()?;
-    let env_start = fields.get(47).and_then(|value| value.parse::<usize>().ok()).unwrap_or(arg_end);
+    let env_start = fields
+        .get(47)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(arg_end);
 
     if arg_start == 0 || arg_end <= arg_start {
         return None;
@@ -69,7 +72,10 @@ unsafe fn init_state() -> Option<ProcTitleState> {
         return None;
     }
 
-    Some(ProcTitleState { argv_start: arg_start as *mut c_char, argv_len })
+    Some(ProcTitleState {
+        argv_start: arg_start as *mut c_char,
+        argv_len,
+    })
 }
 
 /// Set the process title on Unix/Linux systems.
@@ -158,7 +164,11 @@ impl ProcTitleState {
 /// Set title using prctl (Linux only, 15 char limit).
 #[cfg(target_os = "linux")]
 unsafe fn set_title_via_prctl(title: &str) {
-    let truncated_title = if title.len() > 15 { &title[..15] } else { title };
+    let truncated_title = if title.len() > 15 {
+        &title[..15]
+    } else {
+        title
+    };
 
     if let Ok(c_title) = std::ffi::CString::new(truncated_title) {
         libc::prctl(libc::PR_SET_NAME, c_title.as_ptr(), 0, 0, 0);

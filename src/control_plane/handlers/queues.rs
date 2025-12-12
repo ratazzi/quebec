@@ -23,7 +23,8 @@ use crate::entities::{quebec_jobs, quebec_pauses};
 
 impl ControlPlane {
     pub async fn queues(
-        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -44,7 +45,10 @@ impl ControlPlane {
 
         let query = SeaQuery::select()
             .column(Alias::new("queue_name"))
-            .expr_as(Expr::col(Alias::new("queue_name")).count(), Alias::new("count"))
+            .expr_as(
+                Expr::col(Alias::new("queue_name")).count(),
+                Alias::new("count"),
+            )
             .from(jobs_table)
             .and_where(Expr::col(Alias::new("finished_at")).is_null())
             .group_by_col(Alias::new("queue_name"))
@@ -75,7 +79,10 @@ impl ControlPlane {
         let queue_counts: Vec<(String, i64)> = all_queue_names
             .into_iter()
             .map(|queue_name| {
-                (queue_name.clone(), *queue_counts_map.get(&queue_name).unwrap_or(&0))
+                (
+                    queue_name.clone(),
+                    *queue_counts_map.get(&queue_name).unwrap_or(&0),
+                )
             })
             .collect();
 
@@ -121,7 +128,8 @@ impl ControlPlane {
     }
 
     pub async fn pause_queue(
-        State(state): State<Arc<ControlPlane>>, Path(queue_name): Path<String>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(queue_name): Path<String>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -140,7 +148,8 @@ impl ControlPlane {
     }
 
     pub async fn resume_queue(
-        State(state): State<Arc<ControlPlane>>, Path(queue_name): Path<String>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(queue_name): Path<String>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -158,7 +167,8 @@ impl ControlPlane {
     }
 
     pub async fn queue_details(
-        State(state): State<Arc<ControlPlane>>, Path(queue_name): Path<String>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(queue_name): Path<String>,
         Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
@@ -361,10 +371,19 @@ impl ControlPlane {
         context.insert("has_prev", &(page > 1));
         context.insert("has_next", &(page < total_pages));
         context.insert("prev_page", &(if page > 1 { page - 1 } else { 1 }));
-        context.insert("next_page", &(if page < total_pages { page + 1 } else { total_pages }));
+        context.insert(
+            "next_page",
+            &(if page < total_pages {
+                page + 1
+            } else {
+                total_pages
+            }),
+        );
         context.insert("active_page", "queues");
 
-        let html = state.render_template("queue_details.html", &mut context).await?;
+        let html = state
+            .render_template("queue_details.html", &mut context)
+            .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
         Ok(Html(html))

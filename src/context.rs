@@ -152,7 +152,10 @@ pub struct RescueStrategy {
 impl RescueStrategy {
     #[new]
     fn new(exceptions: Py<PyAny>, handler: Py<PyAny>) -> Self {
-        RescueStrategy { exceptions, handler }
+        RescueStrategy {
+            exceptions,
+            handler,
+        }
     }
 
     #[getter]
@@ -180,7 +183,9 @@ pub struct RetryStrategy {
 impl RetryStrategy {
     #[new]
     fn new(
-        exceptions: Py<PyAny>, wait: Option<Duration>, attempts: Option<i64>,
+        exceptions: Py<PyAny>,
+        wait: Option<Duration>,
+        attempts: Option<i64>,
         handler: Option<Py<PyAny>>,
     ) -> Self {
         RetryStrategy {
@@ -225,7 +230,10 @@ pub struct DiscardStrategy {
 impl DiscardStrategy {
     #[new]
     fn new(exceptions: Py<PyAny>, handler: Option<Py<PyAny>>) -> Self {
-        DiscardStrategy { exceptions, handler }
+        DiscardStrategy {
+            exceptions,
+            handler,
+        }
     }
 
     #[getter]
@@ -270,7 +278,9 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(
-        dsn: Url, db: Option<Arc<DatabaseConnection>>, connect_options: ConnectOptions,
+        dsn: Url,
+        db: Option<Arc<DatabaseConnection>>,
+        connect_options: ConnectOptions,
         options: Option<HashMap<String, PyObject>>,
     ) -> Self {
         let mut ctx = Self {
@@ -510,12 +520,18 @@ impl AppContext {
 
     /// Get all registered runnable class names
     pub fn get_runnable_names(&self) -> Vec<String> {
-        self.runnables.read().map(|r| r.keys().cloned().collect()).unwrap_or_else(|_| Vec::new())
+        self.runnables
+            .read()
+            .map(|r| r.keys().cloned().collect())
+            .unwrap_or_else(|_| Vec::new())
     }
 
     /// Check if a job class has concurrency control enabled
     pub fn has_concurrency_control(&self, class_name: &str) -> bool {
-        self.concurrency_enabled.read().map(|c| c.contains(class_name)).unwrap_or(false)
+        self.concurrency_enabled
+            .read()
+            .map(|c| c.contains(class_name))
+            .unwrap_or(false)
     }
 
     /// Enable concurrency control for a job class
@@ -591,7 +607,10 @@ impl ScheduledEntry {
             }
         });
 
-        let cron = Cron::new(&expr).with_seconds_optional().with_dom_and_dow().parse();
+        let cron = Cron::new(&expr)
+            .with_seconds_optional()
+            .with_dom_and_dow()
+            .parse();
         Ok(cron?)
     }
 }

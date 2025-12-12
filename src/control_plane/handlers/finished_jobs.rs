@@ -16,7 +16,8 @@ use crate::entities::quebec_jobs;
 
 impl ControlPlane {
     pub async fn finished_jobs(
-        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -54,7 +55,11 @@ impl ControlPlane {
                         format!("{}h {}m", duration.num_hours(), duration.num_minutes() % 60)
                     }
                     duration if duration.num_minutes() >= 1 => {
-                        format!("{}m {}s", duration.num_minutes(), duration.num_seconds() % 60)
+                        format!(
+                            "{}m {}s",
+                            duration.num_minutes(),
+                            duration.num_seconds() % 60
+                        )
                     }
                     duration => {
                         format!("{}s", duration.num_seconds())
@@ -114,7 +119,9 @@ impl ControlPlane {
         context.insert("queue_names", &queue_names);
         context.insert("job_classes", &job_classes);
 
-        let html = state.render_template("finished-jobs.html", &mut context).await?;
+        let html = state
+            .render_template("finished-jobs.html", &mut context)
+            .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
         Ok(Html(html))

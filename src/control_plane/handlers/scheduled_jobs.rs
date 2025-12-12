@@ -19,7 +19,8 @@ use crate::entities::{quebec_jobs, quebec_scheduled_executions};
 
 impl ControlPlane {
     pub async fn scheduled_jobs(
-        State(state): State<Arc<ControlPlane>>, Query(pagination): Query<Pagination>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -74,32 +75,35 @@ impl ControlPlane {
                 Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
 
             // Parse scheduled execution time
-            let (scheduled_at_str, scheduled_in) = match row
-                .try_get::<chrono::NaiveDateTime>("", "scheduled_at")
-            {
-                Ok(dt) => {
-                    let now = chrono::Utc::now().naive_utc();
-                    let scheduled_in = if dt > now {
-                        let duration = dt.signed_duration_since(now);
-                        if duration.num_hours() > 0 {
-                            format!("in {}h {}m", duration.num_hours(), duration.num_minutes() % 60)
-                        } else if duration.num_minutes() > 0 {
-                            format!(
-                                "in {}m {}s",
-                                duration.num_minutes(),
-                                duration.num_seconds() % 60
-                            )
+            let (scheduled_at_str, scheduled_in) =
+                match row.try_get::<chrono::NaiveDateTime>("", "scheduled_at") {
+                    Ok(dt) => {
+                        let now = chrono::Utc::now().naive_utc();
+                        let scheduled_in = if dt > now {
+                            let duration = dt.signed_duration_since(now);
+                            if duration.num_hours() > 0 {
+                                format!(
+                                    "in {}h {}m",
+                                    duration.num_hours(),
+                                    duration.num_minutes() % 60
+                                )
+                            } else if duration.num_minutes() > 0 {
+                                format!(
+                                    "in {}m {}s",
+                                    duration.num_minutes(),
+                                    duration.num_seconds() % 60
+                                )
+                            } else {
+                                format!("in {}s", duration.num_seconds())
+                            }
                         } else {
-                            format!("in {}s", duration.num_seconds())
-                        }
-                    } else {
-                        "overdue".to_string()
-                    };
+                            "overdue".to_string()
+                        };
 
-                    (Self::format_naive_datetime(dt), scheduled_in)
-                }
-                Err(_) => ("Unknown time".to_string(), "Unknown".to_string()),
-            };
+                        (Self::format_naive_datetime(dt), scheduled_in)
+                    }
+                    Err(_) => ("Unknown time".to_string(), "Unknown".to_string()),
+                };
 
             scheduled_jobs.push(ScheduledJobInfo {
                 id: execution_id,
@@ -124,7 +128,11 @@ impl ControlPlane {
         );
 
         let total_count = db
-            .query_one(Statement::from_sql_and_values(db.get_database_backend(), &count_sql, []))
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                &count_sql,
+                [],
+            ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
@@ -157,14 +165,17 @@ impl ControlPlane {
         context.insert("job_classes", &job_classes);
         context.insert("active_page", "scheduled-jobs");
 
-        let html = state.render_template("scheduled-jobs.html", &mut context).await?;
+        let html = state
+            .render_template("scheduled-jobs.html", &mut context)
+            .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
         Ok(Html(html))
     }
 
     pub async fn cancel_scheduled_job(
-        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
@@ -174,13 +185,15 @@ impl ControlPlane {
             .transaction::<_, (), DbErr>(|txn| {
                 Box::pin(async move {
                     // Find scheduled execution record to cancel
-                    let scheduled_execution =
-                        quebec_scheduled_executions::Entity::find_by_id(id).one(txn).await?;
+                    let scheduled_execution = quebec_scheduled_executions::Entity::find_by_id(id)
+                        .one(txn)
+                        .await?;
 
                     if let Some(execution) = scheduled_execution {
                         // First mark job as completed
-                        let job_result =
-                            quebec_jobs::Entity::find_by_id(execution.job_id).one(txn).await?;
+                        let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
+                            .one(txn)
+                            .await?;
 
                         if let Some(job) = job_result {
                             // Update job status to completed
@@ -192,7 +205,9 @@ impl ControlPlane {
                         }
 
                         // Delete scheduled_execution record
-                        quebec_scheduled_executions::Entity::delete_by_id(id).exec(txn).await?;
+                        quebec_scheduled_executions::Entity::delete_by_id(id)
+                            .exec(txn)
+                            .await?;
 
                         info!("Cancelled scheduled job ID: {}", id);
                     } else {
@@ -211,7 +226,10 @@ impl ControlPlane {
             Ok(_) => (StatusCode::SEE_OTHER, "/scheduled-jobs".to_string()),
             Err(e) => {
                 error!("Failed to cancel scheduled job {}: {}", id, e);
-                (StatusCode::INTERNAL_SERVER_ERROR, "/scheduled-jobs".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "/scheduled-jobs".to_string(),
+                )
             }
         }
     }

@@ -45,9 +45,9 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         Ok(Value::Number(obj.extract::<i64>()?.into()))
     } else if obj.is_instance_of::<PyFloat>() {
         let f = obj.extract::<f64>()?;
-        Ok(Value::Number(serde_json::Number::from_f64(f).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid float value")
-        })?))
+        Ok(Value::Number(serde_json::Number::from_f64(f).ok_or_else(
+            || PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid float value"),
+        )?))
     } else if obj.is_instance_of::<PyString>() {
         Ok(Value::String(obj.extract::<String>()?))
     } else if obj.is_instance_of::<PyDict>() {
@@ -76,7 +76,9 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
     } else if obj.is_none() {
         Ok(Value::Null)
     } else {
-        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>("Unsupported Python type"))
+        Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+            "Unsupported Python type",
+        ))
     }
 }
 
@@ -353,7 +355,10 @@ where
         return Ok(config.clone());
     }
 
-    warn!("Environment '{}' not found in config, using first environment", env);
+    warn!(
+        "Environment '{}' not found in config, using first environment",
+        env
+    );
 
     if let Some((first_env, config)) = env_config.iter().next() {
         info!("Using environment '{}' instead", first_env);
@@ -369,7 +374,8 @@ where
 /// This version returns an error if the specified environment is not found.
 /// Used when you want to enforce that the environment must exist.
 pub fn parse_env_config_strict<T>(
-    env_config: std::collections::HashMap<String, T>, env: Option<&str>,
+    env_config: std::collections::HashMap<String, T>,
+    env: Option<&str>,
 ) -> anyhow::Result<T>
 where
     T: Clone + std::fmt::Debug,

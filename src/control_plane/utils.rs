@@ -105,7 +105,9 @@ impl ControlPlane {
         let total_jobs = quebec_jobs::Entity::find().count(db).await?;
 
         // Count scheduled jobs
-        let scheduled_count = quebec_scheduled_executions::Entity::find().count(db).await? as i64;
+        let scheduled_count = quebec_scheduled_executions::Entity::find()
+            .count(db)
+            .await? as i64;
 
         // Count in-progress jobs
         let in_progress_count = quebec_claimed_executions::Entity::find().count(db).await? as i64;
@@ -166,7 +168,14 @@ impl ControlPlane {
         pagination.insert("has_prev", if page > 1 { 1 } else { 0 });
         pagination.insert("has_next", if page < total_pages { 1 } else { 0 });
         pagination.insert("prev_page", if page > 1 { page - 1 } else { 1 });
-        pagination.insert("next_page", if page < total_pages { page + 1 } else { total_pages });
+        pagination.insert(
+            "next_page",
+            if page < total_pages {
+                page + 1
+            } else {
+                total_pages
+            },
+        );
 
         pagination
     }
@@ -193,7 +202,9 @@ impl ControlPlane {
 
     /// Render template with context
     pub async fn render_template(
-        &self, template_name: &str, context: &mut Context,
+        &self,
+        template_name: &str,
+        context: &mut Context,
     ) -> Result<String, (StatusCode, String)> {
         // In debug compilation mode, reload templates
         #[cfg(debug_assertions)]
@@ -249,7 +260,11 @@ impl ControlPlane {
 
             // If there are query parameters, remove them
             let final_dsn = if clean_dsn.contains("?") {
-                clean_dsn.split("?").next().unwrap_or(&clean_dsn).to_string()
+                clean_dsn
+                    .split("?")
+                    .next()
+                    .unwrap_or(&clean_dsn)
+                    .to_string()
             } else {
                 clean_dsn
             };
@@ -364,7 +379,10 @@ impl ControlPlane {
                     Err(e) => error!("Could not read template file {}: {}", template_path, e),
                 }
 
-                Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Template error: {}", e)))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Template error: {}", e),
+                ))
             }
         }
     }

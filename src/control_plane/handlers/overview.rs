@@ -23,7 +23,8 @@ use crate::entities::{quebec_failed_executions, quebec_jobs, quebec_pauses, queb
 impl ControlPlane {
     #[instrument(skip(state), fields(path = "/"))]
     pub async fn overview(
-        State(state): State<Arc<ControlPlane>>, Query(params): Query<HashMap<String, String>>,
+        State(state): State<Arc<ControlPlane>>,
+        Query(params): Query<HashMap<String, String>>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -31,7 +32,10 @@ impl ControlPlane {
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         // Get time range parameter, default to 24 hours
-        let hours: i64 = params.get("hours").and_then(|h| h.parse().ok()).unwrap_or(24);
+        let hours: i64 = params
+            .get("hours")
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(24);
 
         let now = chrono::Utc::now().naive_utc();
         let period_start = now - chrono::Duration::hours(hours);
@@ -243,7 +247,10 @@ impl ControlPlane {
         // Get job type distribution
         let job_types_query = SeaQuery::select()
             .column(Alias::new("class_name"))
-            .expr_as(Expr::col(Alias::new("class_name")).count(), Alias::new("count"))
+            .expr_as(
+                Expr::col(Alias::new("class_name")).count(),
+                Alias::new("count"),
+            )
             .from(Alias::new(&table_config.jobs))
             .and_where(Expr::col(Alias::new("created_at")).gt(period_start))
             .group_by_col(Alias::new("class_name"))
@@ -345,7 +352,11 @@ impl ControlPlane {
             };
 
             // Check queue status
-            let status = if paused_queue_names.contains(&queue_name) { "paused" } else { "active" };
+            let status = if paused_queue_names.contains(&queue_name) {
+                "paused"
+            } else {
+                "active"
+            };
 
             queue_stats.push(serde_json::json!({
                 "name": queue_name,

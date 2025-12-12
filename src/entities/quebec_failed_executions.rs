@@ -59,7 +59,9 @@ impl ActiveModelBehavior for ActiveModel {}
 impl Retryable for Model {
     async fn retry(&self, txn: &DatabaseTransaction) -> Result<(), DbErr> {
         // 1. Find failed job record
-        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id).one(txn).await?;
+        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id)
+            .one(txn)
+            .await?;
 
         if let Some(job) = job_result {
             // 2. Add job to ready_executions table
@@ -73,12 +75,18 @@ impl Retryable for Model {
             ready_execution.insert(txn).await?;
 
             // 3. Delete failed execution record
-            Entity::delete_many().filter(Column::JobId.eq(self.job_id)).exec(txn).await?;
+            Entity::delete_many()
+                .filter(Column::JobId.eq(self.job_id))
+                .exec(txn)
+                .await?;
 
             info!("Retried failed job {}", self.job_id);
             Ok(())
         } else {
-            Err(DbErr::Custom(format!("Job with ID {} not found", self.job_id)))
+            Err(DbErr::Custom(format!(
+                "Job with ID {} not found",
+                self.job_id
+            )))
         }
     }
 
@@ -90,8 +98,10 @@ impl Retryable for Model {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> =
-            failed_executions.iter().map(|execution| execution.job_id).collect();
+        let job_ids: Vec<i64> = failed_executions
+            .iter()
+            .map(|execution| execution.job_id)
+            .collect();
 
         // 2. Get all related job information
         let jobs = super::quebec_jobs::Entity::find()
@@ -112,8 +122,10 @@ impl Retryable for Model {
         }
 
         // 4. Delete all failed execution records
-        let delete_result =
-            Entity::delete_many().filter(Column::JobId.is_in(job_ids)).exec(txn).await?;
+        let delete_result = Entity::delete_many()
+            .filter(Column::JobId.is_in(job_ids))
+            .exec(txn)
+            .await?;
 
         let count = delete_result.rows_affected;
         info!("Retried all {} failed jobs", jobs.len());
@@ -125,7 +137,9 @@ impl Retryable for Model {
 impl Discardable for Model {
     async fn discard(&self, txn: &DatabaseTransaction) -> Result<(), DbErr> {
         // 1. Find job record
-        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id).one(txn).await?;
+        let job_result = super::quebec_jobs::Entity::find_by_id(self.job_id)
+            .one(txn)
+            .await?;
 
         if let Some(job) = job_result {
             // 2. Update job status to completed
@@ -135,12 +149,18 @@ impl Discardable for Model {
             job_model.update(txn).await?;
 
             // 3. Delete failed execution record
-            Entity::delete_many().filter(Column::JobId.eq(self.job_id)).exec(txn).await?;
+            Entity::delete_many()
+                .filter(Column::JobId.eq(self.job_id))
+                .exec(txn)
+                .await?;
 
             info!("Discarded failed job {}", self.job_id);
             Ok(())
         } else {
-            Err(DbErr::Custom(format!("Job with ID {} not found", self.job_id)))
+            Err(DbErr::Custom(format!(
+                "Job with ID {} not found",
+                self.job_id
+            )))
         }
     }
 
@@ -152,14 +172,18 @@ impl Discardable for Model {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> =
-            failed_executions.iter().map(|execution| execution.job_id).collect();
+        let job_ids: Vec<i64> = failed_executions
+            .iter()
+            .map(|execution| execution.job_id)
+            .collect();
 
         let now = chrono::Utc::now().naive_utc();
 
         // 2. Update all related jobs to completed status
         for job_id in &job_ids {
-            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id).one(txn).await?;
+            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id)
+                .one(txn)
+                .await?;
 
             if let Some(job) = job_result {
                 let mut job_model: super::quebec_jobs::ActiveModel = job.into();
@@ -170,8 +194,10 @@ impl Discardable for Model {
         }
 
         // 3. Delete all failed execution records
-        let delete_result =
-            Entity::delete_many().filter(Column::JobId.is_in(job_ids)).exec(txn).await?;
+        let delete_result = Entity::delete_many()
+            .filter(Column::JobId.is_in(job_ids))
+            .exec(txn)
+            .await?;
 
         let count = delete_result.rows_affected;
         info!("Discarded all {} failed jobs", count);
@@ -196,8 +222,10 @@ impl Retryable for Entity {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> =
-            failed_executions.iter().map(|execution| execution.job_id).collect();
+        let job_ids: Vec<i64> = failed_executions
+            .iter()
+            .map(|execution| execution.job_id)
+            .collect();
 
         // 2. Get all related job information
         let jobs = super::quebec_jobs::Entity::find()
@@ -218,8 +246,10 @@ impl Retryable for Entity {
         }
 
         // 4. Delete all failed execution records
-        let delete_result =
-            Entity::delete_many().filter(Column::JobId.is_in(job_ids)).exec(txn).await?;
+        let delete_result = Entity::delete_many()
+            .filter(Column::JobId.is_in(job_ids))
+            .exec(txn)
+            .await?;
 
         let count = delete_result.rows_affected;
         info!("Retried all {} failed jobs", jobs.len());
@@ -244,14 +274,18 @@ impl Discardable for Entity {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> =
-            failed_executions.iter().map(|execution| execution.job_id).collect();
+        let job_ids: Vec<i64> = failed_executions
+            .iter()
+            .map(|execution| execution.job_id)
+            .collect();
 
         let now = chrono::Utc::now().naive_utc();
 
         // 2. Update all related jobs to completed status
         for job_id in &job_ids {
-            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id).one(txn).await?;
+            let job_result = super::quebec_jobs::Entity::find_by_id(*job_id)
+                .one(txn)
+                .await?;
 
             if let Some(job) = job_result {
                 let mut job_model: super::quebec_jobs::ActiveModel = job.into();
@@ -262,8 +296,10 @@ impl Discardable for Entity {
         }
 
         // 3. Delete all failed execution records
-        let delete_result =
-            Entity::delete_many().filter(Column::JobId.is_in(job_ids)).exec(txn).await?;
+        let delete_result = Entity::delete_many()
+            .filter(Column::JobId.is_in(job_ids))
+            .exec(txn)
+            .await?;
 
         let count = delete_result.rows_affected;
         info!("Discarded all {} failed jobs", count);

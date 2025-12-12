@@ -227,7 +227,13 @@ unsafe fn detach_and_copy_environ(mut area_end: *mut c_char) -> Option<(EnvironC
     let mut pointer_box = pointers.into_boxed_slice();
     *environ_ptr_ptr = pointer_box.as_mut_ptr();
 
-    Some((EnvironCopy { _strings: strings, _pointers: pointer_box }, area_end))
+    Some((
+        EnvironCopy {
+            _strings: strings,
+            _pointers: pointer_box,
+        },
+        area_end,
+    ))
 }
 
 #[cfg(test)]

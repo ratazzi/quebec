@@ -30,7 +30,10 @@ impl WorkerConfig {
     fn __repr__(&self) -> String {
         format!(
             "WorkerConfig(queues={}, threads={:?}, polling_interval={:?})",
-            self.queues.as_ref().map(|q| q.to_string()).unwrap_or_else(|| "None".to_string()),
+            self.queues
+                .as_ref()
+                .map(|q| q.to_string())
+                .unwrap_or_else(|| "None".to_string()),
             self.threads,
             self.polling_interval
         )
@@ -119,16 +122,22 @@ impl QueueSelector {
             QueueSelector::All => vec![(false, "*".to_string())], // Special marker for all
             QueueSelector::Single(q) => {
                 let is_wildcard = q.ends_with('*');
-                let pattern =
-                    if is_wildcard { q.trim_end_matches('*').to_string() } else { q.clone() };
+                let pattern = if is_wildcard {
+                    q.trim_end_matches('*').to_string()
+                } else {
+                    q.clone()
+                };
                 vec![(is_wildcard, pattern)]
             }
             QueueSelector::Multiple(qs) => qs
                 .iter()
                 .map(|q| {
                     let is_wildcard = q.ends_with('*');
-                    let pattern =
-                        if is_wildcard { q.trim_end_matches('*').to_string() } else { q.clone() };
+                    let pattern = if is_wildcard {
+                        q.trim_end_matches('*').to_string()
+                    } else {
+                        q.clone()
+                    };
                     (is_wildcard, pattern)
                 })
                 .collect(),
@@ -163,7 +172,9 @@ impl<'de> serde::Deserialize<'de> for QueueSelector {
                     .collect();
                 queues.map(QueueSelector::Multiple)
             }
-            _ => Err(D::Error::custom("Queues must be '*', a string, or a list of strings")),
+            _ => Err(D::Error::custom(
+                "Queues must be '*', a string, or a list of strings",
+            )),
         }
     }
 }
@@ -325,7 +336,10 @@ impl QueueConfig {
             if path.exists() {
                 return Ok(path.to_path_buf());
             } else {
-                anyhow::bail!("Config file specified in QUEBEC_CONFIG not found: {}", env_path);
+                anyhow::bail!(
+                    "Config file specified in QUEBEC_CONFIG not found: {}",
+                    env_path
+                );
             }
         }
 
@@ -382,7 +396,11 @@ impl QueueConfig {
         format!(
             "QueueConfig(name={}, database={}, workers={}, dispatchers={})",
             self.name.as_deref().unwrap_or("quebec"),
-            if self.database.is_some() { "configured" } else { "None" },
+            if self.database.is_some() {
+                "configured"
+            } else {
+                "None"
+            },
             self.workers.as_ref().map_or(0, |w| w.len()),
             self.dispatchers.as_ref().map_or(0, |d| d.len())
         )

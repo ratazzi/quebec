@@ -12,7 +12,8 @@ use crate::control_plane::{models::JobDetailsInfo, ControlPlane};
 
 impl ControlPlane {
     pub async fn job_details(
-        State(state): State<Arc<ControlPlane>>, Path(id): Path<i64>,
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
@@ -92,8 +93,10 @@ impl ControlPlane {
             };
 
             // Calculate runtime (if completed)
-            let runtime = if let Some(finished) =
-                row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at").ok().flatten()
+            let runtime = if let Some(finished) = row
+                .try_get::<Option<chrono::NaiveDateTime>>("", "finished_at")
+                .ok()
+                .flatten()
             {
                 if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at") {
                     let duration = finished.signed_duration_since(created);
@@ -207,8 +210,9 @@ impl ControlPlane {
                         // Calculate waiting time
                         if let Ok(created) = row.try_get::<chrono::NaiveDateTime>("", "created_at")
                         {
-                            let duration =
-                                chrono::Utc::now().naive_utc().signed_duration_since(created);
+                            let duration = chrono::Utc::now()
+                                .naive_utc()
+                                .signed_duration_since(created);
                             job_details.waiting_time =
                                 Some(format!("{} seconds", duration.num_seconds()));
                         }
@@ -358,12 +362,17 @@ impl ControlPlane {
                 },
             );
 
-            let html = state.render_template("job-details.html", &mut context).await?;
+            let html = state
+                .render_template("job-details.html", &mut context)
+                .await?;
             debug!("Template rendering completed in {:?}", start.elapsed());
 
             Ok(Html(html))
         } else {
-            Err((StatusCode::NOT_FOUND, format!("Job with ID {} not found", id)))
+            Err((
+                StatusCode::NOT_FOUND,
+                format!("Job with ID {} not found", id),
+            ))
         }
     }
 }

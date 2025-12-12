@@ -104,7 +104,10 @@ impl EntityTrait for quebec_semaphores::Entity {
 
 #[pyfunction]
 fn signal_handler(
-    py: Python<'_>, signum: i32, _frame: PyObject, quebec: Py<PyAny>,
+    py: Python<'_>,
+    signum: i32,
+    _frame: PyObject,
+    quebec: Py<PyAny>,
 ) -> PyResult<()> {
     info!("Received signal {}, initiating graceful shutdown", signum);
 
@@ -126,8 +129,11 @@ impl ActiveLogger {
     #[new]
     pub fn new() -> Self {
         let thread_id = std::thread::current().id();
-        let span =
-            tracing::span!(tracing::Level::INFO, "execution", tid = format!("{:?}", thread_id));
+        let span = tracing::span!(
+            tracing::Level::INFO,
+            "execution",
+            tid = format!("{:?}", thread_id)
+        );
         ActiveLogger { span }
     }
 
@@ -659,7 +665,9 @@ impl PyQuebec {
     fn on_start(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
-            return Err(PyTypeError::new_err("Expected a callable object for start handler"));
+            return Err(PyTypeError::new_err(
+                "Expected a callable object for start handler",
+            ));
         }
 
         {
@@ -678,7 +686,9 @@ impl PyQuebec {
     fn on_stop(&mut self, py: Python<'_>, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
-            return Err(PyTypeError::new_err("Expected a callable object for stop handler"));
+            return Err(PyTypeError::new_err(
+                "Expected a callable object for stop handler",
+            ));
         }
 
         {
@@ -712,7 +722,10 @@ impl PyQuebec {
 
     #[pyo3(signature = (klass, *args, **kwargs))]
     pub fn perform_later(
-        &self, py: Python<'_>, klass: &Bound<'_, PyType>, args: &Bound<'_, PyTuple>,
+        &self,
+        py: Python<'_>,
+        klass: &Bound<'_, PyType>,
+        args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         let bound = klass;
@@ -731,38 +744,46 @@ impl PyQuebec {
         let instance = bound.call0()?;
 
         // Check if this job class has concurrency control without needing GIL
-        let (concurrency_key, concurrency_limit) =
-            if self.worker.ctx.has_concurrency_control(&class_name.to_string()) {
-                // If concurrency_info exists, concurrency control is definitely enabled
-                let runnable =
-                    self.worker.ctx.get_runnable(&class_name.to_string()).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to get runnable: {:?}",
-                            e
-                        ))
-                    })?;
+        let (concurrency_key, concurrency_limit) = if self
+            .worker
+            .ctx
+            .has_concurrency_control(&class_name.to_string())
+        {
+            // If concurrency_info exists, concurrency control is definitely enabled
+            let runnable = self
+                .worker
+                .ctx
+                .get_runnable(&class_name.to_string())
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to get runnable: {:?}",
+                        e
+                    ))
+                })?;
 
-                let concurrency_constraint =
-                    runnable.get_concurrency_constraint(Some(args), kwargs).map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to get concurrency info: {:?}",
-                            e
-                        ))
-                    })?;
+            let concurrency_constraint = runnable
+                .get_concurrency_constraint(Some(args), kwargs)
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to get concurrency info: {:?}",
+                        e
+                    ))
+                })?;
 
-                if let Some(constraint) = concurrency_constraint {
-                    (Some(constraint.key), Some(constraint.limit))
-                } else {
-                    (None, None)
-                }
+            if let Some(constraint) = concurrency_constraint {
+                (Some(constraint.key), Some(constraint.limit))
             } else {
                 (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
 
         // Convert Python args and kwargs to JSON only for job arguments storage
         let args_json = crate::utils::python_object(&args).into_json(py)?;
-        let kwargs_json =
-            kwargs.map(|k| crate::utils::python_object(&k).into_json(py)).transpose()?;
+        let kwargs_json = kwargs
+            .map(|k| crate::utils::python_object(&k).into_json(py))
+            .transpose()?;
 
         // Merge args and kwargs for job arguments storage
         let mut combined_args_json = args_json.clone();
@@ -830,7 +851,9 @@ impl PyQuebec {
     fn register_job(&self, py: Python, job_class: Py<PyAny>) -> PyResult<Py<PyAny>> {
         // Check if the passed object is a class
         if !job_class.bind(py).is_instance_of::<PyType>() {
-            return Err(PyTypeError::new_err("Expected a class, but got an instance"));
+            return Err(PyTypeError::new_err(
+                "Expected a class, but got an instance",
+            ));
         }
 
         let binding = job_class.clone();
@@ -866,11 +889,22 @@ impl PyQuebec {
         let kwargs = PyDict::new(py);
         kwargs.set_item("quebec", quebec_obj)?;
 
-        let wrapped_handler = functools.getattr("partial")?.call((handler_func,), Some(&kwargs))?;
+        let wrapped_handler = functools
+            .getattr("partial")?
+            .call((handler_func,), Some(&kwargs))?;
 
-        signal.call_method1("signal", (signal.getattr("SIGINT")?, wrapped_handler.clone()))?;
-        signal.call_method1("signal", (signal.getattr("SIGTERM")?, wrapped_handler.clone()))?;
-        signal.call_method1("signal", (signal.getattr("SIGQUIT")?, wrapped_handler.clone()))?;
+        signal.call_method1(
+            "signal",
+            (signal.getattr("SIGINT")?, wrapped_handler.clone()),
+        )?;
+        signal.call_method1(
+            "signal",
+            (signal.getattr("SIGTERM")?, wrapped_handler.clone()),
+        )?;
+        signal.call_method1(
+            "signal",
+            (signal.getattr("SIGQUIT")?, wrapped_handler.clone()),
+        )?;
 
         info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
         Ok(wrapped_handler.into_pyobject(py)?.into())
@@ -983,7 +1017,9 @@ impl PyQuebec {
     fn on_shutdown(&mut self, py: Python, handler: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let callable = handler.bind(py);
         if !callable.is_callable() {
-            return Err(PyTypeError::new_err("Expected a callable object for shutdown handler"));
+            return Err(PyTypeError::new_err(
+                "Expected a callable object for shutdown handler",
+            ));
         }
 
         {
@@ -1204,7 +1240,9 @@ impl ActiveJob {
 
     #[classmethod]
     pub fn register_rescue_strategy(
-        cls: &Bound<'_, PyType>, py: Python<'_>, strategy: Py<PyAny>,
+        cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        strategy: Py<PyAny>,
     ) -> PyResult<()> {
         let strategy = strategy.extract::<RescueStrategy>(py)?;
         let rescue_strategies = cls.getattr("rescue_strategies")?;
@@ -1250,7 +1288,10 @@ impl ActiveJob {
     #[classmethod]
     #[pyo3(signature = ( quebec, *args, **kwargs))]
     fn perform_later(
-        cls: &Bound<'_, PyType>, py: Python<'_>, quebec: &PyQuebec, args: &Bound<'_, PyTuple>,
+        cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        quebec: &PyQuebec,
+        args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         quebec.perform_later(py, cls, args, kwargs)
@@ -1259,7 +1300,9 @@ impl ActiveJob {
     #[classmethod]
     #[pyo3(signature = (*args, **kwargs))]
     fn perform_later1(
-        cls: &Bound<'_, PyType>, py: Python<'_>, args: &Bound<'_, PyTuple>,
+        cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        args: &Bound<'_, PyTuple>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;

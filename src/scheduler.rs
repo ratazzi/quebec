@@ -67,7 +67,9 @@ use tracing::{error, info, trace, warn};
 // RETURNING "id"
 // ```
 pub async fn upsert_task<C>(
-    db: &C, table_config: &crate::context::TableConfig, entry: ScheduledEntry,
+    db: &C,
+    table_config: &crate::context::TableConfig,
+    entry: ScheduledEntry,
 ) -> Result<ExecResult, DbErr>
 where
     C: ConnectionTrait,
@@ -160,7 +162,10 @@ where
 }
 
 pub async fn enqueue_job<C>(
-    ctx: &Arc<AppContext>, db: &C, entry: ScheduledEntry, scheduled_at: NaiveDateTime,
+    ctx: &Arc<AppContext>,
+    db: &C,
+    entry: ScheduledEntry,
+    scheduled_at: NaiveDateTime,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
@@ -228,7 +233,9 @@ where
 
     let job = job.try_into_model()?;
 
-    let task_key = entry.key.ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
+    let task_key = entry
+        .key
+        .ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
     let _recurring_execution = quebec_recurring_executions::ActiveModel {
         id: ActiveValue::not_set(),
         job_id: ActiveValue::Set(job.id),
@@ -259,7 +266,10 @@ where
             .save(db)
             .await?;
         } else {
-            warn!("Scheduler: Failed to acquire semaphore for key: {}", constraint.key);
+            warn!(
+                "Scheduler: Failed to acquire semaphore for key: {}",
+                constraint.key
+            );
 
             // Create blocked execution - job must wait
             let block_now = chrono::Utc::now().naive_utc();
@@ -311,7 +321,10 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub fn new(ctx: Arc<AppContext>) -> Self {
-        Self { ctx, schedule: Vec::new() }
+        Self {
+            ctx,
+            schedule: Vec::new(),
+        }
     }
 
     fn parse_schedule_file(
@@ -338,7 +351,11 @@ impl Scheduler {
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
 
         let _delta = chrono::Duration::seconds(
-            self.ctx.dispatcher_polling_interval.as_secs().try_into().unwrap_or(1),
+            self.ctx
+                .dispatcher_polling_interval
+                .as_secs()
+                .try_into()
+                .unwrap_or(1),
         );
         let mut scheduled = Vec::<ScheduledEntry>::new();
 
@@ -413,7 +430,10 @@ impl Scheduler {
                 let cron = match entry.as_cron() {
                     Ok(c) => c,
                     Err(e) => {
-                        error!("Failed to parse cron expression for task {}: {}", task_key, e);
+                        error!(
+                            "Failed to parse cron expression for task {}: {}",
+                            task_key, e
+                        );
                         return;
                     }
                 };
@@ -421,7 +441,10 @@ impl Scheduler {
                 let mut last = match cron.find_next_occurrence(&time, false) {
                     Ok(occurrence) => occurrence,
                     Err(e) => {
-                        error!("Failed to find next occurrence for task {}: {}", task_key, e);
+                        error!(
+                            "Failed to find next occurrence for task {}: {}",
+                            task_key, e
+                        );
                         return;
                     }
                 };
@@ -429,7 +452,10 @@ impl Scheduler {
 
                 loop {
                     if graceful_shutdown.is_cancelled() {
-                        info!("Scheduler task for {} exiting due to shutdown signal", task_key);
+                        info!(
+                            "Scheduler task for {} exiting due to shutdown signal",
+                            task_key
+                        );
                         break;
                     }
 
