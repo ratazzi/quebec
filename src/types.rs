@@ -978,6 +978,7 @@ pub struct ActiveJob {
     pub finished_at: Option<chrono::NaiveDateTime>,
     pub concurrency_key: Option<String>,
     pub concurrency_limit: Option<i32>,
+    pub concurrency_on_conflict: crate::context::ConcurrencyConflict,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
     // pub rescue_strategies: Vec<RescueStrategy>,
@@ -1031,6 +1032,7 @@ impl ActiveJob {
             finished_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_on_conflict: crate::context::ConcurrencyConflict::default(),
             created_at: None,
             updated_at: None,
             // rescue_strategies: vec![],
@@ -1095,6 +1097,16 @@ impl ActiveJob {
     #[getter]
     pub fn get_concurrency_key(&self) -> Option<&str> {
         self.concurrency_key.as_deref()
+    }
+
+    #[getter]
+    pub fn get_concurrency_on_conflict(&self) -> crate::context::ConcurrencyConflict {
+        self.concurrency_on_conflict
+    }
+
+    #[setter]
+    pub fn set_concurrency_on_conflict(&mut self, value: crate::context::ConcurrencyConflict) {
+        self.concurrency_on_conflict = value;
     }
 
     #[getter]

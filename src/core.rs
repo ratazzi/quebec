@@ -75,34 +75,51 @@ impl Quebec {
                     let job_id = job_model.id;
                     let job_priority = job_model.priority;
 
+                    // Get queue_name from job for proper propagation
+                    let job_queue_name = job_model.queue_name.clone();
+
+                    // Get conflict strategy from job
+                    let conflict_strategy = job.concurrency_on_conflict;
+
                     if !concurrency_key.is_empty() {
                         // Try to acquire the semaphore
                         let expires_at = now + duration;
                         if acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await? {
                             info!("Semaphore acquired for key: {}", concurrency_key);
                         } else {
-                            info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
+                            // Handle based on conflict strategy
+                            match conflict_strategy {
+                                crate::context::ConcurrencyConflict::Discard => {
+                                    // Discard strategy: silently drop the job without blocking
+                                    info!("Concurrency limit reached for key: {}, discarding job (conflict strategy: discard)", concurrency_key);
+                                    return Ok(job_model);
+                                }
+                                crate::context::ConcurrencyConflict::Block => {
+                                    // Block strategy: add to blocked queue (default behavior)
+                                    info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
 
-                            let _blocked_execution = quebec_blocked_executions::ActiveModel {
-                                id: ActiveValue::NotSet,
-                                queue_name: ActiveValue::Set("default".to_string()),
-                                job_id: ActiveValue::Set(job_id),
-                                priority: ActiveValue::Set(job_priority),
-                                concurrency_key: ActiveValue::Set(concurrency_key.clone()),
-                                expires_at: ActiveValue::Set(expires_at),
-                                created_at: ActiveValue::Set(now),
+                                    let _blocked_execution = quebec_blocked_executions::ActiveModel {
+                                        id: ActiveValue::NotSet,
+                                        queue_name: ActiveValue::Set(job_queue_name.clone()),
+                                        job_id: ActiveValue::Set(job_id),
+                                        priority: ActiveValue::Set(job_priority),
+                                        concurrency_key: ActiveValue::Set(concurrency_key.clone()),
+                                        expires_at: ActiveValue::Set(expires_at),
+                                        created_at: ActiveValue::Set(now),
+                                    }
+                                    .save(txn)
+                                    .await?;
+
+                                    // Job is blocked, don't add to ready queue
+                                    return Ok(job_model);
+                                }
                             }
-                            .save(txn)
-                            .await?;
-
-                            // Job is blocked, don't add to ready queue
-                            return Ok(job_model);
                         }
                     }
 
                     let _ready_execution = quebec_ready_executions::ActiveModel {
                         id: ActiveValue::NotSet,
-                        queue_name: ActiveValue::Set("default".to_string()),
+                        queue_name: ActiveValue::Set(job_queue_name),
                         job_id: ActiveValue::Set(job_id),
                         priority: ActiveValue::Set(job_priority),
                         created_at: ActiveValue::Set(now),

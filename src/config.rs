@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::path::Path;
 use anyhow::Result;
 use pyo3::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Worker configuration
 /// Compatible with Solid Queue's worker config
@@ -52,9 +52,9 @@ impl WorkerConfig {
 /// Handles different queue specification formats from Solid Queue
 #[derive(Debug, Clone)]
 pub enum QueueSelector {
-    All,                    // "*"
-    Single(String),         // "default"
-    Multiple(Vec<String>),  // ["real_time", "background"]
+    All,                   // "*"
+    Single(String),        // "default"
+    Multiple(Vec<String>), // ["real_time", "background"]
 }
 
 impl QueueSelector {
@@ -85,10 +85,7 @@ impl QueueSelector {
             QueueSelector::Single(q) if !q.ends_with('*') => vec![q.clone()],
             QueueSelector::Single(_) => vec![],
             QueueSelector::Multiple(qs) => {
-                qs.iter()
-                    .filter(|q| !q.ends_with('*'))
-                    .cloned()
-                    .collect()
+                qs.iter().filter(|q| !q.ends_with('*')).cloned().collect()
             }
         }
     }
@@ -101,18 +98,48 @@ impl QueueSelector {
                 vec![q.trim_end_matches('*').to_string()]
             }
             QueueSelector::Single(_) => vec![],
-            QueueSelector::Multiple(qs) => {
-                qs.iter()
-                    .filter(|q| q.ends_with('*'))
-                    .map(|q| q.trim_end_matches('*').to_string())
-                    .collect()
-            }
+            QueueSelector::Multiple(qs) => qs
+                .iter()
+                .filter(|q| q.ends_with('*'))
+                .map(|q| q.trim_end_matches('*').to_string())
+                .collect(),
         }
     }
 
     /// Check if has any wildcard patterns
     pub fn has_wildcards(&self) -> bool {
         !self.wildcard_prefixes().is_empty()
+    }
+
+    /// Get ordered queue patterns for processing in configuration order
+    /// Returns a list of (is_wildcard, pattern) tuples
+    /// This preserves queue ordering semantics from Solid Queue
+    pub fn ordered_patterns(&self) -> Vec<(bool, String)> {
+        match self {
+            QueueSelector::All => vec![(false, "*".to_string())], // Special marker for all
+            QueueSelector::Single(q) => {
+                let is_wildcard = q.ends_with('*');
+                let pattern = if is_wildcard {
+                    q.trim_end_matches('*').to_string()
+                } else {
+                    q.clone()
+                };
+                vec![(is_wildcard, pattern)]
+            }
+            QueueSelector::Multiple(qs) => {
+                qs.iter()
+                    .map(|q| {
+                        let is_wildcard = q.ends_with('*');
+                        let pattern = if is_wildcard {
+                            q.trim_end_matches('*').to_string()
+                        } else {
+                            q.clone()
+                        };
+                        (is_wildcard, pattern)
+                    })
+                    .collect()
+            }
+        }
     }
 }
 
@@ -143,9 +170,7 @@ impl<'de> serde::Deserialize<'de> for QueueSelector {
                     .collect();
                 queues.map(QueueSelector::Multiple)
             }
-            _ => Err(D::Error::custom(
-                "Queues must be '*', a string, or a list of strings",
-            )),
+            _ => Err(D::Error::custom("Queues must be '*', a string, or a list of strings")),
         }
     }
 }
@@ -271,9 +296,10 @@ impl QueueConfig {
                 let dispatchers_key = serde_yaml::Value::String("dispatchers".to_string());
                 let database_key = serde_yaml::Value::String("database".to_string());
 
-                if map.contains_key(&workers_key) ||
-                   map.contains_key(&dispatchers_key) ||
-                   map.contains_key(&database_key) {
+                if map.contains_key(&workers_key)
+                    || map.contains_key(&dispatchers_key)
+                    || map.contains_key(&database_key)
+                {
                     // This is a direct config, parse it
                     let config: QueueConfig = serde_yaml::from_value(value)?;
                     return Ok(config);
@@ -382,6 +408,6 @@ impl QueueConfig {
 
 /// Default configuration file paths (in priority order)
 const DEFAULT_CONFIG_PATHS: &[&str] = &[
-    "queue.yml",           // Current directory (Python projects)
-    "config/queue.yml",    // Solid Queue compatible (Rails projects)
+    "queue.yml",        // Current directory (Python projects)
+    "config/queue.yml", // Solid Queue compatible (Rails projects)
 ];

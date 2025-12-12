@@ -80,45 +80,90 @@ where
     acquire_semaphore(db, table_config, constraint.key.clone(), constraint.limit, constraint.duration).await
 }
 
-pub async fn release_semaphore<C>(db: &C, table_config: &TableConfig, key: String) -> Result<(), DbErr>
+/// Release a semaphore, incrementing its value up to the limit.
+/// When value reaches limit (all slots free), keeps the record and updates expires_at.
+/// This matches Solid Queue's behavior in Semaphore#signal -> attempt_increment.
+///
+/// Semaphore value model (matching Solid Queue):
+/// - value = limit: all slots are free
+/// - value = limit - 1: initial state after first job acquires
+/// - value = 0: no slots available (all slots occupied)
+/// - Acquire: decrement value (if value > 0)
+/// - Release: increment value (if value < limit), or just update expires_at
+pub async fn release_semaphore<C>(db: &C, table_config: &TableConfig, key: String, limit: i32, duration: Option<chrono::Duration>) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
     let now = chrono::Utc::now().naive_utc();
+    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
 
-    let sql = match db.get_database_backend() {
+    // Try to increment the semaphore value if below max (limit)
+    // value ranges from 0 to limit, where limit means all slots are free
+    // This matches Solid Queue's: Semaphore.where(key: key, value: ...limit).update_all(...)
+    let increment_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
-            format!("INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (key) DO UPDATE SET \
-             value = {}.value + 1, \
-             updated_at = EXCLUDED.updated_at", table_config.semaphores, table_config.semaphores)
-        }
-        DatabaseBackend::MySql => {
-            format!("INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE \
+            format!("UPDATE {} SET \
              value = value + 1, \
-             updated_at = VALUES(updated_at)", table_config.semaphores)
-        }
+             expires_at = $2, \
+             updated_at = $3 \
+             WHERE key = $1 AND value < $4", table_config.semaphores)
+        },
+        DatabaseBackend::MySql => {
+            format!("UPDATE {} SET \
+             value = value + 1, \
+             expires_at = ?, \
+             updated_at = ? \
+             WHERE key = ? AND value < ?", table_config.semaphores)
+        },
     };
 
-    let result = db
+    let increment_result = db
         .execute(Statement::from_sql_and_values(
             db.get_database_backend(),
-            sql,
-            vec![
-                key.into(),
-                1.into(),
-                now.into(), // expires_at is not relevant for release
-                now.into(),
-                now.into(),
-            ],
+            increment_sql,
+            vec![key.clone().into(), expires_at.into(), now.into(), limit.into()],
         ))
-        .await;
+        .await?;
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
+    if increment_result.rows_affected() > 0 {
+        // Successfully incremented
+        return Ok(true);
     }
+
+    // If increment didn't work, either:
+    // 1. The semaphore doesn't exist
+    // 2. The value is already at limit - 1 (all slots free)
+    // In case 2, just update expires_at to keep the semaphore alive (don't delete!)
+    let update_expires_sql = match db.get_database_backend() {
+        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+            format!("UPDATE {} SET \
+             expires_at = $2, \
+             updated_at = $3 \
+             WHERE key = $1", table_config.semaphores)
+        },
+        DatabaseBackend::MySql => {
+            format!("UPDATE {} SET \
+             expires_at = ?, \
+             updated_at = ? \
+             WHERE key = ?", table_config.semaphores)
+        },
+    };
+
+    let update_result = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            update_expires_sql,
+            vec![key.into(), expires_at.into(), now.into()],
+        ))
+        .await?;
+
+    Ok(update_result.rows_affected() > 0)
+}
+
+/// Convenience function to release semaphore using ConcurrencyConstraint
+pub async fn release_semaphore_with_constraint<C>(db: &C, table_config: &TableConfig, constraint: &ConcurrencyConstraint) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    release_semaphore(db, table_config, constraint.key.clone(), constraint.limit, constraint.duration).await
 }

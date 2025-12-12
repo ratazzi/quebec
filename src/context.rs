@@ -23,6 +23,38 @@ pub struct ConcurrencyConstraint {
     pub duration: Option<chrono::Duration>,
 }
 
+/// Concurrency conflict strategy - what to do when concurrency limit is reached
+/// Matches Solid Queue's concurrency_on_conflict option
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConcurrencyConflict {
+    /// Block the job until a slot becomes available (default behavior)
+    #[default]
+    Block = 0,
+    /// Discard the job silently without executing
+    Discard = 1,
+}
+
+#[pymethods]
+impl ConcurrencyConflict {
+    #[staticmethod]
+    fn block() -> Self {
+        ConcurrencyConflict::Block
+    }
+
+    #[staticmethod]
+    fn discard() -> Self {
+        ConcurrencyConflict::Discard
+    }
+
+    fn __repr__(&self) -> String {
+        match self {
+            ConcurrencyConflict::Block => "ConcurrencyConflict.Block".to_string(),
+            ConcurrencyConflict::Discard => "ConcurrencyConflict.Discard".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub jobs: String,

@@ -123,11 +123,12 @@ impl Dispatcher {
                                               info!("Semaphore acquired for key: {}", concurrency_key);
 
                                               // Move blocked execution to ready execution
+                                              // Use job's queue_name and priority (inherit from job like Solid Queue)
                                               let ready_execution = quebec_ready_executions::ActiveModel {
                                                   id: ActiveValue::NotSet,
-                                                  queue_name: ActiveValue::Set("default".to_string()),
+                                                  queue_name: ActiveValue::Set(job.queue_name.clone()),
                                                   job_id: ActiveValue::Set(execution.job_id),
-                                                  priority: ActiveValue::Set(0),
+                                                  priority: ActiveValue::Set(job.priority),
                                                   created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
                                               };
 

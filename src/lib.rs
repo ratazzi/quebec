@@ -87,6 +87,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyQuebec>()?;
     m.add_class::<ActiveJob>()?;
     m.add_class::<ConcurrencyStrategy>()?;
+    m.add_class::<ConcurrencyConflict>()?;
     m.add_class::<RescueStrategy>()?;
     m.add_class::<RetryStrategy>()?;
     m.add_class::<DiscardStrategy>()?;
@@ -100,6 +101,9 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<config::WorkerConfig>()?;
     m.add_class::<config::DispatcherConfig>()?;
     m.add_class::<config::DatabaseConfig>()?;
+
+    // Add version information
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     // Configuration functions
 
