@@ -5,7 +5,7 @@
 
 use sea_orm::sea_query::{
     Alias, Asterisk, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
-    PostgresQueryBuilder, Query, SelectStatement, SqliteQueryBuilder, UpdateStatement,
+    PostgresQueryBuilder, Query, Returning, SelectStatement, SqliteQueryBuilder, UpdateStatement,
 };
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, FromQueryResult, Statement, Value};
 
@@ -63,13 +63,20 @@ where
 }
 
 /// Execute a SELECT query and return a single result
-pub async fn execute_select_one<T, C>(db: &C, query: SelectStatement) -> Result<Option<T>, DbErr>
+/// Adds LIMIT 1 to the query for efficiency
+pub async fn execute_select_one<T, C>(
+    db: &C,
+    mut query: SelectStatement,
+) -> Result<Option<T>, DbErr>
 where
     T: FromQueryResult,
     C: ConnectionTrait,
 {
-    let results = execute_select::<T, C>(db, query).await?;
-    Ok(results.into_iter().next())
+    // Add LIMIT 1 to avoid fetching unnecessary rows
+    query.limit(1);
+    let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+    let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+    T::find_by_statement(stmt).one(db).await
 }
 
 /// Execute an INSERT query and return the last insert ID
@@ -97,6 +104,45 @@ where
         DbBackend::Sqlite | DbBackend::MySql => {
             let result = db.execute(stmt).await?;
             Ok(result.last_insert_id() as i64)
+        }
+    }
+}
+
+/// Execute an INSERT query with RETURNING * and return the full model
+/// For PostgreSQL/SQLite: uses RETURNING * to get all columns in one query
+/// For MySQL: falls back to insert + select (MySQL doesn't support RETURNING)
+pub async fn execute_insert_returning<T, C>(
+    db: &C,
+    mut query: InsertStatement,
+    fallback_select: impl FnOnce(i64) -> SelectStatement,
+) -> Result<T, DbErr>
+where
+    T: FromQueryResult,
+    C: ConnectionTrait,
+{
+    match db.get_database_backend() {
+        DbBackend::Postgres | DbBackend::Sqlite => {
+            // Add RETURNING * for Postgres/SQLite
+            query.returning(Returning::new().all());
+            let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
+            let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+            T::find_by_statement(stmt).one(db).await?.ok_or_else(|| {
+                DbErr::Custom("Insert with RETURNING did not return a row".to_string())
+            })
+        }
+        DbBackend::MySql => {
+            // MySQL doesn't support RETURNING, fall back to insert + select
+            query.returning_col(col("id"));
+            let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
+            let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+            let result = db.execute(stmt).await?;
+            let id = result.last_insert_id() as i64;
+
+            // Use the provided fallback select query
+            let select_query = fallback_select(id);
+            execute_select_one(db, select_query)
+                .await?
+                .ok_or_else(|| DbErr::Custom("Failed to find inserted row".to_string()))
         }
     }
 }
@@ -279,6 +325,66 @@ pub mod jobs {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Insert a new job and return the full model (optimized with RETURNING * for Postgres/SQLite)
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_returning<C>(
+        db: &C,
+        table_config: &TableConfig,
+        queue_name: &str,
+        class_name: &str,
+        arguments: Option<&str>,
+        priority: i32,
+        active_job_id: Option<&str>,
+        scheduled_at: Option<chrono::NaiveDateTime>,
+        concurrency_key: Option<&str>,
+    ) -> Result<quebec_jobs::Model, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_name = table_config.jobs.clone();
+        let table = Alias::new(&table_name);
+        let now = chrono::Utc::now().naive_utc();
+
+        let query = Query::insert()
+            .into_table(table)
+            .columns([
+                col("queue_name"),
+                col("class_name"),
+                col("arguments"),
+                col("priority"),
+                col("failed_attempts"),
+                col("active_job_id"),
+                col("scheduled_at"),
+                col("concurrency_key"),
+                col("created_at"),
+                col("updated_at"),
+            ])
+            .values_panic([
+                queue_name.into(),
+                class_name.into(),
+                arguments.into(),
+                priority.into(),
+                0i32.into(), // failed_attempts default
+                active_job_id.into(),
+                scheduled_at.into(),
+                concurrency_key.into(),
+                now.into(),
+                now.into(),
+            ])
+            .to_owned();
+
+        // Use execute_insert_returning which handles RETURNING * for Postgres/SQLite
+        // and falls back to insert + select for MySQL
+        execute_insert_returning(db, query, |id| {
+            Query::select()
+                .column(Asterisk)
+                .from(Alias::new(&table_name))
+                .and_where(Expr::col(col("id")).eq(id))
+                .to_owned()
+        })
+        .await
     }
 
     /// Update a job's finished_at timestamp

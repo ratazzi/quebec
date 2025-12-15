@@ -55,8 +55,9 @@ impl Quebec {
                     let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
                     let concurrency_limit = job.concurrency_limit.unwrap_or(1);
 
-                    // Insert job using query_builder with dynamic table names
-                    let job_id = query_builder::jobs::insert(
+                    // Insert job using query_builder with RETURNING * optimization
+                    // This avoids a second round-trip for Postgres/SQLite
+                    let job_model = query_builder::jobs::insert_returning(
                         txn,
                         &ctx.table_config,
                         &job.queue_name,
@@ -69,10 +70,7 @@ impl Quebec {
                     )
                     .await?;
 
-                    // Fetch the inserted job model
-                    let job_model = query_builder::jobs::find_by_id(txn, &ctx.table_config, job_id)
-                        .await?
-                        .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
+                    let job_id = job_model.id;
 
                     let job_priority = job_model.priority;
 
@@ -83,6 +81,9 @@ impl Quebec {
                     let conflict_strategy = job.concurrency_on_conflict;
 
                     // Check if job is scheduled for the future
+                    // Note: When no scheduled_at is specified, it defaults to job creation time.
+                    // By the time we reach this check, `now` will be >= creation time,
+                    // so only explicitly future-scheduled jobs will take this branch.
                     let is_scheduled = job.scheduled_at > now;
 
                     if is_scheduled {
@@ -113,9 +114,18 @@ impl Quebec {
                             // Handle based on conflict strategy
                             match conflict_strategy {
                                 crate::context::ConcurrencyConflict::Discard => {
-                                    // Discard strategy: mark job as finished to avoid dangling job
+                                    // Discard strategy: mark job as finished without execution.
+                                    // This is the expected behavior when user chooses "discard" -
+                                    // the job is intentionally dropped when concurrency limit is reached.
+                                    // Note: The job will appear as "finished" but was never executed.
+                                    // For observability, monitor this log or use external metrics.
                                     // Don't notify - job was discarded
-                                    info!("Concurrency limit reached for key: {}, discarding job (conflict strategy: discard)", concurrency_key);
+                                    warn!(
+                                        job_id = job_id,
+                                        concurrency_key = %concurrency_key,
+                                        class_name = %job.class_name,
+                                        "Job discarded due to concurrency limit (conflict_strategy=discard)"
+                                    );
                                     query_builder::jobs::mark_finished(txn, &ctx.table_config, job_id).await?;
                                     return Ok((job_model, false));
                                 }

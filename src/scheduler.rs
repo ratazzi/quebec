@@ -253,8 +253,12 @@ where
             );
 
             // Create blocked execution - job must wait
+            // Use constraint's duration for consistency with acquire_semaphore_with_constraint
             let block_now = chrono::Utc::now().naive_utc();
-            let duration = ctx.default_concurrency_control_period;
+            let duration = constraint.duration.unwrap_or_else(|| {
+                chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
+            });
             let expires_at = block_now + duration;
 
             query_builder::blocked_executions::insert(
@@ -454,6 +458,8 @@ impl Scheduler {
                     let scheduled_at = next_wall.naive_utc();
 
                     if next_wall == last {
+                        // Avoid busy-wait: sleep briefly before rechecking
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         continue;
                     } else {
                         last = next_wall;
@@ -481,7 +487,8 @@ impl Scheduler {
                         Err(_) => {
                             // Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60... seconds
                             time_error_count = time_error_count.saturating_add(1);
-                            let backoff_secs = std::cmp::min(2u64.saturating_pow(time_error_count), 60);
+                            let backoff_secs =
+                                std::cmp::min(2u64.saturating_pow(time_error_count), 60);
                             warn!(
                                 "Could not convert negative duration for task {} (attempt {}). \
                                  This can happen due to system time changes (e.g., NTP sync, DST). \
@@ -509,18 +516,23 @@ impl Scheduler {
                     }
 
                     let start_time = Instant::now();
-                    let _ = db
-                        .transaction::<_, (), DbErr>(|txn| {
+                    let result = db
+                        .transaction::<_, bool, DbErr>(|txn| {
                             let entry = entry.clone();
                             let task_key = task_key.clone();
                             let ctx = ctx.clone(); // Clone for each transaction
                             Box::pin(async move {
-                                let _ret = enqueue_job(&ctx, txn, entry, scheduled_at).await;
+                                // Propagate errors from enqueue_job to fail the transaction
+                                let ret = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
                                 trace!("Job({:?}) enqueued", task_key);
-                                Ok(())
+                                Ok(ret)
                             })
                         })
                         .await;
+
+                    if let Err(e) = result {
+                        error!("Failed to enqueue scheduled job {}: {}", task_key, e);
+                    }
 
                     let duration = start_time.elapsed();
                     trace!("Interval({:?}) {} ticked: {:?}", &task_key, i, duration);
