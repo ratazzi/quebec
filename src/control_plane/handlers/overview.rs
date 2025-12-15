@@ -5,20 +5,17 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use sea_orm::sea_query::{
-    Alias, Expr, Func, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery,
-    SqliteQueryBuilder,
+    Alias, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
 };
 use sea_orm::Order;
-use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, PaginatorTrait, QueryFilter, Statement,
-};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, instrument};
 
 use crate::control_plane::ControlPlane;
-use crate::entities::{quebec_failed_executions, quebec_jobs, quebec_pauses, quebec_processes};
+use crate::query_builder;
 
 impl ControlPlane {
     #[instrument(skip(state), fields(path = "/"))]
@@ -29,6 +26,7 @@ impl ControlPlane {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         // Get time range parameter, default to 24 hours
@@ -41,22 +39,21 @@ impl ControlPlane {
         let period_start = now - chrono::Duration::hours(hours);
         let previous_period_start = period_start - chrono::Duration::hours(hours);
 
-        // Get total number of completed jobs in current period
-        let total_jobs_processed = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
-            .filter(quebec_jobs::Column::FinishedAt.gt(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get total number of completed jobs in current period using query_builder
+        let total_jobs_processed =
+            query_builder::jobs::count_finished_in_range(db, table_config, period_start, Some(now))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get total number of completed jobs in previous period for calculating change rate
-        let previous_jobs_processed = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
-            .filter(quebec_jobs::Column::FinishedAt.gt(previous_period_start))
-            .filter(quebec_jobs::Column::FinishedAt.lte(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let previous_jobs_processed = query_builder::jobs::count_finished_in_range(
+            db,
+            table_config,
+            previous_period_start,
+            Some(period_start),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Calculate change rate of job processing count
         let jobs_processed_change = if previous_jobs_processed > 0 {
@@ -69,66 +66,73 @@ impl ControlPlane {
         };
 
         // Get average processing time of jobs in current period
-        let table_config = &state.ctx.table_config;
-        let jobs_table = Alias::new(&table_config.jobs);
-
-        let avg_duration_query = SeaQuery::select()
-            .expr_as(
-                Func::avg(Expr::cust("EXTRACT(EPOCH FROM (finished_at - created_at))")),
-                Alias::new("avg_duration"),
-            )
-            .from(jobs_table)
-            .and_where(Expr::col(Alias::new("finished_at")).is_not_null())
-            .and_where(Expr::col(Alias::new("finished_at")).gt(period_start))
-            .to_owned();
-
-        let (avg_duration_sql, avg_duration_values) = match db.get_database_backend() {
-            DbBackend::Postgres => avg_duration_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => avg_duration_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => avg_duration_query.build(MysqlQueryBuilder),
+        // Use database-specific SQL for duration calculation
+        let avg_duration_sql = match db.get_database_backend() {
+            DbBackend::Postgres => format!(
+                r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
+                   FROM "{}"
+                   WHERE finished_at IS NOT NULL AND finished_at > $1"#,
+                table_config.jobs
+            ),
+            DbBackend::Sqlite => format!(
+                r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
+                   FROM "{}"
+                   WHERE finished_at IS NOT NULL AND finished_at > ?"#,
+                table_config.jobs
+            ),
+            DbBackend::MySql => format!(
+                r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
+                   FROM `{}`
+                   WHERE finished_at IS NOT NULL AND finished_at > ?"#,
+                table_config.jobs
+            ),
         };
 
         let avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &avg_duration_sql,
-            avg_duration_values,
+            [period_start.into()],
         );
 
         let avg_duration: Option<f64> = db
             .query_one(avg_duration_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map(|row| row.try_get("", "avg_duration").unwrap_or(0.0));
+            .and_then(|row| row.try_get("", "avg_duration").ok());
 
         // Get average processing time of jobs in previous period
-        let prev_avg_duration_query = SeaQuery::select()
-            .expr_as(
-                Func::avg(Expr::cust("EXTRACT(EPOCH FROM (finished_at - created_at))")),
-                Alias::new("avg_duration"),
-            )
-            .from(Alias::new(&table_config.jobs))
-            .and_where(Expr::col(Alias::new("finished_at")).is_not_null())
-            .and_where(Expr::col(Alias::new("finished_at")).gt(previous_period_start))
-            .and_where(Expr::col(Alias::new("finished_at")).lte(period_start))
-            .to_owned();
-
-        let (prev_avg_duration_sql, prev_avg_duration_values) = match db.get_database_backend() {
-            DbBackend::Postgres => prev_avg_duration_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => prev_avg_duration_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => prev_avg_duration_query.build(MysqlQueryBuilder),
+        let prev_avg_duration_sql = match db.get_database_backend() {
+            DbBackend::Postgres => format!(
+                r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
+                   FROM "{}"
+                   WHERE finished_at IS NOT NULL AND finished_at > $1 AND finished_at <= $2"#,
+                table_config.jobs
+            ),
+            DbBackend::Sqlite => format!(
+                r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
+                   FROM "{}"
+                   WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
+                table_config.jobs
+            ),
+            DbBackend::MySql => format!(
+                r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
+                   FROM `{}`
+                   WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
+                table_config.jobs
+            ),
         };
 
         let prev_avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
             &prev_avg_duration_sql,
-            prev_avg_duration_values,
+            [previous_period_start.into(), period_start.into()],
         );
 
         let prev_avg_duration: Option<f64> = db
             .query_one(prev_avg_duration_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map(|row| row.try_get("", "avg_duration").unwrap_or(0.0));
+            .and_then(|row| row.try_get("", "avg_duration").ok());
 
         // Calculate change rate of average processing time
         let avg_duration_change = match (avg_duration, prev_avg_duration) {
@@ -150,14 +154,12 @@ impl ControlPlane {
             None => "N/A".to_string(),
         };
 
-        // Get number of active workers
-        let active_workers = quebec_processes::Entity::find()
-            .filter(
-                quebec_processes::Column::LastHeartbeatAt.gt(now - chrono::Duration::seconds(30)),
-            )
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get number of active workers using query_builder
+        let heartbeat_threshold = now - chrono::Duration::seconds(30);
+        let active_workers =
+            query_builder::processes::count_active(db, table_config, heartbeat_threshold)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get number of active workers in previous period (simplified here, should query historical data)
         let prev_active_workers = active_workers; // Assume no change, should get from historical data
@@ -165,18 +167,20 @@ impl ControlPlane {
         // Calculate change in number of active workers
         let active_workers_change = active_workers as i32 - prev_active_workers as i32;
 
-        // Calculate failure rate
-        let failed_jobs = quebec_failed_executions::Entity::find()
-            .filter(quebec_failed_executions::Column::CreatedAt.gt(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Calculate failure rate using query_builder
+        let failed_jobs = query_builder::failed_executions::count_created_in_range(
+            db,
+            table_config,
+            period_start,
+            Some(now),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let total_jobs = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::CreatedAt.gt(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_jobs =
+            query_builder::jobs::count_created_in_range(db, table_config, period_start, Some(now))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let failed_jobs_rate = if total_jobs > 0 {
             ((failed_jobs as f64 / total_jobs as f64) * 100.0).round() as i32
@@ -184,20 +188,24 @@ impl ControlPlane {
             0
         };
 
-        // Get failure rate of previous period
-        let prev_failed_jobs = quebec_failed_executions::Entity::find()
-            .filter(quebec_failed_executions::Column::CreatedAt.gt(previous_period_start))
-            .filter(quebec_failed_executions::Column::CreatedAt.lte(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get failure rate of previous period using query_builder
+        let prev_failed_jobs = query_builder::failed_executions::count_created_in_range(
+            db,
+            table_config,
+            previous_period_start,
+            Some(period_start),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let prev_total_jobs = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::CreatedAt.gt(previous_period_start))
-            .filter(quebec_jobs::Column::CreatedAt.lte(period_start))
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let prev_total_jobs = query_builder::jobs::count_created_in_range(
+            db,
+            table_config,
+            previous_period_start,
+            Some(period_start),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let prev_failed_jobs_rate = if prev_total_jobs > 0 {
             ((prev_failed_jobs as f64 / prev_total_jobs as f64) * 100.0).round() as i32
@@ -228,14 +236,15 @@ impl ControlPlane {
 
             time_labels.push(end_time.format(format_string).to_string());
 
-            // Query number of jobs completed in this time period
-            let period_jobs = quebec_jobs::Entity::find()
-                .filter(quebec_jobs::Column::FinishedAt.is_not_null())
-                .filter(quebec_jobs::Column::FinishedAt.gt(start_time))
-                .filter(quebec_jobs::Column::FinishedAt.lte(end_time))
-                .count(db)
-                .await
-                .unwrap_or(0);
+            // Query number of jobs completed in this time period using query_builder
+            let period_jobs = query_builder::jobs::count_finished_in_range(
+                db,
+                table_config,
+                start_time,
+                Some(end_time),
+            )
+            .await
+            .unwrap_or(0);
 
             jobs_processed_data.push(period_jobs);
         }
@@ -287,19 +296,46 @@ impl ControlPlane {
         }
 
         // Get queue performance statistics (using raw SQL for complex aggregations)
+        // Use database-specific SQL for compatibility
         let failed_table = &table_config.failed_executions;
-        let queue_performance_sql = format!(
-            r#"SELECT
-                 j.queue_name,
-                 COUNT(*) FILTER (WHERE j.finished_at IS NOT NULL) as jobs_processed,
-                 AVG(EXTRACT(EPOCH FROM (j.finished_at - j.created_at))) FILTER (WHERE j.finished_at IS NOT NULL) as avg_duration,
-                 COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM {} f WHERE f.job_id = j.id)) as failed_jobs,
-                 COUNT(*) as total_jobs
-               FROM {} j
-               WHERE j.created_at > $1
-               GROUP BY j.queue_name"#,
-            failed_table, table_config.jobs
-        );
+        let queue_performance_sql = match db.get_database_backend() {
+            DbBackend::Postgres => format!(
+                r#"SELECT
+                     j.queue_name,
+                     COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
+                     AVG(EXTRACT(EPOCH FROM (j.finished_at - j.created_at))) as avg_duration,
+                     COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
+                     COUNT(*) as total_jobs
+                   FROM "{}" j
+                   WHERE j.created_at > $1
+                   GROUP BY j.queue_name"#,
+                failed_table, table_config.jobs
+            ),
+            DbBackend::Sqlite => format!(
+                r#"SELECT
+                     j.queue_name,
+                     COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
+                     AVG(CASE WHEN j.finished_at IS NOT NULL THEN (julianday(j.finished_at) - julianday(j.created_at)) * 86400 END) as avg_duration,
+                     COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
+                     COUNT(*) as total_jobs
+                   FROM "{}" j
+                   WHERE j.created_at > ?
+                   GROUP BY j.queue_name"#,
+                failed_table, table_config.jobs
+            ),
+            DbBackend::MySql => format!(
+                r#"SELECT
+                     j.queue_name,
+                     COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
+                     AVG(CASE WHEN j.finished_at IS NOT NULL THEN TIMESTAMPDIFF(SECOND, j.created_at, j.finished_at) END) as avg_duration,
+                     COUNT(CASE WHEN EXISTS (SELECT 1 FROM `{}` f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
+                     COUNT(*) as total_jobs
+                   FROM `{}` j
+                   WHERE j.created_at > ?
+                   GROUP BY j.queue_name"#,
+                failed_table, table_config.jobs
+            ),
+        };
 
         let queue_performance_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -312,14 +348,11 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get paused queues
-        let paused_queues = quebec_pauses::Entity::find()
-            .all(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
+        // Get paused queues using query_builder
         let paused_queue_names: Vec<String> =
-            paused_queues.iter().map(|p| p.queue_name.clone()).collect();
+            query_builder::pauses::find_all_queue_names(db, table_config)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let mut queue_stats = Vec::new();
 
@@ -379,6 +412,10 @@ impl ControlPlane {
         context.insert("failed_rate_change", &failed_rate_change);
 
         // Get recently failed jobs (using raw SQL for JOIN operations)
+        let p1 = match db.get_database_backend() {
+            DbBackend::Postgres => "$1",
+            DbBackend::MySql | DbBackend::Sqlite => "?",
+        };
         let recent_failed_jobs_sql = format!(
             r#"SELECT
                 f.id,
@@ -388,10 +425,10 @@ impl ControlPlane {
                 f.error
               FROM {} f
               JOIN {} j ON f.job_id = j.id
-              WHERE f.created_at > $1
+              WHERE f.created_at > {}
               ORDER BY f.created_at DESC
               LIMIT 10"#,
-            table_config.failed_executions, table_config.jobs
+            table_config.failed_executions, table_config.jobs, p1
         );
 
         let recent_failed_jobs_stmt = Statement::from_sql_and_values(

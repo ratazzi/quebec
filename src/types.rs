@@ -7,7 +7,6 @@ use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
 // use pyo3_asyncio::tokio::future_into_py;
-use sea_orm::sea_query::TableCreateStatement;
 use sea_orm::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -25,82 +24,11 @@ use crate::control_plane::ControlPlaneExt;
 use crate::context::*;
 use crate::core::Quebec;
 use crate::dispatcher::Dispatcher;
-use crate::entities::*;
 use crate::scheduler::Scheduler;
 
 use crate::worker::{Execution, Worker};
 
 use tracing::{debug, error, info, trace, warn};
-
-trait EntityTrait {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement;
-}
-
-impl EntityTrait for quebec_blocked_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_claimed_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_failed_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_jobs::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_pauses::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_processes::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_ready_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_recurring_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_recurring_tasks::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_scheduled_executions::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
-
-impl EntityTrait for quebec_semaphores::Entity {
-    fn create_table_statement(&self, schema: &Schema) -> TableCreateStatement {
-        schema.create_table_from_entity(*self)
-    }
-}
 
 #[pyfunction]
 fn signal_handler(
@@ -633,32 +561,28 @@ impl PyQuebec {
     fn create_table(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await;
-            let schema = Schema::new(db.get_database_backend());
 
-            let tables: Vec<Box<dyn EntityTrait>> = vec![
-                Box::new(quebec_blocked_executions::Entity),
-                Box::new(quebec_claimed_executions::Entity),
-                Box::new(quebec_failed_executions::Entity),
-                Box::new(quebec_jobs::Entity),
-                Box::new(quebec_pauses::Entity),
-                Box::new(quebec_processes::Entity),
-                Box::new(quebec_ready_executions::Entity),
-                Box::new(quebec_recurring_executions::Entity),
-                Box::new(quebec_recurring_tasks::Entity),
-                Box::new(quebec_scheduled_executions::Entity),
-                Box::new(quebec_semaphores::Entity),
-            ];
-
-            for table in tables {
-                let stmt: TableCreateStatement = table.create_table_statement(&schema);
-                let ret = db.execute(db.get_database_backend().build(&stmt)).await;
-                if ret.is_err() {
-                    error!("Failed to create table: {:?}", ret);
-                    return Ok(false);
+            // Use schema_builder with dynamic table names from TableConfig
+            match crate::schema_builder::setup_database(db.as_ref(), &self.ctx.table_config).await {
+                Ok(()) => {
+                    // Extract prefix by removing the "_jobs" suffix from the jobs table name
+                    let prefix = self
+                        .ctx
+                        .table_config
+                        .jobs
+                        .strip_suffix("_jobs")
+                        .unwrap_or("solid_queue");
+                    info!(
+                        "Database tables created successfully with prefix: {}",
+                        prefix
+                    );
+                    Ok(true)
+                }
+                Err(err) => {
+                    error!("Failed to create tables: {:?}", err);
+                    Ok(false)
                 }
             }
-
-            Ok(true)
         })
     }
 
@@ -823,6 +747,25 @@ impl PyQuebec {
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;
         obj.concurrency_limit = concurrency_limit;
+
+        // Check for _scheduled_at in kwargs (used by JobBuilder.set())
+        if let Some(kw) = kwargs {
+            if let Ok(scheduled_at) = kw.get_item("_scheduled_at") {
+                if let Some(val) = scheduled_at {
+                    // Try to extract as f64 (timestamp)
+                    if let Ok(ts) = val.extract::<f64>() {
+                        let secs = ts as i64;
+                        let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+                        if let Some(dt) =
+                            chrono::DateTime::from_timestamp(secs, nsecs)
+                        {
+                            obj.scheduled_at = dt.naive_utc();
+                            debug!("Job scheduled for: {:?}", obj.scheduled_at);
+                        }
+                    }
+                }
+            }
+        }
 
         let start_time = Instant::now();
         // Release GIL during database operations to prevent blocking other Python threads

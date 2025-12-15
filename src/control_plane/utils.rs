@@ -1,17 +1,12 @@
 use axum::http::StatusCode;
 use chrono::{NaiveDateTime, Utc};
-use sea_orm::{
-    ColumnTrait, DbErr, EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
-};
+use sea_orm::DbErr;
 use std::collections::HashMap;
 use std::error::Error;
 use tera::Context;
 use tracing::{debug, error, info};
 
-use crate::entities::{
-    quebec_blocked_executions, quebec_claimed_executions, quebec_failed_executions, quebec_jobs,
-    quebec_pauses, quebec_processes, quebec_scheduled_executions,
-};
+use crate::query_builder;
 
 use super::templates;
 use super::ControlPlane;
@@ -62,64 +57,51 @@ impl ControlPlane {
         }
     }
 
-    /// Get queue names from database
+    /// Get queue names from database using query_builder
     pub async fn get_queue_names(&self) -> Result<Vec<String>, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &self.ctx.table_config;
 
-        let queue_names: Vec<String> = quebec_jobs::Entity::find()
-            .select_only()
-            .column(quebec_jobs::Column::QueueName)
-            .distinct()
-            .order_by(quebec_jobs::Column::QueueName, Order::Asc)
-            .into_tuple()
-            .all(db)
-            .await?;
-
-        Ok(queue_names)
+        query_builder::jobs::get_queue_names(db, table_config).await
     }
 
-    /// Get job class names from database
+    /// Get job class names from database using query_builder
     pub async fn get_job_classes(&self) -> Result<Vec<String>, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &self.ctx.table_config;
 
-        let class_names: Vec<String> = quebec_jobs::Entity::find()
-            .select_only()
-            .column(quebec_jobs::Column::ClassName)
-            .distinct()
-            .order_by(quebec_jobs::Column::ClassName, Order::Asc)
-            .into_tuple()
-            .all(db)
-            .await?;
-
-        Ok(class_names)
+        query_builder::jobs::get_class_names(db, table_config).await
     }
 
-    /// Populate navigation statistics for templates
+    /// Populate navigation statistics for templates using query_builder
     pub async fn populate_nav_stats(&self, context: &mut Context) -> Result<(), DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &self.ctx.table_config;
 
         // Count total jobs
-        let total_jobs = quebec_jobs::Entity::find().count(db).await?;
+        let total_jobs = query_builder::jobs::count_all(db, table_config).await?;
 
         // Count scheduled jobs
-        let scheduled_count = quebec_scheduled_executions::Entity::find()
-            .count(db)
-            .await? as i64;
+        let scheduled_count =
+            query_builder::scheduled_executions::count_all(db, table_config).await? as i64;
 
         // Count in-progress jobs
-        let in_progress_count = quebec_claimed_executions::Entity::find().count(db).await? as i64;
+        let in_progress_count =
+            query_builder::claimed_executions::count_all(db, table_config).await? as i64;
 
         // Count failed jobs
-        let failed_count = quebec_failed_executions::Entity::find().count(db).await? as i64;
+        let failed_count =
+            query_builder::failed_executions::count_all(db, table_config).await? as i64;
 
         // Count blocked jobs
-        let blocked_count = quebec_blocked_executions::Entity::find().count(db).await? as i64;
+        let blocked_count =
+            query_builder::blocked_executions::count_all(db, table_config).await? as i64;
 
         // Count active workers
-        let active_workers = quebec_processes::Entity::find().count(db).await?;
+        let active_workers = query_builder::processes::count_all(db, table_config).await?;
 
         context.insert("nav_total_jobs", &total_jobs);
         context.insert("nav_scheduled_jobs", &scheduled_count);
@@ -142,15 +124,13 @@ impl ControlPlane {
         Ok(())
     }
 
-    /// Check if a queue is paused
+    /// Check if a queue is paused using query_builder
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
         let db = self.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &self.ctx.table_config;
 
-        let pause = quebec_pauses::Entity::find()
-            .filter(quebec_pauses::Column::QueueName.eq(queue_name))
-            .one(db)
-            .await?;
+        let pause = query_builder::pauses::find_by_queue_name(db, table_config, queue_name).await?;
 
         Ok(pause.is_some())
     }

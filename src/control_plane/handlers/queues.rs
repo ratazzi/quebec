@@ -6,10 +6,7 @@ use axum::{
 use sea_orm::sea_query::{
     Alias, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
 };
-use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, Order,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
-};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,7 +16,7 @@ use crate::control_plane::{
     models::{Pagination, QueueInfo},
     ControlPlane,
 };
-use crate::entities::{quebec_jobs, quebec_pauses};
+use crate::query_builder;
 
 impl ControlPlane {
     pub async fn queues(
@@ -89,16 +86,14 @@ impl ControlPlane {
         debug!("Fetched jobs in {:?}", start.elapsed());
 
         let start = Instant::now();
-        // Get paused queues
-        let paused_queues = quebec_pauses::Entity::find()
-            .all(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get paused queues using query_builder
+        let paused_queue_names: Vec<String> =
+            query_builder::pauses::find_all_queue_names(db, table_config)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         debug!("Fetched paused queues in {:?}", start.elapsed());
 
         let start = Instant::now();
-        let paused_queue_names: Vec<String> =
-            paused_queues.iter().map(|p| p.queue_name.clone()).collect();
 
         let queue_infos: Vec<QueueInfo> = queue_counts
             .into_iter()
@@ -133,15 +128,18 @@ impl ControlPlane {
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
 
-        // Create a new pause record
-        let pause = quebec_pauses::ActiveModel {
-            id: ActiveValue::NotSet,
-            queue_name: ActiveValue::Set(queue_name.clone()),
-            created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-        };
-
-        pause.insert(db).await.map(|_| StatusCode::OK).map_err(|e| {
+        // Create a new pause record using query_builder
+        query_builder::pauses::insert(
+            db,
+            table_config,
+            &queue_name,
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
             error!("Failed to pause queue: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })
@@ -153,11 +151,10 @@ impl ControlPlane {
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
 
-        // Delete the pause record for this queue
-        quebec_pauses::Entity::delete_many()
-            .filter(quebec_pauses::Column::QueueName.eq(queue_name.clone()))
-            .exec(db)
+        // Delete the pause record for this queue using query_builder
+        query_builder::pauses::delete_by_queue_name(db, table_config, &queue_name)
             .await
             .map(|_| StatusCode::OK)
             .map_err(|e| {
@@ -174,6 +171,7 @@ impl ControlPlane {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         let page = pagination.page;
@@ -185,24 +183,22 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get total job count for this queue
-        let total_jobs = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::QueueName.eq(&queue_name))
-            .filter(quebec_jobs::Column::FinishedAt.is_null())
-            .count(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get total job count for this queue using query_builder
+        let total_jobs =
+            query_builder::jobs::count_by_queue_unfinished(db, table_config, &queue_name)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get jobs for this queue with pagination
-        let jobs = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::QueueName.eq(&queue_name))
-            .filter(quebec_jobs::Column::FinishedAt.is_null())
-            .order_by(quebec_jobs::Column::CreatedAt, Order::Desc)
-            .limit(state.page_size)
-            .offset(offset)
-            .all(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get jobs for this queue with pagination using query_builder
+        let jobs = query_builder::jobs::find_by_queue_unfinished_paginated(
+            db,
+            table_config,
+            &queue_name,
+            offset,
+            state.page_size,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get execution status for each job
         let job_ids: Vec<i64> = jobs.iter().map(|j| j.id).collect();

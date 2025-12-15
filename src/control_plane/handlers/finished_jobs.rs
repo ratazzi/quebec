@@ -3,7 +3,6 @@ use axum::{
     http::StatusCode,
     response::Html,
 };
-use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info};
@@ -12,7 +11,7 @@ use crate::control_plane::{
     models::{FinishedJobInfo, Pagination},
     ControlPlane,
 };
-use crate::entities::quebec_jobs;
+use crate::query_builder;
 
 impl ControlPlane {
     pub async fn finished_jobs(
@@ -22,6 +21,7 @@ impl ControlPlane {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         let start = Instant::now();
@@ -30,17 +30,11 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get completed jobs
-        let finished_jobs_query = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
-            .order_by_desc(quebec_jobs::Column::FinishedAt)
-            .offset(offset)
-            .limit(page_size);
-
-        let finished_jobs_models = finished_jobs_query
-            .all(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get completed jobs using query_builder
+        let finished_jobs_models =
+            query_builder::jobs::find_finished_paginated(db, table_config, offset, page_size)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store completed job information
         let mut finished_jobs: Vec<FinishedJobInfo> =
@@ -80,12 +74,10 @@ impl ControlPlane {
         debug!("Fetched finished jobs in {:?}", start.elapsed());
         info!("Found {} finished jobs", finished_jobs.len());
 
-        // Get total number of completed jobs for pagination
+        // Get total number of completed jobs for pagination using query_builder
         let start = Instant::now();
 
-        let total_count: u64 = quebec_jobs::Entity::find()
-            .filter(quebec_jobs::Column::FinishedAt.is_not_null())
-            .count(db)
+        let total_count: u64 = query_builder::jobs::count_finished(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

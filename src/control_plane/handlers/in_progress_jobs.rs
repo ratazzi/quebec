@@ -3,10 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
-use sea_orm::{
-    ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, PaginatorTrait,
-    QuerySelect, TransactionTrait,
-};
+use sea_orm::{DbErr, TransactionTrait};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
@@ -15,7 +12,7 @@ use crate::control_plane::{
     models::{InProgressJobInfo, Pagination},
     ControlPlane,
 };
-use crate::entities::{quebec_claimed_executions, quebec_jobs, quebec_processes};
+use crate::query_builder;
 
 impl ControlPlane {
     pub async fn in_progress_jobs(
@@ -25,6 +22,7 @@ impl ControlPlane {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
         let start = Instant::now();
@@ -33,17 +31,14 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get claimed (in-progress) jobs
-        let claimed_executions = quebec_claimed_executions::Entity::find()
-            .offset(offset)
-            .limit(page_size)
-            .all(db)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get claimed (in-progress) jobs using query_builder
+        let claimed_executions =
+            query_builder::claimed_executions::find_paginated(db, table_config, offset, page_size)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get process information
-        let processes = quebec_processes::Entity::find()
-            .all(db)
+        // Get process information using query_builder
+        let processes = query_builder::processes::find_all(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -56,9 +51,8 @@ impl ControlPlane {
 
         // Get job information for each in-progress execution
         for execution in claimed_executions {
-            if let Ok(Some(job)) = quebec_jobs::Entity::find_by_id(execution.job_id)
-                .one(db)
-                .await
+            if let Ok(Some(job)) =
+                query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
                 // Find process information
                 let worker_id = match execution.process_id {
@@ -104,8 +98,7 @@ impl ControlPlane {
         // Get total number of in-progress jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = quebec_claimed_executions::Entity::find()
-            .count(db)
+        let total_count: u64 = query_builder::claimed_executions::count_all(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -155,34 +148,23 @@ impl ControlPlane {
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = state.ctx.table_config.clone();
 
         // Use transaction to operate
         db.transaction::<_, (), DbErr>(|txn| {
+            let table_config = table_config.clone();
             Box::pin(async move {
-                // Find execution record to cancel
-                let claimed_execution = quebec_claimed_executions::Entity::find_by_id(id)
-                    .one(txn)
-                    .await?;
+                // Find execution record to cancel using query_builder
+                let claimed_execution =
+                    query_builder::claimed_executions::find_by_id(txn, &table_config, id).await?;
 
                 if let Some(execution) = claimed_execution {
-                    // First mark job as completed
-                    let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
-                        .one(txn)
+                    // Mark job as finished using query_builder
+                    query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
                         .await?;
 
-                    if let Some(job) = job_result {
-                        // Update job status to completed
-                        let mut job_model: quebec_jobs::ActiveModel = job.into();
-                        job_model.finished_at =
-                            ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
-                        job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-                        job_model.update(txn).await?;
-                    }
-
-                    // Delete claimed_execution record
-                    quebec_claimed_executions::Entity::delete_by_id(id)
-                        .exec(txn)
-                        .await?;
+                    // Delete claimed_execution record using query_builder
+                    query_builder::claimed_executions::delete_by_id(txn, &table_config, id).await?;
 
                     info!("Cancelled in-progress job ID: {}", id);
                 } else {
@@ -214,12 +196,15 @@ impl ControlPlane {
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = state.ctx.table_config.clone();
 
         // Use transaction to operate
         db.transaction::<_, u64, DbErr>(|txn| {
+            let table_config = table_config.clone();
             Box::pin(async move {
-                // Get all in-progress jobs
-                let claimed_executions = quebec_claimed_executions::Entity::find().all(txn).await?;
+                // Get all in-progress jobs using query_builder
+                let claimed_executions =
+                    query_builder::claimed_executions::find_all(txn, &table_config).await?;
 
                 if claimed_executions.is_empty() {
                     return Ok(0);
@@ -230,30 +215,13 @@ impl ControlPlane {
                     .map(|execution| execution.job_id)
                     .collect();
 
-                // Update all related jobs to completed status
-                let now = chrono::Utc::now().naive_utc();
+                // Update all related jobs to completed status using query_builder
+                query_builder::jobs::mark_finished_by_ids(txn, &table_config, job_ids).await?;
 
-                // Use batch update with dynamic table name
-                let table_config = &state.ctx.table_config;
-                let update_sql = format!(
-                    "UPDATE {} SET finished_at = $1, updated_at = $1 WHERE id = ANY($2)",
-                    table_config.jobs
-                );
+                // Delete all claimed_execution records using query_builder
+                let count =
+                    query_builder::claimed_executions::delete_all(txn, &table_config).await?;
 
-                let stmt = sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Postgres,
-                    update_sql,
-                    [now.into(), job_ids.into()],
-                );
-
-                txn.execute(stmt).await?;
-
-                // Delete all claimed_execution records
-                let delete_result = quebec_claimed_executions::Entity::delete_many()
-                    .exec(txn)
-                    .await?;
-
-                let count = delete_result.rows_affected;
                 info!("Cancelled all {} in-progress jobs", count);
                 Ok(count)
             })

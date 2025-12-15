@@ -1,6 +1,6 @@
 use crate::context::*;
-use crate::entities::*;
 use crate::process::{ProcessInfo, ProcessTrait};
+use crate::query_builder;
 use crate::semaphore::acquire_semaphore;
 
 use anyhow::Result;
@@ -56,22 +56,26 @@ impl Dispatcher {
                     let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
                         Box::pin(async move {
                           // Clean up expired semaphores
-                          let expired_semaphores_result = quebec_semaphores::Entity::delete_many()
-                              .filter(
-                                  quebec_semaphores::Column::ExpiresAt.lt(chrono::Utc::now().naive_utc())
-                              )
-                              .exec(txn)
-                              .await?;
+                          let expired_semaphores_count =
+                              query_builder::semaphores::delete_expired(txn, &ctx.table_config).await?;
 
-                          if expired_semaphores_result.rows_affected > 0 {
-                              info!("Cleaned up {} expired semaphores", expired_semaphores_result.rows_affected);
+                          if expired_semaphores_count > 0 {
+                              info!("Cleaned up {} expired semaphores", expired_semaphores_count);
                           }
 
                           // Unblock jobs with expired concurrency keys
-                          let sql = format!("SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < $1 LIMIT $2", ctx.table_config.blocked_executions);
+                          let backend = txn.get_database_backend();
+                          let (p1, p2) = match backend {
+                              DbBackend::Postgres => ("$1", "$2"),
+                              DbBackend::MySql | DbBackend::Sqlite => ("?", "?"),
+                          };
+                          let sql = format!(
+                              "SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < {} LIMIT {}",
+                              ctx.table_config.blocked_executions, p1, p2
+                          );
                           let now = chrono::Utc::now().naive_utc();
                           let expired_keys_result = txn.query_all(Statement::from_sql_and_values(
-                              txn.get_database_backend(),
+                              backend,
                               sql,
                               vec![now.into(), batch_size.into()],
                           )).await?;
@@ -86,20 +90,15 @@ impl Dispatcher {
                               let concurrency_key = row.try_get::<String>("", "concurrency_key")
                                   .map_err(|e| DbErr::Custom(format!("Failed to get concurrency_key: {}", e)))?;
 
-                              let sql = format!(r#"SELECT * FROM "{}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#, ctx.table_config.blocked_executions);
-                              let blocked_execution = quebec_blocked_executions::Entity::find()
-                                  .from_raw_sql(Statement::from_sql_and_values(
-                                      txn.get_database_backend(),
-                                      &sql,
-                                      [concurrency_key.clone().into(), 1.into()],
-                                  ))
-                                  .one(txn)
-                                  .await?;
+                              let blocked_execution = query_builder::blocked_executions::find_one_by_key_for_update(
+                                  txn,
+                                  &ctx.table_config,
+                                  &concurrency_key,
+                              ).await?;
 
                               if let Some(execution) = blocked_execution {
                                   // Get the job to access concurrency information (like original Solid Queue)
-                                  let job = quebec_jobs::Entity::find_by_id(execution.job_id)
-                                      .one(txn)
+                                  let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
                                       .await?;
 
                                   if let Some(job) = job {
@@ -124,19 +123,17 @@ impl Dispatcher {
 
                                               // Move blocked execution to ready execution
                                               // Use job's queue_name and priority (inherit from job like Solid Queue)
-                                              let ready_execution = quebec_ready_executions::ActiveModel {
-                                                  id: ActiveValue::NotSet,
-                                                  queue_name: ActiveValue::Set(job.queue_name.clone()),
-                                                  job_id: ActiveValue::Set(execution.job_id),
-                                                  priority: ActiveValue::Set(job.priority),
-                                                  created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                              };
-
-                                              ready_execution.save(txn).await?;
+                                              query_builder::ready_executions::insert(
+                                                  txn,
+                                                  &ctx.table_config,
+                                                  execution.job_id,
+                                                  &job.queue_name,
+                                                  job.priority,
+                                              )
+                                              .await?;
 
                                               // Remove from blocked executions
-                                              quebec_blocked_executions::Entity::delete_by_id(execution.id)
-                                                  .exec(txn)
+                                              query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
                                                   .await?;
 
                                               info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
@@ -155,30 +152,14 @@ impl Dispatcher {
                           }
 
                           // Dispatch scheduled jobs
-                          let now = chrono::Utc::now().naive_utc();
-
                           // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
                           // This matches Solid Queue's implementation
-                          let scheduled_executions = if ctx.use_skip_locked {
-                              quebec_scheduled_executions::Entity::find()
-                                  .filter(quebec_scheduled_executions::Column::ScheduledAt.lte(now))
-                                  .order_by_asc(quebec_scheduled_executions::Column::ScheduledAt)
-                                  .order_by_asc(quebec_scheduled_executions::Column::Priority)
-                                  .order_by_asc(quebec_scheduled_executions::Column::JobId)
-                                  .limit(batch_size)
-                                  .lock_with_behavior(sea_query::LockType::Update, sea_query::LockBehavior::SkipLocked)
-                                  .all(txn)
-                                  .await
-                          } else {
-                              quebec_scheduled_executions::Entity::find()
-                                  .filter(quebec_scheduled_executions::Column::ScheduledAt.lte(now))
-                                  .order_by_asc(quebec_scheduled_executions::Column::ScheduledAt)
-                                  .order_by_asc(quebec_scheduled_executions::Column::Priority)
-                                  .order_by_asc(quebec_scheduled_executions::Column::JobId)
-                                  .limit(batch_size)
-                                  .all(txn)
-                                  .await
-                          };
+                          let scheduled_executions = query_builder::scheduled_executions::find_due(
+                              txn,
+                              &ctx.table_config,
+                              batch_size,
+                              ctx.use_skip_locked,
+                          ).await;
 
                           if scheduled_executions.is_err() {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
@@ -192,26 +173,27 @@ impl Dispatcher {
 
                           for scheduled_execution in scheduled_executions {
                               // Get job details to retrieve queue_name and priority
-                              let job = quebec_jobs::Entity::find_by_id(scheduled_execution.job_id)
-                                  .one(txn)
+                              let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, scheduled_execution.job_id)
                                   .await?;
 
                               if let Some(job) = job {
                                   let queue_name = job.queue_name.clone();
 
-                                  let _ = quebec_ready_executions::ActiveModel {
-                                      id: ActiveValue::NotSet,
-                                      queue_name: ActiveValue::Set(job.queue_name),
-                                      job_id: ActiveValue::Set(scheduled_execution.job_id),
-                                      priority: ActiveValue::Set(job.priority),
-                                      created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                  }
-                                  .save(txn)
+                                  query_builder::ready_executions::insert(
+                                      txn,
+                                      &ctx.table_config,
+                                      scheduled_execution.job_id,
+                                      &job.queue_name,
+                                      job.priority,
+                                  )
                                   .await?;
 
-                                  quebec_scheduled_executions::Entity::delete_by_id(scheduled_execution.id)
-                                      .exec(txn)
-                                      .await?;
+                                  query_builder::scheduled_executions::delete_by_job_id(
+                                      txn,
+                                      &ctx.table_config,
+                                      scheduled_execution.job_id,
+                                  )
+                                  .await?;
 
                                   notified_queues.insert(queue_name);
                               } else {

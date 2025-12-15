@@ -1,12 +1,11 @@
 use crate::context::{AppContext, ScheduledEntry};
-use crate::entities::*;
 use crate::notify::NotifyManager;
 use crate::process::{ProcessInfo, ProcessTrait};
+use crate::query_builder;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
-use sea_orm::TransactionTrait;
-use sea_orm::*;
+use sea_orm::{ConnectionTrait, DbBackend, DbErr, ExecResult, Statement, TransactionTrait, Value};
 use serde_json::json;
 use serde_yaml;
 use std::collections::HashMap;
@@ -15,57 +14,9 @@ use std::time::Instant;
 
 use tracing::{error, info, trace, warn};
 
-// ```sql
-// INSERT INTO "quebec_recurring_tasks" (
-//     "key",
-//     "schedule",
-//     "command",
-//     "class_name",
-//     "arguments",
-//     "queue_name",
-//     "priority",
-//     "static",
-//     "description",
-//     "created_at",
-//     "updated_at"
-// ) VALUES (
-//     'periodic_cleanup',
-//     'every minute',
-//     NULL,
-//     'FakeJob',
-//     '["every_minute"]',
-//     NULL,
-//     NULL,
-//     TRUE,
-//     NULL,
-//     CURRENT_TIMESTAMP,
-//     CURRENT_TIMESTAMP
-// ) ON CONFLICT ("key") DO UPDATE SET
-//     "updated_at" = (
-//         CASE
-//             WHEN (
-//                 "quebec_recurring_tasks"."schedule" IS NOT DISTINCT FROM excluded."schedule"
-//                 AND "quebec_recurring_tasks"."command" IS NOT DISTINCT FROM excluded."command"
-//                 AND "quebec_recurring_tasks"."class_name" IS NOT DISTINCT FROM excluded."class_name"
-//                 AND "quebec_recurring_tasks"."arguments" IS NOT DISTINCT FROM excluded."arguments"
-//                 AND "quebec_recurring_tasks"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
-//                 AND "quebec_recurring_tasks"."priority" IS NOT DISTINCT FROM excluded."priority"
-//                 AND "quebec_recurring_tasks"."static" IS NOT DISTINCT FROM excluded."static"
-//                 AND "quebec_recurring_tasks"."description" IS NOT DISTINCT FROM excluded."description"
-//             ) THEN "quebec_recurring_tasks".updated_at
-//             ELSE CURRENT_TIMESTAMP
-//         END
-//     ),
-//     "schedule" = excluded."schedule",
-//     "command" = excluded."command",
-//     "class_name" = excluded."class_name",
-//     "arguments" = excluded."arguments",
-//     "queue_name" = excluded."queue_name",
-//     "priority" = excluded."priority",
-//     "static" = excluded."static",
-//     "description" = excluded."description"
-// RETURNING "id"
-// ```
+/// Upsert a recurring task into the database.
+/// Supports PostgreSQL, SQLite, and MySQL with database-specific syntax.
+/// Uses NULL-safe comparison (IS NOT DISTINCT FROM / <=> / IS) to correctly handle nullable columns.
 pub async fn upsert_task<C>(
     db: &C,
     table_config: &crate::context::TableConfig,
@@ -74,86 +25,129 @@ pub async fn upsert_task<C>(
 where
     C: ConnectionTrait,
 {
-    let sql = format!(
-        r#"INSERT INTO "{}" (
-        "key",
-        "schedule",
-        "command",
-        "class_name",
-        "arguments",
-        "queue_name",
-        "priority",
-        "static",
-        "description",
-        "created_at",
-        "updated_at"
-        ) VALUES (
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            $7,
-            $8,
-            $9,
-            CURRENT_TIMESTAMP,
-            CURRENT_TIMESTAMP
-        ) ON CONFLICT ("key") DO UPDATE SET
-            "updated_at" = (
-                CASE
-                    WHEN (
-                        "{}"."schedule" = excluded."schedule"
-                        AND "{}"."command" = excluded."command"
-                        AND "{}"."class_name" = excluded."class_name"
-                        AND "{}"."arguments" = excluded."arguments"
-                        AND "{}"."queue_name" = excluded."queue_name"
-                        AND "{}"."priority" = excluded."priority"
-                        AND "{}"."static" = excluded."static"
-                        AND "{}"."description" = excluded."description"
-                    ) THEN "{}"."updated_at"
-                    ELSE CURRENT_TIMESTAMP
-                END
-            ),
-            "schedule" = excluded."schedule",
-            "command" = excluded."command",
-            "class_name" = excluded."class_name",
-            "arguments" = excluded."arguments",
-            "queue_name" = excluded."queue_name",
-            "priority" = excluded."priority",
-            "static" = excluded."static",
-            "description" = excluded."description"
-        RETURNING "id""#,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks,
-        table_config.recurring_tasks
-    );
+    let backend = db.get_database_backend();
+    let table = &table_config.recurring_tasks;
+
+    // Prepare values
+    // Use NULL for optional fields (command, description) - scheduled tasks use class, not command
+    let values = vec![
+        Value::from(entry.key.clone()),
+        Value::from(entry.schedule.clone()),
+        Value::from(None::<String>), // command - NULL for scheduled tasks
+        Value::from(entry.class.clone()),
+        // Use empty array if args is None, to avoid "arguments is not an array" error
+        Value::from(json!(entry.args.as_ref().unwrap_or(&vec![]))),
+        Value::from(entry.queue.clone()), // queue - NULL if not specified
+        Value::from(entry.priority.unwrap_or(0)),
+        Value::from(true),
+        Value::from(None::<String>), // description - NULL
+    ];
+
+    let sql = match backend {
+        DbBackend::Postgres => {
+            // PostgreSQL: ON CONFLICT DO UPDATE with IS NOT DISTINCT FROM for NULL-safe comparison
+            format!(
+                r#"INSERT INTO "{t}" (
+                    "key", "schedule", "command", "class_name", "arguments",
+                    "queue_name", "priority", "static", "description",
+                    "created_at", "updated_at"
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT ("key") DO UPDATE SET
+                    "updated_at" = CASE
+                        WHEN "{t}"."schedule" IS NOT DISTINCT FROM excluded."schedule"
+                            AND "{t}"."command" IS NOT DISTINCT FROM excluded."command"
+                            AND "{t}"."class_name" IS NOT DISTINCT FROM excluded."class_name"
+                            AND "{t}"."arguments" IS NOT DISTINCT FROM excluded."arguments"
+                            AND "{t}"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
+                            AND "{t}"."priority" IS NOT DISTINCT FROM excluded."priority"
+                            AND "{t}"."static" IS NOT DISTINCT FROM excluded."static"
+                            AND "{t}"."description" IS NOT DISTINCT FROM excluded."description"
+                        THEN "{t}"."updated_at"
+                        ELSE CURRENT_TIMESTAMP
+                    END,
+                    "schedule" = excluded."schedule",
+                    "command" = excluded."command",
+                    "class_name" = excluded."class_name",
+                    "arguments" = excluded."arguments",
+                    "queue_name" = excluded."queue_name",
+                    "priority" = excluded."priority",
+                    "static" = excluded."static",
+                    "description" = excluded."description""#,
+                t = table
+            )
+        }
+        DbBackend::Sqlite => {
+            // SQLite: ON CONFLICT DO UPDATE with IS for NULL-safe comparison
+            format!(
+                r#"INSERT INTO "{t}" (
+                    "key", "schedule", "command", "class_name", "arguments",
+                    "queue_name", "priority", "static", "description",
+                    "created_at", "updated_at"
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT ("key") DO UPDATE SET
+                    "updated_at" = CASE
+                        WHEN "{t}"."schedule" IS excluded."schedule"
+                            AND "{t}"."command" IS excluded."command"
+                            AND "{t}"."class_name" IS excluded."class_name"
+                            AND "{t}"."arguments" IS excluded."arguments"
+                            AND "{t}"."queue_name" IS excluded."queue_name"
+                            AND "{t}"."priority" IS excluded."priority"
+                            AND "{t}"."static" IS excluded."static"
+                            AND "{t}"."description" IS excluded."description"
+                        THEN "{t}"."updated_at"
+                        ELSE CURRENT_TIMESTAMP
+                    END,
+                    "schedule" = excluded."schedule",
+                    "command" = excluded."command",
+                    "class_name" = excluded."class_name",
+                    "arguments" = excluded."arguments",
+                    "queue_name" = excluded."queue_name",
+                    "priority" = excluded."priority",
+                    "static" = excluded."static",
+                    "description" = excluded."description""#,
+                t = table
+            )
+        }
+        DbBackend::MySql => {
+            // MySQL 8.0.20+: Use alias syntax instead of deprecated VALUES()
+            // https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html
+            format!(
+                r#"INSERT INTO `{t}` (
+                    `key`, `schedule`, `command`, `class_name`, `arguments`,
+                    `queue_name`, `priority`, `static`, `description`,
+                    `created_at`, `updated_at`
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                AS new_vals
+                ON DUPLICATE KEY UPDATE
+                    `updated_at` = CASE
+                        WHEN `schedule` <=> new_vals.`schedule`
+                            AND `command` <=> new_vals.`command`
+                            AND `class_name` <=> new_vals.`class_name`
+                            AND `arguments` <=> new_vals.`arguments`
+                            AND `queue_name` <=> new_vals.`queue_name`
+                            AND `priority` <=> new_vals.`priority`
+                            AND `static` <=> new_vals.`static`
+                            AND `description` <=> new_vals.`description`
+                        THEN `updated_at`
+                        ELSE CURRENT_TIMESTAMP
+                    END,
+                    `schedule` = new_vals.`schedule`,
+                    `command` = new_vals.`command`,
+                    `class_name` = new_vals.`class_name`,
+                    `arguments` = new_vals.`arguments`,
+                    `queue_name` = new_vals.`queue_name`,
+                    `priority` = new_vals.`priority`,
+                    `static` = new_vals.`static`,
+                    `description` = new_vals.`description`"#,
+                t = table
+            )
+        }
+    };
 
     let cleaned_sql = sql.lines().map(str::trim).collect::<Vec<&str>>().join(" ");
 
     let ret = db
-        .execute(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            cleaned_sql,
-            vec![
-                Value::from(entry.key),
-                Value::from(entry.schedule),
-                Value::from(Some("")),
-                Value::from(entry.class),
-                Value::from(json!(entry.args)),
-                Value::from(entry.queue.or(Some("".to_string()))),
-                Value::from(entry.priority.unwrap_or(0)),
-                Value::from(true),
-                Value::from(""),
-            ],
-        ))
+        .execute(Statement::from_sql_and_values(backend, cleaned_sql, values))
         .await?;
 
     trace!("upsert_task: {:?}", ret);
@@ -174,13 +168,15 @@ where
     let priority = entry.priority.unwrap_or(0);
 
     let now = chrono::Utc::now().naive_utc();
+    // Use empty array if args is None, to avoid "arguments is not an array" error
+    let args = entry.args.as_ref().cloned().unwrap_or_default();
     let params = serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
         "provider_job_id": "",
         "queue_name": queue_name,
         "priority": priority,
-        "arguments": entry.args,
+        "arguments": args,
         "executions": 0,
         "exception_executions": {},
         "locale": "en",
@@ -190,60 +186,46 @@ where
     });
 
     // Get concurrency constraint using runnable
-    let concurrency_constraint = if ctx.has_concurrency_control(&entry.class.to_string()) {
-        // Only if concurrency control is enabled, get the runnable and compute constraint
+    // Use normalized args (consistent with what's stored in the job)
+    let concurrency_constraint = ctx
+        .has_concurrency_control(&entry.class.to_string())
+        .then(|| ctx.get_runnable(&entry.class).ok())
+        .flatten()
+        .and_then(|runnable| {
+            let args_ref = if args.is_empty() { None } else { Some(&args) };
+            runnable
+                .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
+                .unwrap_or(None)
+        });
 
-        if let Ok(runnable) = ctx.get_runnable(&entry.class) {
-            if let Some(args) = &entry.args {
-                // Assume args is a list of arguments, no kwargs for scheduled jobs
-                runnable
-                    .get_concurrency_constraint(Some(args), None::<&serde_yaml::Value>)
-                    .unwrap_or(None)
-            } else {
-                runnable
-                    .get_concurrency_constraint(
-                        None::<&serde_yaml::Value>,
-                        None::<&serde_yaml::Value>,
-                    )
-                    .unwrap_or(None)
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let job = quebec_jobs::ActiveModel {
-        id: ActiveValue::NotSet,
-        queue_name: ActiveValue::Set(queue_name.to_string()),
-        class_name: ActiveValue::Set(entry.class),
-        arguments: ActiveValue::Set(Some(params.to_string())),
-        priority: ActiveValue::Set(priority),
-        failed_attempts: ActiveValue::Set(0),
-        active_job_id: ActiveValue::Set(Some("".to_string())),
-        scheduled_at: ActiveValue::Set(Some(scheduled_at)),
-        finished_at: ActiveValue::Set(None),
-        concurrency_key: ActiveValue::Set(concurrency_constraint.as_ref().map(|c| c.key.clone())),
-        created_at: ActiveValue::Set(now),
-        updated_at: ActiveValue::Set(now),
-    }
-    .save(db)
+    let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
+    let job_id = query_builder::jobs::insert(
+        db,
+        &ctx.table_config,
+        queue_name,
+        &entry.class,
+        Some(params.to_string()).as_deref(),
+        priority,
+        Some(""),
+        Some(scheduled_at),
+        concurrency_key_str,
+    )
     .await?;
 
-    let job = job.try_into_model()?;
+    let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id)
+        .await?
+        .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
 
     let task_key = entry
         .key
         .ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
-    let _recurring_execution = quebec_recurring_executions::ActiveModel {
-        id: ActiveValue::not_set(),
-        job_id: ActiveValue::Set(job.id),
-        task_key: ActiveValue::Set(task_key),
-        run_at: ActiveValue::Set(scheduled_at),
-        created_at: ActiveValue::Set(now),
-    }
-    .save(db)
+    query_builder::recurring_executions::insert(
+        db,
+        &ctx.table_config,
+        job.id,
+        &task_key,
+        scheduled_at,
+    )
     .await?;
 
     // Apply concurrency control logic
@@ -255,15 +237,13 @@ where
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
 
             // Create ready execution - job can run immediately
-            let ready_created_at = chrono::Utc::now().naive_utc();
-            let _ready_execution = quebec_ready_executions::ActiveModel {
-                id: ActiveValue::not_set(),
-                job_id: ActiveValue::Set(job.id),
-                queue_name: ActiveValue::Set(job.queue_name.clone()),
-                priority: ActiveValue::Set(job.priority),
-                created_at: ActiveValue::Set(ready_created_at),
-            }
-            .save(db)
+            query_builder::ready_executions::insert(
+                db,
+                &ctx.table_config,
+                job.id,
+                &job.queue_name,
+                job.priority,
+            )
             .await?;
         } else {
             warn!(
@@ -276,29 +256,26 @@ where
             let duration = ctx.default_concurrency_control_period;
             let expires_at = block_now + duration;
 
-            let _blocked_execution = quebec_blocked_executions::ActiveModel {
-                id: ActiveValue::NotSet,
-                queue_name: ActiveValue::Set(job.queue_name.clone()),
-                job_id: ActiveValue::Set(job.id),
-                priority: ActiveValue::Set(job.priority),
-                concurrency_key: ActiveValue::Set(constraint.key.clone()),
-                expires_at: ActiveValue::Set(expires_at),
-                created_at: ActiveValue::Set(block_now),
-            }
-            .save(db)
+            query_builder::blocked_executions::insert(
+                db,
+                &ctx.table_config,
+                job.id,
+                &job.queue_name,
+                job.priority,
+                &constraint.key,
+                expires_at,
+            )
             .await?;
         }
     } else {
         // No concurrency control - create ready execution immediately
-        let ready_created_at = chrono::Utc::now().naive_utc();
-        let _ready_execution = quebec_ready_executions::ActiveModel {
-            id: ActiveValue::not_set(),
-            job_id: ActiveValue::Set(job.id),
-            queue_name: ActiveValue::Set(job.queue_name.clone()),
-            priority: ActiveValue::Set(job.priority),
-            created_at: ActiveValue::Set(ready_created_at),
-        }
-        .save(db)
+        query_builder::ready_executions::insert(
+            db,
+            &ctx.table_config,
+            job.id,
+            &job.queue_name,
+            job.priority,
+        )
         .await?;
     }
 
@@ -450,6 +427,9 @@ impl Scheduler {
                 };
                 info!("Starting scheduled task: {}", task_key);
 
+                // Track consecutive time errors for exponential backoff
+                let mut time_error_count: u32 = 0;
+
                 loop {
                     if graceful_shutdown.is_cancelled() {
                         info!(
@@ -481,15 +461,35 @@ impl Scheduler {
                     trace!("next_wall: {:?}", next_wall);
 
                     // Compute a fixed deadline on the monotonic clock to avoid drift
-                    let delay = (next_wall - now_wall).to_std().unwrap_or_else(|_| {
-                        warn!(
-                            r"Could not convert negative duration to std::time::Duration for task {}. \
-                             This can happen due to system time changes (e.g., NTP sync, DST). \
-                             Falling back to a 2-second delay.",
-                            task_key
-                        );
-                        std::time::Duration::from_secs(2)
-                    });
+                    let delay = match (next_wall - now_wall).to_std() {
+                        Ok(d) => {
+                            // Reset error count on successful time calculation
+                            time_error_count = 0;
+
+                            // Detect large time jumps (> 24 hours) and log warning
+                            if d.as_secs() > 86400 {
+                                warn!(
+                                    "Large time jump detected for task {}: next execution in {:.1} hours. \
+                                     This may indicate a system time issue or very sparse schedule.",
+                                    task_key,
+                                    d.as_secs() as f64 / 3600.0
+                                );
+                            }
+                            d
+                        }
+                        Err(_) => {
+                            // Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60... seconds
+                            time_error_count = time_error_count.saturating_add(1);
+                            let backoff_secs = std::cmp::min(2u64.saturating_pow(time_error_count), 60);
+                            warn!(
+                                "Could not convert negative duration for task {} (attempt {}). \
+                                 This can happen due to system time changes (e.g., NTP sync, DST). \
+                                 Using exponential backoff: {} seconds.",
+                                task_key, time_error_count, backoff_secs
+                            );
+                            std::time::Duration::from_secs(backoff_secs)
+                        }
+                    };
                     let deadline = now_monotonic + delay;
 
                     trace!("Job({:?}) next tick at: {:?}", &task_key, next_wall);

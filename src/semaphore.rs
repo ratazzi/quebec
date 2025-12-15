@@ -27,7 +27,7 @@ where
         DatabaseBackend::Sqlite => {
             format!(
                 "INSERT OR IGNORE INTO {} (key, value, expires_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES (?, ?, ?, ?, ?)",
                 table_config.semaphores
             )
         }
@@ -66,13 +66,23 @@ where
     }
 
     let decrement_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+        DatabaseBackend::Postgres => {
             format!(
                 "UPDATE {} SET \
              value = value - 1, \
              expires_at = $2, \
              updated_at = $3 \
              WHERE key = $1 AND value > 0",
+                table_config.semaphores
+            )
+        }
+        DatabaseBackend::Sqlite => {
+            format!(
+                "UPDATE {} SET \
+             value = value - 1, \
+             expires_at = ?, \
+             updated_at = ? \
+             WHERE key = ? AND value > 0",
                 table_config.semaphores
             )
         }
@@ -145,7 +155,7 @@ where
     // value ranges from 0 to limit, where limit means all slots are free
     // This matches Solid Queue's: Semaphore.where(key: key, value: ...limit).update_all(...)
     let increment_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+        DatabaseBackend::Postgres => {
             format!(
                 "UPDATE {} SET \
              value = value + 1, \
@@ -155,7 +165,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::MySql => {
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
             format!(
                 "UPDATE {} SET \
              value = value + 1, \
@@ -190,7 +200,7 @@ where
     // 2. The value is already at limit - 1 (all slots free)
     // In case 2, just update expires_at to keep the semaphore alive (don't delete!)
     let update_expires_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres | DatabaseBackend::Sqlite => {
+        DatabaseBackend::Postgres => {
             format!(
                 "UPDATE {} SET \
              expires_at = $2, \
@@ -199,7 +209,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::MySql => {
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
             format!(
                 "UPDATE {} SET \
              expires_at = ?, \

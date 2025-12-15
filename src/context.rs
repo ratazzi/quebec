@@ -90,6 +90,8 @@ impl Default for TableConfig {
 
 impl TableConfig {
     pub fn with_prefix(prefix: &str) -> Self {
+        // Strip trailing underscore to avoid double underscores (e.g., "hive_" -> "hive__jobs")
+        let prefix = prefix.trim_end_matches('_');
         Self {
             jobs: format!("{}_jobs", prefix),
             ready_executions: format!("{}_ready_executions", prefix),

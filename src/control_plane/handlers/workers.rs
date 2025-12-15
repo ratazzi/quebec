@@ -3,13 +3,12 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
-use sea_orm::{EntityTrait, Order, QueryOrder};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
 use crate::control_plane::{models::WorkerInfo, ControlPlane};
-use crate::entities::quebec_processes;
+use crate::query_builder;
 
 impl ControlPlane {
     pub async fn workers(
@@ -18,12 +17,11 @@ impl ControlPlane {
         let start = Instant::now();
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // Query all worker processes
-        let workers = quebec_processes::Entity::find()
-            .order_by(quebec_processes::Column::LastHeartbeatAt, Order::Desc)
-            .all(db)
+        // Query all worker processes using query_builder
+        let workers = query_builder::processes::find_all_by_heartbeat(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -1,14 +1,11 @@
 use crate::context::*;
 use crate::entities::*;
 use crate::process::{ProcessInfo, ProcessTrait};
+use crate::query_builder;
 use crate::semaphore::release_semaphore;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use sea_query::{
-    Alias, Asterisk, Expr, LockBehavior, MysqlQueryBuilder, PostgresQueryBuilder, Query,
-    SqliteQueryBuilder,
-};
 use tracing::{debug, error, info, trace, warn};
 
 use pyo3::exceptions::PyException;
@@ -810,36 +807,31 @@ impl Execution {
 
                 // Handle retry logic
                 if let Some((scheduled_at, failed_attempts)) = retry_job_data {
-                    let retry_job = quebec_jobs::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        queue_name: ActiveValue::Set(job.queue_name.clone()),
-                        class_name: ActiveValue::Set(job.class_name.clone()),
-                        arguments: ActiveValue::Set(job.arguments.clone()),
-                        priority: ActiveValue::Set(job.priority),
-                        failed_attempts: ActiveValue::Set(failed_attempts),
-                        active_job_id: ActiveValue::Set(job.active_job_id.clone()),
-                        scheduled_at: ActiveValue::Set(Some(scheduled_at)),
-                        finished_at: ActiveValue::Set(None),
-                        concurrency_key: ActiveValue::Set(job.concurrency_key.clone()),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                        updated_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                    };
-                    let saved_job = retry_job.save(txn).await?;
-                    let new_job_id = match saved_job.id.clone() {
-                        ActiveValue::Set(id) => id,
-                        _ => return Err(DbErr::Custom("Failed to get job ID after save".into())),
-                    };
+                    // Insert retry job using query_builder with failed_attempts
+                    let new_job_id = query_builder::jobs::insert_with_failed_attempts(
+                        txn,
+                        &table_config,
+                        &job.queue_name,
+                        &job.class_name,
+                        job.arguments.as_deref(),
+                        job.priority,
+                        failed_attempts,
+                        job.active_job_id.as_deref(),
+                        Some(scheduled_at),
+                        job.concurrency_key.as_deref(),
+                    )
+                    .await?;
 
                     // Create scheduled_execution record
-                    let scheduled_execution = quebec_scheduled_executions::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        job_id: ActiveValue::Set(new_job_id),
-                        queue_name: ActiveValue::Set(job.queue_name.clone()),
-                        priority: ActiveValue::Set(job.priority),
-                        scheduled_at: ActiveValue::Set(scheduled_at),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                    };
-                    scheduled_execution.save(txn).await?;
+                    query_builder::scheduled_executions::insert(
+                        txn,
+                        &table_config,
+                        new_job_id,
+                        &job.queue_name,
+                        job.priority,
+                        scheduled_at,
+                    )
+                    .await?;
 
                     info!("Retry job {} scheduled for {}", new_job_id, scheduled_at);
                 }
@@ -850,33 +842,31 @@ impl Execution {
                     // My strategy: increase failed_attempts field, stop execution if attempts exceed limit
 
                     // Write to failed_executions table
-                    let failed_execution = quebec_failed_executions::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        job_id: ActiveValue::Set(job_id),
-                        error: ActiveValue::Set(err.map(|e| e.to_string())),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                    };
-                    failed_execution.save(txn).await?;
-
-                    // let job = quebec_jobs::Entity::find_by_id(job_id).one(txn).await.unwrap();
-                    // return Ok(job.unwrap().into());
+                    query_builder::failed_executions::insert(
+                        txn,
+                        &table_config,
+                        job_id,
+                        err.map(|e| e.to_string()).as_deref(),
+                    )
+                    .await?;
                 }
 
-                // Update jobs table
-                let mut job: quebec_jobs::ActiveModel = job.clone().into();
-                job.finished_at = ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
-                job.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-                let updated = job.update(txn).await?;
+                // Update jobs table - mark as finished
+                query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
 
                 // Directly delete record from claimed_executions table
-                let delete_result = quebec_claimed_executions::Entity::delete_many()
-                    .filter(quebec_claimed_executions::Column::Id.eq(claimed_id))
-                    .exec(txn)
-                    .await?;
+                let delete_result =
+                    query_builder::claimed_executions::delete_by_id(txn, &table_config, claimed_id)
+                        .await?;
 
-                if delete_result.rows_affected == 0 {
+                if delete_result == 0 {
                     return Err(DbErr::Custom("Claimed job not found".into()));
                 }
+
+                // Fetch updated job model
+                let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
+                    .await?
+                    .ok_or_else(|| DbErr::Custom("Job not found after update".to_string()))?;
 
                 // Release semaphore if job has concurrency control
                 // This must happen AFTER job execution completes (ensure block in Solid Queue)
@@ -1112,71 +1102,46 @@ impl Execution {
                             );
 
                             let db = self.ctx.get_db().await;
-                            db.transaction::<_, quebec_jobs::ActiveModel, DbErr>(|txn| {
+                            let table_config = self.ctx.table_config.clone();
+                            db.transaction::<_, (), DbErr>(|txn| {
+                                let table_config = table_config.clone();
+                                let queue_name = job.queue_name.clone();
+                                let class_name = job.class_name.clone();
+                                let params_str = params.to_string();
+                                let priority = job.priority;
+                                let failed_attempts = job.failed_attempts + 1;
+                                let active_job_id = job.active_job_id.clone();
+                                let concurrency_key =
+                                    job.concurrency_key.clone().unwrap_or_default();
+
                                 Box::pin(async move {
-                                    let concurrency_key =
-                                        job.concurrency_key.clone().unwrap_or("".to_string());
-                                    let job = quebec_jobs::ActiveModel {
-                                        id: ActiveValue::NotSet,
-                                        queue_name: ActiveValue::Set(job.queue_name),
-                                        class_name: ActiveValue::Set(job.class_name),
-                                        arguments: ActiveValue::Set(Some(params.to_string())),
-                                        priority: ActiveValue::Set(job.priority),
-                                        failed_attempts: ActiveValue::Set(job.failed_attempts + 1),
-                                        active_job_id: ActiveValue::Set(job.active_job_id.clone()),
-                                        scheduled_at: ActiveValue::Set(Some(scheduled_at)),
-                                        finished_at: ActiveValue::Set(None),
-                                        concurrency_key: ActiveValue::Set(Some(
-                                            concurrency_key.clone(),
-                                        )),
-                                        created_at: ActiveValue::Set(
-                                            chrono::Utc::now().naive_utc(),
-                                        ),
-                                        updated_at: ActiveValue::Set(
-                                            chrono::Utc::now().naive_utc(),
-                                        ),
-                                    }
-                                    .save(txn)
+                                    // Insert job using query_builder
+                                    let job_id = query_builder::jobs::insert_with_failed_attempts(
+                                        txn,
+                                        &table_config,
+                                        &queue_name,
+                                        &class_name,
+                                        Some(&params_str),
+                                        priority,
+                                        failed_attempts,
+                                        active_job_id.as_deref(),
+                                        Some(scheduled_at),
+                                        Some(&concurrency_key),
+                                    )
                                     .await?;
 
-                                    let job_id = match job.id.clone() {
-                                        ActiveValue::Set(id) => id,
-                                        _ => {
-                                            return Err(DbErr::Custom(
-                                                "Failed to get job ID".into(),
-                                            ))
-                                        }
-                                    };
-                                    let _scheduled_execution =
-                                        quebec_scheduled_executions::ActiveModel {
-                                            id: ActiveValue::not_set(),
-                                            job_id: ActiveValue::Set(job_id),
-                                            queue_name: match job.queue_name.clone() {
-                                                ActiveValue::Set(q) => ActiveValue::Set(q),
-                                                _ => {
-                                                    return Err(DbErr::Custom(
-                                                        "Queue name missing".into(),
-                                                    ))
-                                                }
-                                            },
-                                            priority: match job.priority.clone() {
-                                                ActiveValue::Set(p) => ActiveValue::Set(p),
-                                                _ => {
-                                                    return Err(DbErr::Custom(
-                                                        "Priority missing".into(),
-                                                    ))
-                                                }
-                                            },
-                                            scheduled_at: ActiveValue::Set(scheduled_at),
-                                            created_at: ActiveValue::Set(
-                                                chrono::Utc::now().naive_utc(),
-                                            ),
-                                        }
-                                        .save(txn)
-                                        .await?;
+                                    // Insert scheduled execution
+                                    query_builder::scheduled_executions::insert(
+                                        txn,
+                                        &table_config,
+                                        job_id,
+                                        &queue_name,
+                                        priority,
+                                        scheduled_at,
+                                    )
+                                    .await?;
 
-                                    // debug!("{:?}", scheduled_execution);
-                                    Ok(job)
+                                    Ok(())
                                 })
                             })
                             .await
@@ -1353,18 +1318,17 @@ impl Worker {
 
     pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
         let db = self.ctx.get_db().await;
+        let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
+        let use_skip_locked = self.ctx.use_skip_locked;
 
         let job = db
-            .transaction::<_, quebec_claimed_executions::ActiveModel, DbErr>(|txn| {
+            .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
+                let table_config = table_config.clone();
                 Box::pin(async move {
                     // Get list of paused queues (must filter these out)
-                    let paused_queues: Vec<String> = quebec_pauses::Entity::find()
-                        .select_only()
-                        .column(quebec_pauses::Column::QueueName)
-                        .into_tuple()
-                        .all(txn)
-                        .await?;
+                    let paused_queues =
+                        query_builder::pauses::find_all_queue_names(txn, &table_config).await?;
 
                     if !paused_queues.is_empty() {
                         debug!("Paused queues: {:?}", paused_queues);
@@ -1383,19 +1347,13 @@ impl Worker {
                             // For wildcard patterns, first expand to get all matching queue names
                             // Then poll each concrete queue independently (Solid Queue semantics)
                             // Sort by queue_name to ensure deterministic order
-                            let matching_queues: Vec<String> =
-                                quebec_ready_executions::Entity::find()
-                                    .select_only()
-                                    .column(quebec_ready_executions::Column::QueueName)
-                                    .filter(
-                                        quebec_ready_executions::Column::QueueName
-                                            .like(format!("{}%", pattern)),
-                                    )
-                                    .group_by(quebec_ready_executions::Column::QueueName)
-                                    .order_by_asc(quebec_ready_executions::Column::QueueName)
-                                    .into_tuple()
-                                    .all(txn)
-                                    .await?;
+                            let matching_queues =
+                                query_builder::ready_executions::find_matching_queue_names(
+                                    txn,
+                                    &table_config,
+                                    &pattern,
+                                )
+                                .await?;
 
                             // Poll each concrete queue in alphabetical order
                             for queue_name in matching_queues {
@@ -1404,81 +1362,92 @@ impl Worker {
                                     continue;
                                 }
 
-                                let record = quebec_ready_executions::Entity::find()
-                                    .filter(
-                                        quebec_ready_executions::Column::QueueName.eq(queue_name),
-                                    )
-                                    .order_by_asc(quebec_ready_executions::Column::Priority)
-                                    .order_by_asc(quebec_ready_executions::Column::JobId)
-                                    .lock_with_behavior(
-                                        sea_query::LockType::Update,
-                                        LockBehavior::SkipLocked,
-                                    )
-                                    .limit(1)
-                                    .one(txn)
-                                    .await?;
+                                let record = query_builder::ready_executions::find_one_for_update(
+                                    txn,
+                                    &table_config,
+                                    Some(&queue_name),
+                                    &[],
+                                    use_skip_locked,
+                                )
+                                .await?;
 
                                 if let Some(execution) = record {
-                                    let claimed = quebec_claimed_executions::ActiveModel {
-                                        id: ActiveValue::NotSet,
-                                        job_id: ActiveValue::Set(execution.job_id),
-                                        process_id: ActiveValue::NotSet,
-                                        created_at: ActiveValue::Set(
-                                            chrono::Utc::now().naive_utc(),
-                                        ),
-                                    }
-                                    .save(txn)
+                                    query_builder::claimed_executions::insert(
+                                        txn,
+                                        &table_config,
+                                        execution.job_id,
+                                        None,
+                                    )
                                     .await?;
 
-                                    execution.delete(txn).await?;
-                                    return Ok(claimed);
+                                    query_builder::ready_executions::delete_by_id(
+                                        txn,
+                                        &table_config,
+                                        execution.id,
+                                    )
+                                    .await?;
+
+                                    // Fetch the claimed execution to return
+                                    let claimed =
+                                        query_builder::claimed_executions::find_by_job_id(
+                                            txn,
+                                            &table_config,
+                                            execution.job_id,
+                                        )
+                                        .await?;
+                                    if let Some(claimed_model) = claimed {
+                                        return Ok(claimed_model);
+                                    }
                                 }
                             }
                         } else {
                             // Exact queue name or "*" (all queues)
-                            let mut select = quebec_ready_executions::Entity::find();
-
-                            // Add queue filter based on pattern type
-                            if pattern != "*" {
+                            let (queue_filter, exclude_queues) = if pattern != "*" {
                                 // Skip if this exact queue is paused
                                 if paused_queues.contains(&pattern) {
                                     continue;
                                 }
-                                select = select
-                                    .filter(quebec_ready_executions::Column::QueueName.eq(pattern));
+                                (Some(pattern.as_str()), vec![])
                             } else {
                                 // For "*" (all queues), exclude paused queues
-                                if !paused_queues.is_empty() {
-                                    select = select.filter(
-                                        quebec_ready_executions::Column::QueueName
-                                            .is_not_in(paused_queues.clone()),
-                                    );
-                                }
-                            }
+                                (None, paused_queues.clone())
+                            };
 
-                            let record = select
-                                .order_by_asc(quebec_ready_executions::Column::Priority)
-                                .order_by_asc(quebec_ready_executions::Column::JobId)
-                                .lock_with_behavior(
-                                    sea_query::LockType::Update,
-                                    LockBehavior::SkipLocked,
-                                )
-                                .limit(1)
-                                .one(txn)
-                                .await?;
+                            let record = query_builder::ready_executions::find_one_for_update(
+                                txn,
+                                &table_config,
+                                queue_filter,
+                                &exclude_queues,
+                                use_skip_locked,
+                            )
+                            .await?;
 
                             if let Some(execution) = record {
-                                let claimed = quebec_claimed_executions::ActiveModel {
-                                    id: ActiveValue::NotSet,
-                                    job_id: ActiveValue::Set(execution.job_id),
-                                    process_id: ActiveValue::NotSet,
-                                    created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                }
-                                .save(txn)
+                                query_builder::claimed_executions::insert(
+                                    txn,
+                                    &table_config,
+                                    execution.job_id,
+                                    None,
+                                )
                                 .await?;
 
-                                execution.delete(txn).await?;
-                                return Ok(claimed);
+                                query_builder::ready_executions::delete_by_id(
+                                    txn,
+                                    &table_config,
+                                    execution.id,
+                                )
+                                .await?;
+
+                                // Fetch the claimed execution to return
+                                let claimed = query_builder::claimed_executions::find_by_job_id(
+                                    txn,
+                                    &table_config,
+                                    execution.job_id,
+                                )
+                                .await?;
+                                if let Some(claimed_model) = claimed {
+                                    return Ok(claimed_model);
+                                }
                             }
                         }
                     }
@@ -1488,7 +1457,7 @@ impl Worker {
             })
             .await?;
 
-        Ok(job.try_into_model()?)
+        Ok(job)
     }
 
     // #[tracing::instrument]
@@ -1498,26 +1467,22 @@ impl Worker {
     ) -> Result<Vec<quebec_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await;
-        let _use_skip_locked = self.ctx.use_skip_locked;
+        let use_skip_locked = self.ctx.use_skip_locked;
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
 
         let jobs = db
-            .transaction::<_, Vec<quebec_claimed_executions::ActiveModel>, DbErr>(|txn| {
+            .transaction::<_, Vec<quebec_claimed_executions::Model>, DbErr>(|txn| {
+                let table_config = table_config.clone();
                 Box::pin(async move {
                     // Get list of paused queues
-                    let paused_queues: Vec<String> = quebec_pauses::Entity::find()
-                        .select_only()
-                        .column(quebec_pauses::Column::QueueName)
-                        .into_tuple()
-                        .all(txn)
-                        .await?;
+                    let paused_queues =
+                        query_builder::pauses::find_all_queue_names(txn, &table_config).await?;
 
                     if !paused_queues.is_empty() {
                         debug!("Paused queues: {:?}", paused_queues);
                     }
 
-                    let db_backend = txn.get_database_backend();
                     let mut claimed_jobs = Vec::new();
                     let mut remaining = batch_size;
 
@@ -1534,25 +1499,17 @@ impl Worker {
                             break;
                         }
 
-                        let table_name = &table_config.ready_executions;
-
                         if is_wildcard {
                             // For wildcard patterns, first expand to get all matching queue names
                             // Then poll each concrete queue independently (Solid Queue semantics)
                             // Sort by queue_name to ensure deterministic order
-                            let matching_queues: Vec<String> =
-                                quebec_ready_executions::Entity::find()
-                                    .select_only()
-                                    .column(quebec_ready_executions::Column::QueueName)
-                                    .filter(
-                                        quebec_ready_executions::Column::QueueName
-                                            .like(format!("{}%", pattern)),
-                                    )
-                                    .group_by(quebec_ready_executions::Column::QueueName)
-                                    .order_by_asc(quebec_ready_executions::Column::QueueName)
-                                    .into_tuple()
-                                    .all(txn)
-                                    .await?;
+                            let matching_queues =
+                                query_builder::ready_executions::find_matching_queue_names(
+                                    txn,
+                                    &table_config,
+                                    &pattern,
+                                )
+                                .await?;
 
                             // Poll each concrete queue in alphabetical order
                             for queue_name in matching_queues {
@@ -1565,55 +1522,46 @@ impl Worker {
                                     continue;
                                 }
 
-                                // Build query for this specific queue
-                                let table_alias = Alias::new(table_name);
-                                let mut query = Query::select()
-                                    .column(Asterisk)
-                                    .from(table_alias)
-                                    .and_where(Expr::col("queue_name").eq(queue_name))
-                                    .order_by("priority", sea_query::Order::Asc)
-                                    .order_by("job_id", sea_query::Order::Asc)
-                                    .limit(remaining)
-                                    .to_owned();
-
-                                if db_backend != DbBackend::Sqlite {
-                                    query = query
-                                        .lock_with_behavior(
-                                            sea_query::LockType::Update,
-                                            LockBehavior::SkipLocked,
-                                        )
-                                        .to_owned();
-                                }
-
-                                let (sql, values) = match db_backend {
-                                    DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-                                    DbBackend::Postgres => query.build(PostgresQueryBuilder),
-                                    DbBackend::MySql => query.build(MysqlQueryBuilder),
-                                };
-
-                                let records: Vec<quebec_ready_executions::Model> =
-                                    quebec_ready_executions::Entity::find()
-                                        .from_raw_sql(Statement::from_sql_and_values(
-                                            db_backend, &sql, values,
-                                        ))
-                                        .all(txn)
-                                        .await?;
+                                // Find ready executions for this queue
+                                let records =
+                                    query_builder::ready_executions::find_many_for_update(
+                                        txn,
+                                        &table_config,
+                                        Some(&queue_name),
+                                        &[],
+                                        use_skip_locked,
+                                        remaining,
+                                    )
+                                    .await?;
 
                                 // Claim the jobs from this queue
                                 for execution in records {
-                                    let claimed = quebec_claimed_executions::ActiveModel {
-                                        id: ActiveValue::NotSet,
-                                        job_id: ActiveValue::Set(execution.job_id),
-                                        process_id: ActiveValue::NotSet,
-                                        created_at: ActiveValue::Set(
-                                            chrono::Utc::now().naive_utc(),
-                                        ),
-                                    }
-                                    .save(txn)
+                                    query_builder::claimed_executions::insert(
+                                        txn,
+                                        &table_config,
+                                        execution.job_id,
+                                        None,
+                                    )
                                     .await?;
 
-                                    execution.delete(txn).await?;
-                                    claimed_jobs.push(claimed);
+                                    query_builder::ready_executions::delete_by_id(
+                                        txn,
+                                        &table_config,
+                                        execution.id,
+                                    )
+                                    .await?;
+
+                                    // Fetch the claimed execution
+                                    if let Some(claimed_model) =
+                                        query_builder::claimed_executions::find_by_job_id(
+                                            txn,
+                                            &table_config,
+                                            execution.job_id,
+                                        )
+                                        .await?
+                                    {
+                                        claimed_jobs.push(claimed_model);
+                                    }
                                     remaining = remaining.saturating_sub(1);
                                 }
                             }
@@ -1626,69 +1574,53 @@ impl Worker {
                                 }
                             }
 
-                            // Build query
-                            let table_alias = Alias::new(table_name);
-                            let mut query = Query::select()
-                                .column(Asterisk)
-                                .from(table_alias)
-                                .order_by("priority", sea_query::Order::Asc)
-                                .order_by("job_id", sea_query::Order::Asc)
-                                .limit(remaining)
-                                .to_owned();
-
-                            // Add queue filter if not "*"
-                            if pattern != "*" {
-                                query = query
-                                    .and_where(Expr::col("queue_name").eq(pattern))
-                                    .to_owned();
+                            // Determine queue filter and exclusions
+                            let (queue_filter, exclude_queues) = if pattern != "*" {
+                                (Some(pattern.as_str()), vec![])
                             } else {
                                 // For "*" (all queues), exclude paused queues
-                                if !paused_queues.is_empty() {
-                                    query = query
-                                        .and_where(
-                                            Expr::col("queue_name")
-                                                .is_not_in(paused_queues.clone()),
-                                        )
-                                        .to_owned();
-                                }
-                            }
-
-                            if db_backend != DbBackend::Sqlite {
-                                query = query
-                                    .lock_with_behavior(
-                                        sea_query::LockType::Update,
-                                        LockBehavior::SkipLocked,
-                                    )
-                                    .to_owned();
-                            }
-
-                            let (sql, values) = match db_backend {
-                                DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-                                DbBackend::Postgres => query.build(PostgresQueryBuilder),
-                                DbBackend::MySql => query.build(MysqlQueryBuilder),
+                                (None, paused_queues.clone())
                             };
 
-                            let records: Vec<quebec_ready_executions::Model> =
-                                quebec_ready_executions::Entity::find()
-                                    .from_raw_sql(Statement::from_sql_and_values(
-                                        db_backend, &sql, values,
-                                    ))
-                                    .all(txn)
-                                    .await?;
+                            // Find ready executions
+                            let records = query_builder::ready_executions::find_many_for_update(
+                                txn,
+                                &table_config,
+                                queue_filter,
+                                &exclude_queues,
+                                use_skip_locked,
+                                remaining,
+                            )
+                            .await?;
 
                             // Claim the jobs from this queue
                             for execution in records {
-                                let claimed = quebec_claimed_executions::ActiveModel {
-                                    id: ActiveValue::NotSet,
-                                    job_id: ActiveValue::Set(execution.job_id),
-                                    process_id: ActiveValue::NotSet,
-                                    created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                                }
-                                .save(txn)
+                                query_builder::claimed_executions::insert(
+                                    txn,
+                                    &table_config,
+                                    execution.job_id,
+                                    None,
+                                )
                                 .await?;
 
-                                execution.delete(txn).await?;
-                                claimed_jobs.push(claimed);
+                                query_builder::ready_executions::delete_by_id(
+                                    txn,
+                                    &table_config,
+                                    execution.id,
+                                )
+                                .await?;
+
+                                // Fetch the claimed execution
+                                if let Some(claimed_model) =
+                                    query_builder::claimed_executions::find_by_job_id(
+                                        txn,
+                                        &table_config,
+                                        execution.job_id,
+                                    )
+                                    .await?
+                                {
+                                    claimed_jobs.push(claimed_model);
+                                }
                                 remaining = remaining.saturating_sub(1);
                             }
                         }
@@ -1699,10 +1631,8 @@ impl Worker {
             })
             .await?;
 
-        let claimed_models: Result<Vec<quebec_claimed_executions::Model>, _> =
-            jobs.into_iter().map(|job| job.try_into_model()).collect();
         trace!("elpased: {:?}", timer.elapsed());
-        claimed_models.map_err(|e| anyhow::Error::new(e))
+        Ok(jobs)
     }
 
     pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
@@ -1907,21 +1837,15 @@ impl Worker {
         // Process claimed jobs without holding a long transaction
         // First collect all job data quickly, then create executions
         let job_ids: Vec<i64> = claimed.iter().map(|row| row.job_id).collect();
+        let table_config = ctx.table_config.clone();
         let job_data = {
             let processing_db = ctx.get_db().await;
             // Use a single quick transaction to fetch all job data
             let jobs_result = processing_db
                 .transaction::<_, Vec<quebec_jobs::Model>, DbErr>(|txn| {
+                    let table_config = table_config.clone();
                     Box::pin(async move {
-                        let mut jobs = Vec::new();
-                        for job_id in job_ids {
-                            if let Some(job) =
-                                quebec_jobs::Entity::find_by_id(job_id).one(txn).await?
-                            {
-                                jobs.push(job);
-                            }
-                        }
-                        Ok(jobs)
+                        query_builder::jobs::find_by_ids(txn, &table_config, job_ids).await
                     })
                 })
                 .await;
@@ -1935,8 +1859,21 @@ impl Worker {
             }
         }; // processing_db is released here
 
+        // Build a HashMap to match jobs by ID, since find_by_ids doesn't guarantee order
+        let job_map: std::collections::HashMap<i64, quebec_jobs::Model> =
+            job_data.into_iter().map(|job| (job.id, job)).collect();
+
         // Now create executions without holding any database connections
-        for (row, job) in claimed.into_iter().zip(job_data.into_iter()) {
+        for row in claimed.into_iter() {
+            // Look up the job by ID from the HashMap
+            let job = match job_map.get(&row.job_id) {
+                Some(j) => j.clone(),
+                None => {
+                    error!("Job not found for claimed execution: job_id={}", row.job_id);
+                    continue;
+                }
+            };
+
             // Get runnable with proper GIL handling
             let runnable = Python::with_gil(|_py| self.ctx.get_runnable(&job.class_name));
 

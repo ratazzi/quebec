@@ -1,10 +1,10 @@
 use crate::context::AppContext;
-use crate::entities::*;
+use crate::entities::quebec_processes;
+use crate::query_builder;
 use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
-use sea_orm::TransactionTrait;
-use sea_orm::*;
+use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -60,36 +60,41 @@ pub trait ProcessTrait: Send + Sync {
     /// Called when process starts - registers in database
     async fn on_start(&self, db: &DatabaseConnection) -> Result<quebec_processes::Model, Error> {
         let info = self.process_info();
+        let ctx = self.ctx();
+        let table_config = ctx.table_config.clone();
+
         let process = db
-            .transaction::<_, quebec_processes::ActiveModel, DbErr>(|txn| {
+            .transaction::<_, quebec_processes::Model, DbErr>(|txn| {
                 let hostname = Self::get_hostname();
                 let pid = Self::get_pid();
-                let supervisor_id = Self::get_supervisor_id();
                 let metadata = Self::get_metadata();
                 let kind = info.kind.clone();
                 let name = info.name.clone();
 
                 Box::pin(async move {
-                    let process = quebec_processes::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        kind: ActiveValue::Set(kind),
-                        name: ActiveValue::Set(name),
-                        supervisor_id: ActiveValue::Set(supervisor_id),
-                        metadata: ActiveValue::Set(metadata),
-                        last_heartbeat_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                        pid: ActiveValue::Set(pid),
-                        hostname: ActiveValue::Set(hostname),
-                        created_at: ActiveValue::Set(chrono::Utc::now().naive_utc()),
-                    }
-                    .save(txn)
+                    let process_id = query_builder::processes::insert(
+                        txn,
+                        &table_config,
+                        &kind,
+                        pid,
+                        hostname.as_deref(),
+                        metadata.as_deref(),
+                        &name,
+                    )
                     .await?;
+
+                    let process =
+                        query_builder::processes::find_by_id(txn, &table_config, process_id)
+                            .await?
+                            .ok_or_else(|| {
+                                DbErr::Custom("Failed to find inserted process".to_string())
+                            })?;
 
                     Ok(process)
                 })
             })
             .await?;
 
-        let process = process.try_into_model()?;
         info!(
             "Process started: name={} pid={} hostname={:?}",
             process.name, process.pid, process.hostname
@@ -143,10 +148,8 @@ pub trait ProcessTrait: Send + Sync {
         db: &DatabaseConnection,
         process: &quebec_processes::Model,
     ) -> Result<(), Error> {
-        let mut process = process.clone().into_active_model();
-        process.last_heartbeat_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-        process.clone().update(db).await?;
-
+        let ctx = self.ctx();
+        query_builder::processes::update_heartbeat(db, &ctx.table_config, process.id).await?;
         Ok(())
     }
 
@@ -160,7 +163,8 @@ pub trait ProcessTrait: Send + Sync {
         let process_hostname = process.hostname.clone();
 
         // Delete the process record
-        process.clone().delete(db).await?;
+        let ctx = self.ctx();
+        query_builder::processes::delete_by_id(db, &ctx.table_config, process.id).await?;
 
         info!(
             "Process stopped: name={} pid={} hostname={:?}",

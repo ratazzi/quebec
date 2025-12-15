@@ -1,7 +1,8 @@
 use crate::context::*;
-use crate::entities::*;
+use crate::entities::quebec_jobs;
 use crate::error::Result;
 use crate::notify::NotifyManager;
+use crate::query_builder;
 use crate::semaphore::acquire_semaphore;
 use crate::types::ActiveJob;
 use tracing::{info, trace, warn};
@@ -38,7 +39,7 @@ impl Quebec {
                         "job_class": job.class_name.clone(),
                         "job_id": null,
                         "provider_job_id": "",
-                        "queue_name": "default",
+                        "queue_name": job.queue_name.clone(),
                         "priority": job.priority,
                         "arguments": args,
                         "executions": 0,
@@ -52,27 +53,25 @@ impl Quebec {
                     let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
                     let concurrency_limit = job.concurrency_limit.unwrap_or(1);
 
-                    // Insert job and get the model with generated ID
-                    let job_model = quebec_jobs::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        queue_name: ActiveValue::Set(job.queue_name),
-                        class_name: ActiveValue::Set(job.class_name),
-                        arguments: ActiveValue::Set(Some(params.to_string())),
-                        priority: ActiveValue::Set(job.priority),
-                        failed_attempts: ActiveValue::Set(0),
-                        active_job_id: ActiveValue::Set(Some(job.active_job_id)),
-                        scheduled_at: ActiveValue::Set(Some(job.scheduled_at)),
-                        finished_at: ActiveValue::Set(None),
-                        concurrency_key: ActiveValue::Set(Some(concurrency_key.clone())),
-                        created_at: ActiveValue::Set(now),
-                        updated_at: ActiveValue::Set(now),
-                    }
-                    .save(txn)
+                    // Insert job using query_builder with dynamic table names
+                    let job_id = query_builder::jobs::insert(
+                        txn,
+                        &ctx.table_config,
+                        &job.queue_name,
+                        &job.class_name,
+                        Some(params.to_string()).as_deref(),
+                        job.priority,
+                        Some(job.active_job_id.as_str()),
+                        Some(job.scheduled_at),
+                        if concurrency_key.is_empty() { None } else { Some(concurrency_key.as_str()) },
+                    )
                     .await?;
 
-                    // Convert ActiveModel to Model
-                    let job_model = job_model.try_into_model()?;
-                    let job_id = job_model.id;
+                    // Fetch the inserted job model
+                    let job_model = query_builder::jobs::find_by_id(txn, &ctx.table_config, job_id)
+                        .await?
+                        .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
+
                     let job_priority = job_model.priority;
 
                     // Get queue_name from job for proper propagation
@@ -90,24 +89,24 @@ impl Quebec {
                             // Handle based on conflict strategy
                             match conflict_strategy {
                                 crate::context::ConcurrencyConflict::Discard => {
-                                    // Discard strategy: silently drop the job without blocking
+                                    // Discard strategy: mark job as finished to avoid dangling job
                                     info!("Concurrency limit reached for key: {}, discarding job (conflict strategy: discard)", concurrency_key);
+                                    query_builder::jobs::mark_finished(txn, &ctx.table_config, job_id).await?;
                                     return Ok(job_model);
                                 }
                                 crate::context::ConcurrencyConflict::Block => {
                                     // Block strategy: add to blocked queue (default behavior)
                                     info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
 
-                                    let _blocked_execution = quebec_blocked_executions::ActiveModel {
-                                        id: ActiveValue::NotSet,
-                                        queue_name: ActiveValue::Set(job_queue_name.clone()),
-                                        job_id: ActiveValue::Set(job_id),
-                                        priority: ActiveValue::Set(job_priority),
-                                        concurrency_key: ActiveValue::Set(concurrency_key.clone()),
-                                        expires_at: ActiveValue::Set(expires_at),
-                                        created_at: ActiveValue::Set(now),
-                                    }
-                                    .save(txn)
+                                    query_builder::blocked_executions::insert(
+                                        txn,
+                                        &ctx.table_config,
+                                        job_id,
+                                        &job_queue_name,
+                                        job_priority,
+                                        &concurrency_key,
+                                        expires_at,
+                                    )
                                     .await?;
 
                                     // Job is blocked, don't add to ready queue
@@ -117,14 +116,13 @@ impl Quebec {
                         }
                     }
 
-                    let _ready_execution = quebec_ready_executions::ActiveModel {
-                        id: ActiveValue::NotSet,
-                        queue_name: ActiveValue::Set(job_queue_name),
-                        job_id: ActiveValue::Set(job_id),
-                        priority: ActiveValue::Set(job_priority),
-                        created_at: ActiveValue::Set(now),
-                    }
-                    .save(txn)
+                    query_builder::ready_executions::insert(
+                        txn,
+                        &ctx.table_config,
+                        job_id,
+                        &job_queue_name,
+                        job_priority,
+                    )
                     .await?;
 
                     // info!("Job created: {:?}", job_model);

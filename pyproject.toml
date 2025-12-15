@@ -35,7 +35,7 @@ Repository = "https://github.com/ratazzi/quebec"
 test = ["pytest < 5.0.0", "pytest-cov[all]"]
 
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin>=1.10,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]

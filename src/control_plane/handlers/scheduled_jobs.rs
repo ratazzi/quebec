@@ -3,10 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
-use sea_orm::{
-    ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, Statement,
-    TransactionTrait, Value,
-};
+use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info};
@@ -15,7 +12,7 @@ use crate::control_plane::{
     models::{Pagination, ScheduledJobInfo},
     ControlPlane,
 };
-use crate::entities::{quebec_jobs, quebec_scheduled_executions};
+use crate::query_builder;
 
 impl ControlPlane {
     pub async fn scheduled_jobs(
@@ -35,6 +32,16 @@ impl ControlPlane {
 
         // Get scheduled jobs with related information using dynamic table names
         let table_config = &state.ctx.table_config;
+        let backend = db.get_database_backend();
+
+        // Use database-specific placeholders
+        let (p1, p2) = match backend {
+            sea_orm::DbBackend::Postgres => ("$1".to_string(), "$2".to_string()),
+            sea_orm::DbBackend::MySql | sea_orm::DbBackend::Sqlite => {
+                ("?".to_string(), "?".to_string())
+            }
+        };
+
         let scheduled_jobs_sql = format!(
             "SELECT
                 s.id as execution_id,
@@ -47,13 +54,13 @@ impl ControlPlane {
             JOIN {} j ON s.job_id = j.id
             WHERE j.finished_at IS NULL
             ORDER BY s.scheduled_at ASC
-            LIMIT $1 OFFSET $2",
-            table_config.scheduled_executions, table_config.jobs
+            LIMIT {} OFFSET {}",
+            table_config.scheduled_executions, table_config.jobs, p1, p2
         );
 
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
-                db.get_database_backend(),
+                backend,
                 &scheduled_jobs_sql,
                 [Value::from(page_size as i32), Value::from(offset as i32)],
             ))
@@ -128,11 +135,7 @@ impl ControlPlane {
         );
 
         let total_count = db
-            .query_one(Statement::from_sql_and_values(
-                db.get_database_backend(),
-                &count_sql,
-                [],
-            ))
+            .query_one(Statement::from_sql_and_values(backend, &count_sql, []))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
@@ -179,34 +182,25 @@ impl ControlPlane {
     ) -> impl IntoResponse {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
+        let table_config = state.ctx.table_config.clone();
 
         // Use transaction to operate
         let txn_result = db
             .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
                 Box::pin(async move {
-                    // Find scheduled execution record to cancel
-                    let scheduled_execution = quebec_scheduled_executions::Entity::find_by_id(id)
-                        .one(txn)
-                        .await?;
-
-                    if let Some(execution) = scheduled_execution {
-                        // First mark job as completed
-                        let job_result = quebec_jobs::Entity::find_by_id(execution.job_id)
-                            .one(txn)
+                    // Find scheduled execution record to cancel using query_builder
+                    let scheduled_execution =
+                        query_builder::scheduled_executions::find_by_id(txn, &table_config, id)
                             .await?;
 
-                        if let Some(job) = job_result {
-                            // Update job status to completed
-                            let mut job_model: quebec_jobs::ActiveModel = job.into();
-                            job_model.finished_at =
-                                ActiveValue::Set(Some(chrono::Utc::now().naive_utc()));
-                            job_model.updated_at = ActiveValue::Set(chrono::Utc::now().naive_utc());
-                            job_model.update(txn).await?;
-                        }
+                    if let Some(execution) = scheduled_execution {
+                        // Mark job as finished using query_builder
+                        query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
+                            .await?;
 
-                        // Delete scheduled_execution record
-                        quebec_scheduled_executions::Entity::delete_by_id(id)
-                            .exec(txn)
+                        // Delete scheduled_execution record using query_builder
+                        query_builder::scheduled_executions::delete_by_id(txn, &table_config, id)
                             .await?;
 
                         info!("Cancelled scheduled job ID: {}", id);
