@@ -105,40 +105,6 @@ pub fn set_title(title: &str) {
     }
 }
 
-/// Get the current process title (best-effort, mainly for tests).
-pub fn get_title() -> Option<String> {
-    init();
-
-    #[cfg(target_os = "linux")]
-    {
-        let guard = PROCTITLE_STATE.lock().unwrap();
-        if let Some(state) = guard.as_ref() {
-            unsafe {
-                let argv0_str = CStr::from_ptr(state.argv_start as *const c_char);
-                return argv0_str.to_str().ok().map(|s| s.to_string());
-            }
-        }
-
-        // Fallback to PR_GET_NAME.
-        let mut buffer = [0u8; 16];
-        unsafe {
-            if libc::prctl(libc::PR_GET_NAME, buffer.as_mut_ptr() as *mut _, 0, 0, 0) == 0 {
-                if let Some(first_null) = buffer.iter().position(|&b| b == 0) {
-                    let title_bytes = &buffer[..first_null];
-                    return String::from_utf8(title_bytes.to_vec()).ok();
-                }
-            }
-        }
-
-        return None;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        return None;
-    }
-}
-
 #[cfg(target_os = "linux")]
 impl ProcTitleState {
     /// Write the supplied title into the reserved argv buffer.

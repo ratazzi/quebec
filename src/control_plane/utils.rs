@@ -36,12 +36,14 @@ impl ControlPlane {
     }
 
     /// Calculate runtime from start time to now
+    #[allow(dead_code)]
     pub fn calculate_runtime(started_at: NaiveDateTime) -> String {
         let duration = Utc::now().naive_utc() - started_at;
         format!("{:.2}s", duration.num_milliseconds() as f64 / 1000.0)
     }
 
     /// Calculate time difference from now
+    #[allow(dead_code)]
     pub fn calculate_time_diff(from: NaiveDateTime) -> String {
         let duration = Utc::now().naive_utc() - from;
         let seconds = duration.num_seconds();
@@ -136,6 +138,7 @@ impl ControlPlane {
     }
 
     /// Get pagination parameters
+    #[allow(dead_code)]
     pub fn get_pagination_params(&self, page: u64, total_items: u64) -> HashMap<&'static str, u64> {
         let total_pages = (total_items as f64 / self.page_size as f64).ceil() as u64;
         let total_pages = total_pages.max(1);
@@ -171,6 +174,7 @@ impl ControlPlane {
     }
 
     /// Format error message with optional backtrace
+    #[allow(dead_code)]
     pub fn format_error_with_backtrace(error: Option<String>, backtrace: Option<String>) -> String {
         match (error, backtrace) {
             (Some(err), Some(bt)) => format!("{}\n\nBacktrace:\n{}", err, bt),

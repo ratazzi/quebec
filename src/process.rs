@@ -135,6 +135,8 @@ pub trait ProcessTrait: Send + Sync {
         tid
     }
 
+    // TODO: Will be used when Supervisor process management is implemented
+    #[allow(dead_code)]
     fn get_supervisor_id() -> Option<i64> {
         None
     }

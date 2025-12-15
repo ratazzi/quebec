@@ -138,28 +138,6 @@ pub fn set_title(title: &str) {
     }
 }
 
-/// Get the current process title (for debugging/testing)
-pub fn get_title() -> Option<String> {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe {
-            let state_guard = PROCTITLE_STATE.lock().unwrap();
-            if let Some(state) = state_guard.as_ref() {
-                let argv0_str = CStr::from_ptr(state.argv_start as *const c_char);
-                argv0_str.to_str().ok().map(|s| s.to_string())
-            } else {
-                None
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Not implemented for other platforms
-        None
-    }
-}
-
 impl ProcTitleState {
     /// Write the supplied title into the reserved argv buffer.
     unsafe fn write_title(&mut self, title: &str) {

@@ -616,8 +616,3 @@ impl ScheduledEntry {
         Ok(cron?)
     }
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Schedule {
-    pub entries: HashMap<String, ScheduledEntry>,
-}

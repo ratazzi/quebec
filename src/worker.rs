@@ -675,7 +675,6 @@ pub struct Execution {
     job: quebec_jobs::Model,
     runnable: Runnable,
     metric: Option<Metric>,
-    result: Option<Result<quebec_jobs::Model>>,
     retry_info: Option<RetryInfo>,
 }
 
@@ -706,13 +705,8 @@ impl Execution {
             job,
             runnable,
             metric: None,
-            result: None,
             retry_info: None,
         }
-    }
-
-    fn post_result(&mut self, result: Result<quebec_jobs::Model>) {
-        self.result = Some(result);
     }
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {

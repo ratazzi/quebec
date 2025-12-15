@@ -2,10 +2,13 @@ use rust_embed::RustEmbed;
 use tracing::error;
 
 // Define embedded template resources
+// Note: Templates is only used in release builds (embedded assets),
+// in debug builds we read directly from filesystem for hot-reload
 #[derive(RustEmbed)]
 #[folder = "src/control_plane/templates/"]
 #[prefix = "templates/"]
 #[include = "*.html"]
+#[allow(dead_code)]
 pub struct Templates;
 
 // Read templates from filesystem in development mode, use embedded resources in production mode

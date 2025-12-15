@@ -46,22 +46,14 @@ fn signal_handler(
 }
 
 #[pyclass(name = "ActiveLogger", subclass)]
-#[derive(Debug, Clone)]
-pub struct ActiveLogger {
-    span: tracing::Span,
-}
+#[derive(Debug, Clone, Default)]
+pub struct ActiveLogger;
 
 #[pymethods]
 impl ActiveLogger {
     #[new]
     pub fn new() -> Self {
-        let thread_id = std::thread::current().id();
-        let span = tracing::span!(
-            tracing::Level::INFO,
-            "execution",
-            tid = format!("{:?}", thread_id)
-        );
-        ActiveLogger { span }
+        ActiveLogger
     }
 
     fn trace(&self, message: String) -> PyResult<()> {
@@ -703,9 +695,9 @@ impl PyQuebec {
         };
 
         // Convert Python args and kwargs to JSON only for job arguments storage
-        let args_json = crate::utils::python_object(&args).into_json(py)?;
+        let args_json = crate::utils::python_object(&args).into_json()?;
         let kwargs_json = kwargs
-            .map(|k| crate::utils::python_object(&k).into_json(py))
+            .map(|k| crate::utils::python_object(&k).into_json())
             .transpose()?;
 
         // Merge args and kwargs for job arguments storage

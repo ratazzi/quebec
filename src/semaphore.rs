@@ -272,22 +272,3 @@ where
 
     Ok(update_result.rows_affected() > 0)
 }
-
-/// Convenience function to release semaphore using ConcurrencyConstraint
-pub async fn release_semaphore_with_constraint<C>(
-    db: &C,
-    table_config: &TableConfig,
-    constraint: &ConcurrencyConstraint,
-) -> Result<bool, DbErr>
-where
-    C: ConnectionTrait,
-{
-    release_semaphore(
-        db,
-        table_config,
-        constraint.key.clone(),
-        constraint.limit,
-        constraint.duration,
-    )
-    .await
-}

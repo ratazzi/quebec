@@ -140,17 +140,6 @@ impl NotifyManager {
         Ok(())
     }
 
-    /// Send a NOTIFY message for a specific queue
-    pub async fn notify(&self, queue_name: &str, event: &str) -> Result<(), anyhow::Error> {
-        if !self.ctx.is_postgres() {
-            trace!("Skipping NOTIFY - not using PostgreSQL");
-            return Ok(());
-        }
-
-        let db = self.ctx.get_db().await;
-        Self::send_notify(&self.ctx.name, &*db, queue_name, event).await
-    }
-
     /// Static method to send NOTIFY using existing database connection
     pub async fn send_notify<C>(
         app_name: &str,
@@ -207,14 +196,10 @@ impl NotifyManager {
     }
 
     /// Get the channel name this manager is listening on
+    #[cfg(test)]
     pub fn get_channel_name(&self) -> &str {
         &self.channel_name
     }
-}
-
-/// Helper function to create a NotifyManager
-pub fn create_notify_manager(ctx: Arc<AppContext>) -> NotifyManager {
-    NotifyManager::new(ctx)
 }
 
 #[cfg(test)]

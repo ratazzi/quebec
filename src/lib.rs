@@ -7,7 +7,14 @@ mod entities;
 mod error;
 mod notify;
 mod process;
+#[cfg(target_os = "macos")]
 mod proctitle_macos;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd"
+))]
 mod proctitle_unix;
 pub mod query_builder;
 mod scheduler;

@@ -51,7 +51,7 @@ pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResu
 }
 
 /// Convert Python object to JSON value
-pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyInt>() {
         Ok(Value::Number(obj.extract::<i64>()?.into()))
     } else if obj.is_instance_of::<PyFloat>() {
@@ -66,7 +66,7 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (key, value) in dict {
             let key: String = key.extract()?;
-            let value = python_to_json_value(py, &value)?;
+            let value = python_to_json_value(&value)?;
             map.insert(key, value);
         }
         Ok(Value::Object(map))
@@ -74,14 +74,14 @@ pub fn python_to_json_value(py: Python, obj: &Bound<'_, PyAny>) -> PyResult<Valu
         let list = obj.downcast::<PyList>()?;
         let vec = list
             .iter()
-            .map(|item| python_to_json_value(py, &item))
+            .map(|item| python_to_json_value(&item))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_instance_of::<PyTuple>() {
         let tuple = obj.downcast::<PyTuple>()?;
         let vec = tuple
             .iter()
-            .map(|item| python_to_json_value(py, &item))
+            .map(|item| python_to_json_value(&item))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_none() {
@@ -131,42 +131,6 @@ pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject>
 // Wrapper types for implementing Into-like trait patterns
 // These provide a more idiomatic Rust API for type conversions
 
-/// Wrapper for YAML values that provides idiomatic conversion methods
-///
-/// # Example
-/// ```rust
-/// use quebec::utils::{yaml_value, YamlValue};
-/// use serde_yaml::Value as YamlValue;
-///
-/// let yaml_val = YamlValue::String("hello".to_string());
-/// let wrapper = yaml_value(&yaml_val);
-///
-/// Python::with_gil(|py| {
-///     let py_obj = wrapper.into_python(py)?;
-///     // py_obj is now a Python string
-/// });
-/// ```
-#[derive(Debug, Clone)]
-pub struct YamlValue<'a>(pub &'a serde_yaml::Value);
-
-/// Wrapper for JSON values that provides idiomatic conversion methods
-///
-/// # Example
-/// ```rust
-/// use quebec::utils::{json_value, JsonValue};
-/// use serde_json::Value as JsonValue;
-///
-/// let json_val = JsonValue::String("hello".to_string());
-/// let wrapper = json_value(&json_val);
-///
-/// Python::with_gil(|py| {
-///     let py_obj = wrapper.into_python(py)?;
-///     // py_obj is now a Python string
-/// });
-/// ```
-#[derive(Debug, Clone)]
-pub struct JsonValue<'a>(pub &'a Value);
-
 /// Wrapper for Python objects that provides idiomatic conversion methods
 ///
 /// # Example
@@ -183,32 +147,12 @@ pub struct JsonValue<'a>(pub &'a Value);
 #[derive(Debug)]
 pub struct PythonObject<'a>(pub &'a Bound<'a, PyAny>);
 
-// Idiomatic Rust conversion methods
-
-impl<'a> YamlValue<'a> {
-    /// Convert YAML value to Python object using idiomatic Rust pattern
-    ///
-    /// This method provides a more ergonomic API compared to the standalone function
-    pub fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
-        yaml_value_to_python(py, self.0)
-    }
-}
-
-impl<'a> JsonValue<'a> {
-    /// Convert JSON value to Python object using idiomatic Rust pattern
-    ///
-    /// This method provides a more ergonomic API compared to the standalone function
-    pub fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_python(py, self.0)
-    }
-}
-
 impl<'a> PythonObject<'a> {
     /// Convert Python object to JSON value using idiomatic Rust pattern
     ///
     /// This method provides a more ergonomic API compared to the standalone function
-    pub fn into_json(self, py: Python) -> PyResult<Value> {
-        python_to_json_value(py, self.0)
+    pub fn into_json(self) -> PyResult<Value> {
+        python_to_json_value(self.0)
     }
 }
 
@@ -217,20 +161,7 @@ pub trait IntoPython {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject>;
 }
 
-// Implement the trait for our wrapper types
-impl<'a> IntoPython for YamlValue<'a> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
-        yaml_value_to_python(py, self.0)
-    }
-}
-
-impl<'a> IntoPython for JsonValue<'a> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_python(py, self.0)
-    }
-}
-
-// Implement for direct value references too
+// Implement for direct value references
 impl IntoPython for &serde_yaml::Value {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
         yaml_value_to_python(py, self)
@@ -289,38 +220,6 @@ impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
     fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
         Ok(self.clone().unbind())
     }
-}
-
-// Convenience constructor functions for wrapper types
-
-/// Create a YamlValue wrapper for idiomatic conversions
-///
-/// # Example
-/// ```rust
-/// let yaml_val = serde_yaml::Value::String("test".to_string());
-/// let wrapper = yaml_value(&yaml_val);
-///
-/// Python::with_gil(|py| {
-///     let py_obj = wrapper.into_python(py)?;
-/// });
-/// ```
-pub fn yaml_value(value: &serde_yaml::Value) -> YamlValue<'_> {
-    YamlValue(value)
-}
-
-/// Create a JsonValue wrapper for idiomatic conversions
-///
-/// # Example
-/// ```rust
-/// let json_val = serde_json::Value::String("test".to_string());
-/// let wrapper = json_value(&json_val);
-///
-/// Python::with_gil(|py| {
-///     let py_obj = wrapper.into_python(py)?;
-/// });
-/// ```
-pub fn json_value(value: &Value) -> JsonValue<'_> {
-    JsonValue(value)
 }
 
 /// Create a PythonObject wrapper for idiomatic conversions

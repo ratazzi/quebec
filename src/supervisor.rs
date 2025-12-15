@@ -1,3 +1,9 @@
+// TODO: Supervisor is a placeholder for future process-based architecture.
+// Currently Quebec uses a thread-based model. When migrating to multi-process
+// mode (like Solid Queue's fork-based supervision), this module will manage
+// child process lifecycles, health checks, and restarts.
+#![allow(dead_code)]
+
 use crate::context::AppContext;
 use crate::process::{ProcessInfo, ProcessTrait};
 use anyhow::Result;
