@@ -28,8 +28,10 @@ impl Quebec {
         let ctx = self.ctx.clone(); // Clone ctx for the async closure
         trace!("job: {:?}", job);
 
-        let job = db
-            .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
+        // Transaction returns (job_model, should_notify)
+        // should_notify is true only when job goes to ready_executions
+        let (job_model, should_notify) = db
+            .transaction::<_, (quebec_jobs::Model, bool), DbErr>(|txn| {
                 Box::pin(async move {
                     let now = chrono::Utc::now().naive_utc();
                     let args: serde_json::Value = serde_json::from_str(job.arguments.as_str())
@@ -80,6 +82,28 @@ impl Quebec {
                     // Get conflict strategy from job
                     let conflict_strategy = job.concurrency_on_conflict;
 
+                    // Check if job is scheduled for the future
+                    let is_scheduled = job.scheduled_at > now;
+
+                    if is_scheduled {
+                        // Job is scheduled for future, add to scheduled_executions
+                        // Don't notify - job is not ready yet
+                        info!(
+                            "Job scheduled for future execution at {:?}",
+                            job.scheduled_at
+                        );
+                        query_builder::scheduled_executions::insert(
+                            txn,
+                            &ctx.table_config,
+                            job_id,
+                            &job_queue_name,
+                            job_priority,
+                            job.scheduled_at,
+                        )
+                        .await?;
+                        return Ok((job_model, false));
+                    }
+
                     if !concurrency_key.is_empty() {
                         // Try to acquire the semaphore
                         let expires_at = now + duration;
@@ -90,12 +114,14 @@ impl Quebec {
                             match conflict_strategy {
                                 crate::context::ConcurrencyConflict::Discard => {
                                     // Discard strategy: mark job as finished to avoid dangling job
+                                    // Don't notify - job was discarded
                                     info!("Concurrency limit reached for key: {}, discarding job (conflict strategy: discard)", concurrency_key);
                                     query_builder::jobs::mark_finished(txn, &ctx.table_config, job_id).await?;
-                                    return Ok(job_model);
+                                    return Ok((job_model, false));
                                 }
                                 crate::context::ConcurrencyConflict::Block => {
                                     // Block strategy: add to blocked queue (default behavior)
+                                    // Don't notify - job is blocked
                                     info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
 
                                     query_builder::blocked_executions::insert(
@@ -110,7 +136,7 @@ impl Quebec {
                                     .await?;
 
                                     // Job is blocked, don't add to ready queue
-                                    return Ok(job_model);
+                                    return Ok((job_model, false));
                                 }
                             }
                         }
@@ -125,17 +151,15 @@ impl Quebec {
                     )
                     .await?;
 
-                    // info!("Job created: {:?}", job_model);
-                    Ok(job_model)
+                    // Job is ready - should notify
+                    Ok((job_model, true))
                 })
             })
             .await
             .map_err(|e| crate::error::QuebecError::from(e))?;
 
-        let job_model = job;
-
-        // Send PostgreSQL NOTIFY after job is successfully created
-        if self.ctx.is_postgres() {
+        // Send PostgreSQL NOTIFY only when job is ready for immediate execution
+        if should_notify && self.ctx.is_postgres() {
             if let Err(e) =
                 NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job")
                     .await

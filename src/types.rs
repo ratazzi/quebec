@@ -709,11 +709,16 @@ impl PyQuebec {
             .transpose()?;
 
         // Merge args and kwargs for job arguments storage
+        // Filter out internal parameters (prefixed with _) like _scheduled_at
         let mut combined_args_json = args_json.clone();
         if let Some(kwargs_json) = &kwargs_json {
             if let Value::Array(ref mut args_array) = combined_args_json {
                 if let Value::Object(kwargs_map) = kwargs_json {
                     for (key, value) in kwargs_map {
+                        // Skip internal parameters
+                        if key.starts_with('_') {
+                            continue;
+                        }
                         args_array.push(Value::Object(serde_json::Map::from_iter(vec![(
                             key.clone(),
                             value.clone(),
@@ -747,21 +752,34 @@ impl PyQuebec {
         obj.concurrency_key = concurrency_key;
         obj.concurrency_limit = concurrency_limit;
 
-        // Check for _scheduled_at in kwargs (used by JobBuilder.set())
+        // Check for internal options in kwargs (used by JobBuilder.set())
+        // These are prefixed with _ and will be filtered out from job arguments
         if let Some(kw) = kwargs {
-            if let Ok(scheduled_at) = kw.get_item("_scheduled_at") {
-                if let Some(val) = scheduled_at {
-                    // Try to extract as f64 (timestamp)
-                    if let Ok(ts) = val.extract::<f64>() {
-                        let secs = ts as i64;
-                        let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
-                        if let Some(dt) =
-                            chrono::DateTime::from_timestamp(secs, nsecs)
-                        {
-                            obj.scheduled_at = dt.naive_utc();
-                            debug!("Job scheduled for: {:?}", obj.scheduled_at);
-                        }
+            // _scheduled_at: Override scheduled execution time
+            if let Ok(Some(val)) = kw.get_item("_scheduled_at") {
+                if let Ok(ts) = val.extract::<f64>() {
+                    let secs = ts as i64;
+                    let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+                        obj.scheduled_at = dt.naive_utc();
+                        debug!("Job scheduled for: {:?}", obj.scheduled_at);
                     }
+                }
+            }
+
+            // _queue: Override queue name
+            if let Ok(Some(val)) = kw.get_item("_queue") {
+                if let Ok(q) = val.extract::<String>() {
+                    obj.queue_name = q;
+                    debug!("Job queue overridden to: {}", obj.queue_name);
+                }
+            }
+
+            // _priority: Override priority
+            if let Ok(Some(val)) = kw.get_item("_priority") {
+                if let Ok(p) = val.extract::<i32>() {
+                    obj.priority = p;
+                    debug!("Job priority overridden to: {}", obj.priority);
                 }
             }
         }

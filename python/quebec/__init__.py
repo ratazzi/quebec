@@ -3,8 +3,9 @@ import logging
 import time
 import queue
 import threading
+from datetime import datetime, timedelta, timezone
 from functools import wraps
-from typing import Callable, List, Tuple, Type, Any, Optional
+from typing import Callable, List, Tuple, Type, Any, Optional, Union
 import dataclasses
 from .logger import job_id_var
 
@@ -13,6 +14,61 @@ if hasattr(quebec, "__all__"):
     __all__ = quebec.__all__
 
 logger = logging.getLogger(__name__)
+
+
+class JobBuilder:
+    """Builder for configuring job options before enqueueing.
+
+    This allows chaining configuration like:
+        MyJob.set(wait=3600).perform_later(qc, arg1, arg2)
+        MyJob.set(queue='high', priority=10).perform_later(qc, arg1)
+    """
+
+    def __init__(self, job_class: Type, **options):
+        self.job_class = job_class
+        self.options = options
+
+    def _calculate_scheduled_at(self) -> Optional[datetime]:
+        """Calculate scheduled_at from wait or wait_until options."""
+        wait = self.options.get('wait')
+        wait_until = self.options.get('wait_until')
+
+        if wait_until is not None:
+            if isinstance(wait_until, datetime):
+                # Ensure timezone-aware for correct timestamp conversion
+                if wait_until.tzinfo is None:
+                    # Assume naive datetime is UTC
+                    wait_until = wait_until.replace(tzinfo=timezone.utc)
+                return wait_until
+            raise ValueError("wait_until must be a datetime object")
+
+        if wait is not None:
+            # Use timezone-aware UTC datetime
+            now = datetime.now(timezone.utc)
+            if isinstance(wait, (int, float)):
+                return now + timedelta(seconds=wait)
+            elif isinstance(wait, timedelta):
+                return now + wait
+            raise ValueError("wait must be a number (seconds) or timedelta")
+
+        return None
+
+    def perform_later(self, qc: 'Quebec', *args, **kwargs) -> 'ActiveJob':
+        """Enqueue the job with configured options."""
+        scheduled_at = self._calculate_scheduled_at()
+
+        # Pass internal options via kwargs (will be filtered out before serialization)
+        if scheduled_at is not None:
+            kwargs['_scheduled_at'] = scheduled_at.timestamp()
+
+        if 'queue' in self.options:
+            kwargs['_queue'] = self.options['queue']
+
+        if 'priority' in self.options:
+            kwargs['_priority'] = self.options['priority']
+
+        # Call the original perform_later
+        return self.job_class.perform_later(qc, *args, **kwargs)
 
 
 class TestJob:
@@ -34,7 +90,37 @@ class NoNewOverrideMeta(type):
         return super().__new__(cls, name, bases, dct)
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
-    pass
+    @classmethod
+    def set(cls, wait: Union[int, float, timedelta] = None,
+            wait_until: datetime = None,
+            queue: str = None,
+            priority: int = None) -> JobBuilder:
+        """Configure job options before enqueueing.
+
+        Args:
+            wait: Delay in seconds (int/float) or timedelta before running
+            wait_until: Specific datetime when the job should run
+            queue: Queue name to enqueue the job to
+            priority: Job priority (lower number = higher priority)
+
+        Returns:
+            JobBuilder instance for chaining with perform_later
+
+        Example:
+            MyJob.set(wait=3600).perform_later(qc, arg1)  # Run in 1 hour
+            MyJob.set(wait_until=tomorrow).perform_later(qc, arg1)
+            MyJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+        """
+        options = {}
+        if wait is not None:
+            options['wait'] = wait
+        if wait_until is not None:
+            options['wait_until'] = wait_until
+        if queue is not None:
+            options['queue'] = queue
+        if priority is not None:
+            options['priority'] = priority
+        return JobBuilder(cls, **options)
 
 
 class ThreadedRunner:
