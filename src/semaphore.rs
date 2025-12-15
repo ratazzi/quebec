@@ -98,11 +98,23 @@ where
         }
     };
 
+    // Note: Parameter order differs between Postgres ($1,$2,$3) and SQLite/MySQL (? ? ?)
+    let decrement_values = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            // Postgres: $1=key, $2=expires_at, $3=now
+            vec![key.into(), expires_at.into(), now.into()]
+        }
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+            // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key (order in SQL)
+            vec![expires_at.into(), now.into(), key.into()]
+        }
+    };
+
     let decrement_result = db
         .execute(Statement::from_sql_and_values(
             db.get_database_backend(),
             decrement_sql,
-            vec![key.into(), expires_at.into(), now.into()],
+            decrement_values,
         ))
         .await?;
 
@@ -177,16 +189,34 @@ where
         }
     };
 
-    let increment_result = db
-        .execute(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            increment_sql,
+    // Note: Parameter order differs between Postgres ($1,$2,$3,$4) and SQLite/MySQL (? ? ? ?)
+    // Postgres uses positional params, SQLite/MySQL uses sequential order of appearance
+    let increment_values = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            // Postgres: $1=key, $2=expires_at, $3=now, $4=limit
             vec![
                 key.clone().into(),
                 expires_at.into(),
                 now.into(),
                 limit.into(),
-            ],
+            ]
+        }
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+            // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key, ?=limit (order in SQL)
+            vec![
+                expires_at.into(),
+                now.into(),
+                key.clone().into(),
+                limit.into(),
+            ]
+        }
+    };
+
+    let increment_result = db
+        .execute(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            increment_sql,
+            increment_values,
         ))
         .await?;
 
@@ -220,11 +250,23 @@ where
         }
     };
 
+    // Same parameter order issue as above
+    let update_values = match db.get_database_backend() {
+        DatabaseBackend::Postgres => {
+            // Postgres: $1=key, $2=expires_at, $3=now
+            vec![key.into(), expires_at.into(), now.into()]
+        }
+        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+            // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key (order in SQL)
+            vec![expires_at.into(), now.into(), key.into()]
+        }
+    };
+
     let update_result = db
         .execute(Statement::from_sql_and_values(
             db.get_database_backend(),
             update_expires_sql,
-            vec![key.into(), expires_at.into(), now.into()],
+            update_values,
         ))
         .await?;
 
