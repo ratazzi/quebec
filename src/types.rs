@@ -17,7 +17,6 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use url::Url;
-use uuid;
 
 use crate::control_plane::ControlPlaneExt;
 
@@ -742,7 +741,7 @@ impl PyQuebec {
         let mut obj = instance.clone().extract::<ActiveJob>()?;
         obj.class_name = class_name.to_string();
         obj.arguments = arguments;
-        obj.active_job_id = uuid::Uuid::new_v4().to_string().replace("-", "");
+        obj.active_job_id = crate::utils::generate_job_id();
         obj.queue_name = queue_name;
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;

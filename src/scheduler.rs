@@ -199,6 +199,7 @@ where
         });
 
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
+    let active_job_id = crate::utils::generate_job_id();
     let job_id = query_builder::jobs::insert(
         db,
         &ctx.table_config,
@@ -206,7 +207,7 @@ where
         &entry.class,
         Some(params.to_string()).as_deref(),
         priority,
-        Some(""),
+        Some(active_job_id.as_str()),
         Some(scheduled_at),
         concurrency_key_str,
     )

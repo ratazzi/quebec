@@ -54,10 +54,10 @@ class ThreadedRunner:
                 self.queue.task_done()
                 self.execution.tid = str(threading.get_ident())
 
-                # Inject job_id into the context before execution, clean up after execution.
-                token = job_id_var.set(str(self.execution.jid))
+                # Inject jid (active_job_id) into the context before execution, clean up after execution.
+                token = job_id_var.set(self.execution.jid)
                 self.execution.perform()
-                logger.debug(self.execution.metric)
+                logger.debug(str(self.execution.metric) + "\n")
                 job_id_var.reset(token)
             except queue.Empty:
                 time.sleep(0.1)

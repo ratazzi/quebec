@@ -718,11 +718,11 @@ impl Execution {
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
         self.timer = Instant::now();
         let mut job = self.job.clone();
-        let job_id = self.claimed.job_id;
+        let jid = job.active_job_id.clone().unwrap_or_default();
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
-            jid = job_id,
+            jid = jid,
             tid = self.tid.clone()
         );
         // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
@@ -930,8 +930,8 @@ impl Execution {
     }
 
     #[getter]
-    fn get_jid(&self) -> i64 {
-        self.job.id
+    fn get_jid(&self) -> String {
+        self.job.active_job_id.clone().unwrap_or_default()
     }
 
     #[getter]
@@ -1070,10 +1070,11 @@ impl Execution {
             "enqueued_at": scheduled_at,
         });
 
+        let jid = job.active_job_id.clone().unwrap_or_default();
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
-            jid = job.id,
+            jid = jid,
             tid = self.tid.clone()
         );
         let _enter = span.enter();

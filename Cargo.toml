@@ -67,6 +67,7 @@ tokio-cron-scheduler = { version = "0.13.0", features = [
 serde_yaml = "0.9.34"
 serde = { version = "1.0.214", features = ["derive"] }
 uuid = { version = "1.11.0", features = ["v1", "v4"] }
+nanoid = "0.4"
 hostname = "0.4.0"
 async-trait = "0.1.83"
 humantime = "2.1.0"

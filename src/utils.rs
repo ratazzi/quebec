@@ -3,6 +3,18 @@ use pyo3::types::{PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
 use serde_yaml;
 
+/// Alphabet for generating lowercase alphanumeric nanoid (a-z, 0-9)
+const NANOID_ALPHABET: [char; 36] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
+/// Generate a 12-character lowercase alphanumeric job ID using nanoid
+pub fn generate_job_id() -> String {
+    nanoid::nanoid!(12, &NANOID_ALPHABET)
+}
+
 /// Convert YAML value to Python object
 pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<PyObject> {
     match value {
