@@ -691,12 +691,9 @@ pub mod jobs {
         let stmt = Statement::from_string(backend, sql);
         let rows = db.query_all(stmt).await?;
 
-        let mut names = Vec::new();
-        for row in rows {
-            let name: String = row.try_get("", "queue_name")?;
-            names.push(name);
-        }
-        Ok(names)
+        rows.into_iter()
+            .map(|row| row.try_get("", "queue_name"))
+            .collect()
     }
 
     /// Get distinct class names
@@ -724,12 +721,9 @@ pub mod jobs {
         let stmt = Statement::from_string(backend, sql);
         let rows = db.query_all(stmt).await?;
 
-        let mut names = Vec::new();
-        for row in rows {
-            let name: String = row.try_get("", "class_name")?;
-            names.push(name);
-        }
-        Ok(names)
+        rows.into_iter()
+            .map(|row| row.try_get("", "class_name"))
+            .collect()
     }
 }
 
@@ -1042,12 +1036,9 @@ pub mod ready_executions {
             Statement::from_sql_and_values(db.get_database_backend(), sql, [like_pattern.into()]);
         let rows = db.query_all(stmt).await?;
 
-        let mut queue_names = Vec::new();
-        for row in rows {
-            let queue_name: String = row.try_get("", "queue_name")?;
-            queue_names.push(queue_name);
-        }
-        Ok(queue_names)
+        rows.into_iter()
+            .map(|row| row.try_get("", "queue_name"))
+            .collect()
     }
 }
 
@@ -2117,12 +2108,9 @@ pub mod pauses {
         let stmt = Statement::from_string(db.get_database_backend(), sql);
         let rows = db.query_all(stmt).await?;
 
-        let mut queue_names = Vec::new();
-        for row in rows {
-            let queue_name: String = row.try_get("", "queue_name")?;
-            queue_names.push(queue_name);
-        }
-        Ok(queue_names)
+        rows.into_iter()
+            .map(|row| row.try_get("", "queue_name"))
+            .collect()
     }
 
     /// Find all pauses

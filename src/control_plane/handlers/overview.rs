@@ -284,16 +284,14 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let mut job_types_labels = Vec::new();
-        let mut job_types_data = Vec::new();
-
-        for row in job_types_result {
-            let class_name: String = row.try_get("", "class_name").unwrap_or_default();
-            let count: i64 = row.try_get("", "count").unwrap_or_default();
-
-            job_types_labels.push(class_name);
-            job_types_data.push(count);
-        }
+        let (job_types_labels, job_types_data): (Vec<String>, Vec<i64>) = job_types_result
+            .into_iter()
+            .map(|row| {
+                let class_name: String = row.try_get("", "class_name").unwrap_or_default();
+                let count: i64 = row.try_get("", "count").unwrap_or_default();
+                (class_name, count)
+            })
+            .unzip();
 
         // Get queue performance statistics (using raw SQL for complex aggregations)
         // Use database-specific SQL for compatibility

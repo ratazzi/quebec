@@ -172,26 +172,23 @@ impl PyQuebec {
         let db_option = Some(Arc::new(db));
 
         // Convert kwargs to HashMap<String, PyObject>
-        let options = if let Some(kwargs) = kwargs {
-            let mut options_map = HashMap::new();
-            for (k, v) in kwargs.iter() {
-                let key = k.extract::<String>().map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                        "Invalid option key: {}",
-                        e
-                    ))
-                })?;
-                // Use Python::with_gil to get GIL
-                Python::with_gil(|py| -> PyResult<()> {
-                    let obj = v.into_pyobject(py)?;
-                    options_map.insert(key.clone(), obj.into());
-                    Ok(())
-                })?;
-            }
-            Some(options_map)
-        } else {
-            None
-        };
+        let options = kwargs
+            .map(|kw| -> PyResult<_> {
+                let py = kw.py();
+                kw.iter()
+                    .map(|(k, v)| {
+                        let key = k.extract::<String>().map_err(|_| {
+                            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                                "Invalid option key: {:?}",
+                                k
+                            ))
+                        })?;
+                        let obj: PyObject = v.into_pyobject(py)?.into();
+                        Ok((key, obj))
+                    })
+                    .collect()
+            })
+            .transpose()?;
 
         // Try to load configuration file BEFORE creating AppContext
         // This allows code parameters to override config file values

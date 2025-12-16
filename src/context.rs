@@ -316,123 +316,123 @@ impl AppContext {
         // Override default configuration if options are provided
         if let Some(options) = options {
             Python::with_gil(|py| {
-                // Handle use_skip_locked
-                if let Some(val) = options.get("use_skip_locked") {
-                    if let Ok(value) = val.extract::<bool>(py) {
-                        ctx.use_skip_locked = value;
-                    }
-                }
+                // Helper closures that warn on type mismatch
+                let get_bool = |key: &str| -> Option<bool> {
+                    options.get(key).and_then(|v| {
+                        v.extract(py)
+                            .map_err(|_| {
+                                warn!(
+                                    "Config '{}': expected bool, got {:?}",
+                                    key,
+                                    v.bind(py).get_type()
+                                );
+                            })
+                            .ok()
+                    })
+                };
+                let get_u64 = |key: &str| -> Option<u64> {
+                    options.get(key).and_then(|v| {
+                        v.extract(py)
+                            .map_err(|_| {
+                                warn!(
+                                    "Config '{}': expected u64, got {:?}",
+                                    key,
+                                    v.bind(py).get_type()
+                                );
+                            })
+                            .ok()
+                    })
+                };
+                let get_duration = |key: &str| -> Option<Duration> {
+                    options.get(key).and_then(|v| {
+                        v.extract::<Duration>(py)
+                            .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
+                            .map_err(|_| {
+                                warn!(
+                                    "Config '{}': expected Duration or u64, got {:?}",
+                                    key,
+                                    v.bind(py).get_type()
+                                );
+                            })
+                            .ok()
+                    })
+                };
 
-                // Handle process_heartbeat_interval
-                if let Some(val) = options.get("process_heartbeat_interval") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.process_heartbeat_interval = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.process_heartbeat_interval = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_bool("use_skip_locked") {
+                    ctx.use_skip_locked = v;
                 }
-
-                // Handle process_alive_threshold
-                if let Some(val) = options.get("process_alive_threshold") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.process_alive_threshold = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.process_alive_threshold = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_duration("process_heartbeat_interval") {
+                    ctx.process_heartbeat_interval = v;
                 }
-
-                // Handle shutdown_timeout
-                if let Some(val) = options.get("shutdown_timeout") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.shutdown_timeout = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.shutdown_timeout = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_duration("process_alive_threshold") {
+                    ctx.process_alive_threshold = v;
                 }
-
-                // Handle silence_polling
-                if let Some(val) = options.get("silence_polling") {
-                    if let Ok(value) = val.extract::<bool>(py) {
-                        ctx.silence_polling = value;
-                    }
+                if let Some(v) = get_duration("shutdown_timeout") {
+                    ctx.shutdown_timeout = v;
                 }
-
-                // Handle preserve_finished_jobs
-                if let Some(val) = options.get("preserve_finished_jobs") {
-                    if let Ok(value) = val.extract::<bool>(py) {
-                        ctx.preserve_finished_jobs = value;
-                    }
+                if let Some(v) = get_bool("silence_polling") {
+                    ctx.silence_polling = v;
                 }
-
-                // Handle clear_finished_jobs_after
-                if let Some(val) = options.get("clear_finished_jobs_after") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.clear_finished_jobs_after = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.clear_finished_jobs_after = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_bool("preserve_finished_jobs") {
+                    ctx.preserve_finished_jobs = v;
                 }
-
-                // Handle default_concurrency_control_period
-                if let Some(val) = options.get("default_concurrency_control_period") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.default_concurrency_control_period = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.default_concurrency_control_period = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_duration("clear_finished_jobs_after") {
+                    ctx.clear_finished_jobs_after = v;
                 }
-
-                // Handle dispatcher_polling_interval
-                if let Some(val) = options.get("dispatcher_polling_interval") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.dispatcher_polling_interval = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.dispatcher_polling_interval = Duration::from_secs(value);
-                    }
+                if let Some(v) = get_duration("default_concurrency_control_period") {
+                    ctx.default_concurrency_control_period = v;
                 }
-
-                // Handle dispatcher_batch_size
-                if let Some(val) = options.get("dispatcher_batch_size") {
-                    if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.dispatcher_batch_size = value;
-                    }
+                if let Some(v) = get_duration("dispatcher_polling_interval") {
+                    ctx.dispatcher_polling_interval = v;
                 }
-
-                // Handle dispatcher_concurrency_maintenance_interval
-                if let Some(val) = options.get("dispatcher_concurrency_maintenance_interval") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.dispatcher_concurrency_maintenance_interval = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.dispatcher_concurrency_maintenance_interval =
-                            Duration::from_secs(value);
-                    }
+                if let Some(v) = get_u64("dispatcher_batch_size") {
+                    ctx.dispatcher_batch_size = v;
                 }
-
-                // Handle worker_polling_interval
+                if let Some(v) = get_duration("dispatcher_concurrency_maintenance_interval") {
+                    ctx.dispatcher_concurrency_maintenance_interval = v;
+                }
+                // worker_polling_interval: also accepts f64 for sub-second precision
                 if let Some(val) = options.get("worker_polling_interval") {
-                    if let Ok(value) = val.extract::<Duration>(py) {
-                        ctx.worker_polling_interval = value;
-                    } else if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.worker_polling_interval = Duration::from_secs(value);
-                    } else if let Ok(value) = val.extract::<f64>(py) {
-                        ctx.worker_polling_interval =
-                            Duration::from_millis((value * 1000.0) as u64);
+                    let result = val
+                        .extract::<Duration>(py)
+                        .or_else(|_| val.extract::<u64>(py).map(Duration::from_secs))
+                        .or_else(|_| {
+                            val.extract::<f64>(py).and_then(|f| {
+                                if f.is_finite() && f >= 0.0 {
+                                    Ok(Duration::from_secs_f64(f))
+                                } else {
+                                    warn!(
+                                        "Config 'worker_polling_interval': invalid f64 value {}",
+                                        f
+                                    );
+                                    Err(pyo3::PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                                        "invalid",
+                                    ))
+                                }
+                            })
+                        });
+                    match result {
+                        Ok(v) => ctx.worker_polling_interval = v,
+                        Err(_) => warn!(
+                            "Config 'worker_polling_interval': expected Duration, u64 or f64, got {:?}",
+                            val.bind(py).get_type()
+                        ),
                     }
                 }
-
-                // Handle worker_threads
-                if let Some(val) = options.get("worker_threads") {
-                    if let Ok(value) = val.extract::<u64>(py) {
-                        ctx.worker_threads = value;
-                    }
+                if let Some(v) = get_u64("worker_threads") {
+                    ctx.worker_threads = v;
                 }
-
-                // Handle table_name_prefix for dynamic table naming
+                // table_name_prefix: only apply if non-empty
                 if let Some(val) = options.get("table_name_prefix") {
-                    if let Ok(prefix) = val.extract::<String>(py) {
-                        if !prefix.is_empty() {
+                    match val.extract::<String>(py) {
+                        Ok(prefix) if !prefix.is_empty() => {
                             ctx.table_config = TableConfig::with_prefix(&prefix);
                         }
+                        Ok(_) => {} // empty string, ignore
+                        Err(_) => warn!(
+                            "Config 'table_name_prefix': expected String, got {:?}",
+                            val.bind(py).get_type()
+                        ),
                     }
                 }
             });
