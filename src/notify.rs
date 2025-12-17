@@ -99,35 +99,30 @@ impl NotifyManager {
 
         loop {
             tokio::select! {
-                // Wait for NOTIFY messages
                 notification = listener.recv() => {
-                    match notification {
-                        Ok(notification) => {
-                            trace!("Received NOTIFY on {}: {}", notification.channel(), notification.payload());
-
-                            // Use try_send to avoid blocking - if channel is full, drop the notification
-                            // This implements natural backpressure: when worker can't keep up, skip notifications
-                            match tx.try_send(notification.payload().to_string()) {
-                                Ok(_) => {
-                                    trace!("NOTIFY message sent to worker queue");
-                                }
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    warn!("NOTIFY channel full - dropping notification (worker overloaded)");
-                                    // Don't break the loop, just drop this notification and continue
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    warn!("NOTIFY channel closed - stopping LISTEN loop");
-                                    break;
-                                }
-                            }
-                        }
+                    let notification = match notification {
+                        Ok(n) => n,
                         Err(e) => {
                             error!("Error receiving NOTIFY on {}: {}", channel, e);
                             return Err(anyhow::anyhow!("LISTEN receive error: {}", e));
                         }
+                    };
+
+                    trace!("Received NOTIFY on {}: {}", notification.channel(), notification.payload());
+
+                    // Use try_send to avoid blocking - if channel is full, drop the notification
+                    // This implements natural backpressure: when worker can't keep up, skip notifications
+                    match tx.try_send(notification.payload().to_string()) {
+                        Ok(_) => trace!("NOTIFY message sent to worker queue"),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("NOTIFY channel full - dropping notification (worker overloaded)");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("NOTIFY channel closed - stopping LISTEN loop");
+                            break;
+                        }
                     }
                 }
-                // Check for shutdown signal
                 _ = graceful_shutdown.cancelled() => {
                     info!("LISTEN loop for {} cancelled by shutdown signal", channel);
                     break;

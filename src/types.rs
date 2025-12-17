@@ -198,16 +198,17 @@ impl PyQuebec {
             .and_then(|v| v.extract::<String>().ok())
             .or_else(|| std::env::var("QUEBEC_ENV").ok());
 
-        let config = match crate::config::QueueConfig::find(env.as_deref()) {
-            Ok(config) => {
-                info!("Loaded configuration successfully");
-                Some(config)
-            }
-            Err(e) => {
-                info!("No configuration file found, using defaults: {}", e);
-                None
-            }
-        };
+        let config = crate::config::QueueConfig::find(env.as_deref())
+            .inspect(|_| info!("Loaded configuration successfully"))
+            .inspect_err(|e| {
+                let err_msg = e.to_string().to_lowercase();
+                if err_msg.contains("not found") {
+                    info!("No configuration file found, using defaults");
+                } else {
+                    warn!("Failed to load configuration: {}, using defaults", e);
+                }
+            })
+            .ok();
 
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
         // Bind the runtime handle so other parts can reuse the single runtime
@@ -416,64 +417,54 @@ impl PyQuebec {
                 // Get GIL and send result to Python queue
                 Python::with_gil(|py| {
                     let queue = queue.bind(py);
-                    // Check queue type and choose appropriate method
-                    match result {
-                        Ok(res) => {
-                            if queue.hasattr("put_nowait").unwrap_or(false) {
-                                // Handle asyncio.Queue
-                                if let Ok(put_method) = queue.getattr("put_nowait") {
-                                    if let Err(e) = put_method.call1((res,)) {
-                                        error!("Failed to put job to asyncio queue: {}", e);
-                                    }
-                                }
-                            } else if queue.hasattr("put").unwrap_or(false) {
-                                // Handle queue.Queue, multiprocessing.Queue
-                                if let Ok(put_method) = queue.getattr("put") {
-                                    if let Err(e) = put_method.call1((res,)) {
-                                        error!("Failed to put job to queue: {}", e);
-                                    }
-                                }
-                            } else {
-                                error!("Unsupported queue type");
-                            }
-                        }
-                        Err(e) => {
-                            debug!("No job available: {}", e);
-                        }
+
+                    let Ok(res) = result else {
+                        debug!("No job available");
+                        return;
+                    };
+
+                    // Determine which method to use based on queue type
+                    let method_name = if queue.hasattr("put_nowait").unwrap_or(false) {
+                        "put_nowait" // asyncio.Queue
+                    } else if queue.hasattr("put").unwrap_or(false) {
+                        "put" // queue.Queue, multiprocessing.Queue
+                    } else {
+                        error!("Unsupported queue type");
+                        return;
+                    };
+
+                    if let Err(e) = queue.getattr(method_name).and_then(|m| m.call1((res,))) {
+                        error!("Failed to put job to queue via {}: {}", method_name, e);
                     }
                 });
             }
         });
 
         let handle = self.rt.spawn(async move {
-            tokio::select! {
-                _ = graceful_shutdown.cancelled() => {
-                    Python::with_gil(|py| {
-                        let queue = queue1.bind(py);
-                        // Check queue type and choose appropriate method
-                        if queue.hasattr("close").unwrap_or(false) {
-                            // Handle asyncio.Queue
-                            if let Ok(close_method) = queue.getattr("close") {
-                                if let Err(e) = close_method.call0() {
-                                    error!("Failed to close asyncio queue: {}", e);
-                                }
-                                info!("<asyncio.Queue> shutdown");
-                            }
-                        } else if queue.hasattr("join").unwrap_or(false) {
-                            // Handle queue.Queue
-                            if let Ok(join_method) = queue.getattr("join") {
-                                if let Err(e) = join_method.call0() {
-                                    error!("Failed to join queue: {}", e);
-                                }
-                            }
-                        } else {
-                            error!("Unsupported queue type");
-                        }
-                    });
-                }
-            }
+            graceful_shutdown.cancelled().await;
 
-            // info!("sink job poller shutdown");
+            Python::with_gil(|py| {
+                let queue = queue1.bind(py);
+
+                // Determine shutdown method based on queue type
+                let (method_name, success_msg) = if queue.hasattr("close").unwrap_or(false) {
+                    ("close", Some("<asyncio.Queue> shutdown"))
+                } else if queue.hasattr("join").unwrap_or(false) {
+                    ("join", None)
+                } else {
+                    error!("Unsupported queue type");
+                    return;
+                };
+
+                match queue.getattr(method_name).and_then(|m| m.call0()) {
+                    Ok(_) => {
+                        if let Some(msg) = success_msg {
+                            info!("{}", msg);
+                        }
+                    }
+                    Err(e) => error!("Failed to {} queue: {}", method_name, e),
+                }
+            });
         });
         self.handles
             .lock()
@@ -530,19 +521,11 @@ impl PyQuebec {
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await;
-            // match db {
-            match db.ping().await {
-                Ok(_) => Ok(true),
-                Err(err) => {
-                    error!("Ping failed: {:?}", err);
-                    Ok(false)
-                }
-            }
-            // Err(err) => {
-            //     eprintln!("Failed to connect to database: {:?}", err);
-            //     Ok(false)
-            // }
-            // }
+            Ok(db
+                .ping()
+                .await
+                .inspect_err(|e| error!("Ping failed: {:?}", e))
+                .is_ok())
         })
     }
 
@@ -551,26 +534,25 @@ impl PyQuebec {
             let db = self.ctx.get_db().await;
 
             // Use schema_builder with dynamic table names from TableConfig
-            match crate::schema_builder::setup_database(db.as_ref(), &self.ctx.table_config).await {
-                Ok(()) => {
-                    // Extract prefix by removing the "_jobs" suffix from the jobs table name
-                    let prefix = self
-                        .ctx
-                        .table_config
-                        .jobs
-                        .strip_suffix("_jobs")
-                        .unwrap_or("solid_queue");
-                    info!(
-                        "Database tables created successfully with prefix: {}",
-                        prefix
-                    );
-                    Ok(true)
-                }
-                Err(err) => {
-                    error!("Failed to create tables: {:?}", err);
-                    Ok(false)
-                }
-            }
+            let success =
+                crate::schema_builder::setup_database(db.as_ref(), &self.ctx.table_config)
+                    .await
+                    .inspect(|()| {
+                        let prefix = self
+                            .ctx
+                            .table_config
+                            .jobs
+                            .strip_suffix("_jobs")
+                            .unwrap_or("solid_queue");
+                        info!(
+                            "Database tables created successfully with prefix: {}",
+                            prefix
+                        );
+                    })
+                    .inspect_err(|err| error!("Failed to create tables: {:?}", err))
+                    .is_ok();
+
+            Ok(success)
         })
     }
 
@@ -643,15 +625,19 @@ impl PyQuebec {
         let bound = klass;
         let class_name = bound.downcast::<PyType>()?.qualname()?;
 
-        let mut queue_name = "default".to_string();
-        if bound.hasattr("queue_as")? {
-            queue_name = bound.getattr("queue_as")?.extract::<String>()?;
-        }
+        let queue_name = match bound.getattr("queue_as") {
+            Ok(attr) => attr.extract::<String>()?,
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+                "default".to_string()
+            }
+            Err(e) => return Err(e),
+        };
 
-        let mut priority = 0;
-        if bound.hasattr("queue_with_priority")? {
-            priority = bound.getattr("queue_with_priority")?.extract::<i32>()?;
-        }
+        let priority = match bound.getattr("queue_with_priority") {
+            Ok(attr) => attr.extract::<i32>()?,
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
+            Err(e) => return Err(e),
+        };
 
         let instance = bound.call0()?;
 
@@ -700,20 +686,17 @@ impl PyQuebec {
         // Merge args and kwargs for job arguments storage
         // Filter out internal parameters (prefixed with _) like _scheduled_at
         let mut combined_args_json = args_json.clone();
-        if let Some(kwargs_json) = &kwargs_json {
-            if let Value::Array(ref mut args_array) = combined_args_json {
-                if let Value::Object(kwargs_map) = kwargs_json {
-                    for (key, value) in kwargs_map {
-                        // Skip internal parameters
-                        if key.starts_with('_') {
-                            continue;
-                        }
-                        args_array.push(Value::Object(serde_json::Map::from_iter(vec![(
-                            key.clone(),
-                            value.clone(),
-                        )])));
-                    }
+        if let (Some(Value::Object(kwargs_map)), Value::Array(ref mut args_array)) =
+            (&kwargs_json, &mut combined_args_json)
+        {
+            for (key, value) in kwargs_map {
+                if key.starts_with('_') {
+                    continue;
                 }
+                args_array.push(Value::Object(serde_json::Map::from_iter(vec![(
+                    key.clone(),
+                    value.clone(),
+                )])));
             }
         }
 
@@ -745,31 +728,41 @@ impl PyQuebec {
         // These are prefixed with _ and will be filtered out from job arguments
         if let Some(kw) = kwargs {
             // _scheduled_at: Override scheduled execution time
-            if let Ok(Some(val)) = kw.get_item("_scheduled_at") {
-                if let Ok(ts) = val.extract::<f64>() {
+            if let Some(dt) = kw
+                .get_item("_scheduled_at")
+                .ok()
+                .flatten()
+                .and_then(|val| val.extract::<f64>().ok())
+                .and_then(|ts| {
                     let secs = ts as i64;
                     let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
-                        obj.scheduled_at = dt.naive_utc();
-                        debug!("Job scheduled for: {:?}", obj.scheduled_at);
-                    }
-                }
+                    chrono::DateTime::from_timestamp(secs, nsecs)
+                })
+            {
+                obj.scheduled_at = dt.naive_utc();
+                debug!("Job scheduled for: {:?}", obj.scheduled_at);
             }
 
             // _queue: Override queue name
-            if let Ok(Some(val)) = kw.get_item("_queue") {
-                if let Ok(q) = val.extract::<String>() {
-                    obj.queue_name = q;
-                    debug!("Job queue overridden to: {}", obj.queue_name);
-                }
+            if let Some(q) = kw
+                .get_item("_queue")
+                .ok()
+                .flatten()
+                .and_then(|val| val.extract::<String>().ok())
+            {
+                obj.queue_name = q;
+                debug!("Job queue overridden to: {}", obj.queue_name);
             }
 
             // _priority: Override priority
-            if let Ok(Some(val)) = kw.get_item("_priority") {
-                if let Ok(p) = val.extract::<i32>() {
-                    obj.priority = p;
-                    debug!("Job priority overridden to: {}", obj.priority);
-                }
+            if let Some(p) = kw
+                .get_item("_priority")
+                .ok()
+                .flatten()
+                .and_then(|val| val.extract::<i32>().ok())
+            {
+                obj.priority = p;
+                debug!("Job priority overridden to: {}", obj.priority);
             }
         }
 
@@ -988,11 +981,11 @@ impl PyQuebec {
         let ctx = self.ctx.clone();
         let rt = self.rt.clone();
         let handle = rt.spawn(async move {
-            let server_handle = ControlPlaneExt::start_control_plane(&ctx, addr);
-            match server_handle.await {
-                Ok(_) => debug!("Control plane server task completed"),
-                Err(e) => error!("Control plane server task failed: {}", e),
-            }
+            ControlPlaneExt::start_control_plane(&ctx, addr)
+                .await
+                .inspect(|_| debug!("Control plane server task completed"))
+                .inspect_err(|e| error!("Control plane server task failed: {}", e))
+                .ok();
         });
         self.handles
             .lock()

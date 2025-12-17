@@ -96,57 +96,54 @@ impl Dispatcher {
                                   &concurrency_key,
                               ).await?;
 
-                              if let Some(execution) = blocked_execution {
-                                  // Get the job to access concurrency information (like original Solid Queue)
-                                  let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
+                              let Some(execution) = blocked_execution else { continue };
+
+                              // Get the job to access concurrency information (like original Solid Queue)
+                              let Some(job) = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
+                                  .await? else {
+                                  warn!("Job {} not found for blocked execution", execution.job_id);
+                                  continue;
+                              };
+
+                              // Get concurrency_limit from registered runnable
+                              let concurrency_limit = {
+                                  let Ok(runnables) = ctx.runnables.read()
+                                      .inspect_err(|e| warn!("Failed to acquire read lock: {}", e)) else {
+                                      continue;
+                                  };
+                                  runnables
+                                      .get(&job.class_name)
+                                      .and_then(|runnable| runnable.concurrency_limit)
+                                      .unwrap_or(1)
+                              };
+
+                              // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
+                              match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
+                                  Ok(true) => {
+                                      info!("Semaphore acquired for key: {}", concurrency_key);
+
+                                      // Move blocked execution to ready execution
+                                      // Use job's queue_name and priority (inherit from job like Solid Queue)
+                                      query_builder::ready_executions::insert(
+                                          txn,
+                                          &ctx.table_config,
+                                          execution.job_id,
+                                          &job.queue_name,
+                                          job.priority,
+                                      )
                                       .await?;
 
-                                  if let Some(job) = job {
-                                      // Get concurrency_limit from registered runnable
-                                      let concurrency_limit = {
-                                          let runnables = match ctx.runnables.read() {
-                                              Ok(r) => r,
-                                              Err(e) => {
-                                                  warn!("Failed to acquire read lock: {}", e);
-                                                  continue;
-                                              }
-                                          };
-                                          runnables.get(&job.class_name)
-                                              .and_then(|runnable| runnable.concurrency_limit)
-                                              .unwrap_or(1) // Default to 1 if not found
-                                      };
+                                      // Remove from blocked executions
+                                      query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
+                                          .await?;
 
-                                      // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
-                                      match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
-                                          Ok(true) => {
-                                              info!("Semaphore acquired for key: {}", concurrency_key);
-
-                                              // Move blocked execution to ready execution
-                                              // Use job's queue_name and priority (inherit from job like Solid Queue)
-                                              query_builder::ready_executions::insert(
-                                                  txn,
-                                                  &ctx.table_config,
-                                                  execution.job_id,
-                                                  &job.queue_name,
-                                                  job.priority,
-                                              )
-                                              .await?;
-
-                                              // Remove from blocked executions
-                                              query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
-                                                  .await?;
-
-                                              info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
-                                          },
-                                          Ok(false) => {
-                                              trace!("Failed to acquire semaphore for key: {} (no available slots)", concurrency_key);
-                                          },
-                                          Err(e) => {
-                                              warn!("Error acquiring semaphore for key {}: {:?}", concurrency_key, e);
-                                          }
-                                      }
-                                  } else {
-                                      warn!("Job {} not found for blocked execution", execution.job_id);
+                                      info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
+                                  },
+                                  Ok(false) => {
+                                      trace!("Failed to acquire semaphore for key: {} (no available slots)", concurrency_key);
+                                  },
+                                  Err(e) => {
+                                      warn!("Error acquiring semaphore for key {}: {:?}", concurrency_key, e);
                                   }
                               }
                           }
@@ -176,29 +173,30 @@ impl Dispatcher {
                               let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, scheduled_execution.job_id)
                                   .await?;
 
-                              if let Some(job) = job {
-                                  let queue_name = job.queue_name.clone();
-
-                                  query_builder::ready_executions::insert(
-                                      txn,
-                                      &ctx.table_config,
-                                      scheduled_execution.job_id,
-                                      &job.queue_name,
-                                      job.priority,
-                                  )
-                                  .await?;
-
-                                  query_builder::scheduled_executions::delete_by_job_id(
-                                      txn,
-                                      &ctx.table_config,
-                                      scheduled_execution.job_id,
-                                  )
-                                  .await?;
-
-                                  notified_queues.insert(queue_name);
-                              } else {
+                              let Some(job) = job else {
                                   warn!("Job {} not found for scheduled execution {}", scheduled_execution.job_id, scheduled_execution.id);
-                              }
+                                  continue;
+                              };
+
+                              let queue_name = job.queue_name.clone();
+
+                              query_builder::ready_executions::insert(
+                                  txn,
+                                  &ctx.table_config,
+                                  scheduled_execution.job_id,
+                                  &job.queue_name,
+                                  job.priority,
+                              )
+                              .await?;
+
+                              query_builder::scheduled_executions::delete_by_job_id(
+                                  txn,
+                                  &ctx.table_config,
+                                  scheduled_execution.job_id,
+                              )
+                              .await?;
+
+                              notified_queues.insert(queue_name);
                           }
 
                           if size > 0 {
@@ -212,14 +210,14 @@ impl Dispatcher {
                     .await;
 
                     // Send NOTIFY for each unique queue after transaction commits
-                    if let Ok(queues) = transaction_result {
-                        for queue_name in queues {
-                            if self.ctx.is_postgres() {
-                                if let Err(e) = crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name, "new_job").await {
-                                    warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e);
-                                }
-                            }
-                        }
+                    let Ok(queues) = transaction_result else { continue };
+                    if !self.ctx.is_postgres() { continue; }
+
+                    for queue_name in queues {
+                        crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name, "new_job")
+                            .await
+                            .inspect_err(|e| warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e))
+                            .ok();
                     }
                 }
             }

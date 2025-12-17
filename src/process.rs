@@ -119,13 +119,11 @@ pub trait ProcessTrait: Send + Sync {
         if is_running_in_pyo3() {
             let mut thread_id: u64 = 0;
             Python::with_gil(|py| {
-                if let Ok(threading) = PyModule::import(py, "threading") {
-                    if let Ok(bound) = threading.getattr("get_ident") {
-                        if let Ok(ident) = bound.call0() {
-                            thread_id = ident.extract::<u64>().unwrap_or(0);
-                        }
-                    }
-                }
+                thread_id = PyModule::import(py, "threading")
+                    .and_then(|threading| threading.getattr("get_ident"))
+                    .and_then(|bound| bound.call0())
+                    .and_then(|ident| ident.extract::<u64>())
+                    .unwrap_or(0);
             });
 
             tid = format!("{}", thread_id);

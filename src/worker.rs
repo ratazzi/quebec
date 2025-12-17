@@ -95,53 +95,44 @@ async fn runner(
               drop(receiver);
               let Some(mut execution) = execution else { continue };
               execution.tid = tid.clone();
-              let _job_id = execution.claimed.job_id;
 
-              // async {
-                  // Try to acquire lock, process task if successful
-                  // let _lock = state.lock().await;
-                  let class_name = execution.job.class_name.clone();
+              let class_name = execution.job.class_name.clone();
+              info!("Job `{}' started", class_name);
 
-                  info!("Job `{}' started", class_name);
+              let timeout_duration = std::time::Duration::from_secs(10);
 
-                  let timeout_duration = std::time::Duration::from_secs(10);
-
-                  let result = tokio::select! {
-                      _ = graceful_shutdown.cancelled() => {
-                          info!("Graceful cancelling");
-
-                          Err(anyhow::anyhow!("Job `{}' cancelling", class_name))
-                      }
-                      _ = force_quit.cancelled() => {
-                          error!("Job `{}' cancelled", class_name);
-                          break;
-                      }
-                      _ = tokio::time::sleep(timeout_duration) => {
-                          error!("Job `{}' timeout", class_name);
-                          Err(anyhow::anyhow!("Job `{}' timeout", class_name))
-                      }
-                      result = tokio::task::spawn_blocking(move || {
-                          tokio::runtime::Handle::current().block_on(execution.invoke())
-                      }) => {
-                          match result {
-                              Ok(result) => result,
-                              Err(e) => Err(anyhow::anyhow!("Job `{}' failed: {:?}", class_name, e)),
-                          }
-                      }
-                  };
-
-                  match result {
-                      Ok(_) => info!("Job `{}' completed successfully", class_name),
-                      Err(e) => error!("Job `{}' failed: {:?}", class_name, e),
+              let result = tokio::select! {
+                  _ = graceful_shutdown.cancelled() => {
+                      info!("Graceful cancelling");
+                      Err(anyhow::anyhow!("Job `{}' cancelling", class_name))
                   }
-
-                  if graceful_shutdown.is_cancelled() {
-                      trace!("Current job executed, shutdown gracefully");
+                  _ = force_quit.cancelled() => {
+                      error!("Job `{}' cancelled", class_name);
                       break;
                   }
-              // }
-              // .instrument(tracing::info_span!("rust_runner", jid = job_id))
-              // .await;
+                  _ = tokio::time::sleep(timeout_duration) => {
+                      error!("Job `{}' timeout", class_name);
+                      Err(anyhow::anyhow!("Job `{}' timeout", class_name))
+                  }
+                  result = tokio::task::spawn_blocking(move || {
+                      tokio::runtime::Handle::current().block_on(execution.invoke())
+                  }) => {
+                      match result {
+                          Ok(result) => result,
+                          Err(e) => Err(anyhow::anyhow!("Job `{}' failed: {:?}", class_name, e)),
+                      }
+                  }
+              };
+
+              match result {
+                  Ok(_) => info!("Job `{}' completed successfully", class_name),
+                  Err(e) => error!("Job `{}' failed: {:?}", class_name, e),
+              }
+
+              if graceful_shutdown.is_cancelled() {
+                  trace!("Current job executed, shutdown gracefully");
+                  break;
+              }
           }
         }
     }
@@ -389,12 +380,12 @@ impl Runnable {
         }
 
         if let Ok(exception_tuple) = exceptions_bound.downcast::<PyTuple>() {
-            for item in exception_tuple.iter() {
-                if let Ok(exception_type) = item.downcast::<PyType>() {
-                    if error.is_instance(py, exception_type) {
-                        return Ok(true);
-                    }
-                }
+            let matched = exception_tuple.iter().any(|item| {
+                item.downcast::<PyType>()
+                    .is_ok_and(|exception_type| error.is_instance(py, exception_type))
+            });
+            if matched {
+                return Ok(true);
             }
         }
 
@@ -741,6 +732,42 @@ impl Execution {
         Ok(job.clone())
     }
 
+    /// Schedule a retry job with the given parameters
+    async fn schedule_retry_job<C: ConnectionTrait>(
+        txn: &C,
+        table_config: &crate::context::TableConfig,
+        job: &quebec_jobs::Model,
+        scheduled_at: chrono::NaiveDateTime,
+        failed_attempts: i32,
+    ) -> Result<(), DbErr> {
+        let new_job_id = query_builder::jobs::insert_with_failed_attempts(
+            txn,
+            table_config,
+            &job.queue_name,
+            &job.class_name,
+            job.arguments.as_deref(),
+            job.priority,
+            failed_attempts,
+            job.active_job_id.as_deref(),
+            Some(scheduled_at),
+            job.concurrency_key.as_deref(),
+        )
+        .await?;
+
+        query_builder::scheduled_executions::insert(
+            txn,
+            table_config,
+            new_job_id,
+            &job.queue_name,
+            job.priority,
+            scheduled_at,
+        )
+        .await?;
+
+        info!("Retry job {} scheduled for {}", new_job_id, scheduled_at);
+        Ok(())
+    }
+
     async fn after_executed(
         &mut self,
         result: Result<quebec_jobs::Model>,
@@ -799,35 +826,15 @@ impl Execution {
             Box::pin(async move {
                 let claimed_id = claimed.id;
 
-                // Handle retry logic
                 if let Some((scheduled_at, failed_attempts)) = retry_job_data {
-                    // Insert retry job using query_builder with failed_attempts
-                    let new_job_id = query_builder::jobs::insert_with_failed_attempts(
+                    Self::schedule_retry_job(
                         txn,
                         &table_config,
-                        &job.queue_name,
-                        &job.class_name,
-                        job.arguments.as_deref(),
-                        job.priority,
-                        failed_attempts,
-                        job.active_job_id.as_deref(),
-                        Some(scheduled_at),
-                        job.concurrency_key.as_deref(),
-                    )
-                    .await?;
-
-                    // Create scheduled_execution record
-                    query_builder::scheduled_executions::insert(
-                        txn,
-                        &table_config,
-                        new_job_id,
-                        &job.queue_name,
-                        job.priority,
+                        &job,
                         scheduled_at,
+                        failed_attempts,
                     )
                     .await?;
-
-                    info!("Retry job {} scheduled for {}", new_job_id, scheduled_at);
                 }
 
                 if failed {
@@ -864,27 +871,22 @@ impl Execution {
 
                 // Release semaphore if job has concurrency control
                 // This must happen AFTER job execution completes (ensure block in Solid Queue)
-                if let Some(ref key) = concurrency_key {
-                    if !key.is_empty() {
-                        match release_semaphore(
-                            txn,
-                            &table_config,
-                            key.clone(),
-                            concurrency_limit,
-                            concurrency_duration,
-                        )
-                        .await
-                        {
-                            Ok(released) => {
-                                if released {
-                                    trace!("Released semaphore for key: {}", key);
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to release semaphore for key {}: {:?}", key, e);
-                            }
+                if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
+                    release_semaphore(
+                        txn,
+                        &table_config,
+                        key.clone(),
+                        concurrency_limit,
+                        concurrency_duration,
+                    )
+                    .await
+                    .inspect(|&released| {
+                        if released {
+                            trace!("Released semaphore for key: {}", key);
                         }
-                    }
+                    })
+                    .inspect_err(|e| warn!("Failed to release semaphore for key {}: {:?}", key, e))
+                    .ok();
                 }
 
                 Ok(updated)
@@ -965,36 +967,27 @@ impl Execution {
     }
 
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
-        let result = if exc.is_instance_of::<PyException>() {
-            let e = match exc.downcast::<PyException>() {
-                Ok(ex) => ex,
-                Err(_) => {
-                    error!("Failed to downcast exception");
-                    return;
-                }
+        let result = if !exc.is_instance_of::<PyException>() {
+            Ok(self.job.clone())
+        } else {
+            let Some(e) = exc.downcast::<PyException>().ok() else {
+                error!("Failed to downcast exception");
+                return;
             };
+
+            let exception_class = e
+                .get_type()
+                .str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "Unknown".to_string());
+
             error!("error: {:?}", e);
-            debug!("is PyException: {:?}", e.is_instance_of::<PyException>());
-            // debug!("is CustomError: {:?}", e.is_instance_of::<CustomError>(py));
+            error!("error_type: {}", exception_class);
+            error!("error_description: {}", e);
 
-            // let mut backtrace: Vec<String> = vec![];
             let backtrace: Vec<_> = traceback.lines().map(String::from).collect();
-
-            // if let Some(tb) = traceback {
-            //     backtrace = tb.format().unwrap().to_string().lines().map(String::from).collect();
-            // }
-
-            error!(
-                "error_type: {}",
-                e.get_type()
-                    .str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| "Unknown".to_string())
-            );
-            error!("error_description: {}", e.to_string());
-
             let error_payload = serde_json::json!({
-                "exception_class": e.get_type().str().map(|s| s.to_string()).unwrap_or_else(|_| "Unknown".to_string()),
+                "exception_class": exception_class,
                 "message": e.to_string(),
                 "backtrace": backtrace,
             });
@@ -1003,21 +996,17 @@ impl Execution {
                 .unwrap_or_else(
                     |_| "Error serialization failed".to_string()
                 )))
-        } else {
-            // info!("Job done");
-            Ok(self.job.clone())
         };
 
         py.allow_threads(|| {
-            // Use the shared runtime to run the async post handler
-            if let Some(handle) = self.ctx.get_runtime_handle() {
-                handle.block_on(async move {
-                    let ret = self.after_executed(result).await;
-                    debug!("Job result post: {:?}", ret);
-                });
-            } else {
+            let Some(handle) = self.ctx.get_runtime_handle() else {
                 error!("Tokio runtime handle not initialized; cannot post job result");
-            }
+                return;
+            };
+            handle.block_on(async move {
+                let ret = self.after_executed(result).await;
+                debug!("Job result post: {:?}", ret);
+            });
         });
     }
 
@@ -1082,68 +1071,62 @@ impl Execution {
         }
 
         py.allow_threads(|| {
-            let span = span.clone();
+            let retry_future = async {
+                warn!(
+                    "Attempt {} scheduled due to `{}' on {:?}",
+                    format!("#{}", job.failed_attempts + 1).bright_purple(),
+                    error_type,
+                    scheduled_at
+                );
+
+                let db = self.ctx.get_db().await;
+                let table_config = self.ctx.table_config.clone();
+                db.transaction::<_, (), DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    let queue_name = job.queue_name.clone();
+                    let class_name = job.class_name.clone();
+                    let params_str = params.to_string();
+                    let priority = job.priority;
+                    let failed_attempts = job.failed_attempts + 1;
+                    let active_job_id = job.active_job_id.clone();
+                    let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
+
+                    Box::pin(async move {
+                        let job_id = query_builder::jobs::insert_with_failed_attempts(
+                            txn,
+                            &table_config,
+                            &queue_name,
+                            &class_name,
+                            Some(&params_str),
+                            priority,
+                            failed_attempts,
+                            active_job_id.as_deref(),
+                            Some(scheduled_at),
+                            Some(&concurrency_key),
+                        )
+                        .await?;
+
+                        query_builder::scheduled_executions::insert(
+                            txn,
+                            &table_config,
+                            job_id,
+                            &queue_name,
+                            priority,
+                            scheduled_at,
+                        )
+                        .await?;
+
+                        Ok(())
+                    })
+                })
+                .await
+            }
+            .instrument(span.clone());
+
             let job = self
                 .ctx
                 .get_runtime_handle()
-                .map(|h| {
-                    h.block_on(
-                        async {
-                            warn!(
-                                "Attempt {} scheduled due to `{}' on {:?}",
-                                format!("#{}", job.failed_attempts + 1).bright_purple(),
-                                error_type,
-                                scheduled_at
-                            );
-
-                            let db = self.ctx.get_db().await;
-                            let table_config = self.ctx.table_config.clone();
-                            db.transaction::<_, (), DbErr>(|txn| {
-                                let table_config = table_config.clone();
-                                let queue_name = job.queue_name.clone();
-                                let class_name = job.class_name.clone();
-                                let params_str = params.to_string();
-                                let priority = job.priority;
-                                let failed_attempts = job.failed_attempts + 1;
-                                let active_job_id = job.active_job_id.clone();
-                                let concurrency_key =
-                                    job.concurrency_key.clone().unwrap_or_default();
-
-                                Box::pin(async move {
-                                    // Insert job using query_builder
-                                    let job_id = query_builder::jobs::insert_with_failed_attempts(
-                                        txn,
-                                        &table_config,
-                                        &queue_name,
-                                        &class_name,
-                                        Some(&params_str),
-                                        priority,
-                                        failed_attempts,
-                                        active_job_id.as_deref(),
-                                        Some(scheduled_at),
-                                        Some(&concurrency_key),
-                                    )
-                                    .await?;
-
-                                    // Insert scheduled execution
-                                    query_builder::scheduled_executions::insert(
-                                        txn,
-                                        &table_config,
-                                        job_id,
-                                        &queue_name,
-                                        priority,
-                                        scheduled_at,
-                                    )
-                                    .await?;
-
-                                    Ok(())
-                                })
-                            })
-                            .await
-                        }
-                        .instrument(span),
-                    )
-                })
+                .map(|h| h.block_on(retry_future))
                 .unwrap_or_else(|| {
                     Err(sea_orm::TransactionError::Connection(DbErr::Custom(
                         "Runtime handle unavailable".into(),
@@ -1201,48 +1184,33 @@ impl Worker {
         }
     }
 
-    pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
-        let callable = handler.bind(py);
-        if !callable.is_callable() {
-            return Err(PyTypeError::new_err(
-                "Expected a callable object for worker start handler",
-            ));
+    fn register_handler(
+        &self,
+        py: Python,
+        handler: Py<PyAny>,
+        handlers: &RwLock<Vec<Py<PyAny>>>,
+        handler_type: &str,
+    ) -> PyResult<()> {
+        if !handler.bind(py).is_callable() {
+            return Err(PyTypeError::new_err(format!(
+                "Expected a callable object for worker {} handler",
+                handler_type
+            )));
         }
-
-        {
-            if let Ok(mut handlers) = self.start_handlers.write() {
-                handlers.push(handler.clone_ref(py));
-            }
-            debug!("Worker start handler: {:?} registered", handler);
+        if let Ok(mut h) = handlers.write() {
+            h.push(handler.clone_ref(py));
         }
-
+        debug!("Worker {} handler: {:?} registered", handler_type, handler);
         Ok(())
+    }
+
+    pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
+        self.register_handler(py, handler, &self.start_handlers, "start")
     }
 
     pub fn register_stop_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
-        let callable = handler.bind(py);
-        if !callable.is_callable() {
-            return Err(PyTypeError::new_err(
-                "Expected a callable object for worker stop handler",
-            ));
-        }
-
-        {
-            if let Ok(mut handlers) = self.stop_handlers.write() {
-                handlers.push(handler.clone_ref(py));
-            }
-            debug!("Worker stop handler: {:?} registered", handler);
-        }
-
-        Ok(())
+        self.register_handler(py, handler, &self.stop_handlers, "stop")
     }
-
-    // fn get_job_class(&self, class_name: &str) -> PyResult<Py<PyAny>> {
-    //     let runnables = self.runnables.read().unwrap();
-    //     let runnable = runnables.get(class_name).unwrap();
-    //     let job_class = runnable.handler.clone();
-    //     Ok(job_class.clone())
-    // }
 
     pub fn register_job_class(&self, _py: Python, klass: Py<PyAny>) -> PyResult<()> {
         Python::with_gil(|py| -> PyResult<()> {
@@ -1270,23 +1238,24 @@ impl Worker {
             }
 
             // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)
-            let has_concurrency_control = if bound.hasattr("concurrency_key")? {
-                let concurrency_key_attr = bound.getattr("concurrency_key")?;
-                if concurrency_key_attr.is_none() {
-                    false
-                } else if concurrency_key_attr.is_callable() {
-                    // If it's a method, assume it provides concurrency control
-                    true
-                } else {
-                    // If it's a property, check if it's not empty string
-                    match concurrency_key_attr.extract::<String>() {
-                        Ok(key) => !key.is_empty(),
-                        Err(_) => false,
-                    }
+            let has_concurrency_control = (|| -> PyResult<bool> {
+                if !bound.hasattr("concurrency_key")? {
+                    return Ok(false);
                 }
-            } else {
-                false
-            };
+                let attr = bound.getattr("concurrency_key")?;
+                if attr.is_none() {
+                    return Ok(false);
+                }
+                if attr.is_callable() {
+                    return Ok(true); // Method implies concurrency control
+                }
+                // Property: check if not empty string
+                Ok(attr
+                    .extract::<String>()
+                    .map(|k| !k.is_empty())
+                    .unwrap_or(false))
+            })()
+            .unwrap_or(false);
 
             let runnable = Runnable {
                 class_name: class_name.to_string().clone(),
@@ -1311,6 +1280,18 @@ impl Worker {
         })
     }
 
+    /// Helper: claim a single execution (insert claimed, delete ready, return model)
+    async fn claim_execution<C: ConnectionTrait>(
+        txn: &C,
+        table_config: &crate::context::TableConfig,
+        execution: &quebec_ready_executions::Model,
+    ) -> Result<Option<quebec_claimed_executions::Model>, DbErr> {
+        query_builder::claimed_executions::insert(txn, table_config, execution.job_id, None)
+            .await?;
+        query_builder::ready_executions::delete_by_id(txn, table_config, execution.id).await?;
+        query_builder::claimed_executions::find_by_job_id(txn, table_config, execution.job_id).await
+    }
+
     pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
         let db = self.ctx.get_db().await;
         let table_config = self.ctx.table_config.clone();
@@ -1321,7 +1302,6 @@ impl Worker {
             .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
                 let table_config = table_config.clone();
                 Box::pin(async move {
-                    // Get list of paused queues (must filter these out)
                     let paused_queues =
                         query_builder::pauses::find_all_queue_names(txn, &table_config).await?;
 
@@ -1329,19 +1309,34 @@ impl Worker {
                         debug!("Paused queues: {:?}", paused_queues);
                     }
 
-                    // Get ordered queue patterns from selector
-                    // This preserves Solid Queue's queue ordering semantics
                     let queue_patterns = queue_selector
                         .as_ref()
                         .map(|q| q.ordered_patterns())
-                        .unwrap_or_else(|| vec![(false, "*".to_string())]); // Default to all
+                        .unwrap_or_else(|| vec![(false, "*".to_string())]);
 
-                    // Process queues in configuration order, return first found job
+                    // Helper macro to avoid duplicating find + claim logic
+                    macro_rules! try_claim_one {
+                        ($filter:expr, $exclude:expr) => {{
+                            let record = query_builder::ready_executions::find_one_for_update(
+                                txn,
+                                &table_config,
+                                $filter,
+                                $exclude,
+                                use_skip_locked,
+                            )
+                            .await?;
+                            if let Some(ref execution) = record {
+                                if let Some(claimed) =
+                                    Self::claim_execution(txn, &table_config, execution).await?
+                                {
+                                    return Ok(claimed);
+                                }
+                            }
+                        }};
+                    }
+
                     for (is_wildcard, pattern) in queue_patterns {
                         if is_wildcard {
-                            // For wildcard patterns, first expand to get all matching queue names
-                            // Then poll each concrete queue independently (Solid Queue semantics)
-                            // Sort by queue_name to ensure deterministic order
                             let matching_queues =
                                 query_builder::ready_executions::find_matching_queue_names(
                                     txn,
@@ -1350,99 +1345,20 @@ impl Worker {
                                 )
                                 .await?;
 
-                            // Poll each concrete queue in alphabetical order
-                            for queue_name in matching_queues {
-                                // Skip paused queues
-                                if paused_queues.contains(&queue_name) {
+                            for queue_name in &matching_queues {
+                                if paused_queues.contains(queue_name) {
                                     continue;
                                 }
-
-                                let record = query_builder::ready_executions::find_one_for_update(
-                                    txn,
-                                    &table_config,
-                                    Some(&queue_name),
-                                    &[],
-                                    use_skip_locked,
-                                )
-                                .await?;
-
-                                if let Some(execution) = record {
-                                    query_builder::claimed_executions::insert(
-                                        txn,
-                                        &table_config,
-                                        execution.job_id,
-                                        None,
-                                    )
-                                    .await?;
-
-                                    query_builder::ready_executions::delete_by_id(
-                                        txn,
-                                        &table_config,
-                                        execution.id,
-                                    )
-                                    .await?;
-
-                                    // Fetch the claimed execution to return
-                                    let claimed =
-                                        query_builder::claimed_executions::find_by_job_id(
-                                            txn,
-                                            &table_config,
-                                            execution.job_id,
-                                        )
-                                        .await?;
-                                    if let Some(claimed_model) = claimed {
-                                        return Ok(claimed_model);
-                                    }
-                                }
+                                try_claim_one!(Some(queue_name.as_str()), &[]);
                             }
                         } else {
-                            // Exact queue name or "*" (all queues)
-                            let (queue_filter, exclude_queues) = if pattern != "*" {
-                                // Skip if this exact queue is paused
-                                if paused_queues.contains(&pattern) {
-                                    continue;
-                                }
-                                (Some(pattern.as_str()), vec![])
+                            if pattern != "*" && paused_queues.contains(&pattern) {
+                                continue;
+                            }
+                            if pattern != "*" {
+                                try_claim_one!(Some(pattern.as_str()), &[]);
                             } else {
-                                // For "*" (all queues), exclude paused queues
-                                (None, paused_queues.clone())
-                            };
-
-                            let record = query_builder::ready_executions::find_one_for_update(
-                                txn,
-                                &table_config,
-                                queue_filter,
-                                &exclude_queues,
-                                use_skip_locked,
-                            )
-                            .await?;
-
-                            if let Some(execution) = record {
-                                query_builder::claimed_executions::insert(
-                                    txn,
-                                    &table_config,
-                                    execution.job_id,
-                                    None,
-                                )
-                                .await?;
-
-                                query_builder::ready_executions::delete_by_id(
-                                    txn,
-                                    &table_config,
-                                    execution.id,
-                                )
-                                .await?;
-
-                                // Fetch the claimed execution to return
-                                let claimed = query_builder::claimed_executions::find_by_job_id(
-                                    txn,
-                                    &table_config,
-                                    execution.job_id,
-                                )
-                                .await?;
-                                if let Some(claimed_model) = claimed {
-                                    return Ok(claimed_model);
-                                }
+                                try_claim_one!(None, &paused_queues);
                             }
                         }
                     }
@@ -1488,16 +1404,36 @@ impl Worker {
                         .map(|q| q.ordered_patterns())
                         .unwrap_or_else(|| vec![(false, "*".to_string())]); // Default to all
 
-                    // Process queues in configuration order
+                    // Helper macro to claim jobs from a queue
+                    macro_rules! claim_from_queue {
+                        ($filter:expr, $exclude:expr) => {{
+                            let records = query_builder::ready_executions::find_many_for_update(
+                                txn,
+                                &table_config,
+                                $filter,
+                                $exclude,
+                                use_skip_locked,
+                                remaining,
+                            )
+                            .await?;
+
+                            for execution in records {
+                                if let Some(claimed) =
+                                    Self::claim_execution(txn, &table_config, &execution).await?
+                                {
+                                    claimed_jobs.push(claimed);
+                                }
+                                remaining = remaining.saturating_sub(1);
+                            }
+                        }};
+                    }
+
                     for (is_wildcard, pattern) in queue_patterns {
                         if remaining == 0 {
                             break;
                         }
 
                         if is_wildcard {
-                            // For wildcard patterns, first expand to get all matching queue names
-                            // Then poll each concrete queue independently (Solid Queue semantics)
-                            // Sort by queue_name to ensure deterministic order
                             let matching_queues =
                                 query_builder::ready_executions::find_matching_queue_names(
                                     txn,
@@ -1506,117 +1442,23 @@ impl Worker {
                                 )
                                 .await?;
 
-                            // Poll each concrete queue in alphabetical order
-                            for queue_name in matching_queues {
+                            for queue_name in &matching_queues {
                                 if remaining == 0 {
                                     break;
                                 }
-
-                                // Skip paused queues
-                                if paused_queues.contains(&queue_name) {
+                                if paused_queues.contains(queue_name) {
                                     continue;
                                 }
-
-                                // Find ready executions for this queue
-                                let records =
-                                    query_builder::ready_executions::find_many_for_update(
-                                        txn,
-                                        &table_config,
-                                        Some(&queue_name),
-                                        &[],
-                                        use_skip_locked,
-                                        remaining,
-                                    )
-                                    .await?;
-
-                                // Claim the jobs from this queue
-                                for execution in records {
-                                    query_builder::claimed_executions::insert(
-                                        txn,
-                                        &table_config,
-                                        execution.job_id,
-                                        None,
-                                    )
-                                    .await?;
-
-                                    query_builder::ready_executions::delete_by_id(
-                                        txn,
-                                        &table_config,
-                                        execution.id,
-                                    )
-                                    .await?;
-
-                                    // Fetch the claimed execution
-                                    if let Some(claimed_model) =
-                                        query_builder::claimed_executions::find_by_job_id(
-                                            txn,
-                                            &table_config,
-                                            execution.job_id,
-                                        )
-                                        .await?
-                                    {
-                                        claimed_jobs.push(claimed_model);
-                                    }
-                                    remaining = remaining.saturating_sub(1);
-                                }
+                                claim_from_queue!(Some(queue_name.as_str()), &[]);
                             }
                         } else {
-                            // Exact queue name or "*" (all queues)
-                            if pattern != "*" {
-                                // Skip if this exact queue is paused
-                                if paused_queues.contains(&pattern) {
-                                    continue;
-                                }
+                            if pattern != "*" && paused_queues.contains(&pattern) {
+                                continue;
                             }
-
-                            // Determine queue filter and exclusions
-                            let (queue_filter, exclude_queues) = if pattern != "*" {
-                                (Some(pattern.as_str()), vec![])
+                            if pattern != "*" {
+                                claim_from_queue!(Some(pattern.as_str()), &[]);
                             } else {
-                                // For "*" (all queues), exclude paused queues
-                                (None, paused_queues.clone())
-                            };
-
-                            // Find ready executions
-                            let records = query_builder::ready_executions::find_many_for_update(
-                                txn,
-                                &table_config,
-                                queue_filter,
-                                &exclude_queues,
-                                use_skip_locked,
-                                remaining,
-                            )
-                            .await?;
-
-                            // Claim the jobs from this queue
-                            for execution in records {
-                                query_builder::claimed_executions::insert(
-                                    txn,
-                                    &table_config,
-                                    execution.job_id,
-                                    None,
-                                )
-                                .await?;
-
-                                query_builder::ready_executions::delete_by_id(
-                                    txn,
-                                    &table_config,
-                                    execution.id,
-                                )
-                                .await?;
-
-                                // Fetch the claimed execution
-                                if let Some(claimed_model) =
-                                    query_builder::claimed_executions::find_by_job_id(
-                                        txn,
-                                        &table_config,
-                                        execution.job_id,
-                                    )
-                                    .await?
-                                {
-                                    claimed_jobs.push(claimed_model);
-                                }
-                                remaining = remaining.saturating_sub(1);
+                                claim_from_queue!(None, &paused_queues);
                             }
                         }
                     }
@@ -1628,6 +1470,77 @@ impl Worker {
 
         trace!("elpased: {:?}", timer.elapsed());
         Ok(jobs)
+    }
+
+    /// Check if this worker should handle the notify message for the given queue
+    fn should_handle_notify(&self, msg: &str) -> bool {
+        let notify_msg = match serde_json::from_str::<crate::notify::NotifyMessage>(msg) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Failed to parse NOTIFY message '{}': {}", msg, e);
+                return true; // If we can't parse, process anyway to be safe
+            }
+        };
+
+        trace!("Received NOTIFY for queue: {}", notify_msg.queue);
+
+        let Some(ref queues) = self.ctx.worker_queues else {
+            return true; // No queue config, process all queues
+        };
+
+        if queues.is_all() {
+            return true;
+        }
+
+        let exact = queues.exact_names();
+        let wildcards = queues.wildcard_prefixes();
+
+        exact.contains(&notify_msg.queue)
+            || wildcards
+                .iter()
+                .any(|prefix| notify_msg.queue.starts_with(prefix))
+    }
+
+    /// Drain pending notify messages from the channel, return count drained
+    fn drain_pending_notifies(
+        notify_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
+    ) -> usize {
+        let mut count = 0;
+        while let Some(rx) = notify_rx.as_mut() {
+            if rx.try_recv().is_err() {
+                break;
+            }
+            count += 1;
+        }
+        count
+    }
+
+    /// Set up PostgreSQL LISTEN/NOTIFY for immediate job notifications
+    async fn setup_notify_listener(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        if !self.ctx.is_postgres() {
+            info!("Non-PostgreSQL database detected, using polling only");
+            return None;
+        }
+
+        info!("PostgreSQL detected, enabling LISTEN/NOTIFY for immediate job processing");
+        let notify_manager = NotifyManager::new(self.ctx.clone());
+
+        match notify_manager.start_listener().await {
+            Ok(rx) => {
+                info!(
+                    "LISTEN started on '{}_jobs' channel - jobs will be processed immediately when notified",
+                    self.ctx.name
+                );
+                Some(rx)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to start real LISTEN, falling back to polling only: {}",
+                    e
+                );
+                None
+            }
+        }
     }
 
     pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
@@ -1653,28 +1566,7 @@ impl Worker {
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
 
-        // Set up PostgreSQL LISTEN if available
-        // Now using real sqlx PgListener for immediate notifications
-        let mut notify_rx = None;
-        if self.ctx.is_postgres() {
-            info!("PostgreSQL detected, enabling LISTEN/NOTIFY for immediate job processing");
-
-            let notify_manager = NotifyManager::new(self.ctx.clone());
-            match notify_manager.start_listener().await {
-                Ok(rx) => {
-                    notify_rx = Some(rx);
-                    info!("LISTEN started on '{}_jobs' channel - jobs will be processed immediately when notified", self.ctx.name);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to start real LISTEN, falling back to polling only: {}",
-                        e
-                    );
-                }
-            }
-        } else {
-            info!("Non-PostgreSQL database detected, using polling only");
-        }
+        let mut notify_rx = self.setup_notify_listener().await;
 
         // Call worker start handlers before starting the main loop
         Python::with_gil(|py| {
@@ -1724,58 +1616,18 @@ impl Worker {
                     }
                 } => {
                     if let Some(msg) = notify_msg {
-                        // Parse the notification message
-                        let should_process = match serde_json::from_str::<crate::notify::NotifyMessage>(&msg) {
-                            Ok(notify_msg) => {
-                                trace!("Received NOTIFY for queue: {}", notify_msg.queue);
+                        if self.should_handle_notify(&msg) {
+                            let total_notifies = 1 + Self::drain_pending_notifies(&mut notify_rx);
 
-                                // Check if this worker should process this queue
-                                if let Some(ref queues) = self.ctx.worker_queues {
-                                    queues.is_all() || {
-                                        let exact = queues.exact_names();
-                                        let wildcards = queues.wildcard_prefixes();
+                            async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }
+                                .instrument(tracing::info_span!("listener", consumed = total_notifies))
+                                .await;
 
-                                        // Check exact match
-                                        exact.contains(&notify_msg.queue) ||
-                                        // Check wildcard match
-                                        wildcards.iter().any(|prefix| notify_msg.queue.starts_with(prefix))
-                                    }
-                                } else {
-                                    // No queue config, process all queues
-                                    true
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed to parse NOTIFY message '{}': {}", msg, e);
-                                // If we can't parse, process anyway to be safe
-                                true
-                            }
-                        };
-
-                        if should_process {
-                            // Simple batching: consume additional immediate messages
-                            let mut total_notifies = 1;
-                            while let Some(rx) = notify_rx.as_mut() {
-                                if rx.try_recv().is_err() {
-                                    break;
-                                }
-                                total_notifies += 1;
-                            }
-
-                            async { debug!("Processing jobs immediately (batched {} notifications)", total_notifies); }.instrument(tracing::info_span!("listener", consumed=total_notifies)).await;
-                            trace!("Received {} NOTIFY message(s), processing jobs immediately", total_notifies);
-
-                            // Process jobs with timeout protection to prevent blocking main loop
                             let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
-                            let timeout_duration = tokio::time::Duration::from_millis(100); // 100ms max
+                            let timeout_duration = tokio::time::Duration::from_millis(100);
 
-                            match tokio::time::timeout(timeout_duration, process_future).await {
-                                Ok(_) => {
-                                    trace!("NOTIFY job processing completed within timeout");
-                                }
-                                Err(_) => {
-                                    warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
-                                }
+                            if tokio::time::timeout(timeout_duration, process_future).await.is_err() {
+                                warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
                             }
                         } else {
                             trace!("Ignoring NOTIFY for queue not in worker config");

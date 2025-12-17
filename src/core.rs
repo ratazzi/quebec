@@ -11,6 +11,25 @@ use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::sync::Arc;
 
+/// Where the job was routed after enqueue
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobDestination {
+    /// Job is ready for immediate execution
+    Ready,
+    /// Job is scheduled for future execution
+    Scheduled,
+    /// Job is blocked by concurrency limit
+    Blocked,
+    /// Job was discarded due to concurrency limit
+    Discarded,
+}
+
+impl JobDestination {
+    fn should_notify(&self) -> bool {
+        matches!(self, JobDestination::Ready)
+    }
+}
+
 #[derive(Debug)]
 pub struct Quebec {
     pub ctx: Arc<AppContext>,
@@ -23,161 +42,200 @@ impl Quebec {
 
     pub async fn perform_later(&self, job: ActiveJob) -> Result<quebec_jobs::Model> {
         let db = self.ctx.get_db().await;
-        let _ = db.ping().await?;
-        let duration = self.ctx.default_concurrency_control_period;
-        let ctx = self.ctx.clone(); // Clone ctx for the async closure
+        let ctx = self.ctx.clone();
         trace!("job: {:?}", job);
 
-        // Transaction returns (job_model, should_notify)
-        // should_notify is true only when job goes to ready_executions
-        let (job_model, should_notify) = db
-            .transaction::<_, (quebec_jobs::Model, bool), DbErr>(|txn| {
-                Box::pin(async move {
-                    let now = chrono::Utc::now().naive_utc();
-                    let args: serde_json::Value = serde_json::from_str(job.arguments.as_str())
-                        .map_err(|e| DbErr::Custom(format!("Serialization error: {}", e)))?;
-
-                    let params = serde_json::json!({
-                        "job_class": job.class_name.clone(),
-                        "job_id": null,
-                        "provider_job_id": "",
-                        "queue_name": job.queue_name.clone(),
-                        "priority": job.priority,
-                        "arguments": args,
-                        "executions": 0,
-                        "exception_executions": {},
-                        "locale": "en",
-                        "timezone": "UTC",
-                        "scheduled_at": null,
-                        "enqueued_at": now,
-                    });
-
-                    let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
-                    let concurrency_limit = job.concurrency_limit.unwrap_or(1);
-
-                    // Insert job using query_builder with RETURNING * optimization
-                    // This avoids a second round-trip for Postgres/SQLite
-                    let job_model = query_builder::jobs::insert_returning(
-                        txn,
-                        &ctx.table_config,
-                        &job.queue_name,
-                        &job.class_name,
-                        Some(params.to_string()).as_deref(),
-                        job.priority,
-                        Some(job.active_job_id.as_str()),
-                        Some(job.scheduled_at),
-                        if concurrency_key.is_empty() { None } else { Some(concurrency_key.as_str()) },
-                    )
-                    .await?;
-
-                    let job_id = job_model.id;
-
-                    let job_priority = job_model.priority;
-
-                    // Get queue_name from job for proper propagation
-                    let job_queue_name = job_model.queue_name.clone();
-
-                    // Get conflict strategy from job
-                    let conflict_strategy = job.concurrency_on_conflict;
-
-                    // Check if job is scheduled for the future
-                    // Note: When no scheduled_at is specified, it defaults to job creation time.
-                    // By the time we reach this check, `now` will be >= creation time,
-                    // so only explicitly future-scheduled jobs will take this branch.
-                    let is_scheduled = job.scheduled_at > now;
-
-                    if is_scheduled {
-                        // Job is scheduled for future, add to scheduled_executions
-                        // Don't notify - job is not ready yet
-                        info!(
-                            "Job scheduled for future execution at {:?}",
-                            job.scheduled_at
-                        );
-                        query_builder::scheduled_executions::insert(
-                            txn,
-                            &ctx.table_config,
-                            job_id,
-                            &job_queue_name,
-                            job_priority,
-                            job.scheduled_at,
-                        )
-                        .await?;
-                        return Ok((job_model, false));
-                    }
-
-                    if !concurrency_key.is_empty() {
-                        // Try to acquire the semaphore
-                        let expires_at = now + duration;
-                        if acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await? {
-                            info!("Semaphore acquired for key: {}", concurrency_key);
-                        } else {
-                            // Handle based on conflict strategy
-                            match conflict_strategy {
-                                crate::context::ConcurrencyConflict::Discard => {
-                                    // Discard strategy: mark job as finished without execution.
-                                    // This is the expected behavior when user chooses "discard" -
-                                    // the job is intentionally dropped when concurrency limit is reached.
-                                    // Note: The job will appear as "finished" but was never executed.
-                                    // For observability, monitor this log or use external metrics.
-                                    // Don't notify - job was discarded
-                                    warn!(
-                                        job_id = job_id,
-                                        concurrency_key = %concurrency_key,
-                                        class_name = %job.class_name,
-                                        "Job discarded due to concurrency limit (conflict_strategy=discard)"
-                                    );
-                                    query_builder::jobs::mark_finished(txn, &ctx.table_config, job_id).await?;
-                                    return Ok((job_model, false));
-                                }
-                                crate::context::ConcurrencyConflict::Block => {
-                                    // Block strategy: add to blocked queue (default behavior)
-                                    // Don't notify - job is blocked
-                                    info!("Failed to acquire semaphore for key: {}, adding to blocked queue", concurrency_key);
-
-                                    query_builder::blocked_executions::insert(
-                                        txn,
-                                        &ctx.table_config,
-                                        job_id,
-                                        &job_queue_name,
-                                        job_priority,
-                                        &concurrency_key,
-                                        expires_at,
-                                    )
-                                    .await?;
-
-                                    // Job is blocked, don't add to ready queue
-                                    return Ok((job_model, false));
-                                }
-                            }
-                        }
-                    }
-
-                    query_builder::ready_executions::insert(
-                        txn,
-                        &ctx.table_config,
-                        job_id,
-                        &job_queue_name,
-                        job_priority,
-                    )
-                    .await?;
-
-                    // Job is ready - should notify
-                    Ok((job_model, true))
-                })
+        let (job_model, destination) = db
+            .transaction::<_, (quebec_jobs::Model, JobDestination), DbErr>(|txn| {
+                let table_config = ctx.table_config.clone();
+                let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                    .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                let job = job.clone();
+                Box::pin(async move { enqueue_job(txn, &table_config, &job, duration).await })
             })
             .await
-            .map_err(|e| crate::error::QuebecError::from(e))?;
+            .map_err(crate::error::QuebecError::from)?;
 
-        // Send PostgreSQL NOTIFY only when job is ready for immediate execution
-        if should_notify && self.ctx.is_postgres() {
-            if let Err(e) =
-                NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job")
-                    .await
-            {
-                warn!("Failed to send NOTIFY: {}", e);
-            }
+        if destination.should_notify() && self.ctx.is_postgres() {
+            NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job")
+                .await
+                .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
+                .ok();
         }
 
         Ok(job_model)
+    }
+}
+
+/// Core job enqueue logic, runs inside a transaction
+async fn enqueue_job(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    job: &ActiveJob,
+    concurrency_duration: chrono::Duration,
+) -> std::result::Result<(quebec_jobs::Model, JobDestination), DbErr> {
+    let now = chrono::Utc::now().naive_utc();
+
+    // Validate arguments JSON without full parsing (zero-copy validation)
+    let args: Box<serde_json::value::RawValue> = serde_json::from_str(&job.arguments)
+        .map_err(|e| DbErr::Custom(format!("Invalid JSON in arguments: {}", e)))?;
+
+    let params = serde_json::json!({
+        "job_class": job.class_name,
+        "job_id": null,
+        "provider_job_id": "",
+        "queue_name": job.queue_name,
+        "priority": job.priority,
+        "arguments": args,
+        "executions": 0,
+        "exception_executions": {},
+        "locale": "en",
+        "timezone": "UTC",
+        "scheduled_at": null,
+        "enqueued_at": now,
+    });
+
+    let concurrency_key = job.concurrency_key.as_deref().unwrap_or_default();
+
+    // Insert job record
+    let job_model = query_builder::jobs::insert_returning(
+        txn,
+        table_config,
+        &job.queue_name,
+        &job.class_name,
+        Some(&params.to_string()),
+        job.priority,
+        Some(&job.active_job_id),
+        Some(job.scheduled_at),
+        if concurrency_key.is_empty() {
+            None
+        } else {
+            Some(concurrency_key)
+        },
+    )
+    .await?;
+
+    // Route job to appropriate destination
+    let destination = route_job(
+        txn,
+        table_config,
+        &job_model,
+        job,
+        concurrency_key,
+        now,
+        concurrency_duration,
+    )
+    .await?;
+
+    Ok((job_model, destination))
+}
+
+/// Determine where the job should go based on scheduling and concurrency
+async fn route_job(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    job_model: &quebec_jobs::Model,
+    job: &ActiveJob,
+    concurrency_key: &str,
+    now: chrono::NaiveDateTime,
+    concurrency_duration: chrono::Duration,
+) -> std::result::Result<JobDestination, DbErr> {
+    let job_id = job_model.id;
+
+    // Check if job is scheduled for the future
+    if job.scheduled_at > now {
+        info!(job_id, scheduled_at = ?job.scheduled_at, "Job scheduled for future execution");
+        query_builder::scheduled_executions::insert(
+            txn,
+            table_config,
+            job_id,
+            &job_model.queue_name,
+            job_model.priority,
+            job.scheduled_at,
+        )
+        .await?;
+        return Ok(JobDestination::Scheduled);
+    }
+
+    // Handle concurrency control if configured
+    if !concurrency_key.is_empty() {
+        let acquired = acquire_semaphore(
+            txn,
+            table_config,
+            concurrency_key.to_string(),
+            job.concurrency_limit.unwrap_or(1),
+            None,
+        )
+        .await?;
+
+        if !acquired {
+            return handle_concurrency_conflict(
+                txn,
+                table_config,
+                job_model,
+                job,
+                concurrency_key,
+                now,
+                concurrency_duration,
+            )
+            .await;
+        }
+        info!(job_id, concurrency_key, "Semaphore acquired");
+    }
+
+    // Job is ready for immediate execution
+    query_builder::ready_executions::insert(
+        txn,
+        table_config,
+        job_id,
+        &job_model.queue_name,
+        job_model.priority,
+    )
+    .await?;
+
+    Ok(JobDestination::Ready)
+}
+
+/// Handle the case when concurrency limit is reached
+async fn handle_concurrency_conflict(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    job_model: &quebec_jobs::Model,
+    job: &ActiveJob,
+    concurrency_key: &str,
+    now: chrono::NaiveDateTime,
+    concurrency_duration: chrono::Duration,
+) -> std::result::Result<JobDestination, DbErr> {
+    let job_id = job_model.id;
+
+    match job.concurrency_on_conflict {
+        ConcurrencyConflict::Discard => {
+            warn!(
+                job_id,
+                concurrency_key,
+                class_name = %job.class_name,
+                "Job discarded due to concurrency limit"
+            );
+            query_builder::jobs::mark_finished(txn, table_config, job_id).await?;
+            Ok(JobDestination::Discarded)
+        }
+        ConcurrencyConflict::Block => {
+            info!(
+                job_id,
+                concurrency_key, "Job blocked, adding to blocked queue"
+            );
+            let expires_at = now + concurrency_duration;
+            query_builder::blocked_executions::insert(
+                txn,
+                table_config,
+                job_id,
+                &job_model.queue_name,
+                job_model.priority,
+                concurrency_key,
+                expires_at,
+            )
+            .await?;
+            Ok(JobDestination::Blocked)
+        }
     }
 }

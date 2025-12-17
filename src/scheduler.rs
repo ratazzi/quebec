@@ -230,50 +230,45 @@ where
     .await?;
 
     // Apply concurrency control logic
-    if let Some(constraint) = &concurrency_constraint {
+    // Returns Some(constraint) if blocked, None if ready to execute
+    let blocked_by = if let Some(constraint) = &concurrency_constraint {
         use crate::semaphore::acquire_semaphore_with_constraint;
 
-        // Try to acquire the semaphore using the constraint
         if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
             info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
-
-            // Create ready execution - job can run immediately
-            query_builder::ready_executions::insert(
-                db,
-                &ctx.table_config,
-                job.id,
-                &job.queue_name,
-                job.priority,
-            )
-            .await?;
+            None
         } else {
             warn!(
                 "Scheduler: Failed to acquire semaphore for key: {}",
                 constraint.key
             );
-
-            // Create blocked execution - job must wait
-            // Use constraint's duration for consistency with acquire_semaphore_with_constraint
-            let block_now = chrono::Utc::now().naive_utc();
-            let duration = constraint.duration.unwrap_or_else(|| {
-                chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
-            });
-            let expires_at = block_now + duration;
-
-            query_builder::blocked_executions::insert(
-                db,
-                &ctx.table_config,
-                job.id,
-                &job.queue_name,
-                job.priority,
-                &constraint.key,
-                expires_at,
-            )
-            .await?;
+            Some(constraint)
         }
     } else {
-        // No concurrency control - create ready execution immediately
+        None
+    };
+
+    if let Some(constraint) = blocked_by {
+        // Create blocked execution - job must wait
+        let block_now = chrono::Utc::now().naive_utc();
+        let duration = constraint.duration.unwrap_or_else(|| {
+            chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+        });
+        let expires_at = block_now + duration;
+
+        query_builder::blocked_executions::insert(
+            db,
+            &ctx.table_config,
+            job.id,
+            &job.queue_name,
+            job.priority,
+            &constraint.key,
+            expires_at,
+        )
+        .await?;
+    } else {
+        // Job is ready to execute
         query_builder::ready_executions::insert(
             db,
             &ctx.table_config,
@@ -286,10 +281,10 @@ where
 
     // Send PostgreSQL NOTIFY after scheduled job is created
     if ctx.is_postgres() {
-        if let Err(e) = NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job").await
-        {
-            warn!("Failed to send NOTIFY for scheduled job: {}", e);
-        }
+        NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job")
+            .await
+            .inspect_err(|e| warn!("Failed to send NOTIFY for scheduled job: {}", e))
+            .ok();
     }
 
     Ok(true)
@@ -307,6 +302,26 @@ impl Scheduler {
             ctx,
             schedule: Vec::new(),
         }
+    }
+
+    /// Find schedule file with priority:
+    /// 1. SOLID_QUEUE_RECURRING_SCHEDULE env var (for Solid Queue compatibility)
+    /// 2. QUEBEC_RECURRING_SCHEDULE env var
+    /// 3. recurring.yml (current directory)
+    /// 4. config/recurring.yml (Solid Queue compatible)
+    fn find_schedule_path() -> Option<String> {
+        std::env::var("SOLID_QUEUE_RECURRING_SCHEDULE")
+            .or_else(|_| std::env::var("QUEBEC_RECURRING_SCHEDULE"))
+            .ok()
+            .or_else(|| {
+                if std::path::Path::new("recurring.yml").exists() {
+                    Some("recurring.yml".to_string())
+                } else if std::path::Path::new("config/recurring.yml").exists() {
+                    Some("config/recurring.yml".to_string())
+                } else {
+                    None
+                }
+            })
     }
 
     fn parse_schedule_file(
@@ -327,236 +342,214 @@ impl Scheduler {
         Ok(vec![tasks])
     }
 
-    pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let db = self.ctx.get_db().await;
-        let mut interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
-        let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
-
-        let _delta = chrono::Duration::seconds(
-            self.ctx
-                .dispatcher_polling_interval
-                .as_secs()
-                .try_into()
-                .unwrap_or(1),
-        );
-        let mut scheduled = Vec::<ScheduledEntry>::new();
-
-        // Find schedule file with priority:
-        // 1. SOLID_QUEUE_RECURRING_SCHEDULE env var (for Solid Queue compatibility)
-        // 2. QUEBEC_RECURRING_SCHEDULE env var
-        // 3. recurring.yml (current directory)
-        // 4. config/recurring.yml (Solid Queue compatible)
-        let schedule_path = std::env::var("SOLID_QUEUE_RECURRING_SCHEDULE")
-            .or_else(|_| std::env::var("QUEBEC_RECURRING_SCHEDULE"))
-            .ok()
-            .or_else(|| {
-                if std::path::Path::new("recurring.yml").exists() {
-                    Some("recurring.yml".to_string())
-                } else if std::path::Path::new("config/recurring.yml").exists() {
-                    Some("config/recurring.yml".to_string())
-                } else {
-                    None
-                }
-            });
-
-        let schedule: Vec<HashMap<String, ScheduledEntry>> = match schedule_path {
-            None => {
-                info!("No schedule file found, running without scheduled tasks");
-                Vec::new()
-            }
-            Some(path) => {
-                info!("Loading schedule from: {}", path);
-                let contents = std::fs::read_to_string(&path).map_err(|e| {
-                    error!("Failed to read schedule file {}: {}", path, e);
-                    anyhow::anyhow!("Failed to read schedule file: {}", e)
-                })?;
-
-                Self::parse_schedule_file(&contents)?
-            }
+    /// Load schedule from file path, returns empty vec if no path provided
+    fn load_schedule(
+        path: Option<String>,
+    ) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+        let Some(path) = path else {
+            info!("No schedule file found, running without scheduled tasks");
+            return Ok(Vec::new());
         };
 
-        trace!("Schedule: {:?}", schedule);
+        info!("Loading schedule from: {}", path);
+        let contents = std::fs::read_to_string(&path).map_err(|e| {
+            error!("Failed to read schedule file {}: {}", path, e);
+            anyhow::anyhow!("Failed to read schedule file: {}", e)
+        })?;
 
-        let process = self.on_start(&db).await?;
-        info!(">> Process started: {:?}", process);
+        Self::parse_schedule_file(&contents)
+    }
+
+    /// Sync scheduled tasks to database (upsert recurring_tasks table)
+    async fn sync_tasks_to_db<C: ConnectionTrait + TransactionTrait>(
+        db: &C,
+        table_config: &crate::context::TableConfig,
+        schedule: Vec<HashMap<String, ScheduledEntry>>,
+    ) -> Result<Vec<ScheduledEntry>, anyhow::Error> {
+        let mut scheduled = Vec::new();
 
         for entry in schedule {
             for (key, mut value) in entry {
-                value.key = Some(key.clone());
-                scheduled.push(value.clone());
+                value.key = Some(key);
 
-                let table_config = self.ctx.table_config.clone();
                 let ret = db
                     .transaction::<_, ExecResult, DbErr>(|txn| {
-                        Box::pin(
-                            async move { upsert_task(txn, &table_config, value.clone()).await },
-                        )
+                        let tc = table_config.clone();
+                        let v = value.clone();
+                        Box::pin(async move { upsert_task(txn, &tc, v).await })
                     })
                     .await?;
 
                 trace!("Upsert task: {:?}", ret);
+                scheduled.push(value);
             }
         }
+
         trace!("Scheduled: {:?}", scheduled);
+        Ok(scheduled)
+    }
 
-        let entries = scheduled.clone();
-        let mut task_handles = Vec::new();
+    /// Run the cron loop for a single scheduled task
+    async fn run_task_loop(
+        ctx: Arc<AppContext>,
+        db: Arc<sea_orm::DatabaseConnection>,
+        entry: ScheduledEntry,
+        task_key: String,
+        graceful_shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let cron = match entry.as_cron() {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    "Failed to parse cron expression for task {}: {}",
+                    task_key, e
+                );
+                return;
+            }
+        };
 
-        for (i, entry) in entries.into_iter().enumerate() {
-            let db = self.ctx.get_db().await;
-            let graceful_shutdown = self.ctx.graceful_shutdown.clone();
-            let ctx = self.ctx.clone(); // Clone context for the async move block
+        info!("Starting scheduled task: {}", task_key);
 
-            let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
-            let handle = tokio::spawn(async move {
-                let cron = match entry.as_cron() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(
-                            "Failed to parse cron expression for task {}: {}",
-                            task_key, e
+        // Track consecutive time errors for exponential backoff
+        let mut time_error_count: u32 = 0;
+        let mut last_planned: Option<chrono::DateTime<chrono::Local>> = None;
+
+        loop {
+            if graceful_shutdown.is_cancelled() {
+                info!(
+                    "Scheduler task for {} exiting due to shutdown signal",
+                    task_key
+                );
+                break;
+            }
+
+            // Capture both time domains: wall clock for cron and monotonic for sleeping
+            let now_monotonic = tokio::time::Instant::now();
+            let now_wall = chrono::Local::now();
+
+            // Ensure we don't repeatedly return the same occurrence (can happen around time jumps).
+            // Search from a time strictly after the last planned occurrence to avoid duplicate enqueues.
+            let mut search_from = now_wall;
+            if let Some(last) = last_planned {
+                if last >= search_from {
+                    search_from = last + chrono::Duration::milliseconds(1);
+                }
+            }
+
+            let next_wall = match cron.find_next_occurrence(&search_from, false) {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!("No next occurrence found for task {}: {}", task_key, e);
+                    break;
+                }
+            };
+            last_planned = Some(next_wall);
+
+            trace!("next_wall: {:?}", next_wall);
+
+            // Compute a fixed deadline on the monotonic clock to avoid drift
+            let delay = match (next_wall - now_wall).to_std() {
+                Ok(d) => {
+                    // Reset error count on successful time calculation
+                    time_error_count = 0;
+
+                    // Detect large time jumps (> 24 hours) and log warning
+                    if d.as_secs() > 86400 {
+                        warn!(
+                            "Large time jump detected for task {}: next execution in {:.1} hours. \
+                             This may indicate a system time issue or very sparse schedule.",
+                            task_key,
+                            d.as_secs() as f64 / 3600.0
                         );
-                        return;
                     }
-                };
-                let time = chrono::Local::now();
-                let mut last = match cron.find_next_occurrence(&time, false) {
-                    Ok(occurrence) => occurrence,
-                    Err(e) => {
-                        error!(
-                            "Failed to find next occurrence for task {}: {}",
-                            task_key, e
-                        );
-                        return;
-                    }
-                };
-                info!("Starting scheduled task: {}", task_key);
-
-                // Track consecutive time errors for exponential backoff
-                let mut time_error_count: u32 = 0;
-
-                loop {
-                    if graceful_shutdown.is_cancelled() {
-                        info!(
-                            "Scheduler task for {} exiting due to shutdown signal",
-                            task_key
-                        );
-                        break;
-                    }
-
-                    // Capture both time domains: wall clock for cron and monotonic for sleeping
-                    let now_monotonic = tokio::time::Instant::now();
-                    let now_wall = chrono::Local::now();
-
-                    let next_wall = match cron.find_next_occurrence(&now_wall, false) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!("No next occurrence found for task {}: {}", task_key, e);
-                            break;
-                        }
-                    };
-                    let scheduled_at = next_wall.naive_utc();
-
-                    if next_wall == last {
-                        // Avoid busy-wait: sleep briefly before rechecking
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        continue;
-                    } else {
-                        last = next_wall;
-                    }
-
-                    trace!("next_wall: {:?}", next_wall);
-
-                    // Compute a fixed deadline on the monotonic clock to avoid drift
-                    let delay = match (next_wall - now_wall).to_std() {
-                        Ok(d) => {
-                            // Reset error count on successful time calculation
-                            time_error_count = 0;
-
-                            // Detect large time jumps (> 24 hours) and log warning
-                            if d.as_secs() > 86400 {
-                                warn!(
-                                    "Large time jump detected for task {}: next execution in {:.1} hours. \
-                                     This may indicate a system time issue or very sparse schedule.",
-                                    task_key,
-                                    d.as_secs() as f64 / 3600.0
-                                );
-                            }
-                            d
-                        }
-                        Err(_) => {
-                            // Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60... seconds
-                            time_error_count = time_error_count.saturating_add(1);
-                            let backoff_secs =
-                                std::cmp::min(2u64.saturating_pow(time_error_count), 60);
-                            warn!(
-                                "Could not convert negative duration for task {} (attempt {}). \
-                                 This can happen due to system time changes (e.g., NTP sync, DST). \
-                                 Using exponential backoff: {} seconds.",
-                                task_key, time_error_count, backoff_secs
-                            );
-                            std::time::Duration::from_secs(backoff_secs)
-                        }
-                    };
-                    let deadline = now_monotonic + delay;
-
-                    trace!("Job({:?}) next tick at: {:?}", &task_key, next_wall);
+                    d
+                }
+                Err(_) => {
+                    // Exponential backoff: 2, 4, 8, 16, 32, 60, 60, 60... seconds
+                    time_error_count = time_error_count.saturating_add(1);
+                    let backoff_secs = std::cmp::min(2u64.saturating_pow(time_error_count), 60);
+                    let backoff = std::time::Duration::from_secs(backoff_secs);
+                    warn!(
+                        "Could not convert negative duration for task {} (attempt {}). \
+                         This can happen due to system time changes (e.g., NTP sync, DST). \
+                         Using exponential backoff: {} seconds and retrying time calculation.",
+                        task_key, time_error_count, backoff_secs
+                    );
 
                     tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => { }
+                        _ = tokio::time::sleep(backoff) => { }
                         _ = graceful_shutdown.cancelled() => {
-                            info!("Scheduler task for {} cancelled during sleep", task_key);
+                            info!("Scheduler task for {} cancelled during backoff", task_key);
                             return;
                         }
                     }
-
-                    if graceful_shutdown.is_cancelled() {
-                        info!("Scheduler task for {} exiting before transaction", task_key);
-                        break;
-                    }
-
-                    let start_time = Instant::now();
-                    let result = db
-                        .transaction::<_, bool, DbErr>(|txn| {
-                            let entry = entry.clone();
-                            let task_key = task_key.clone();
-                            let ctx = ctx.clone(); // Clone for each transaction
-                            Box::pin(async move {
-                                // Propagate errors from enqueue_job to fail the transaction
-                                let ret = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
-                                trace!("Job({:?}) enqueued", task_key);
-                                Ok(ret)
-                            })
-                        })
-                        .await;
-
-                    if let Err(e) = result {
-                        error!("Failed to enqueue scheduled job {}: {}", task_key, e);
-                    }
-
-                    let duration = start_time.elapsed();
-                    trace!("Interval({:?}) {} ticked: {:?}", &task_key, i, duration);
+                    continue;
                 }
+            };
+            let scheduled_at = next_wall.naive_utc();
+            let deadline = now_monotonic + delay;
 
-                info!("Scheduler task for {} completed", task_key);
-            });
+            trace!("Job({:?}) next tick at: {:?}", &task_key, next_wall);
 
-            task_handles.push(handle);
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => { }
+                _ = graceful_shutdown.cancelled() => {
+                    info!("Scheduler task for {} cancelled during sleep", task_key);
+                    return;
+                }
+            }
+
+            if graceful_shutdown.is_cancelled() {
+                info!("Scheduler task for {} exiting before transaction", task_key);
+                break;
+            }
+
+            let start_time = Instant::now();
+            let result = db
+                .transaction::<_, bool, DbErr>(|txn| {
+                    let entry = entry.clone();
+                    let task_key = task_key.clone();
+                    let ctx = ctx.clone();
+                    Box::pin(async move {
+                        let ret = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
+                        trace!("Job({:?}) enqueued", task_key);
+                        Ok(ret)
+                    })
+                })
+                .await;
+
+            if let Err(e) = result {
+                error!("Failed to enqueue scheduled job {}: {}", task_key, e);
+            }
+
+            let duration = start_time.elapsed();
+            trace!("Task({:?}) ticked: {:?}", &task_key, duration);
         }
 
-        info!("Started {} scheduled tasks", task_handles.len());
+        info!("Scheduler task for {} completed", task_key);
+    }
 
+    /// Main loop: heartbeat + graceful shutdown handling
+    async fn run_main_loop(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        process: &crate::entities::quebec_processes::Model,
+        mut heartbeat_interval: tokio::time::Interval,
+        mut interval: tokio::time::Interval,
+        task_handles: Vec<tokio::task::JoinHandle<()>>,
+    ) -> Result<(), anyhow::Error> {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    self.heartbeat(&db, &process).await?;
+                    self.heartbeat(db, process).await?;
                     trace!("Scheduler heartbeat");
                 }
                 _ = graceful_shutdown.cancelled() => {
                     info!("Scheduler stopping - waiting for {} tasks to complete", task_handles.len());
 
-                    self.on_stop(&db, &process).await?;
+                    self.on_stop(db, process).await?;
 
                     let shutdown_timeout = tokio::time::Duration::from_secs(5);
                     match tokio::time::timeout(shutdown_timeout, futures::future::join_all(task_handles)).await {
@@ -572,6 +565,51 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    pub async fn run(&self) -> Result<(), anyhow::Error> {
+        let db = self.ctx.get_db().await;
+        let interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
+        let heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
+
+        let _delta = chrono::Duration::seconds(
+            self.ctx
+                .dispatcher_polling_interval
+                .as_secs()
+                .try_into()
+                .unwrap_or(1),
+        );
+
+        let schedule = Self::load_schedule(Self::find_schedule_path())?;
+        trace!("Schedule: {:?}", schedule);
+
+        let process = self.on_start(&db).await?;
+        info!(">> Process started: {:?}", process);
+
+        let scheduled = Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?;
+
+        let mut task_handles = Vec::new();
+
+        for (i, entry) in scheduled.into_iter().enumerate() {
+            let db = self.ctx.get_db().await;
+            let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+            let ctx = self.ctx.clone();
+            let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
+
+            let handle = tokio::spawn(Self::run_task_loop(
+                ctx,
+                db,
+                entry,
+                task_key,
+                graceful_shutdown,
+            ));
+            task_handles.push(handle);
+        }
+
+        info!("Started {} scheduled tasks", task_handles.len());
+
+        self.run_main_loop(&db, &process, heartbeat_interval, interval, task_handles)
+            .await
     }
 }
 
