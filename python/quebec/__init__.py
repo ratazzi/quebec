@@ -6,6 +6,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Callable, List, Tuple, Type, Any, Optional, Union
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 from .logger import job_id_var
 
@@ -70,16 +71,6 @@ class JobBuilder:
         # Call the original perform_later
         return self.job_class.perform_later(qc, *args, **kwargs)
 
-
-class TestJob:
-    def perform(self):
-        pass
-
-# @dataclasses.dataclass
-# class RetryStrategy:
-#     wait: int = 3 # seconds
-#     attempts: int = 5 # attempts
-#     # exceptions: tuple = (Exception,)
 
 class NoNewOverrideMeta(type):
     def __new__(cls, name, bases, dct):
@@ -164,28 +155,82 @@ class ThreadedRunner:
         except Exception as e:
             logger.error(f"Error in cleanup: {e}", exc_info=True)
 
-# def rescue_from(func):
-#     @wraps(func)
-#     def wrapper(self, *args, **kwargs):
-#         # 这里可以访问到 self
-#         print(f"Before calling {func.__name__}")
-#         result = func(self, *args, **kwargs)
-#         print(f"After calling {func.__name__}")
-#         return result
-#     return wrapper
 
-# def rescue_from(*exceptions: Type[Exception]):
-#     print(f">>>>>>>>>>>>> {exceptions}")
-#     def decorator(func: Callable[[Any, Exception], None]):
-#         @wraps(func)
-#         def wrapper(self, *args, **kwargs):
-#             print(f"registering {self} with {exceptions}")
-#             print(self.rescue_strategies)
-#             return func(self, *args, **kwargs)
-#         # cls.rescue_strategies.append(RescueStrategy(exceptions, func))
-#         print(decorator.__class__)
-#         # print(dir(func))
-#         # print(dir(wrapper))
-#         print(f"--------------------------- rescue_from {exceptions} {func}")
-#         return wrapper
-#     return decorator
+def _quebec_run(
+    self,
+    *,
+    create_tables: bool = False,
+    control_plane: Optional[str] = None,
+    spawn: Optional[List[str]] = None,
+    threads: int = 1,
+):
+    """One-stop method to start Quebec.
+
+    Args:
+        create_tables: Whether to create database tables (default False).
+                       Set to True only if the current user has DDL permissions.
+        control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
+        spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
+               None means spawn all components.
+        threads: Number of worker threads to run jobs (default 1).
+
+    Example:
+        qc.run()  # Start all components
+        qc.run(create_tables=True)  # Create tables and start all
+        qc.run(spawn=['worker'])  # Only start worker
+        qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
+        qc.run(threads=4)  # Run with 4 worker threads
+    """
+    if create_tables:
+        self.create_table()
+
+    self.setup_signal_handler()
+
+    if control_plane:
+        self.start_control_plane(control_plane)
+
+    # Spawn components based on spawn parameter
+    if spawn is None:
+        self.spawn_all()
+    else:
+        for component in spawn:
+            if component == 'worker':
+                self.spawn_job_claim_poller()
+            elif component == 'dispatcher':
+                self.spawn_dispatcher()
+            elif component == 'scheduler':
+                self.spawn_scheduler()
+            else:
+                raise ValueError(f"Unknown component: {component}")
+
+    # Set up threading infrastructure
+    shutdown_event = threading.Event()
+    job_queue = queue.Queue()
+
+    # Register internal shutdown handler to signal the event
+    @self.on_shutdown
+    def _internal_shutdown_handler():
+        shutdown_event.set()
+
+    if threads > 0:
+        self.feed_jobs_to_queue(job_queue)
+
+    def run_worker():
+        runner = ThreadedRunner(job_queue, shutdown_event)
+        runner.run()
+
+    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix='quebec-worker') as executor:
+        for _ in range(threads):
+            executor.submit(run_worker)
+
+        # Main loop
+        try:
+            while not shutdown_event.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            logger.debug('KeyboardInterrupt, shutting down...')
+            self.graceful_shutdown()
+
+
+# Attach run method to Quebec class
+Quebec.run = _quebec_run
