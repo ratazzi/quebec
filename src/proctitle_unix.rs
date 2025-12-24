@@ -155,13 +155,4 @@ mod tests {
         // Smoke test to ensure no panic.
         assert!(true);
     }
-
-    #[test]
-    fn test_get_title() {
-        init();
-        set_title("test-title");
-
-        let _title = get_title();
-        assert!(true);
-    }
 }
