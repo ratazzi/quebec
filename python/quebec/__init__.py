@@ -1,13 +1,12 @@
 from .quebec import * # NOQA
+from . import quebec
+from .quebec import Quebec, ActiveJob
 import logging
 import time
 import queue
 import threading
 from datetime import datetime, timedelta, timezone
-from functools import wraps
-from typing import Callable, List, Tuple, Type, Any, Optional, Union
-from concurrent.futures import ThreadPoolExecutor
-import dataclasses
+from typing import List, Type, Any, Optional, Union
 from .logger import job_id_var
 
 __doc__ = quebec.__doc__
@@ -138,7 +137,7 @@ class ThreadedRunner:
                 job_id_var.reset(token)
             except queue.Empty:
                 time.sleep(0.1)
-            except (queue.ShutDown, KeyboardInterrupt) as e:
+            except (queue.ShutDown, KeyboardInterrupt):
                 break
             except Exception as e:
                 logger.error(f"Unexpected exception in ThreadedRunner: {e}", exc_info=True)
@@ -156,7 +155,11 @@ class ThreadedRunner:
             logger.error(f"Error in cleanup: {e}", exc_info=True)
 
 
-def _quebec_run(
+# Runtime state for Quebec instances (PyO3 classes don't support dynamic attributes)
+_quebec_state: dict = {}
+
+
+def _quebec_start(
     self,
     *,
     create_tables: bool = False,
@@ -164,7 +167,7 @@ def _quebec_run(
     spawn: Optional[List[str]] = None,
     threads: int = 1,
 ):
-    """One-stop method to start Quebec.
+    """Non-blocking start. Returns immediately after all components are started.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -175,11 +178,9 @@ def _quebec_run(
         threads: Number of worker threads to run jobs (default 1).
 
     Example:
-        qc.run()  # Start all components
-        qc.run(create_tables=True)  # Create tables and start all
-        qc.run(spawn=['worker'])  # Only start worker
-        qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
-        qc.run(threads=4)  # Run with 4 worker threads
+        qc.start()
+        # ... do other work ...
+        qc.wait()  # Block until shutdown
     """
     if create_tables:
         self.create_table()
@@ -219,18 +220,87 @@ def _quebec_run(
         runner = ThreadedRunner(job_queue, shutdown_event)
         runner.run()
 
-    with ThreadPoolExecutor(max_workers=threads, thread_name_prefix='quebec-worker') as executor:
-        for _ in range(threads):
-            executor.submit(run_worker)
+    # Start worker threads as daemon so program can exit after start()
+    worker_threads = []
+    for i in range(threads):
+        t = threading.Thread(target=run_worker, name=f'quebec-worker-{i}', daemon=True)
+        t.start()
+        worker_threads.append(t)
 
-        # Main loop
-        try:
-            while not shutdown_event.is_set():
-                time.sleep(0.5)
-        except KeyboardInterrupt:
-            logger.debug('KeyboardInterrupt, shutting down...')
-            self.graceful_shutdown()
+    # Store state by instance id
+    _quebec_state[id(self)] = {
+        'shutdown_event': shutdown_event,
+        'job_queue': job_queue,
+        'worker_threads': worker_threads,
+    }
+
+    return self  # Enable chaining: qc.start().wait()
 
 
-# Attach run method to Quebec class
+def _quebec_wait(self):
+    """Block until shutdown signal is received.
+
+    Call this after start() to wait for graceful shutdown.
+
+    Example:
+        qc.start()
+        # ... do other work ...
+        qc.wait()
+    """
+    state = _quebec_state.get(id(self))
+    if state is None:
+        raise RuntimeError("Quebec not started. Call start() first.")
+
+    try:
+        while not state['shutdown_event'].is_set():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        logger.debug('KeyboardInterrupt, shutting down...')
+        self.graceful_shutdown()
+    finally:
+        # Wait for worker threads to finish
+        for t in state['worker_threads']:
+            t.join(timeout=5.0)
+        _quebec_state.pop(id(self), None)
+
+
+def _quebec_run(
+    self,
+    *,
+    create_tables: bool = False,
+    control_plane: Optional[str] = None,
+    spawn: Optional[List[str]] = None,
+    threads: int = 1,
+):
+    """Blocking run. Starts all components and waits until shutdown.
+
+    This is equivalent to calling start() followed by wait().
+
+    Args:
+        create_tables: Whether to create database tables (default False).
+                       Set to True only if the current user has DDL permissions.
+        control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
+        spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
+               None means spawn all components.
+        threads: Number of worker threads to run jobs (default 1).
+
+    Example:
+        qc.run()  # Start all components and block
+        qc.run(create_tables=True)  # Create tables and start all
+        qc.run(spawn=['worker'])  # Only start worker
+        qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
+        qc.run(threads=4)  # Run with 4 worker threads
+    """
+    self.start(
+        create_tables=create_tables,
+        control_plane=control_plane,
+        spawn=spawn,
+        threads=threads,
+    )
+    self.wait()
+
+
+# Attach methods to Quebec class
+Quebec.start = _quebec_start
+Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
