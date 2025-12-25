@@ -87,7 +87,7 @@
                 <pre class="mt-2 p-2 bg-gray-50 rounded text-xs overflow-auto max-h-40 border">{{ job.error }}</pre>
               </details>
             </div>
-            <div class="text-xs text-gray-400">{{ job.failed_at }}</div>
+            <div class="text-xs text-gray-400"><span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span></div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
             <form action="/failed-jobs/{{ job.id }}/delete" method="post" class="inline">

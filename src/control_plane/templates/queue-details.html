@@ -82,7 +82,7 @@
                 </span>
               </td>
               <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                {{ job.created_at }}
+                <span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span>
               </td>
               <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                 {% if job.status == 'failed' %}

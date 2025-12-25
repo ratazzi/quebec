@@ -78,7 +78,7 @@
               <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
             </div>
             <div class="text-sm text-gray-500">id: {{ job.id }}</div>
-            <div class="text-xs text-gray-400">Started {{ job.started_at }}</div>
+            <div class="text-xs text-gray-400">Started <span data-controller="localtime" data-localtime-datetime-value="{{ job.started_at }}">{{ job.started_at }}</span></div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900">{{ job.queue_name }}</div>

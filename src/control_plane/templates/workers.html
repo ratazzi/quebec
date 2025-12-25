@@ -40,7 +40,7 @@
             <div class="text-sm text-gray-900">{{ worker.pid }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
-            <div class="text-sm text-gray-900">{{ worker.last_heartbeat_at }} ({{ worker.seconds_since_heartbeat }}s ago)</div>
+            <div class="text-sm text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
             {% if worker.status == "alive" %}

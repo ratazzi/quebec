@@ -172,7 +172,7 @@
                   {{ job.queue_name }}
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm">
-                  {{ job.failed_at }}
+                  <span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span>
                 </td>
                 <td class="px-6 py-4 text-sm max-w-xs truncate">
                   <div class="tooltip">

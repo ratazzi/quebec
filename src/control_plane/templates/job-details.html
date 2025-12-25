@@ -91,18 +91,18 @@
           </div>
           <div class="grid grid-cols-3 gap-2">
             <div class="text-sm text-gray-500">Created at</div>
-            <div class="col-span-2 text-sm">{{ job.created_at }}</div>
+            <div class="col-span-2 text-sm"><span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span></div>
           </div>
           {% if job.status == 'failed' and job.failed_at %}
           <div class="grid grid-cols-3 gap-2">
             <div class="text-sm text-gray-500">Failed at</div>
-            <div class="col-span-2 text-sm">{{ job.failed_at }}</div>
+            <div class="col-span-2 text-sm"><span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span></div>
           </div>
           {% endif %}
           {% if job.status == 'finished' and job.finished_at %}
           <div class="grid grid-cols-3 gap-2">
             <div class="text-sm text-gray-500">Finished at</div>
-            <div class="col-span-2 text-sm">{{ job.finished_at }}</div>
+            <div class="col-span-2 text-sm"><span data-controller="localtime" data-localtime-datetime-value="{{ job.finished_at }}">{{ job.finished_at }}</span></div>
           </div>
           {% endif %}
           <div class="grid grid-cols-3 gap-2">
@@ -180,7 +180,7 @@
             <div class="flex justify-between items-start">
               <div>
                 <div class="text-sm font-medium">Attempt #1</div>
-                <div class="text-xs text-gray-500">{% if job.failed_at %}{{ job.failed_at }}{% elif job.finished_at %}{{ job.finished_at }}{% else %}{{ job.created_at }}{% endif %}</div>
+                <div class="text-xs text-gray-500">{% if job.failed_at %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span>{% elif job.finished_at %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.finished_at }}">{{ job.finished_at }}</span>{% else %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span>{% endif %}</div>
               </div>
               <span class="px-2 py-1 text-xs font-medium rounded-full 
                 {% if job.status == 'failed' %}bg-red-100 text-red-800
