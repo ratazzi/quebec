@@ -11,6 +11,11 @@ use crate::query_builder;
 use super::templates;
 use super::ControlPlane;
 
+/// Clean SQL string by removing extra whitespace and joining lines
+pub fn clean_sql(sql: &str) -> String {
+    sql.lines().map(str::trim).collect::<Vec<_>>().join(" ")
+}
+
 impl ControlPlane {
     /// Format timestamp with custom format
     pub fn format_timestamp(datetime: Result<NaiveDateTime, DbErr>, format: &str) -> String {

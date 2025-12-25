@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
-use crate::control_plane::{models::JobDetailsInfo, ControlPlane};
+use crate::control_plane::{models::JobDetailsInfo, utils::clean_sql, ControlPlane};
 
 impl ControlPlane {
     pub async fn job_details(
@@ -33,43 +33,41 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         // Use subqueries to avoid row multiplication from multiple failed_executions records
         // and check failed status BEFORE finished_at (since failed jobs also get mark_finished called)
-        let job_details_sql = format!(
-            "SELECT
-                j.id,
-                j.queue_name,
-                j.class_name,
-                j.created_at,
-                j.finished_at,
-                j.arguments,
-                CASE
-                    WHEN EXISTS (SELECT 1 FROM {fe} WHERE job_id = j.id) THEN 'failed'
-                    WHEN c.id IS NOT NULL THEN 'processing'
-                    WHEN s.id IS NOT NULL THEN 'scheduled'
-                    WHEN b.id IS NOT NULL THEN 'blocked'
-                    WHEN j.finished_at IS NOT NULL THEN 'finished'
-                    ELSE 'pending'
-                END AS status,
-                c.id as claimed_id,
-                (SELECT id FROM {fe} WHERE job_id = j.id ORDER BY created_at DESC LIMIT 1) as failed_id,
-                s.id as scheduled_id,
-                b.id as blocked_id,
-                (SELECT error FROM {fe} WHERE job_id = j.id ORDER BY created_at DESC LIMIT 1) as error_message,
-                s.scheduled_at,
-                b.concurrency_key,
-                b.expires_at,
-                c.process_id
-            FROM {jobs} j
-            LEFT JOIN {ce} c ON j.id = c.job_id
-            LEFT JOIN {se} s ON j.id = s.job_id
-            LEFT JOIN {be} b ON j.id = b.job_id
-            WHERE j.id = {p}",
-            jobs = table_config.jobs,
-            ce = table_config.claimed_executions,
-            fe = table_config.failed_executions,
-            se = table_config.scheduled_executions,
-            be = table_config.blocked_executions,
-            p = p1
-        );
+        let job_details_sql = clean_sql(&format!("SELECT
+            j.id,
+            j.queue_name,
+            j.class_name,
+            j.created_at,
+            j.finished_at,
+            j.arguments,
+            CASE
+                WHEN EXISTS (SELECT 1 FROM {fe} WHERE job_id = j.id) THEN 'failed'
+                WHEN c.id IS NOT NULL THEN 'processing'
+                WHEN s.id IS NOT NULL THEN 'scheduled'
+                WHEN b.id IS NOT NULL THEN 'blocked'
+                WHEN j.finished_at IS NOT NULL THEN 'finished'
+                ELSE 'pending'
+            END AS status,
+            c.id as claimed_id,
+            (SELECT id FROM {fe} WHERE job_id = j.id ORDER BY created_at DESC LIMIT 1) as failed_id,
+            s.id as scheduled_id,
+            b.id as blocked_id,
+            (SELECT error FROM {fe} WHERE job_id = j.id ORDER BY created_at DESC LIMIT 1) as error_message,
+            s.scheduled_at,
+            b.concurrency_key,
+            b.expires_at,
+            c.process_id
+        FROM {jobs} j
+        LEFT JOIN {ce} c ON j.id = c.job_id
+        LEFT JOIN {se} s ON j.id = s.job_id
+        LEFT JOIN {be} b ON j.id = b.job_id
+        WHERE j.id = {p}",
+        jobs = table_config.jobs,
+        ce = table_config.claimed_executions,
+        fe = table_config.failed_executions,
+        se = table_config.scheduled_executions,
+        be = table_config.blocked_executions,
+        p = p1));
 
         let job_result = db
             .query_one(Statement::from_sql_and_values(
@@ -149,10 +147,10 @@ impl ControlPlane {
                     job_details.execution_id = Some(failed_id);
 
                     // Get failure information
-                    let failed_details_sql = format!(
+                    let failed_details_sql = clean_sql(&format!(
                         "SELECT error, created_at as failed_at FROM {} WHERE id = {}",
                         table_config.failed_executions, p1
-                    );
+                    ));
 
                     if let Ok(failed_info) = db
                         .query_one(Statement::from_sql_and_values(
@@ -234,10 +232,10 @@ impl ControlPlane {
                     // Get processing information
                     if let Ok(process_id) = row.try_get::<i64>("", "process_id") {
                         // Get worker process information
-                        let worker_details_sql = format!(
+                        let worker_details_sql = clean_sql(&format!(
                             "SELECT name, hostname FROM {} WHERE id = {}",
                             table_config.processes, p1
-                        );
+                        ));
 
                         if let Ok(worker_info) = db
                             .query_one(Statement::from_sql_and_values(
@@ -268,10 +266,10 @@ impl ControlPlane {
                     }
 
                     // Get start time and runtime
-                    let claimed_details_sql = format!(
+                    let claimed_details_sql = clean_sql(&format!(
                         "SELECT created_at FROM {} WHERE id = {}",
                         table_config.claimed_executions, p1
-                    );
+                    ));
 
                     if let Ok(claimed_info) = db
                         .query_one(Statement::from_sql_and_values(
@@ -298,33 +296,33 @@ impl ControlPlane {
             }
 
             // Get execution history using dynamic table names
-            let history_sql = format!(
+            let history_sql = clean_sql(&format!(
                 "SELECT
-                    'failed' as event_type,
-                    created_at as timestamp,
-                    error
-                 FROM {}
-                 WHERE job_id = {p}
-                 UNION ALL
-                 SELECT
-                    'scheduled' as event_type,
-                    created_at as timestamp,
-                    NULL as error
-                 FROM {}
-                 WHERE job_id = {p}
-                 UNION ALL
-                 SELECT
-                    'claimed' as event_type,
-                    created_at as timestamp,
-                    NULL as error
-                 FROM {}
-                 WHERE job_id = {p}
-                 ORDER BY timestamp DESC",
+                'failed' as event_type,
+                created_at as timestamp,
+                error
+             FROM {}
+             WHERE job_id = {p}
+             UNION ALL
+             SELECT
+                'scheduled' as event_type,
+                created_at as timestamp,
+                NULL as error
+             FROM {}
+             WHERE job_id = {p}
+             UNION ALL
+             SELECT
+                'claimed' as event_type,
+                created_at as timestamp,
+                NULL as error
+             FROM {}
+             WHERE job_id = {p}
+             ORDER BY timestamp DESC",
                 table_config.failed_executions,
                 table_config.scheduled_executions,
                 table_config.claimed_executions,
                 p = p1
-            );
+            ));
 
             let history_result = db
                 .query_all(Statement::from_sql_and_values(

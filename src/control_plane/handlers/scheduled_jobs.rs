@@ -10,6 +10,7 @@ use tracing::{debug, error, info};
 
 use crate::control_plane::{
     models::{Pagination, ScheduledJobInfo},
+    utils::clean_sql,
     ControlPlane,
 };
 use crate::query_builder;
@@ -42,21 +43,21 @@ impl ControlPlane {
             }
         };
 
-        let scheduled_jobs_sql = format!(
+        let scheduled_jobs_sql = clean_sql(&format!(
             "SELECT
-                s.id as execution_id,
-                s.job_id,
-                s.scheduled_at,
-                j.class_name,
-                j.queue_name,
-                j.created_at
-            FROM {} s
-            JOIN {} j ON s.job_id = j.id
-            WHERE j.finished_at IS NULL
-            ORDER BY s.scheduled_at ASC
-            LIMIT {} OFFSET {}",
+            s.id as execution_id,
+            s.job_id,
+            s.scheduled_at,
+            j.class_name,
+            j.queue_name,
+            j.created_at
+        FROM {} s
+        JOIN {} j ON s.job_id = j.id
+        WHERE j.finished_at IS NULL
+        ORDER BY s.scheduled_at ASC
+        LIMIT {} OFFSET {}",
             table_config.scheduled_executions, table_config.jobs, p1, p2
-        );
+        ));
 
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
@@ -126,13 +127,13 @@ impl ControlPlane {
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
         // Get total number of scheduled jobs for pagination
-        let count_sql = format!(
+        let count_sql = clean_sql(&format!(
             "SELECT COUNT(*) AS count
-             FROM {} s
-             JOIN {} j ON s.job_id = j.id
-             WHERE j.finished_at IS NULL",
+         FROM {} s
+         JOIN {} j ON s.job_id = j.id
+         WHERE j.finished_at IS NULL",
             table_config.scheduled_executions, table_config.jobs
-        );
+        ));
 
         let total_count = db
             .query_one(Statement::from_sql_and_values(backend, &count_sql, []))

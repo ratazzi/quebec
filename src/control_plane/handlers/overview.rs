@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, instrument};
 
-use crate::control_plane::ControlPlane;
+use crate::control_plane::{utils::clean_sql, ControlPlane};
 use crate::query_builder;
 
 impl ControlPlane {
@@ -67,26 +67,23 @@ impl ControlPlane {
 
         // Get average processing time of jobs in current period
         // Use database-specific SQL for duration calculation
-        let avg_duration_sql = match db.get_database_backend() {
+        let avg_duration_sql = clean_sql(&match db.get_database_backend() {
             DbBackend::Postgres => format!(
                 r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
-                   FROM "{}"
-                   WHERE finished_at IS NOT NULL AND finished_at > $1"#,
+                   FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > $1"#,
                 table_config.jobs
             ),
             DbBackend::Sqlite => format!(
                 r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
-                   FROM "{}"
-                   WHERE finished_at IS NOT NULL AND finished_at > ?"#,
+                   FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > ?"#,
                 table_config.jobs
             ),
             DbBackend::MySql => format!(
                 r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
-                   FROM `{}`
-                   WHERE finished_at IS NOT NULL AND finished_at > ?"#,
+                   FROM `{}` WHERE finished_at IS NOT NULL AND finished_at > ?"#,
                 table_config.jobs
             ),
-        };
+        });
 
         let avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -101,26 +98,23 @@ impl ControlPlane {
             .and_then(|row| row.try_get("", "avg_duration").ok());
 
         // Get average processing time of jobs in previous period
-        let prev_avg_duration_sql = match db.get_database_backend() {
+        let prev_avg_duration_sql = clean_sql(&match db.get_database_backend() {
             DbBackend::Postgres => format!(
                 r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
-                   FROM "{}"
-                   WHERE finished_at IS NOT NULL AND finished_at > $1 AND finished_at <= $2"#,
+                   FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > $1 AND finished_at <= $2"#,
                 table_config.jobs
             ),
             DbBackend::Sqlite => format!(
                 r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
-                   FROM "{}"
-                   WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
+                   FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
                 table_config.jobs
             ),
             DbBackend::MySql => format!(
                 r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
-                   FROM `{}`
-                   WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
+                   FROM `{}` WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
                 table_config.jobs
             ),
-        };
+        });
 
         let prev_avg_duration_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -296,44 +290,35 @@ impl ControlPlane {
         // Get queue performance statistics (using raw SQL for complex aggregations)
         // Use database-specific SQL for compatibility
         let failed_table = &table_config.failed_executions;
-        let queue_performance_sql = match db.get_database_backend() {
+        let queue_performance_sql = clean_sql(&match db.get_database_backend() {
             DbBackend::Postgres => format!(
-                r#"SELECT
-                     j.queue_name,
+                r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(EXTRACT(EPOCH FROM (j.finished_at - j.created_at))) as avg_duration,
                      COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
                      COUNT(*) as total_jobs
-                   FROM "{}" j
-                   WHERE j.created_at > $1
-                   GROUP BY j.queue_name"#,
+                   FROM "{}" j WHERE j.created_at > $1 GROUP BY j.queue_name"#,
                 failed_table, table_config.jobs
             ),
             DbBackend::Sqlite => format!(
-                r#"SELECT
-                     j.queue_name,
+                r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN (julianday(j.finished_at) - julianday(j.created_at)) * 86400 END) as avg_duration,
                      COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
                      COUNT(*) as total_jobs
-                   FROM "{}" j
-                   WHERE j.created_at > ?
-                   GROUP BY j.queue_name"#,
+                   FROM "{}" j WHERE j.created_at > ? GROUP BY j.queue_name"#,
                 failed_table, table_config.jobs
             ),
             DbBackend::MySql => format!(
-                r#"SELECT
-                     j.queue_name,
+                r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN TIMESTAMPDIFF(SECOND, j.created_at, j.finished_at) END) as avg_duration,
                      COUNT(CASE WHEN EXISTS (SELECT 1 FROM `{}` f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
                      COUNT(*) as total_jobs
-                   FROM `{}` j
-                   WHERE j.created_at > ?
-                   GROUP BY j.queue_name"#,
+                   FROM `{}` j WHERE j.created_at > ? GROUP BY j.queue_name"#,
                 failed_table, table_config.jobs
             ),
-        };
+        });
 
         let queue_performance_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),
@@ -414,20 +399,20 @@ impl ControlPlane {
             DbBackend::Postgres => "$1",
             DbBackend::MySql | DbBackend::Sqlite => "?",
         };
-        let recent_failed_jobs_sql = format!(
+        let recent_failed_jobs_sql = clean_sql(&format!(
             r#"SELECT
-                f.id,
-                j.class_name,
-                j.queue_name,
-                f.created_at as failed_at,
-                f.error
-              FROM {} f
-              JOIN {} j ON f.job_id = j.id
-              WHERE f.created_at > {}
-              ORDER BY f.created_at DESC
-              LIMIT 10"#,
+            f.id,
+            j.class_name,
+            j.queue_name,
+            f.created_at as failed_at,
+            f.error
+          FROM {} f
+          JOIN {} j ON f.job_id = j.id
+          WHERE f.created_at > {}
+          ORDER BY f.created_at DESC
+          LIMIT 10"#,
             table_config.failed_executions, table_config.jobs, p1
-        );
+        ));
 
         let recent_failed_jobs_stmt = Statement::from_sql_and_values(
             db.get_database_backend(),

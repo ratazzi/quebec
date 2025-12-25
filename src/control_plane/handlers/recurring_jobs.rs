@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::context::ScheduledEntry;
-use crate::control_plane::{models::RecurringTaskInfo, ControlPlane};
+use crate::control_plane::{models::RecurringTaskInfo, utils::clean_sql, ControlPlane};
 use crate::notify::NotifyManager;
 use crate::scheduler::enqueue_job;
 
@@ -25,20 +25,20 @@ impl ControlPlane {
         let backend = db.get_database_backend();
 
         // Get all recurring tasks
-        let sql = format!(
+        let sql = clean_sql(&format!(
             "SELECT
-                rt.id,
-                rt.key,
-                rt.class_name,
-                rt.schedule,
-                rt.queue_name,
-                rt.priority,
-                rt.description,
-                (SELECT MAX(re.run_at) FROM {} re WHERE re.task_key = rt.key) as last_run_at
-            FROM {}  rt
-            ORDER BY rt.key ASC",
+            rt.id,
+            rt.key,
+            rt.class_name,
+            rt.schedule,
+            rt.queue_name,
+            rt.priority,
+            rt.description,
+            (SELECT MAX(re.run_at) FROM {} re WHERE re.task_key = rt.key) as last_run_at
+        FROM {}  rt
+        ORDER BY rt.key ASC",
             table_config.recurring_executions, table_config.recurring_tasks
-        );
+        ));
 
         let result = db
             .query_all(Statement::from_sql_and_values(backend, &sql, []))
@@ -107,10 +107,10 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
 
-        let sql = format!(
+        let sql = clean_sql(&format!(
             "SELECT key, class_name, queue_name, priority, arguments FROM {} WHERE id = $1",
             table_config.recurring_tasks
-        );
+        ));
 
         let row = db
             .query_one(Statement::from_sql_and_values(
