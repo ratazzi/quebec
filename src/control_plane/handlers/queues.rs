@@ -378,7 +378,7 @@ impl ControlPlane {
         context.insert("active_page", "queues");
 
         let html = state
-            .render_template("queue_details.html", &mut context)
+            .render_template("queue-details.html", &mut context)
             .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 

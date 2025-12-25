@@ -17,7 +17,7 @@
     {% elif job.status == 'finished' %}
       <a href="/finished-jobs" class="hover:text-black">Finished jobs</a>
     {% else %}
-      <a href="/queues/{{ job.queue_name }}" class="hover:text-black">Queue: {{ job.queue_name }}</a>
+      <a href="/queues/{{ job.queue_name }}" data-turbo-action="advance" class="hover:text-black">Queue: {{ job.queue_name }}</a>
     {% endif %}
     <span class="mx-2">/</span>
     <span class="text-black">{{ job.class_name }} #{{ job.id }}</span>

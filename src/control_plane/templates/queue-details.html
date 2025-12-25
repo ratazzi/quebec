@@ -8,10 +8,10 @@
   <div class="flex items-center justify-between mb-6">
     <div>
       <h1 class="text-2xl font-bold text-gray-900">Queue: {{ queue_name }}</h1>
-      <p class="text-sm text-gray-500 mt-1">Status: <span class="font-medium {% if status == 'active' %}text-green-600{% else %}text-amber-600{% endif %}">{{ status }}</span></p>
+      <p class="text-sm text-gray-500 mt-1">Status: <span class="font-medium {% if queue_status == 'active' %}text-green-600{% else %}text-amber-600{% endif %}">{{ queue_status }}</span></p>
     </div>
     <div class="flex gap-2">
-      {% if status == 'active' %}
+      {% if queue_status == 'active' %}
         <form action="/queues/{{ queue_name }}/pause" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
             Pause Queue
@@ -27,26 +27,6 @@
       <a href="/queues" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
         Back to Queues
       </a>
-    </div>
-  </div>
-
-  <!-- Queue Stats -->
-  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
-      <h3 class="text-sm font-medium text-gray-500">Waiting</h3>
-      <p class="text-2xl font-bold text-gray-900 mt-1">{{ waiting_count }}</p>
-    </div>
-    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
-      <h3 class="text-sm font-medium text-gray-500">Processing</h3>
-      <p class="text-2xl font-bold text-gray-900 mt-1">{{ processing_count }}</p>
-    </div>
-    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
-      <h3 class="text-sm font-medium text-gray-500">Scheduled</h3>
-      <p class="text-2xl font-bold text-gray-900 mt-1">{{ scheduled_count }}</p>
-    </div>
-    <div class="bg-white border border-gray-200 rounded-lg shadow-sm p-4">
-      <h3 class="text-sm font-medium text-gray-500">Failed</h3>
-      <p class="text-2xl font-bold text-gray-900 mt-1">{{ failed_count }}</p>
     </div>
   </div>
 
@@ -80,7 +60,7 @@
             <tr>
               <td class="px-6 py-4 whitespace-nowrap">
                 <div class="text-sm font-medium text-gray-900">
-                  <a href="/jobs/{{ job.id }}" class="hover:underline">{{ job.class_name }}</a>
+                  <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
                 </div>
               </td>
               <td class="px-6 py-4 whitespace-nowrap">
@@ -132,11 +112,11 @@
   <!-- Pagination -->
   <div class="flex items-center justify-between mt-4">
     <div class="text-sm text-gray-700">
-      Page {{ current_page_num }} of {{ total_pages }}
+      Page {{ current_page }} of {{ total_pages }}
     </div>
     <div class="flex space-x-2">
-      {% if current_page_num > 1 %}
-        <a href="/queues/{{ queue_name }}?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      {% if current_page > 1 %}
+        <a href="/queues/{{ queue_name }}?page={{ current_page - 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
           Previous page
         </a>
       {% else %}
@@ -145,8 +125,8 @@
         </button>
       {% endif %}
 
-      {% if current_page_num < total_pages %}
-        <a href="/queues/{{ queue_name }}?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      {% if current_page < total_pages %}
+        <a href="/queues/{{ queue_name }}?page={{ current_page + 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
           Next page
         </a>
       {% else %}
