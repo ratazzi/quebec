@@ -123,3 +123,16 @@ pub struct ExecutionHistoryItem {
     pub status: String,
     pub error: Option<String>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct RecurringTaskInfo {
+    pub id: i64,
+    pub key: String,
+    pub class_name: String,
+    pub schedule: String,
+    pub queue_name: String,
+    pub priority: i32,
+    pub description: Option<String>,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+}

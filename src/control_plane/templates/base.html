@@ -357,32 +357,35 @@
     <!-- 导航部分使用 nav 和 auto-refresh 控制器 -->
     <div data-controller="nav" data-nav-active-class-value="border-b-2 border-black" class="flex flex-col flex-grow">
       <turbo-frame id="nav-frame">
-        <nav class="flex flex-wrap border-b mb-6">
-          <a href="/" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+        <nav class="flex flex-nowrap border-b mb-6">
+          <a href="/" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Overview
           </a>
-          <a href="/queues" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/queues" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Queues
           </a>
 
           <!-- 统计数据部分 -->
-          <a href="/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Failed jobs <span id="failed-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             In Progress jobs <span id="in-progress-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Blocked jobs <span id="blocked-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Scheduled jobs <span id="scheduled-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/recurring-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Recurring
+          </a>
+          <a href="/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
 
-          <a href="/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Workers
           </a>
         </nav>

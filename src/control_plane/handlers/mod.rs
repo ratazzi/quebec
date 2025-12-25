@@ -5,5 +5,6 @@ pub mod in_progress_jobs;
 pub mod job_details;
 pub mod overview;
 pub mod queues;
+pub mod recurring_jobs;
 pub mod scheduled_jobs;
 pub mod workers;

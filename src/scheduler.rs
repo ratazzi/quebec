@@ -155,12 +155,14 @@ where
     Ok(ret)
 }
 
+/// Enqueue a job for execution. Returns the queue name for NOTIFY.
+/// IMPORTANT: Caller should send NOTIFY after transaction commits, not inside.
 pub async fn enqueue_job<C>(
     ctx: &Arc<AppContext>,
     db: &C,
     entry: ScheduledEntry,
     scheduled_at: NaiveDateTime,
-) -> Result<bool, DbErr>
+) -> Result<String, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -279,15 +281,8 @@ where
         .await?;
     }
 
-    // Send PostgreSQL NOTIFY after scheduled job is created
-    if ctx.is_postgres() {
-        NotifyManager::send_notify(&ctx.name, db, &job.queue_name, "new_job")
-            .await
-            .inspect_err(|e| warn!("Failed to send NOTIFY for scheduled job: {}", e))
-            .ok();
-    }
-
-    Ok(true)
+    // Return queue name so caller can send NOTIFY after transaction commits
+    Ok(job.queue_name)
 }
 
 #[derive(Debug)]
@@ -506,24 +501,28 @@ impl Scheduler {
 
             let start_time = Instant::now();
             let result = db
-                .transaction::<_, bool, DbErr>(|txn| {
+                .transaction::<_, String, DbErr>(|txn| {
                     let entry = entry.clone();
                     let task_key = task_key.clone();
                     let ctx = ctx.clone();
                     Box::pin(async move {
-                        let ret = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
+                        let queue_name = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
                         trace!("Job({:?}) enqueued", task_key);
-                        Ok(ret)
+                        Ok(queue_name)
                     })
                 })
-                .await;
+                .await
+                .inspect_err(|e| error!("Failed to enqueue scheduled job {}: {}", task_key, e));
 
-            if let Err(e) = result {
-                error!("Failed to enqueue scheduled job {}: {}", task_key, e);
+            // Send NOTIFY after transaction commits
+            if let Some(queue_name) = result.ok().filter(|_| ctx.is_postgres()) {
+                NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name, "new_job")
+                    .await
+                    .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
+                    .ok();
             }
 
-            let duration = start_time.elapsed();
-            trace!("Task({:?}) ticked: {:?}", &task_key, duration);
+            trace!("Task({:?}) ticked: {:?}", &task_key, start_time.elapsed());
         }
 
         info!("Scheduler task for {} completed", task_key);
