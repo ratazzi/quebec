@@ -1,0 +1,21 @@
+{% for time in times %}
+<turbo-stream action="update" target="recurring-{{ time.id }}-last-run">
+  <template>
+    {% if time.last_run_at %}
+      <span data-controller="timeago" data-timeago-datetime-value="{{ time.last_run_at }}"></span>
+    {% else %}
+      <span class="text-gray-400">Never</span>
+    {% endif %}
+  </template>
+</turbo-stream>
+
+<turbo-stream action="update" target="recurring-{{ time.id }}-next-run">
+  <template>
+    {% if time.next_run_at %}
+      <span data-controller="timeago" data-timeago-datetime-value="{{ time.next_run_at }}"></span>
+    {% else %}
+      <span class="text-gray-400">-</span>
+    {% endif %}
+  </template>
+</turbo-stream>
+{% endfor %}

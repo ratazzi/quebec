@@ -181,7 +181,7 @@
                   </div>
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm">
-                  <a href="/failed-jobs/{{ job.id }}" class="text-blue-600 hover:text-blue-800">Details</a>
+                  <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-800">Details</a>
                 </td>
               </tr>
               {% endfor %}
@@ -197,7 +197,7 @@
       </div>
       {% if recent_failed_jobs|length > 0 %}
         <div class="mt-4 text-right">
-          <a href="/failed-jobs" class="text-sm text-blue-600 hover:text-blue-800">View all failed jobs →</a>
+          <a href="/failed-jobs" data-turbo-action="advance" class="text-sm text-blue-600 hover:text-blue-800">View all failed jobs →</a>
         </div>
       {% endif %}
     </div>

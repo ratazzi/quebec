@@ -291,19 +291,76 @@
           : this.datetimeValue.replace(' ', 'T') + 'Z'
         const datetime = new Date(datetimeStr)
         if (isNaN(datetime.getTime())) return
-        this.element.textContent = this.timeago(datetime)
+
+        const wasFuture = this.isFuture
+        const { text, isFuture } = this.timeago(datetime)
+        this.isFuture = isFuture
+        this.element.textContent = text
         this.element.title = datetime.toLocaleString()
+
+        // Dispatch event when transitioning from future to past
+        if (wasFuture && !isFuture) {
+          this.dispatch("due", { bubbles: true })
+        }
       }
 
       timeago(date) {
         const now = new Date()
-        const seconds = Math.floor((now - date) / 1000)
+        const diff = Math.floor((now - date) / 1000)
+        const seconds = Math.abs(diff)
+        const isFuture = diff < 0
 
-        if (seconds < 60) return `${seconds}s ago`
-        if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
-        if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`
-        if (seconds < 604800) return `${Math.floor(seconds / 86400)}d ago`
-        return date.toLocaleDateString()
+        const format = (value, unit) => isFuture ? `in ${value}${unit}` : `${value}${unit} ago`
+
+        let text
+        if (seconds < 60) text = format(seconds, 's')
+        else if (seconds < 3600) text = format(Math.floor(seconds / 60), 'm')
+        else if (seconds < 86400) text = format(Math.floor(seconds / 3600), 'h')
+        else if (seconds < 604800) text = format(Math.floor(seconds / 86400), 'd')
+        else text = date.toLocaleDateString()
+
+        return { text, isFuture }
+      }
+    })
+
+    // Recurring jobs times controller - auto-refreshes last_run/next_run via turbo-stream
+    Stimulus.register("recurring-times", class extends Controller {
+      static values = {
+        interval: { type: Number, default: 5000 }
+      }
+
+      connect() {
+        this.refresh()
+        this.timer = setInterval(() => this.refresh(), this.intervalValue)
+        // Listen for timeago:due events (bubbles up from timeago controllers)
+        this.boundOnDue = this.onDue.bind(this)
+        this.element.addEventListener("timeago:due", this.boundOnDue)
+      }
+
+      disconnect() {
+        if (this.timer) clearInterval(this.timer)
+        this.element.removeEventListener("timeago:due", this.boundOnDue)
+      }
+
+      onDue() {
+        // Debounce: wait a bit for the job to complete, then refresh
+        if (this.dueTimer) return
+        this.dueTimer = setTimeout(() => {
+          this.refresh()
+          this.dueTimer = null
+        }, 3000)
+      }
+
+      async refresh() {
+        try {
+          const response = await fetch('/recurring-jobs/schedule')
+          if (response.ok) {
+            const html = await response.text()
+            Turbo.renderStreamMessage(html)
+          }
+        } catch (e) {
+          console.error('Failed to refresh recurring job times:', e)
+        }
       }
     })
 

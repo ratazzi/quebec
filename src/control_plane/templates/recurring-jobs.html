@@ -3,7 +3,7 @@
 {% block title %}Recurring Jobs - Control Plane{% endblock %}
 
 {% block content %}
-<turbo-frame id="content">
+<turbo-frame id="content" data-controller="recurring-times">
 
 <!-- Table -->
 <div class="overflow-x-auto rounded-lg border border-gray-200">
@@ -49,21 +49,13 @@
             <div class="text-xs text-gray-500">priority: {{ task.priority }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
-            <div class="text-sm text-gray-900">
-              {% if task.last_run_at %}
-                <span data-controller="timeago" data-timeago-datetime-value="{{ task.last_run_at }}"></span>
-              {% else %}
-                <span class="text-gray-400">Never</span>
-              {% endif %}
+            <div id="recurring-{{ task.id }}-last-run" class="text-sm text-gray-900">
+              <span class="text-gray-400">-</span>
             </div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
-            <div class="text-sm text-gray-900">
-              {% if task.next_run_at %}
-                {{ task.next_run_at }}
-              {% else %}
-                <span class="text-gray-400">-</span>
-              {% endif %}
+            <div id="recurring-{{ task.id }}-next-run" class="text-sm text-gray-900">
+              <span class="text-gray-400">-</span>
             </div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">

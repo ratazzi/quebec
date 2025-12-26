@@ -24,20 +24,19 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
 
-        // Get all recurring tasks
+        // Get all recurring tasks (times are loaded separately via /recurring-jobs/times)
         let sql = clean_sql(&format!(
             "SELECT
-            rt.id,
-            rt.key,
-            rt.class_name,
-            rt.schedule,
-            rt.queue_name,
-            rt.priority,
-            rt.description,
-            (SELECT MAX(re.run_at) FROM {} re WHERE re.task_key = rt.key) as last_run_at
-        FROM {}  rt
-        ORDER BY rt.key ASC",
-            table_config.recurring_executions, table_config.recurring_tasks
+                rt.id,
+                rt.key,
+                rt.class_name,
+                rt.schedule,
+                rt.queue_name,
+                rt.priority,
+                rt.description
+            FROM {} rt
+            ORDER BY rt.key ASC",
+            table_config.recurring_tasks
         ));
 
         let result = db
@@ -57,14 +56,6 @@ impl ControlPlane {
             let priority: i32 = row.try_get("", "priority").unwrap_or(0);
             let description: Option<String> = row.try_get("", "description").ok();
 
-            let last_run_at = row
-                .try_get::<chrono::NaiveDateTime>("", "last_run_at")
-                .ok()
-                .map(|dt| Self::format_naive_datetime(dt));
-
-            // Calculate next run time based on cron schedule
-            let next_run_at = Self::calculate_next_run(&schedule);
-
             tasks.push(RecurringTaskInfo {
                 id,
                 key,
@@ -73,8 +64,8 @@ impl ControlPlane {
                 queue_name,
                 priority,
                 description,
-                last_run_at,
-                next_run_at,
+                last_run_at: None,
+                next_run_at: None,
             });
         }
 
@@ -174,14 +165,90 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Returns turbo-stream updates for recurring job schedule (last_run, next_run)
+    pub async fn recurring_jobs_schedule(
+        State(state): State<Arc<ControlPlane>>,
+    ) -> Result<Html<String>, (StatusCode, String)> {
+        let db = state.ctx.get_db().await;
+        let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
+        let backend = db.get_database_backend();
+
+        let sql = clean_sql(&format!(
+            "SELECT
+                rt.id,
+                rt.schedule,
+                (SELECT MAX(re.run_at) FROM {} re WHERE re.task_key = rt.key) as last_run_at
+            FROM {} rt
+            ORDER BY rt.key ASC",
+            table_config.recurring_executions, table_config.recurring_tasks
+        ));
+
+        let result = db
+            .query_all(Statement::from_sql_and_values(backend, &sql, []))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let mut times = Vec::with_capacity(result.len());
+        for row in result {
+            let id: i64 = row.try_get("", "id").unwrap_or_default();
+            let schedule: String = row.try_get("", "schedule").unwrap_or_default();
+            let last_run_at = row
+                .try_get::<chrono::NaiveDateTime>("", "last_run_at")
+                .ok()
+                .map(|dt| Self::format_naive_datetime(dt));
+            let next_run_at = Self::calculate_next_run(&schedule);
+
+            times.push(serde_json::json!({
+                "id": id,
+                "last_run_at": last_run_at,
+                "next_run_at": next_run_at,
+            }));
+        }
+
+        let mut context = tera::Context::new();
+        context.insert("times", &times);
+
+        let html = state
+            .render_template("recurring-jobs-schedule.html", &mut context)
+            .await?;
+
+        Ok(Html(html))
+    }
+
     fn calculate_next_run(schedule: &str) -> Option<String> {
         use croner::Cron;
+        use english_to_cron::str_cron_syntax;
 
-        Cron::new(schedule)
+        // Convert natural language to cron expression if needed
+        let mut expr = schedule.to_string();
+        if let Ok(s) = str_cron_syntax(schedule) {
+            let parts: Vec<&str> = s.split_whitespace().collect();
+            // If 7 parts (with year), take first 6
+            if parts.len() >= 7 {
+                expr = parts[..6].join(" ");
+            } else {
+                expr = s;
+            }
+        }
+
+        let cron = Cron::new(&expr)
             .with_seconds_optional()
+            .with_dom_and_dow()
             .parse()
-            .ok()
-            .and_then(|cron| cron.find_next_occurrence(&chrono::Utc::now(), false).ok())
-            .map(|dt| Self::format_naive_datetime(dt.naive_utc()))
+            .ok()?;
+
+        let now = chrono::Utc::now();
+        let next = cron.find_next_occurrence(&now, false).ok()?;
+
+        // If next occurrence is in the past (just executed), find the one after
+        let next = if next <= now {
+            cron.find_next_occurrence(&(now + chrono::Duration::seconds(1)), false)
+                .ok()?
+        } else {
+            next
+        };
+
+        Some(Self::format_naive_datetime(next.naive_utc()))
     }
 }
