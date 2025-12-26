@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Response},
 };
 use sea_orm::sea_query::{
     Alias, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
@@ -133,42 +133,44 @@ impl ControlPlane {
     pub async fn pause_queue(
         State(state): State<Arc<ControlPlane>>,
         Path(queue_name): Path<String>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
 
         // Create a new pause record using query_builder
-        query_builder::pauses::insert(
+        if let Err(e) = query_builder::pauses::insert(
             db,
             table_config,
             &queue_name,
             chrono::Utc::now().naive_utc(),
         )
         .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
+        {
             error!("Failed to pause queue: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        Self::redirect_back(&format!("/queues/{}", queue_name))
     }
 
     pub async fn resume_queue(
         State(state): State<Arc<ControlPlane>>,
         Path(queue_name): Path<String>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
 
         // Delete the pause record for this queue using query_builder
-        query_builder::pauses::delete_by_queue_name(db, table_config, &queue_name)
-            .await
-            .map(|_| StatusCode::OK)
-            .map_err(|e| {
-                error!("Failed to resume queue: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
+        if let Err(e) =
+            query_builder::pauses::delete_by_queue_name(db, table_config, &queue_name).await
+        {
+            error!("Failed to resume queue: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        Self::redirect_back(&format!("/queues/{}", queue_name))
     }
 
     pub async fn queue_details(

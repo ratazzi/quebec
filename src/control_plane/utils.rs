@@ -1,4 +1,5 @@
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
+use axum::response::Response;
 use chrono::{NaiveDateTime, Utc};
 use sea_orm::DbErr;
 use std::collections::HashMap;
@@ -140,6 +141,15 @@ impl ControlPlane {
         let pause = query_builder::pauses::find_by_queue_name(db, table_config, queue_name).await?;
 
         Ok(pause.is_some())
+    }
+
+    /// Redirect back to the given URL with 303 See Other
+    pub fn redirect_back(url: &str) -> Response {
+        Response::builder()
+            .status(StatusCode::SEE_OTHER)
+            .header(header::LOCATION, url)
+            .body(axum::body::Body::empty())
+            .unwrap()
     }
 
     /// Get pagination parameters
