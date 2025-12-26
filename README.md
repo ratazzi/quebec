@@ -23,6 +23,12 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Signal handling
 - Lifecycle hooks
 
+### Control Plane
+
+Built-in web dashboard for monitoring jobs, queues, and workers in real-time.
+
+![Control Plane](docs/images/control-plane.png)
+
 ## Database Support
 
 - SQLite
