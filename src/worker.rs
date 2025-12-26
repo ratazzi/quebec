@@ -667,6 +667,8 @@ pub struct Execution {
     runnable: Runnable,
     metric: Option<Metric>,
     retry_info: Option<RetryInfo>,
+    /// Direct reference to idle notifier - avoids RwLock access in async context
+    idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Execution {
@@ -697,7 +699,21 @@ impl Execution {
             runnable,
             metric: None,
             retry_info: None,
+            idle_notify: None,
         }
+    }
+
+    /// Create execution with idle notifier for on_idle wake-up
+    pub fn with_idle_notify(
+        ctx: Arc<AppContext>,
+        claimed: quebec_claimed_executions::Model,
+        job: quebec_jobs::Model,
+        runnable: Runnable,
+        idle_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        let mut exec = Self::new(ctx, claimed, job, runnable);
+        exec.idle_notify = Some(idle_notify);
+        exec
     }
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
@@ -909,6 +925,13 @@ impl Execution {
         })
         .ok();
 
+        // Notify main loop that this thread is now idle and ready for new jobs
+        // Uses direct Arc<Notify> reference to avoid RwLock access in async context
+        if let Some(ref notify) = self.idle_notify {
+            trace!("Execution: notifying idle");
+            notify.notify_one();
+        }
+
         result
     }
 }
@@ -950,14 +973,18 @@ impl Execution {
         Python::with_gil(|py| self.runnable.clone_with_gil(py))
     }
 
-    fn perform(&mut self) -> PyResult<()> {
+    fn perform(&mut self, py: Python<'_>) -> PyResult<()> {
         // Reuse the shared runtime handle when blocking on async work
         let handle = self.ctx.get_runtime_handle().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Tokio runtime handle not initialized",
             )
         })?;
-        let ret = handle.block_on(async { self.invoke().await });
+
+        // CRITICAL: Release GIL during block_on to avoid deadlock!
+        // The async code calls notify_idle() which wakes the main loop,
+        // and the main loop needs GIL for Python::with_gil() calls.
+        let ret = py.allow_threads(|| handle.block_on(async { self.invoke().await }));
 
         if let Err(e) = ret {
             return Err(e.into());
@@ -1155,6 +1182,8 @@ pub struct Worker {
     dispatch_sender: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Sender<Execution>>>,
     sink_receiver: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Execution>>>,
     sink_sender: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Sender<Execution>>>,
+    /// Notify for idle wake-up - when a worker thread finishes a job
+    idle_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -1171,6 +1200,12 @@ impl Worker {
         let sink_receiver = Arc::new(tokio::sync::Mutex::new(_rx1));
         let sink_sender = Arc::new(tokio::sync::Mutex::new(tx1));
 
+        // Idle notification - simple notify for wake-up, no data needed
+        let idle_notify = Arc::new(tokio::sync::Notify::new());
+
+        // Register idle_notify with AppContext so Execution can use it
+        ctx.set_idle_notify(idle_notify.clone());
+
         Self {
             ctx,
             start_handlers,
@@ -1181,6 +1216,7 @@ impl Worker {
             dispatch_sender,
             sink_sender,
             sink_receiver,
+            idle_notify,
         }
     }
 
@@ -1568,6 +1604,9 @@ impl Worker {
 
         let mut notify_rx = self.setup_notify_listener().await;
 
+        // Get idle notifier for on_idle wake-up
+        let idle_notify = self.idle_notify.clone();
+
         // Call worker start handlers before starting the main loop
         Python::with_gil(|py| {
             let handlers = self.start_handlers.read().expect("Lock poisoned");
@@ -1624,7 +1663,7 @@ impl Worker {
                                 .await;
 
                             let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
-                            let timeout_duration = tokio::time::Duration::from_millis(100);
+                            let timeout_duration = tokio::time::Duration::from_secs(1);
 
                             if tokio::time::timeout(timeout_duration, process_future).await.is_err() {
                                 warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
@@ -1633,6 +1672,11 @@ impl Worker {
                             trace!("Ignoring NOTIFY for queue not in worker config");
                         }
                     }
+                }
+                // Handle idle notifications from worker threads - wake up immediately when a thread finishes a job
+                _ = idle_notify.notified() => {
+                    trace!("Worker thread idle, checking for new jobs");
+                    self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "IDLE").await;
                 }
                 _ = polling_interval.tick() => {
                     // debug!("⏰ POLLING triggered - regular interval check");
@@ -1730,7 +1774,9 @@ impl Worker {
             }
 
             let execution = match runnable {
-                Ok(r) => Execution::new(ctx.clone(), row, job, r),
+                Ok(r) => {
+                    Execution::with_idle_notify(ctx.clone(), row, job, r, self.idle_notify.clone())
+                }
                 Err(_) => continue,
             };
 
@@ -1790,6 +1836,17 @@ impl Worker {
 
     pub async fn post_execution(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Notify the main loop that a worker thread has become idle.
+    /// This triggers an immediate poll for new jobs instead of waiting for the polling interval.
+    ///
+    /// Uses notify_one() which stores a permit if no task is waiting, ensuring the notification
+    /// isn't lost when the main loop is busy processing jobs.
+    pub fn notify_idle(&self) {
+        trace!("notify_idle called");
+        self.idle_notify.notify_one();
+        trace!("notify_idle completed");
     }
 }
 

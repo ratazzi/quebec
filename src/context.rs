@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -276,6 +277,8 @@ pub struct AppContext {
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
     pub runtime_handle: Option<Handle>,
     pub table_config: TableConfig, // Dynamic table name configuration
+    /// Optional notifier for idle worker threads - when set, signals main loop to poll for new jobs
+    pub idle_notify: Arc<RwLock<Option<Arc<Notify>>>>,
 }
 
 impl AppContext {
@@ -311,6 +314,7 @@ impl AppContext {
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
+            idle_notify: Arc::new(RwLock::new(None)),
         };
 
         // Override default configuration if options are provided
@@ -584,6 +588,24 @@ impl AppContext {
         }
 
         trace!("Set process title: {}", title);
+    }
+
+    /// Set the idle notifier for worker thread notifications
+    pub fn set_idle_notify(&self, notify: Arc<Notify>) {
+        if let Ok(mut idle_notify) = self.idle_notify.write() {
+            *idle_notify = Some(notify);
+        }
+    }
+
+    /// Notify that a worker thread has become idle (finished a job)
+    /// This triggers the main loop to poll for new jobs immediately
+    pub fn notify_idle(&self) {
+        if let Ok(idle_notify) = self.idle_notify.read() {
+            if let Some(ref notify) = *idle_notify {
+                trace!("AppContext: notifying idle");
+                notify.notify_one();
+            }
+        }
     }
 }
 

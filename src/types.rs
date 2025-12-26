@@ -614,6 +614,13 @@ impl PyQuebec {
         Ok(())
     }
 
+    /// Notify the main loop that a worker thread has become idle.
+    /// This triggers an immediate poll for new jobs instead of waiting for the polling interval.
+    /// Should be called after each job execution completes.
+    fn notify_idle(&self) {
+        self.worker.notify_idle();
+    }
+
     #[pyo3(signature = (klass, *args, **kwargs))]
     pub fn perform_later(
         &self,

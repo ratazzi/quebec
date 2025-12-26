@@ -136,7 +136,7 @@ class ThreadedRunner:
                 logger.debug(str(self.execution.metric) + "\n")
                 job_id_var.reset(token)
             except queue.Empty:
-                time.sleep(0.1)
+                pass  # No job available, just continue waiting
             except (queue.ShutDown, KeyboardInterrupt):
                 break
             except Exception as e:
