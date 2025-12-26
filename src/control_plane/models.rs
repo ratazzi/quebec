@@ -23,10 +23,19 @@ pub struct WorkerInfo {
 pub struct Pagination {
     #[serde(default = "default_page")]
     pub page: u64,
+    pub class_name: Option<String>,
+    pub queue_name: Option<String>,
+    pub status: Option<String>,
 }
 
 fn default_page() -> u64 {
     1
+}
+
+#[derive(Debug, Serialize)]
+pub struct FilterOptions {
+    pub class_names: Vec<String>,
+    pub queue_names: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

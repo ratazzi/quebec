@@ -307,6 +307,79 @@
       }
     })
 
+    // Filter controller - handles URL-based filtering
+    Stimulus.register("filter", class extends Controller {
+      static targets = ["classSelect", "queueSelect", "statusSelect", "hoursSelect"]
+
+      connect() {
+        this.setInitialValues()
+      }
+
+      setInitialValues() {
+        const params = new URLSearchParams(window.location.search)
+        if (this.hasClassSelectTarget && params.get('class_name')) {
+          this.classSelectTarget.value = params.get('class_name')
+        }
+        if (this.hasQueueSelectTarget && params.get('queue_name')) {
+          this.queueSelectTarget.value = params.get('queue_name')
+        }
+        if (this.hasStatusSelectTarget && params.get('status')) {
+          this.statusSelectTarget.value = params.get('status')
+        }
+        if (this.hasHoursSelectTarget && params.get('hours')) {
+          this.hoursSelectTarget.value = params.get('hours')
+        }
+      }
+
+      apply() {
+        const params = new URLSearchParams(window.location.search)
+        params.delete('page')
+
+        if (this.hasClassSelectTarget) {
+          const classValue = this.classSelectTarget.value
+          if (classValue && !classValue.startsWith('Filter by')) {
+            params.set('class_name', classValue)
+          } else {
+            params.delete('class_name')
+          }
+        }
+
+        if (this.hasQueueSelectTarget) {
+          const queueValue = this.queueSelectTarget.value
+          if (queueValue && !queueValue.startsWith('Filter by')) {
+            params.set('queue_name', queueValue)
+          } else {
+            params.delete('queue_name')
+          }
+        }
+
+        if (this.hasStatusSelectTarget) {
+          const statusValue = this.statusSelectTarget.value
+          if (statusValue && !statusValue.startsWith('Filter by')) {
+            params.set('status', statusValue)
+          } else {
+            params.delete('status')
+          }
+        }
+
+        if (this.hasHoursSelectTarget) {
+          const hoursValue = this.hoursSelectTarget.value
+          if (hoursValue) {
+            params.set('hours', hoursValue)
+          } else {
+            params.delete('hours')
+          }
+        }
+
+        const query = params.toString()
+        window.location.href = window.location.pathname + (query ? '?' + query : '')
+      }
+
+      clear() {
+        window.location.href = window.location.pathname
+      }
+    })
+
     // Navigation controller - manages navigation and active page state
     Stimulus.register("nav", class extends Controller {
       static targets = ["navItem", "content"]

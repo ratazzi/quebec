@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
 use crate::control_plane::{
-    models::{BlockedJobInfo, Pagination},
+    models::{BlockedJobInfo, FilterOptions, Pagination},
     ControlPlane,
 };
 use crate::query_builder;
@@ -48,6 +48,18 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
+                // Apply filters
+                if let Some(ref filter_class) = pagination.class_name {
+                    if &job.class_name != filter_class {
+                        continue;
+                    }
+                }
+                if let Some(ref filter_queue) = pagination.queue_name {
+                    if &execution.queue_name != filter_queue {
+                        continue;
+                    }
+                }
+
                 // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
@@ -78,6 +90,20 @@ impl ControlPlane {
             }
         }
 
+        // Get global filter options
+        let class_names = state
+            .get_job_classes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let filter_options = FilterOptions {
+            class_names,
+            queue_names,
+        };
+
         debug!("Fetched blocked jobs in {:?}", start.elapsed());
         info!("Found {} blocked jobs", blocked_jobs.len());
 
@@ -98,25 +124,13 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // Use abstract method to get all queue names and job classes
-        let queue_names = state
-            .get_queue_names()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let job_classes = state
-            .get_job_classes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("blocked_jobs", &blocked_jobs);
+        context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "blocked-jobs");
-        context.insert("queue_names", &queue_names);
-        context.insert("job_classes", &job_classes);
 
         let html = state
             .render_template("blocked-jobs.html", &mut context)

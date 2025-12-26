@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
 use crate::control_plane::{
-    models::{FailedJobInfo, Pagination},
+    models::{FailedJobInfo, FilterOptions, Pagination},
     ControlPlane,
 };
 use crate::entities::quebec_failed_executions::{
@@ -48,6 +48,18 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
+                // Apply filters
+                if let Some(ref filter_class) = pagination.class_name {
+                    if &job.class_name != filter_class {
+                        continue;
+                    }
+                }
+                if let Some(ref filter_queue) = pagination.queue_name {
+                    if &job.queue_name != filter_queue {
+                        continue;
+                    }
+                }
+
                 failed_jobs.push(FailedJobInfo {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
@@ -57,6 +69,20 @@ impl ControlPlane {
                 });
             }
         }
+
+        // Get global filter options
+        let class_names = state
+            .get_job_classes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let filter_options = FilterOptions {
+            class_names,
+            queue_names,
+        };
 
         debug!("Fetched failed jobs in {:?}", start.elapsed());
         info!("Found {} failed jobs", failed_jobs.len());
@@ -82,6 +108,7 @@ impl ControlPlane {
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("failed_jobs", &failed_jobs);
+        context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "failed-jobs");

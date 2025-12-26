@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 
 use crate::control_plane::{
-    models::{InProgressJobInfo, Pagination},
+    models::{FilterOptions, InProgressJobInfo, Pagination},
     ControlPlane,
 };
 use crate::query_builder;
@@ -54,6 +54,18 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
+                // Apply filters
+                if let Some(ref filter_class) = pagination.class_name {
+                    if &job.class_name != filter_class {
+                        continue;
+                    }
+                }
+                if let Some(ref filter_queue) = pagination.queue_name {
+                    if &job.queue_name != filter_queue {
+                        continue;
+                    }
+                }
+
                 // Find process information
                 let worker_id = match execution.process_id {
                     Some(pid) => {
@@ -92,6 +104,20 @@ impl ControlPlane {
             }
         }
 
+        // Get global filter options
+        let class_names = state
+            .get_job_classes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let filter_options = FilterOptions {
+            class_names,
+            queue_names,
+        };
+
         debug!("Fetched in-progress jobs in {:?}", start.elapsed());
         info!("Found {} in-progress jobs", in_progress_jobs.len());
 
@@ -112,25 +138,13 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // Use abstract method to get all queue names and job classes
-        let queue_names = state
-            .get_queue_names()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let job_classes = state
-            .get_job_classes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("in_progress_jobs", &in_progress_jobs);
+        context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "in-progress-jobs");
-        context.insert("queue_names", &queue_names);
-        context.insert("job_classes", &job_classes);
 
         let html = state
             .render_template("in-progress-jobs.html", &mut context)

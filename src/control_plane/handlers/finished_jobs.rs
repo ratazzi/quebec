@@ -8,7 +8,7 @@ use std::time::Instant;
 use tracing::{debug, info};
 
 use crate::control_plane::{
-    models::{FinishedJobInfo, Pagination},
+    models::{FilterOptions, FinishedJobInfo, Pagination},
     ControlPlane,
 };
 use crate::query_builder;
@@ -42,6 +42,17 @@ impl ControlPlane {
 
         // Get information for each completed job
         for job in finished_jobs_models {
+            // Apply filters
+            if let Some(ref filter_class) = pagination.class_name {
+                if &job.class_name != filter_class {
+                    continue;
+                }
+            }
+            if let Some(ref filter_queue) = pagination.queue_name {
+                if &job.queue_name != filter_queue {
+                    continue;
+                }
+            }
             if let Some(finished_at) = job.finished_at {
                 // Calculate runtime
                 let runtime = match finished_at.signed_duration_since(job.created_at) {
@@ -71,6 +82,20 @@ impl ControlPlane {
             }
         }
 
+        // Get global filter options
+        let class_names = state
+            .get_job_classes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let filter_options = FilterOptions {
+            class_names,
+            queue_names,
+        };
+
         debug!("Fetched finished jobs in {:?}", start.elapsed());
         info!("Found {} finished jobs", finished_jobs.len());
 
@@ -91,25 +116,13 @@ impl ControlPlane {
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
-        // Use abstract method to get all queue names and job classes
-        let queue_names = state
-            .get_queue_names()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let job_classes = state
-            .get_job_classes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("finished_jobs", &finished_jobs);
+        context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "finished-jobs");
-        context.insert("queue_names", &queue_names);
-        context.insert("job_classes", &job_classes);
 
         let html = state
             .render_template("finished-jobs.html", &mut context)

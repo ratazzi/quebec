@@ -106,6 +106,14 @@ impl ControlPlane {
                     "active".to_string()
                 },
             })
+            .filter(|queue| {
+                // Apply status filter if provided
+                if let Some(ref filter_status) = pagination.status {
+                    &queue.status == filter_status
+                } else {
+                    true
+                }
+            })
             .collect();
         debug!("Processed queue data in {:?}", start.elapsed());
 

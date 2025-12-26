@@ -9,7 +9,7 @@ use std::time::Instant;
 use tracing::{debug, error, info};
 
 use crate::control_plane::{
-    models::{Pagination, ScheduledJobInfo},
+    models::{FilterOptions, Pagination, ScheduledJobInfo},
     utils::clean_sql,
     ControlPlane,
 };
@@ -78,6 +78,18 @@ impl ControlPlane {
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
 
+            // Apply filters
+            if let Some(ref filter_class) = pagination.class_name {
+                if &class_name != filter_class {
+                    continue;
+                }
+            }
+            if let Some(ref filter_queue) = pagination.queue_name {
+                if &queue_name != filter_queue {
+                    continue;
+                }
+            }
+
             // Parse creation time
             let created_at_str =
                 Self::format_datetime(row.try_get::<chrono::NaiveDateTime>("", "created_at"));
@@ -124,6 +136,20 @@ impl ControlPlane {
             });
         }
 
+        // Get global filter options
+        let class_names = state
+            .get_job_classes()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let filter_options = FilterOptions {
+            class_names,
+            queue_names,
+        };
+
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
         // Get total number of scheduled jobs for pagination
@@ -149,24 +175,12 @@ impl ControlPlane {
             return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
         }
 
-        // Use abstract method to get all queue names and job classes
-        let queue_names = state
-            .get_queue_names()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let job_classes = state
-            .get_job_classes()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("scheduled_jobs", &scheduled_jobs);
+        context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
-        context.insert("queue_names", &queue_names);
-        context.insert("job_classes", &job_classes);
         context.insert("active_page", "scheduled-jobs");
 
         let html = state
