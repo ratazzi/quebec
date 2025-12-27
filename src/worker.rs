@@ -954,6 +954,11 @@ impl Execution {
     }
 
     #[getter]
+    fn get_queue(&self) -> String {
+        self.job.queue_name.clone()
+    }
+
+    #[getter]
     fn get_tid(&self) -> String {
         self.tid.clone()
     }

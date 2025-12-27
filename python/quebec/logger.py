@@ -4,13 +4,16 @@ from datetime import datetime, timezone
 from typing import Optional
 
 job_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("job_id", default=None)
+queue_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("queue", default=None)
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             record.job_id = job_id_var.get(None)
+            record.queue = queue_var.get(None)
         except Exception:
             record.job_id = None
+            record.queue = None
         return True
 
 class QuebecFormatter(logging.Formatter):
@@ -22,8 +25,12 @@ class QuebecFormatter(logging.Formatter):
         record.asctime = self.formatTime(record)
         record.message = record.getMessage()
         jid = getattr(record, 'job_id', None)
-        ctx = f" [jid={jid}]" if jid not in (None, '', '-') else ""
-        origin = f"[{record.name}:{record.filename}:{record.lineno}:{record.thread}]"
+        queue = getattr(record, 'queue', None)
+        if jid not in (None, '', '-'):
+            ctx = f' {{queue="{queue}" jid="{jid}" tid="{record.thread}"}}:'
+        else:
+            ctx = ""
+        origin = f"{record.name}:{record.filename}: {record.lineno}:"
         return f"{record.asctime} {record.levelname:>5}{ctx} {origin} {record.message}"
 
 

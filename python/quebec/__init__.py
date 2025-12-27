@@ -7,7 +7,7 @@ import queue
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import List, Type, Any, Optional, Union
-from .logger import job_id_var
+from .logger import job_id_var, queue_var
 
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
@@ -130,11 +130,13 @@ class ThreadedRunner:
                 self.queue.task_done()
                 self.execution.tid = str(threading.get_ident())
 
-                # Inject jid (active_job_id) into the context before execution, clean up after execution.
-                token = job_id_var.set(self.execution.jid)
+                # Inject jid and queue into context before execution, clean up after
+                jid_token = job_id_var.set(self.execution.jid)
+                queue_token = queue_var.set(self.execution.queue)
                 self.execution.perform()
-                logger.debug(str(self.execution.metric) + "\n")
-                job_id_var.reset(token)
+                logger.debug(self.execution.metric)
+                queue_var.reset(queue_token)
+                job_id_var.reset(jid_token)
             except queue.Empty:
                 pass  # No job available, just continue waiting
             except (queue.ShutDown, KeyboardInterrupt):
