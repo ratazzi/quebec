@@ -3,7 +3,8 @@
 {% block title %}Recurring Jobs - Control Plane{% endblock %}
 
 {% block content %}
-<turbo-frame id="content" data-controller="recurring-times">
+<turbo-frame id="content">
+<div data-controller="recurring-times">
 
 <!-- Table -->
 <div class="overflow-x-auto rounded-lg border border-gray-200">
@@ -78,5 +79,6 @@
   </table>
 </div>
 
+</div>
 </turbo-frame>
 {% endblock %}

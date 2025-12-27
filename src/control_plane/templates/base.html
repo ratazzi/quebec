@@ -330,6 +330,7 @@
       }
 
       connect() {
+        this.abortController = new AbortController()
         this.refresh()
         this.timer = setInterval(() => this.refresh(), this.intervalValue)
         // Listen for timeago:due events (bubbles up from timeago controllers)
@@ -339,6 +340,8 @@
 
       disconnect() {
         if (this.timer) clearInterval(this.timer)
+        if (this.dueTimer) clearTimeout(this.dueTimer)
+        if (this.abortController) this.abortController.abort()
         this.element.removeEventListener("timeago:due", this.boundOnDue)
       }
 
@@ -353,13 +356,17 @@
 
       async refresh() {
         try {
-          const response = await fetch('/recurring-jobs/schedule')
+          const response = await fetch('/recurring-jobs/schedule', {
+            signal: this.abortController?.signal
+          })
           if (response.ok) {
             const html = await response.text()
             Turbo.renderStreamMessage(html)
           }
         } catch (e) {
-          console.error('Failed to refresh recurring job times:', e)
+          if (e.name !== 'AbortError') {
+            console.error('Failed to refresh recurring job times:', e)
+          }
         }
       }
     })
