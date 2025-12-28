@@ -1,6 +1,6 @@
 [project]
 name = "quebec"
-version = "0.2.0"
+version = "0.2.1"
 requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Rust",
@@ -32,7 +32,8 @@ Homepage = "https://github.com/ratazzi/quebec"
 Repository = "https://github.com/ratazzi/quebec"
 
 [project.optional-dependencies]
-test = ["pytest < 5.0.0", "pytest-cov[all]"]
+test = ["pytest>=7.0.0", "pytest-cov"]
+docs = ["sphinx>=7.0", "shibuya", "myst-parser"]
 
 [build-system]
 requires = ["maturin>=1.10,<2.0"]
@@ -48,4 +49,13 @@ dev = [
     "psycopg2>=2.9.10",
     "rich>=14.0.0",
     "sqlalchemy>=2.0.40",
+    "pytest>=7.0.0",
+    "pytest-cov",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
