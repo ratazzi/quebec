@@ -1189,6 +1189,8 @@ pub struct Worker {
     sink_sender: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Sender<Execution>>>,
     /// Notify for idle wake-up - when a worker thread finishes a job
     idle_notify: Arc<tokio::sync::Notify>,
+    /// Process ID for this worker (set after on_start)
+    process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Worker {
@@ -1222,6 +1224,7 @@ impl Worker {
             sink_sender,
             sink_receiver,
             idle_notify,
+            process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -1326,8 +1329,9 @@ impl Worker {
         txn: &C,
         table_config: &crate::context::TableConfig,
         execution: &quebec_ready_executions::Model,
+        process_id: Option<i64>,
     ) -> Result<Option<quebec_claimed_executions::Model>, DbErr> {
-        query_builder::claimed_executions::insert(txn, table_config, execution.job_id, None)
+        query_builder::claimed_executions::insert(txn, table_config, execution.job_id, process_id)
             .await?;
         query_builder::ready_executions::delete_by_id(txn, table_config, execution.id).await?;
         query_builder::claimed_executions::find_by_job_id(txn, table_config, execution.job_id).await
@@ -1338,6 +1342,7 @@ impl Worker {
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
         let use_skip_locked = self.ctx.use_skip_locked;
+        let process_id = *self.process_id.lock().await;
 
         let job = db
             .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
@@ -1368,7 +1373,8 @@ impl Worker {
                             .await?;
                             if let Some(ref execution) = record {
                                 if let Some(claimed) =
-                                    Self::claim_execution(txn, &table_config, execution).await?
+                                    Self::claim_execution(txn, &table_config, execution, process_id)
+                                        .await?
                                 {
                                     return Ok(claimed);
                                 }
@@ -1422,6 +1428,7 @@ impl Worker {
         let use_skip_locked = self.ctx.use_skip_locked;
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
+        let process_id = *self.process_id.lock().await;
 
         let jobs = db
             .transaction::<_, Vec<quebec_claimed_executions::Model>, DbErr>(|txn| {
@@ -1459,8 +1466,13 @@ impl Worker {
                             .await?;
 
                             for execution in records {
-                                if let Some(claimed) =
-                                    Self::claim_execution(txn, &table_config, &execution).await?
+                                if let Some(claimed) = Self::claim_execution(
+                                    txn,
+                                    &table_config,
+                                    &execution,
+                                    process_id,
+                                )
+                                .await?
                                 {
                                     claimed_jobs.push(claimed);
                                 }
@@ -1606,6 +1618,9 @@ impl Worker {
         let init_db = self.ctx.get_db().await;
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
+
+        // Store process_id for use in claim_jobs
+        *self.process_id.lock().await = Some(process.id);
 
         let mut notify_rx = self.setup_notify_listener().await;
 
