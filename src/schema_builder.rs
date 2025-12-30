@@ -477,6 +477,19 @@ where
             .table(tbl(&table_config.processes))
             .col(col("last_heartbeat_at"))
             .to_owned(),
+        // Recurring executions unique index - required for ON CONFLICT handling
+        // Matches Solid Queue: index_solid_queue_recurring_executions_on_task_key_and_run_at
+        Index::create()
+            .if_not_exists()
+            .unique()
+            .name(&format!(
+                "index_{}_on_task_key_and_run_at",
+                table_config.recurring_executions
+            ))
+            .table(tbl(&table_config.recurring_executions))
+            .col(col("task_key"))
+            .col(col("run_at"))
+            .to_owned(),
     ];
 
     for index in indexes {
@@ -485,10 +498,32 @@ where
             DbBackend::Sqlite => index.to_string(SqliteQueryBuilder),
             DbBackend::MySql => index.to_string(MysqlQueryBuilder),
         };
-        // Ignore index creation errors (index may already exist)
-        let _ = db
-            .execute(Statement::from_string(db.get_database_backend(), sql))
-            .await;
+
+        // Check if this is the critical unique index for recurring_executions
+        let is_recurring_unique_index = sql.contains("task_key_and_run_at");
+
+        match db
+            .execute(Statement::from_string(
+                db.get_database_backend(),
+                sql.clone(),
+            ))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                // Warn for unique index failures on recurring_executions
+                // as this is required for ON CONFLICT handling
+                if is_recurring_unique_index {
+                    tracing::warn!(
+                        "Failed to create unique index for recurring_executions: {}. \
+                         This may cause scheduler race condition handling to fail. \
+                         Check for duplicate (task_key, run_at) data.",
+                        e
+                    );
+                }
+                // Ignore other index errors (index may already exist)
+            }
+        }
     }
 
     Ok(())

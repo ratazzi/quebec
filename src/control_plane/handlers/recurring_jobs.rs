@@ -140,26 +140,28 @@ impl ControlPlane {
         let ctx = state.ctx.clone();
 
         let enqueued_queue = db
-            .transaction::<_, String, DbErr>(|txn| {
+            .transaction::<_, Option<String>, DbErr>(|txn| {
                 let entry = entry.clone();
                 let ctx = ctx.clone();
                 Box::pin(async move { enqueue_job(&ctx, txn, entry, now).await })
             })
             .await?;
 
-        // Send NOTIFY after transaction commits
-        if state.ctx.is_postgres() {
-            NotifyManager::send_notify(&state.ctx.name, db, &enqueued_queue, "new_job")
-                .await
-                .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
-                .ok();
+        // Send NOTIFY after transaction commits (only if job was created)
+        if let Some(ref queue) = enqueued_queue {
+            if state.ctx.is_postgres() {
+                NotifyManager::send_notify(&state.ctx.name, db, queue, "new_job")
+                    .await
+                    .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
+                    .ok();
+            }
         }
 
+        let actual_queue =
+            enqueued_queue.unwrap_or_else(|| "(skipped - already scheduled)".to_string());
         info!(
             "Manually triggered recurring job: {} ({}) -> queue: {}",
-            key,
-            class_name,
-            queue_name.as_deref().unwrap_or("default")
+            key, class_name, actual_queue
         );
 
         Ok(())

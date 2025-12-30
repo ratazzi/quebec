@@ -155,17 +155,27 @@ where
     Ok(ret)
 }
 
-/// Enqueue a job for execution. Returns the queue name for NOTIFY.
+/// Enqueue a job for execution. Returns Some(queue_name) for NOTIFY, or None if skipped.
+/// Uses optimistic locking to handle concurrent schedulers:
+/// 1. Create the job first
+/// 2. Try to insert recurring_execution with ON CONFLICT DO NOTHING
+/// 3. If already exists (another scheduler won), delete the job and return None
 /// IMPORTANT: Caller should send NOTIFY after transaction commits, not inside.
 pub async fn enqueue_job<C>(
     ctx: &Arc<AppContext>,
     db: &C,
     entry: ScheduledEntry,
     scheduled_at: NaiveDateTime,
-) -> Result<String, DbErr>
+) -> Result<Option<String>, DbErr>
 where
     C: ConnectionTrait,
 {
+    let task_key = entry
+        .key
+        .clone()
+        .ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
+
+    // Step 1: Create the job first
     let queue_name = entry.queue.as_deref().unwrap_or("default");
     let priority = entry.priority.unwrap_or(0);
 
@@ -219,10 +229,9 @@ where
         .await?
         .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
 
-    let task_key = entry
-        .key
-        .ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
-    query_builder::recurring_executions::insert(
+    // Step 2: Try to claim this execution slot using optimistic locking
+    // If another scheduler already claimed it, we delete the job and skip
+    let claimed = query_builder::recurring_executions::try_insert(
         db,
         &ctx.table_config,
         job.id,
@@ -230,6 +239,18 @@ where
         scheduled_at,
     )
     .await?;
+
+    if !claimed {
+        // Another scheduler instance already claimed this execution
+        // Delete the job we just created and return None
+        query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
+        trace!(
+            "Skipping job {} at {} - already claimed by another scheduler",
+            task_key,
+            scheduled_at
+        );
+        return Ok(None);
+    }
 
     // Apply concurrency control logic
     // Returns Some(constraint) if blocked, None if ready to execute
@@ -282,7 +303,7 @@ where
     }
 
     // Return queue name so caller can send NOTIFY after transaction commits
-    Ok(job.queue_name)
+    Ok(Some(job.queue_name))
 }
 
 #[derive(Debug)]
@@ -501,25 +522,29 @@ impl Scheduler {
 
             let start_time = Instant::now();
             let result = db
-                .transaction::<_, String, DbErr>(|txn| {
+                .transaction::<_, Option<String>, DbErr>(|txn| {
                     let entry = entry.clone();
                     let task_key = task_key.clone();
                     let ctx = ctx.clone();
                     Box::pin(async move {
                         let queue_name = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
-                        trace!("Job({:?}) enqueued", task_key);
+                        if queue_name.is_some() {
+                            trace!("Job({:?}) enqueued", task_key);
+                        }
                         Ok(queue_name)
                     })
                 })
                 .await
                 .inspect_err(|e| error!("Failed to enqueue scheduled job {}: {}", task_key, e));
 
-            // Send NOTIFY after transaction commits
-            if let Some(queue_name) = result.ok().filter(|_| ctx.is_postgres()) {
-                NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name, "new_job")
-                    .await
-                    .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
-                    .ok();
+            // Send NOTIFY after transaction commits (only if job was actually created)
+            if let Ok(Some(queue_name)) = result {
+                if ctx.is_postgres() {
+                    NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name, "new_job")
+                        .await
+                        .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
+                        .ok();
+                }
             }
 
             trace!("Task({:?}) ticked: {:?}", &task_key, start_time.elapsed());

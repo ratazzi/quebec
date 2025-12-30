@@ -4,7 +4,7 @@
 //! allowing table names to be dynamically set at runtime via TableConfig.
 
 use sea_orm::sea_query::{
-    Alias, Asterisk, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
+    Alias, Asterisk, Cond, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
     PostgresQueryBuilder, Query, Returning, SelectStatement, SqliteQueryBuilder, UpdateStatement,
 };
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, FromQueryResult, Statement, Value};
@@ -1206,6 +1206,81 @@ pub mod claimed_executions {
 
         execute_delete(db, query).await
     }
+
+    /// Find claimed executions by process_id
+    pub async fn find_by_process_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        process_id: i64,
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::select()
+            .column(Asterisk)
+            .from(table)
+            .and_where(Expr::col(col("process_id")).eq(process_id))
+            .to_owned();
+
+        execute_select(db, query).await
+    }
+
+    /// Find orphaned claimed executions (process_id is NULL or process doesn't exist)
+    /// This uses a LEFT JOIN to find executions where the process record is missing
+    pub async fn find_orphaned<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let claimed_table = Alias::new(&table_config.claimed_executions);
+        let processes_table = Alias::new(&table_config.processes);
+
+        // Find claimed executions where:
+        // 1. process_id IS NULL, OR
+        // 2. process_id references a non-existent process (via LEFT JOIN)
+        let query = Query::select()
+            .columns([
+                (claimed_table.clone(), col("id")),
+                (claimed_table.clone(), col("job_id")),
+                (claimed_table.clone(), col("process_id")),
+                (claimed_table.clone(), col("created_at")),
+            ])
+            .from(claimed_table.clone())
+            .left_join(
+                processes_table.clone(),
+                Expr::col((claimed_table.clone(), col("process_id")))
+                    .equals((processes_table.clone(), col("id"))),
+            )
+            .cond_where(
+                Cond::any()
+                    .add(Expr::col((claimed_table.clone(), col("process_id"))).is_null())
+                    .add(Expr::col((processes_table, col("id"))).is_null()),
+            )
+            .to_owned();
+
+        execute_select(db, query).await
+    }
+
+    /// Delete claimed executions by process_id and return deleted count
+    pub async fn delete_by_process_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        process_id: i64,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::delete()
+            .from_table(table)
+            .and_where(Expr::col(col("process_id")).eq(process_id))
+            .to_owned();
+
+        execute_delete(db, query).await
+    }
 }
 
 // =============================================================================
@@ -1438,7 +1513,9 @@ pub mod failed_executions {
     use super::*;
     use crate::entities::quebec_failed_executions;
 
-    /// Insert a failed execution record
+    /// Insert a failed execution record (idempotent - like Solid Queue's create_or_find_by!)
+    /// Uses ON CONFLICT DO NOTHING (PostgreSQL/SQLite) or INSERT IGNORE (MySQL)
+    /// to handle concurrent cleanup of the same job gracefully.
     pub async fn insert<C>(
         db: &C,
         table_config: &TableConfig,
@@ -1448,20 +1525,65 @@ pub mod failed_executions {
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.failed_executions);
+        let backend = db.get_database_backend();
+        let table = &table_config.failed_executions;
         let now = chrono::Utc::now().naive_utc();
 
-        let mut query = Query::insert()
-            .into_table(table)
-            .columns([col("job_id"), col("error"), col("created_at")])
-            .values_panic([job_id.into(), error.into(), now.into()])
-            .to_owned();
+        // Build database-specific INSERT with conflict handling
+        match backend {
+            DbBackend::Postgres => {
+                // For PostgreSQL, use query_one to handle RETURNING properly
+                // When conflict occurs, no row is returned
+                let sql = format!(
+                    r#"INSERT INTO "{}" ("job_id", "error", "created_at")
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT ("job_id") DO NOTHING
+                       RETURNING "id""#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [job_id.into(), error.into(), now.into()],
+                );
 
-        if db.get_database_backend() == DbBackend::Postgres {
-            query.returning_col(col("id"));
+                match db.query_one(stmt).await? {
+                    Some(row) => {
+                        let id: i64 = row.try_get("", "id")?;
+                        Ok(id)
+                    }
+                    None => Ok(0), // Conflict - record already exists
+                }
+            }
+            DbBackend::Sqlite => {
+                let sql = format!(
+                    r#"INSERT OR IGNORE INTO "{}" ("job_id", "error", "created_at")
+                       VALUES (?, ?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [job_id.into(), error.into(), now.into()],
+                );
+                let result = db.execute(stmt).await?;
+                Ok(result.last_insert_id() as i64)
+            }
+            DbBackend::MySql => {
+                let sql = format!(
+                    r#"INSERT IGNORE INTO `{}` (`job_id`, `error`, `created_at`)
+                       VALUES (?, ?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [job_id.into(), error.into(), now.into()],
+                );
+                let result = db.execute(stmt).await?;
+                Ok(result.last_insert_id() as i64)
+            }
         }
-
-        execute_insert(db, query).await
     }
 
     /// Find all failed executions
@@ -1984,6 +2106,39 @@ pub mod processes {
 
         execute_select(db, query).await
     }
+
+    /// Find prunable (stale) processes with heartbeat before threshold
+    /// These are processes that have stopped sending heartbeats
+    pub async fn find_prunable<C>(
+        db: &C,
+        table_config: &TableConfig,
+        heartbeat_threshold: chrono::NaiveDateTime,
+        exclude_id: Option<i64>,
+    ) -> Result<Vec<quebec_processes::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.processes);
+        let mut query = Query::select()
+            .column(Asterisk)
+            .from(table)
+            .and_where(Expr::col(col("last_heartbeat_at")).lt(heartbeat_threshold))
+            .to_owned();
+
+        if let Some(id) = exclude_id {
+            query = query.and_where(Expr::col(col("id")).ne(id)).to_owned();
+        }
+
+        execute_select(db, query).await
+    }
+
+    /// Delete a process and return the number of rows deleted
+    pub async fn prune<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        delete_by_id(db, table_config, id).await
+    }
 }
 
 // =============================================================================
@@ -2023,6 +2178,64 @@ pub mod recurring_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Try to insert a recurring execution record, returns true if inserted, false if already exists.
+    /// Uses INSERT ... ON CONFLICT DO NOTHING (PostgreSQL/SQLite) or INSERT IGNORE (MySQL)
+    /// to handle concurrent scheduler instances gracefully.
+    pub async fn try_insert<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_id: i64,
+        task_key: &str,
+        run_at: chrono::NaiveDateTime,
+    ) -> Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let table = &table_config.recurring_executions;
+        let now = chrono::Utc::now().naive_utc();
+
+        // Build database-specific INSERT with conflict handling
+        let sql = match backend {
+            DbBackend::Postgres => {
+                format!(
+                    r#"INSERT INTO "{}" ("job_id", "task_key", "run_at", "created_at")
+                       VALUES ($1, $2, $3, $4)
+                       ON CONFLICT ("task_key", "run_at") DO NOTHING"#,
+                    table
+                )
+            }
+            DbBackend::Sqlite => {
+                format!(
+                    r#"INSERT OR IGNORE INTO "{}" ("job_id", "task_key", "run_at", "created_at")
+                       VALUES (?, ?, ?, ?)"#,
+                    table
+                )
+            }
+            DbBackend::MySql => {
+                format!(
+                    r#"INSERT IGNORE INTO `{}` (`job_id`, `task_key`, `run_at`, `created_at`)
+                       VALUES (?, ?, ?, ?)"#,
+                    table
+                )
+            }
+        };
+
+        let values = vec![
+            Value::from(job_id),
+            Value::from(task_key),
+            Value::from(run_at),
+            Value::from(now),
+        ];
+
+        let result = db
+            .execute(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+
+        // rows_affected > 0 means insert succeeded, 0 means conflict (already exists)
+        Ok(result.rows_affected() > 0)
     }
 
     /// Delete a recurring execution by job_id
