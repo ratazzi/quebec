@@ -22,6 +22,7 @@ pub use ext::ControlPlaneExt;
 pub struct ControlPlane {
     pub(crate) ctx: Arc<AppContext>,
     pub(crate) tera: RwLock<Tera>,
+    #[cfg(debug_assertions)]
     pub(crate) template_path: String,
     pub(crate) page_size: u64,
 }
@@ -50,13 +51,11 @@ impl ControlPlane {
         debug!("Available templates: {:?}", template_list);
         debug!("Tera template engine initialized in {:?}", start.elapsed());
 
-        // Save template path for hot reload
-        let template_path = "src/templates/**/*".to_string();
-
         Self {
             ctx,
             tera: RwLock::new(tera),
-            template_path,
+            #[cfg(debug_assertions)]
+            template_path: "src/templates/**/*".to_string(),
             page_size: 10,
         }
     }

@@ -9,6 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::query_builder;
 
+#[cfg(debug_assertions)]
 use super::templates;
 use super::ControlPlane;
 
