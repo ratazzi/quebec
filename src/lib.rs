@@ -65,6 +65,67 @@ fn init_proctitle() {
     // No initialization needed for other platforms
 }
 
+/// Initialize logging with format support via QUEBEC_LOG_FORMAT environment variable.
+///
+/// Supported formats:
+/// - "console" (default): Human-readable colored output
+/// - "json": JSON structured logs
+/// - "logfmt": key=value format
+fn init_logging() {
+    use tracing_subscriber::prelude::*;
+
+    // Default to "info" level for production; use RUST_LOG env var to override
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let format = std::env::var("QUEBEC_LOG_FORMAT").unwrap_or_else(|_| "console".to_string());
+
+    let use_ansi = match std::env::var("QUEBEC_COLOR").as_deref() {
+        Ok("always") => true,
+        Ok("never") => false,
+        _ => atty::is(atty::Stream::Stdout),
+    };
+
+    let result = match format.as_str() {
+        "json" => {
+            // Disable colored crate output for machine-readable format
+            colored::control::set_override(false);
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .json()
+                .flatten_event(true)
+                .with_current_span(false)
+                .with_line_number(true)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+        }
+        "logfmt" => {
+            // Disable colored crate output - tracing-logfmt escapes ANSI codes
+            colored::control::set_override(false);
+            let subscriber = tracing_subscriber::registry()
+                .with(env_filter)
+                .with(tracing_logfmt::layer());
+            tracing::subscriber::set_global_default(subscriber)
+        }
+        _ => {
+            // console (default)
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_line_number(true)
+                .with_ansi(use_ansi)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+        }
+    };
+
+    if result.is_err() {
+        eprintln!(
+            "quebec: tracing subscriber already initialized, QUEBEC_LOG_FORMAT={} ignored",
+            format
+        );
+    }
+}
+
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
@@ -75,29 +136,8 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // pyo3_log::init(); // Can cause mysterious deadlocks
 
-    // Use tracing
-    {
-        // Use custom EnvFilter, default to DEBUG level
-        let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
-
-        // Check for QUEBEC_COLOR environment variable to override ANSI detection
-        let use_ansi = match std::env::var("QUEBEC_COLOR").as_deref() {
-            Ok("always") => true,
-            Ok("never") => false,
-            _ => atty::is(atty::Stream::Stdout), // default behavior
-        };
-
-        let subscriber = tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_env_filter(env_filter)
-            .with_line_number(true)
-            .with_ansi(use_ansi)
-            .finish();
-
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("setting default subscriber failed");
-    }
+    // Initialize logging with format support (console/json/logfmt)
+    init_logging();
 
     // debug!("duration: {:?}", parse_duration("1s"));
     // debug!("-------------- is_running_in_pyo3: {:?}", is_running_in_pyo3());
