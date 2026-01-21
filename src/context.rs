@@ -264,6 +264,8 @@ pub struct AppContext {
     pub silence_polling: bool,
     pub preserve_finished_jobs: bool,
     pub clear_finished_jobs_after: Duration,
+    pub cleanup_batch_size: u64,
+    pub cleanup_interval: Duration,
     pub default_concurrency_control_period: Duration,
     pub dispatcher_polling_interval: Duration,
     pub dispatcher_batch_size: u64,
@@ -301,8 +303,10 @@ impl AppContext {
             silence_polling: true,
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
-            default_concurrency_control_period: Duration::from_secs(60),    // 1 minute
-            dispatcher_polling_interval: Duration::from_secs(1),            // 1 seconds
+            cleanup_batch_size: 500,
+            cleanup_interval: Duration::ZERO, // disabled by default, set to enable (e.g. 3600s)
+            default_concurrency_control_period: Duration::from_secs(60), // 1 minute
+            dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
@@ -382,6 +386,12 @@ impl AppContext {
                 }
                 if let Some(v) = get_duration("clear_finished_jobs_after") {
                     ctx.clear_finished_jobs_after = v;
+                }
+                if let Some(v) = get_u64("cleanup_batch_size") {
+                    ctx.cleanup_batch_size = v;
+                }
+                if let Some(v) = get_duration("cleanup_interval") {
+                    ctx.cleanup_interval = v;
                 }
                 if let Some(v) = get_duration("default_concurrency_control_period") {
                     ctx.default_concurrency_control_period = v;

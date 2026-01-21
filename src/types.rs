@@ -1017,6 +1017,166 @@ impl PyQuebec {
         self.ctx.set_proc_title(process_type, details.as_deref());
         Ok(())
     }
+
+    /// Clear finished jobs older than the configured threshold.
+    /// Returns the total number of jobs deleted.
+    ///
+    /// Args:
+    ///     batch_size: Optional batch size for deletion (default: cleanup_batch_size config)
+    ///     finished_before: Optional timestamp - delete jobs finished before this time
+    ///                      (default: now - clear_finished_jobs_after config)
+    ///
+    /// Returns:
+    ///     int: Number of deleted jobs
+    #[pyo3(signature = (batch_size=None, finished_before=None))]
+    fn clear_finished_jobs(
+        &self,
+        py: Python<'_>,
+        batch_size: Option<u64>,
+        finished_before: Option<f64>,
+    ) -> PyResult<u64> {
+        let batch_size = batch_size.unwrap_or(self.ctx.cleanup_batch_size);
+        let clear_after = self.ctx.clear_finished_jobs_after;
+        let table_config = self.ctx.table_config.clone();
+
+        // Calculate the cutoff timestamp
+        let finished_before = match finished_before {
+            Some(ts) => {
+                // Validate timestamp: reject NaN and infinity
+                if ts.is_nan() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "finished_before cannot be NaN",
+                    ));
+                }
+                if ts.is_infinite() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "finished_before cannot be infinite",
+                    ));
+                }
+                let secs = ts as i64;
+                let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+                chrono::DateTime::from_timestamp(secs, nsecs)
+                    .map(|dt| dt.naive_utc())
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid timestamp: {} is out of range",
+                            ts
+                        ))
+                    })?
+            }
+            None => {
+                let duration = chrono::Duration::from_std(clear_after).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid clear_finished_jobs_after duration: {}",
+                        e
+                    ))
+                })?;
+                chrono::Utc::now().naive_utc() - duration
+            }
+        };
+
+        py.allow_threads(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await;
+                let mut total_deleted: u64 = 0;
+
+                loop {
+                    let deleted = crate::query_builder::jobs::delete_finished_before(
+                        db.as_ref(),
+                        &table_config,
+                        finished_before,
+                        batch_size,
+                    )
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to delete finished jobs: {}",
+                            e
+                        ))
+                    })?;
+
+                    total_deleted += deleted;
+
+                    if deleted == 0 {
+                        break;
+                    }
+
+                    // Sleep briefly between batches (same as worker's clear_finished_jobs)
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                }
+
+                Ok(total_deleted)
+            })
+        })
+    }
+
+    /// Count finished jobs older than the configured threshold that can be cleared.
+    ///
+    /// Args:
+    ///     finished_before: Optional timestamp - count jobs finished before this time
+    ///                      (default: now - clear_finished_jobs_after config)
+    ///
+    /// Returns:
+    ///     int: Number of clearable jobs
+    #[pyo3(signature = (finished_before=None))]
+    fn count_clearable_jobs(&self, py: Python<'_>, finished_before: Option<f64>) -> PyResult<u64> {
+        let clear_after = self.ctx.clear_finished_jobs_after;
+        let table_config = self.ctx.table_config.clone();
+
+        // Calculate the cutoff timestamp
+        let finished_before = match finished_before {
+            Some(ts) => {
+                // Validate timestamp: reject NaN and infinity
+                if ts.is_nan() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "finished_before cannot be NaN",
+                    ));
+                }
+                if ts.is_infinite() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "finished_before cannot be infinite",
+                    ));
+                }
+                let secs = ts as i64;
+                let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+                chrono::DateTime::from_timestamp(secs, nsecs)
+                    .map(|dt| dt.naive_utc())
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid timestamp: {} is out of range",
+                            ts
+                        ))
+                    })?
+            }
+            None => {
+                let duration = chrono::Duration::from_std(clear_after).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid clear_finished_jobs_after duration: {}",
+                        e
+                    ))
+                })?;
+                chrono::Utc::now().naive_utc() - duration
+            }
+        };
+
+        py.allow_threads(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await;
+                crate::query_builder::jobs::count_finished_before(
+                    db.as_ref(),
+                    &table_config,
+                    finished_before,
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to count clearable jobs: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
 }
 
 // impl PyQuebec {

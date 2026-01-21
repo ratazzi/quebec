@@ -725,6 +725,69 @@ pub mod jobs {
             .map(|row| row.try_get("", "class_name"))
             .collect()
     }
+
+    /// Delete finished jobs older than the specified timestamp in batches.
+    /// Uses subquery DELETE pattern to avoid SQLite's 999 bind variable limit.
+    /// Returns the number of deleted rows.
+    pub async fn delete_finished_before<C>(
+        db: &C,
+        table_config: &TableConfig,
+        finished_before: chrono::NaiveDateTime,
+        batch_size: u64,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_name = &table_config.jobs;
+        let backend = db.get_database_backend();
+
+        // Use raw SQL with subquery to avoid SQLite's 999 bind variable limit
+        // This pattern: DELETE FROM table WHERE id IN (SELECT id FROM table WHERE ... LIMIT ?)
+        let sql = match backend {
+            DbBackend::Postgres => format!(
+                r#"DELETE FROM "{table}" WHERE "id" IN (SELECT "id" FROM "{table}" WHERE "finished_at" IS NOT NULL AND "finished_at" < $1 LIMIT $2)"#,
+                table = table_name
+            ),
+            DbBackend::MySql => format!(
+                r#"DELETE FROM `{table}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table}` WHERE `finished_at` IS NOT NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#,
+                table = table_name
+            ),
+            DbBackend::Sqlite => format!(
+                r#"DELETE FROM "{table}" WHERE "id" IN (SELECT "id" FROM "{table}" WHERE "finished_at" IS NOT NULL AND "finished_at" < ? LIMIT ?)"#,
+                table = table_name
+            ),
+        };
+
+        let stmt = Statement::from_sql_and_values(
+            backend,
+            sql,
+            [finished_before.into(), (batch_size as i64).into()],
+        );
+
+        let result = db.execute(stmt).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Count finished jobs older than the specified timestamp.
+    /// Used to check how many jobs are clearable.
+    pub async fn count_finished_before<C>(
+        db: &C,
+        table_config: &TableConfig,
+        finished_before: chrono::NaiveDateTime,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.jobs);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .and_where(Expr::col(col("finished_at")).is_not_null())
+            .and_where(Expr::col(col("finished_at")).lt(finished_before))
+            .to_owned();
+
+        execute_count(db, query).await
+    }
 }
 
 // =============================================================================

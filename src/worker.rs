@@ -1736,6 +1736,70 @@ impl Worker {
         Ok(count)
     }
 
+    /// Clear finished jobs older than the configured threshold.
+    /// Called periodically to clean up completed jobs.
+    /// Returns the total number of jobs deleted.
+    async fn clear_finished_jobs(&self) -> Result<u64, anyhow::Error> {
+        // Skip if preserve_finished_jobs is false (jobs are deleted immediately after completion)
+        if !self.ctx.preserve_finished_jobs {
+            return Ok(0);
+        }
+
+        let db = self.ctx.get_db().await;
+        let table_config = self.ctx.table_config.clone();
+        let batch_size = self.ctx.cleanup_batch_size;
+        let clear_after = self.ctx.clear_finished_jobs_after;
+        let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+
+        // Calculate the cutoff timestamp
+        let finished_before = chrono::Utc::now().naive_utc()
+            - chrono::Duration::from_std(clear_after).map_err(|e| {
+                anyhow::anyhow!("Invalid clear_finished_jobs_after duration: {}", e)
+            })?;
+
+        let mut total_deleted: u64 = 0;
+
+        // Loop: delete batch → sleep → repeat until 0 deleted or shutdown requested
+        loop {
+            // Check for graceful shutdown between batches
+            if graceful_shutdown.is_cancelled() {
+                debug!("Clear finished jobs interrupted by shutdown");
+                break;
+            }
+
+            let deleted = query_builder::jobs::delete_finished_before(
+                db.as_ref(),
+                &table_config,
+                finished_before,
+                batch_size,
+            )
+            .await?;
+
+            total_deleted += deleted;
+
+            if deleted == 0 {
+                break;
+            }
+
+            debug!(
+                "Cleared {} finished job(s) (total: {})",
+                deleted, total_deleted
+            );
+
+            // Sleep briefly between batches to reduce database pressure
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        }
+
+        if total_deleted > 0 {
+            info!(
+                "Cleared {} finished job(s) older than {:?}",
+                total_deleted, clear_after
+            );
+        }
+
+        Ok(total_deleted)
+    }
+
     /// Release all claimed executions for a process back to ready state.
     /// Used for maintenance/admin purposes - re-queues jobs for other workers.
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
@@ -1918,6 +1982,16 @@ impl Worker {
         // Maintenance interval: 3x heartbeat interval (same as Solid Queue's process_alive_threshold)
         let mut maintenance_interval =
             tokio::time::interval(self.ctx.process_heartbeat_interval * 3);
+        // Cleanup interval for clearing finished jobs (disabled if zero)
+        let cleanup_enabled = !self.ctx.cleanup_interval.is_zero();
+        let cleanup_duration = if cleanup_enabled {
+            self.ctx
+                .cleanup_interval
+                .max(std::time::Duration::from_secs(1))
+        } else {
+            std::time::Duration::from_secs(3600) // dummy interval when disabled
+        };
+        let mut cleanup_interval = tokio::time::interval(cleanup_duration);
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
         let ctx = self.ctx.clone();
@@ -1978,6 +2052,12 @@ impl Worker {
                 _ = maintenance_interval.tick() => {
                     if let Err(e) = self.prune_dead_processes(Some(process.id)).await {
                         warn!("Failed to prune dead processes: {}", e);
+                    }
+                }
+                // Periodic cleanup: clear finished jobs older than threshold (if enabled)
+                _ = cleanup_interval.tick(), if cleanup_enabled => {
+                    if let Err(e) = self.clear_finished_jobs().await {
+                        warn!("Failed to clear finished jobs: {}", e);
                     }
                 }
                 _ = quit.cancelled() => {
