@@ -1,5 +1,6 @@
 from .quebec import * # NOQA
 from . import quebec
+from . import sqlalchemy # NOQA
 from .quebec import Quebec, ActiveJob
 import logging
 import time
