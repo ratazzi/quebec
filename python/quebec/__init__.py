@@ -1,6 +1,6 @@
-from .quebec import * # NOQA
+from .quebec import *  # NOQA
 from . import quebec
-from . import sqlalchemy # NOQA
+from . import sqlalchemy  # NOQA
 from .quebec import Quebec, ActiveJob
 import logging
 import time
@@ -31,8 +31,8 @@ class JobBuilder:
 
     def _calculate_scheduled_at(self) -> Optional[datetime]:
         """Calculate scheduled_at from wait or wait_until options."""
-        wait = self.options.get('wait')
-        wait_until = self.options.get('wait_until')
+        wait = self.options.get("wait")
+        wait_until = self.options.get("wait_until")
 
         if wait_until is not None:
             if isinstance(wait_until, datetime):
@@ -54,19 +54,19 @@ class JobBuilder:
 
         return None
 
-    def perform_later(self, qc: 'Quebec', *args, **kwargs) -> 'ActiveJob':
+    def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
         """Enqueue the job with configured options."""
         scheduled_at = self._calculate_scheduled_at()
 
         # Pass internal options via kwargs (will be filtered out before serialization)
         if scheduled_at is not None:
-            kwargs['_scheduled_at'] = scheduled_at.timestamp()
+            kwargs["_scheduled_at"] = scheduled_at.timestamp()
 
-        if 'queue' in self.options:
-            kwargs['_queue'] = self.options['queue']
+        if "queue" in self.options:
+            kwargs["_queue"] = self.options["queue"]
 
-        if 'priority' in self.options:
-            kwargs['_priority'] = self.options['priority']
+        if "priority" in self.options:
+            kwargs["_priority"] = self.options["priority"]
 
         # Call the original perform_later
         return self.job_class.perform_later(qc, *args, **kwargs)
@@ -74,18 +74,22 @@ class JobBuilder:
 
 class NoNewOverrideMeta(type):
     def __new__(cls, name, bases, dct):
-        if '__new__' in dct:
+        if "__new__" in dct:
             raise TypeError(f"Overriding __new__ is not allowed in class {name}")
-        if '__init__' in dct:
+        if "__init__" in dct:
             raise TypeError(f"Overriding __init__ is not allowed in class {name}")
         return super().__new__(cls, name, bases, dct)
 
+
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
     @classmethod
-    def set(cls, wait: Union[int, float, timedelta] = None,
-            wait_until: datetime = None,
-            queue: str = None,
-            priority: int = None) -> JobBuilder:
+    def set(
+        cls,
+        wait: Union[int, float, timedelta] = None,
+        wait_until: datetime = None,
+        queue: str = None,
+        priority: int = None,
+    ) -> JobBuilder:
         """Configure job options before enqueueing.
 
         Args:
@@ -104,13 +108,13 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
         """
         options = {}
         if wait is not None:
-            options['wait'] = wait
+            options["wait"] = wait
         if wait_until is not None:
-            options['wait_until'] = wait_until
+            options["wait_until"] = wait_until
         if queue is not None:
-            options['queue'] = queue
+            options["queue"] = queue
         if priority is not None:
-            options['priority'] = priority
+            options["priority"] = priority
         return JobBuilder(cls, **options)
 
 
@@ -143,7 +147,9 @@ class ThreadedRunner:
             except (queue.ShutDown, KeyboardInterrupt):
                 break
             except Exception as e:
-                logger.error(f"Unexpected exception in ThreadedRunner: {e}", exc_info=True)
+                logger.error(
+                    f"Unexpected exception in ThreadedRunner: {e}", exc_info=True
+                )
             finally:
                 self.cleanup()
 
@@ -152,7 +158,7 @@ class ThreadedRunner:
     def cleanup(self):
         """Cleanup after job execution"""
         try:
-            if self.execution and hasattr(self.execution, 'cleanup'):
+            if self.execution and hasattr(self.execution, "cleanup"):
                 self.execution.cleanup()
         except Exception as e:
             logger.error(f"Error in cleanup: {e}", exc_info=True)
@@ -198,11 +204,11 @@ def _quebec_start(
         self.spawn_all()
     else:
         for component in spawn:
-            if component == 'worker':
+            if component == "worker":
                 self.spawn_job_claim_poller()
-            elif component == 'dispatcher':
+            elif component == "dispatcher":
                 self.spawn_dispatcher()
-            elif component == 'scheduler':
+            elif component == "scheduler":
                 self.spawn_scheduler()
             else:
                 raise ValueError(f"Unknown component: {component}")
@@ -226,15 +232,15 @@ def _quebec_start(
     # Start worker threads as daemon so program can exit after start()
     worker_threads = []
     for i in range(threads):
-        t = threading.Thread(target=run_worker, name=f'quebec-worker-{i}', daemon=True)
+        t = threading.Thread(target=run_worker, name=f"quebec-worker-{i}", daemon=True)
         t.start()
         worker_threads.append(t)
 
     # Store state by instance id
     _quebec_state[id(self)] = {
-        'shutdown_event': shutdown_event,
-        'job_queue': job_queue,
-        'worker_threads': worker_threads,
+        "shutdown_event": shutdown_event,
+        "job_queue": job_queue,
+        "worker_threads": worker_threads,
     }
 
     return self  # Enable chaining: qc.start().wait()
@@ -255,14 +261,14 @@ def _quebec_wait(self):
         raise RuntimeError("Quebec not started. Call start() first.")
 
     try:
-        while not state['shutdown_event'].is_set():
+        while not state["shutdown_event"].is_set():
             time.sleep(0.5)
     except KeyboardInterrupt:
-        logger.debug('KeyboardInterrupt, shutting down...')
+        logger.debug("KeyboardInterrupt, shutting down...")
         self.graceful_shutdown()
     finally:
         # Wait for worker threads to finish
-        for t in state['worker_threads']:
+        for t in state["worker_threads"]:
             t.join(timeout=5.0)
         _quebec_state.pop(id(self), None)
 

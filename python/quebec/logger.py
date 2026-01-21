@@ -3,8 +3,13 @@ import contextvars
 from datetime import datetime, timezone
 from typing import Optional
 
-job_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("job_id", default=None)
-queue_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("queue", default=None)
+job_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "job_id", default=None
+)
+queue_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "queue", default=None
+)
+
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -20,14 +25,14 @@ class ContextFilter(logging.Filter):
 class QuebecFormatter(logging.Formatter):
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
-        return dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     def format(self, record: logging.LogRecord) -> str:
         record.asctime = self.formatTime(record)
         record.message = record.getMessage()
-        jid = getattr(record, 'job_id', None)
-        queue = getattr(record, 'queue', None)
-        if jid not in (None, '', '-'):
+        jid = getattr(record, "job_id", None)
+        queue = getattr(record, "queue", None)
+        if jid not in (None, "", "-"):
             ctx = f' {{queue="{queue}" jid="{jid}" tid="{record.thread}"}}:'
         else:
             ctx = ""
@@ -77,9 +82,8 @@ class TracingConsoleRenderer:
         import os
         import sys
 
-        self._use_colors = (
-            os.environ.get("QUEBEC_COLOR") == "always"
-            or (os.environ.get("QUEBEC_COLOR") != "never" and colors and sys.stdout.isatty())
+        self._use_colors = os.environ.get("QUEBEC_COLOR") == "always" or (
+            os.environ.get("QUEBEC_COLOR") != "never" and colors and sys.stdout.isatty()
         )
         self._styles = self._load_styles() if self._use_colors else None
 
@@ -91,6 +95,7 @@ class TracingConsoleRenderer:
         """
         try:
             import structlog
+
             cr = structlog.dev.ConsoleRenderer(colors=True)
             return {
                 "reset": cr._styles.reset,
@@ -102,6 +107,7 @@ class TracingConsoleRenderer:
             global _styles_warning_shown
             if not _styles_warning_shown:
                 import sys
+
                 print(
                     f"quebec: failed to load structlog color styles ({e}), falling back to plain output",
                     file=sys.stderr,
@@ -140,7 +146,7 @@ class TracingConsoleRenderer:
         for k, v in event_dict.items():
             if isinstance(v, str):
                 # Escape internal quotes and wrap in quotes if contains whitespace/quotes
-                escaped = v.replace('\\', '\\\\').replace('"', '\\"')
+                escaped = v.replace("\\", "\\\\").replace('"', '\\"')
                 parts.append(f'{k}="{escaped}"')
             else:
                 parts.append(f"{k}={v}")
@@ -164,6 +170,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
         log.info("job started", queue="default")
     """
     import os
+
     if format is None:
         format = os.environ.get("QUEBEC_LOG_FORMAT", "console")
     try:
@@ -185,7 +192,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
     if format == "json":
         processors = shared_processors + [
             structlog.processors.TimeStamper(fmt="iso"),
-            structlog.processors.JSONRenderer()
+            structlog.processors.JSONRenderer(),
         ]
     elif format == "logfmt":
         # Use ts=/message= to match Rust tracing-logfmt output
@@ -195,7 +202,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
             structlog.processors.LogfmtRenderer(
                 key_order=["ts", "level", "message"],
                 sort_keys=True,
-            )
+            ),
         ]
     else:  # console
         processors = shared_processors + [
