@@ -401,7 +401,7 @@ impl PyQuebec {
         Ok(())
     }
 
-    fn feed_jobs_to_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
+    fn bind_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone_ref(py);
         let queue1 = queue.clone_ref(py);
@@ -529,7 +529,7 @@ impl PyQuebec {
         })
     }
 
-    fn create_table(&self) -> PyResult<bool> {
+    fn create_tables(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await;
 

@@ -192,7 +192,7 @@ def _quebec_start(
         qc.wait()  # Block until shutdown
     """
     if create_tables:
-        self.create_table()
+        self.create_tables()
 
     self.setup_signal_handler()
 
@@ -223,7 +223,7 @@ def _quebec_start(
         shutdown_event.set()
 
     if threads > 0:
-        self.feed_jobs_to_queue(job_queue)
+        self.bind_queue(job_queue)
 
     def run_worker():
         runner = ThreadedRunner(job_queue, shutdown_event)
