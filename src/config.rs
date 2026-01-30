@@ -2,6 +2,7 @@ use anyhow::Result;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// Worker configuration
 /// Compatible with Solid Queue's worker config
@@ -271,7 +272,10 @@ impl QueueConfig {
     /// 3. ./config/queue.yml (Solid Queue compatible)
     pub fn find(env: Option<&str>) -> Result<Self> {
         let path = Self::find_config_file()?;
-        Self::load(path.to_str().unwrap(), env)
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Config path is not valid UTF-8: {}", path.display()))?;
+        Self::load(path_str, env)
     }
 
     /// Load configuration from file
@@ -361,21 +365,26 @@ impl QueueConfig {
     fn expand_env_vars(content: &str) -> String {
         use tracing::debug;
 
-        let mut result = content.to_string();
+        static ENV_VAR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+                .expect("env var regex is a valid constant pattern")
+        });
 
-        // Match ${VAR} or $VAR
-        let re = regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
-            .unwrap();
+        let mut result = content.to_string();
 
         debug!("expand_env_vars: checking content for env vars");
 
-        for cap in re.captures_iter(content) {
-            let var_name = cap.get(1).or_else(|| cap.get(2)).unwrap().as_str();
+        for cap in ENV_VAR_RE.captures_iter(content) {
+            let Some(var_name) = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str()) else {
+                continue;
+            };
             debug!("Found env var reference: {}", var_name);
 
             match std::env::var(var_name) {
                 Ok(value) => {
-                    let pattern = cap.get(0).unwrap().as_str();
+                    let Some(pattern) = cap.get(0).map(|m| m.as_str()) else {
+                        continue;
+                    };
                     debug!("Replacing {} with {}", pattern, value);
                     result = result.replace(pattern, &value);
                 }

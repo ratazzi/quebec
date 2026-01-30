@@ -1318,7 +1318,7 @@ impl Worker {
             .unwrap_or(false);
 
             let runnable = Runnable {
-                class_name: class_name.to_string().clone(),
+                class_name: class_name.to_string(),
                 handler: klass,
                 queue_as: queue_name,
                 priority: 0,

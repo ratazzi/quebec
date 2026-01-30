@@ -465,17 +465,10 @@ impl AppContext {
 
     // New method that returns Result type, allowing callers to handle errors
     pub async fn get_db_result(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
-        // For SQLite database, always return shared connection (SQLite can't handle multiple write connections)
-        if self.dsn.scheme().contains("sqlite") {
-            if let Some(db) = &self.db {
-                return Ok(db.clone());
-            }
-        }
-
-        // For PostgreSQL, use shared connection pool instead of creating new connections each time
-        // This fixes the 6+ second connection delays we were seeing
+        // Prefer shared connection pool when available (SQLite needs a shared connection).
+        // For PostgreSQL, this also avoids creating new connections each time.
         if let Some(db) = &self.db {
-            return Ok(db.clone());
+            return Ok(Arc::clone(db));
         }
 
         // Fallback: create new connection if no shared connection available
