@@ -10,6 +10,7 @@ use pyo3::types::{PyDict, PyTuple, PyType};
 use sea_orm::*;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -17,6 +18,41 @@ use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use url::Url;
+
+/// Extract a value from kwargs, falling back to an environment variable, then to a default.
+/// Priority: kwargs > env var > default
+fn extract_kwarg_or_env<T>(
+    kwargs: Option<&Bound<'_, PyDict>>,
+    key: &str,
+    env_key: &str,
+    default: T,
+) -> T
+where
+    T: for<'py> FromPyObject<'py> + FromStr,
+{
+    // 1. Try kwargs — warn on type mismatch when key is present
+    if let Some(py_val) = kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
+        match py_val.extract::<T>() {
+            Ok(val) => return val,
+            Err(_) => warn!(
+                "Config '{}': type mismatch, falling back to env/default",
+                key
+            ),
+        }
+    }
+    // 2. Try environment variable — warn on parse failure when var is set
+    if let Ok(raw) = std::env::var(env_key) {
+        match raw.parse::<T>() {
+            Ok(parsed) => return parsed,
+            Err(_) => warn!(
+                "Env '{}': failed to parse '{}', falling back to default",
+                env_key, raw
+            ),
+        }
+    }
+    // 3. Default
+    default
+}
 
 use crate::control_plane::ControlPlaneExt;
 
@@ -126,14 +162,55 @@ impl PyQuebec {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
         })?;
         let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
-        let min_conns = if url.contains("sqlite") { 1 } else { 20 };
-        let max_conns = if url.contains("sqlite") { 1 } else { 300 };
+        let is_sqlite = url.contains("sqlite");
+        let min_conns: u32 = extract_kwarg_or_env(
+            kwargs,
+            "db_min_connections",
+            "QUEBEC_DB_MIN_CONNECTIONS",
+            if is_sqlite { 1 } else { 20 },
+        );
+        let max_conns: u32 = extract_kwarg_or_env(
+            kwargs,
+            "db_max_connections",
+            "QUEBEC_DB_MAX_CONNECTIONS",
+            if is_sqlite { 1 } else { 300 },
+        );
+        let acquire_timeout: u64 =
+            extract_kwarg_or_env(kwargs, "db_acquire_timeout", "QUEBEC_DB_ACQUIRE_TIMEOUT", 5);
+        let connect_timeout: u64 =
+            extract_kwarg_or_env(kwargs, "db_connect_timeout", "QUEBEC_DB_CONNECT_TIMEOUT", 3);
+        let idle_timeout: u64 =
+            extract_kwarg_or_env(kwargs, "db_idle_timeout", "QUEBEC_DB_IDLE_TIMEOUT", 600);
+        let max_lifetime: u64 =
+            extract_kwarg_or_env(kwargs, "db_max_lifetime", "QUEBEC_DB_MAX_LIFETIME", 1800);
+        if is_sqlite && (min_conns > 1 || max_conns > 1) {
+            warn!(
+                "SQLite with min_connections={} max_connections={}: \
+                 multiple connections may cause 'database is locked' errors",
+                min_conns, max_conns
+            );
+        }
+        let max_conns = if max_conns == 0 {
+            warn!("db_max_connections is 0, setting to 1");
+            1
+        } else {
+            max_conns
+        };
+        let min_conns = if min_conns > max_conns {
+            warn!(
+                "db_min_connections ({}) > db_max_connections ({}), clamping to max",
+                min_conns, max_conns
+            );
+            max_conns
+        } else {
+            min_conns
+        };
         opt.min_connections(min_conns)
             .max_connections(max_conns)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(3))
-            .idle_timeout(Duration::from_secs(600))
-            .max_lifetime(Duration::from_secs(1800))
+            .acquire_timeout(Duration::from_secs(acquire_timeout))
+            .connect_timeout(Duration::from_secs(connect_timeout))
+            .idle_timeout(Duration::from_secs(idle_timeout))
+            .max_lifetime(Duration::from_secs(max_lifetime))
             .sqlx_logging(true)
             .sqlx_logging_level(tracing::log::LevelFilter::Trace);
 

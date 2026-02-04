@@ -283,6 +283,24 @@ pub struct AppContext {
     pub idle_notify: Arc<RwLock<Option<Arc<Notify>>>>,
 }
 
+/// Parse env var string as bool: true/1/yes → true, false/0/no → false
+fn parse_bool_env(s: &str) -> Option<bool> {
+    match s.to_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse env var string as Duration (supports f64 for sub-second precision)
+fn parse_duration_f64_env(s: &str) -> Option<Duration> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .and_then(|f| Duration::try_from_secs_f64(f).ok())
+        .or_else(|| s.parse::<u64>().ok().map(Duration::from_secs))
+}
+
 impl AppContext {
     pub fn new(
         dsn: Url,
@@ -325,45 +343,87 @@ impl AppContext {
         if let Some(options) = options {
             Python::with_gil(|py| {
                 // Helper closures that warn on type mismatch
+                // Priority: kwargs > env var (QUEBEC_<KEY_UPPER>) > default (None)
+                let env_var = |key: &str| -> Option<String> {
+                    std::env::var(format!("QUEBEC_{}", key.to_uppercase())).ok()
+                };
                 let get_bool = |key: &str| -> Option<bool> {
-                    options.get(key).and_then(|v| {
-                        v.extract(py)
-                            .map_err(|_| {
+                    options
+                        .get(key)
+                        .and_then(|v| {
+                            v.extract(py)
+                                .map_err(|_| {
+                                    warn!(
+                                        "Config '{}': expected bool, got {:?}",
+                                        key,
+                                        v.bind(py).get_type()
+                                    );
+                                })
+                                .ok()
+                        })
+                        .or_else(|| {
+                            let s = env_var(key)?;
+                            parse_bool_env(&s).or_else(|| {
                                 warn!(
-                                    "Config '{}': expected bool, got {:?}",
-                                    key,
-                                    v.bind(py).get_type()
+                                    "Env 'QUEBEC_{}': expected bool (true/1/yes or false/0/no), got '{}'",
+                                    key.to_uppercase(), s
                                 );
+                                None
                             })
-                            .ok()
-                    })
+                        })
                 };
                 let get_u64 = |key: &str| -> Option<u64> {
-                    options.get(key).and_then(|v| {
-                        v.extract(py)
-                            .map_err(|_| {
+                    options
+                        .get(key)
+                        .and_then(|v| {
+                            v.extract(py)
+                                .map_err(|_| {
+                                    warn!(
+                                        "Config '{}': expected u64, got {:?}",
+                                        key,
+                                        v.bind(py).get_type()
+                                    );
+                                })
+                                .ok()
+                        })
+                        .or_else(|| {
+                            let s = env_var(key)?;
+                            s.parse().ok().or_else(|| {
                                 warn!(
-                                    "Config '{}': expected u64, got {:?}",
-                                    key,
-                                    v.bind(py).get_type()
+                                    "Env 'QUEBEC_{}': failed to parse '{}' as u64",
+                                    key.to_uppercase(),
+                                    s
                                 );
+                                None
                             })
-                            .ok()
-                    })
+                        })
                 };
                 let get_duration = |key: &str| -> Option<Duration> {
-                    options.get(key).and_then(|v| {
-                        v.extract::<Duration>(py)
-                            .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
-                            .map_err(|_| {
+                    options
+                        .get(key)
+                        .and_then(|v| {
+                            v.extract::<Duration>(py)
+                                .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
+                                .map_err(|_| {
+                                    warn!(
+                                        "Config '{}': expected Duration or u64, got {:?}",
+                                        key,
+                                        v.bind(py).get_type()
+                                    );
+                                })
+                                .ok()
+                        })
+                        .or_else(|| {
+                            let s = env_var(key)?;
+                            parse_duration_f64_env(&s).or_else(|| {
                                 warn!(
-                                    "Config '{}': expected Duration or u64, got {:?}",
-                                    key,
-                                    v.bind(py).get_type()
+                                    "Env 'QUEBEC_{}': failed to parse '{}' as duration",
+                                    key.to_uppercase(),
+                                    s
                                 );
+                                None
                             })
-                            .ok()
-                    })
+                        })
                 };
 
                 if let Some(v) = get_bool("use_skip_locked") {
@@ -432,6 +492,14 @@ impl AppContext {
                             val.bind(py).get_type()
                         ),
                     }
+                } else if let Some(s) = env_var("worker_polling_interval") {
+                    match parse_duration_f64_env(&s) {
+                        Some(v) => ctx.worker_polling_interval = v,
+                        None => warn!(
+                            "Env 'QUEBEC_WORKER_POLLING_INTERVAL': failed to parse '{}' as duration",
+                            s
+                        ),
+                    }
                 }
                 if let Some(v) = get_u64("worker_threads") {
                     ctx.worker_threads = v;
@@ -448,6 +516,9 @@ impl AppContext {
                             val.bind(py).get_type()
                         ),
                     }
+                } else if let Some(prefix) = env_var("table_name_prefix").filter(|s| !s.is_empty())
+                {
+                    ctx.table_config = TableConfig::with_prefix(&prefix);
                 }
             });
         }
