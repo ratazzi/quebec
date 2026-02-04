@@ -27,7 +27,7 @@ authors = [{name = "ratazzi", email = "ratazzi.potts@gmail.com"}]
 keywords = ["solid_queue", "postgresql", "mysql", "sqlite", "queue"]
 
 [project.urls]
-Documentation = "https://github.com/ratazzi/quebec/REDME.md"
+Documentation = "https://github.com/ratazzi/quebec/README.md"
 Homepage = "https://github.com/ratazzi/quebec"
 Repository = "https://github.com/ratazzi/quebec"
 
@@ -41,6 +41,7 @@ build-backend = "maturin"
 
 [tool.maturin]
 python-source = "python"
+exclude = [".github/**"]
 
 [dependency-groups]
 dev = [
