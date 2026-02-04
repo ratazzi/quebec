@@ -167,7 +167,7 @@ impl PyQuebec {
             kwargs,
             "db_min_connections",
             "QUEBEC_DB_MIN_CONNECTIONS",
-            if is_sqlite { 1 } else { 20 },
+            if is_sqlite { 1 } else { 0 },
         );
         let max_conns: u32 = extract_kwarg_or_env(
             kwargs,
@@ -218,13 +218,18 @@ impl PyQuebec {
         // This connection will be wrapped in Arc and used when needed
         // For high concurrency operations, new connections will be obtained through get_connection method
         let db = rt.block_on(async {
-            // Try to connect with retries instead of panicking on failure
+            // Probe with a single connection first to surface real errors
+            // (pool timeout errors hide the actual cause)
+            let mut probe_opt = opt.clone();
+            probe_opt.min_connections(0).max_connections(1);
+
             let mut retry_count = 0;
             const MAX_RETRIES: usize = 3;
 
             loop {
-                match Database::connect(opt.clone()).await {
-                    Ok(db) => return db,
+                // Phase 1: probe connectivity with a single connection
+                let probe = match Database::connect(probe_opt.clone()).await {
+                    Ok(db) => db,
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= MAX_RETRIES {
@@ -235,8 +240,50 @@ impl PyQuebec {
                             panic!("Database connection failed: {}", e);
                         }
                         warn!(
-                            "Database connection attempt {} failed, retrying: {}",
-                            retry_count, e
+                            "Database connection attempt {}/{} failed: {}",
+                            retry_count, MAX_RETRIES, e
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            1000 * retry_count as u64,
+                        ))
+                        .await;
+                        continue;
+                    }
+                };
+
+                // Phase 2: verify the connection actually works (ping)
+                if let Err(e) = probe.ping().await {
+                    retry_count += 1;
+                    drop(probe);
+                    if retry_count >= MAX_RETRIES {
+                        error!("Database ping failed after {} retries: {}", MAX_RETRIES, e);
+                        panic!("Database connection failed: {}", e);
+                    }
+                    warn!(
+                        "Database ping attempt {}/{} failed: {}",
+                        retry_count, MAX_RETRIES, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 * retry_count as u64))
+                        .await;
+                    continue;
+                }
+                drop(probe);
+
+                // Phase 3: create the actual connection pool
+                match Database::connect(opt.clone()).await {
+                    Ok(db) => return db,
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count >= MAX_RETRIES {
+                            error!(
+                                "Failed to create connection pool after {} retries: {}",
+                                MAX_RETRIES, e
+                            );
+                            panic!("Database connection failed: {}", e);
+                        }
+                        warn!(
+                            "Connection pool creation attempt {}/{} failed: {}",
+                            retry_count, MAX_RETRIES, e
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(
                             1000 * retry_count as u64,
