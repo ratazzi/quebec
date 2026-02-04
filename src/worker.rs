@@ -726,7 +726,6 @@ impl Execution {
             jid = jid,
             tid = self.tid.clone()
         );
-        // let result = self.runnable.invoke(&mut job).instrument(span.clone()).await;
         let result = async {
             let invoke_result = self.runnable.invoke(&mut job);
             // Move retry information from runnable to execution
@@ -816,7 +815,6 @@ impl Execution {
             };
             self.metric = Some(metric);
         }
-        // .instrument(tracing::info_span!("runner", jid = job_id, tid = self.tid.clone()))
         .await;
 
         let db = self.ctx.get_db().await;
@@ -1181,7 +1179,6 @@ impl Execution {
                     )))
                 });
 
-            // debug!("scheduled: {:?}", job);
             if job.is_err() {
                 error!("Job failed to schedule: {:?}", job.err());
             }
@@ -1434,7 +1431,6 @@ impl Worker {
         Ok(job)
     }
 
-    // #[tracing::instrument]
     pub async fn claim_jobs(
         &self,
         batch_size: u64,
@@ -2120,7 +2116,6 @@ impl Worker {
                     self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "IDLE").await;
                 }
                 _ = polling_interval.tick() => {
-                    // debug!("⏰ POLLING triggered - regular interval check");
                     // Regular polling at configured interval (backup for reliability) - get fresh connection
                     self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "POLLING").await;
                 }
@@ -2152,7 +2147,6 @@ impl Worker {
             Err(_) => return,
         };
         if claimed.is_empty() {
-            // debug!("[{}] no jobs available", source);
             return;
         }
 

@@ -46,10 +46,6 @@ impl Dispatcher {
                     self.on_stop(&stop_db, &process).await?;
                     return Ok(());
                 }
-                // _ = tokio::signal::ctrl_c() => {
-                //   info!("ctrl-c received");
-                //   return Ok(());
-                // }
                 _ = polling_interval.tick() => {
                     let polling_db = self.ctx.get_db().await;
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure

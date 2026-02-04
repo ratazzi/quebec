@@ -36,8 +36,6 @@ use worker::{Execution, Runnable};
 
 use pyo3::prelude::*;
 
-// pyo3::create_exception!(quebec, CustomError, PyException);
-
 // Initialize process title system early based on platform
 #[cfg(target_os = "macos")]
 fn init_proctitle() {
@@ -139,9 +137,6 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize logging with format support (console/json/logfmt)
     init_logging();
 
-    // debug!("duration: {:?}", parse_duration("1s"));
-    // debug!("-------------- is_running_in_pyo3: {:?}", is_running_in_pyo3());
-
     m.add_class::<PyQuebec>()?;
     m.add_class::<ActiveJob>()?;
     m.add_class::<ConcurrencyStrategy>()?;
@@ -162,8 +157,6 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Add version information
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
-
-    // Configuration functions
 
     Ok(())
 }

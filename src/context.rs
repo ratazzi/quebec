@@ -175,7 +175,6 @@ impl RescueStrategy {
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct RetryStrategy {
-    // pub wait: i64,
     pub wait: Duration,
     pub attempts: i64,
     pub exceptions: Py<PyAny>,

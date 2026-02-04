@@ -6,7 +6,6 @@ use pyo3::prelude::*;
 use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
-// use pyo3_asyncio::tokio::future_into_py;
 use sea_orm::*;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -135,7 +134,6 @@ pub struct PyQuebec {
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
-// static LIST_CELL: GILOnceCell<Py<PyQuebec>> = GILOnceCell::new();
 static INSTANCE_MAP: GILOnceCell<RwLock<HashMap<String, Py<PyQuebec>>>> = GILOnceCell::new();
 
 #[pymethods]
@@ -455,20 +453,6 @@ impl PyQuebec {
         })
     }
 
-    // #[staticmethod]
-    // fn get_instance(py: Python<'_>) -> &pyo3::Bound<'_, PyQuebec> {
-    //     LIST_CELL
-    //         .get_or_init(py, || {
-    //             PyQuebec::new("postgres://ratazzi:@localhost:5432/helvetica_test".to_string())
-    //                 .to_object(py)
-    //                 .into_bound(py)
-    //                 .unbind()
-    //                 .extract(py)
-    //                 .unwrap()
-    //         })
-    //         .bind(py)
-    // }
-
     #[staticmethod]
     fn get_instance(py: Python<'_>, url: String) -> PyResult<Py<PyQuebec>> {
         let instance_map = INSTANCE_MAP.get_or_init(py, || RwLock::new(HashMap::new()));
@@ -601,19 +585,6 @@ impl PyQuebec {
 
         Ok(())
     }
-
-    // fn post_job(&self, job: Py<PyAny>) -> PyResult<()> {
-    //     let job = job.extract::<Job>().unwrap();
-    //     let dispatcher = self.dispatcher.clone();
-    //     let handle = self.rt.spawn(async move {
-    //         let _ = dispatcher.post_job(job).await;
-    //     });
-    //
-    //     self.handles.lock()
-    //         .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire lock for handles"))?
-    //         .push(handle);
-    //     Ok(())
-    // }
 
     fn spawn_job_claim_poller(&self) -> PyResult<()> {
         let worker = self.worker.clone();
@@ -939,16 +910,10 @@ impl PyQuebec {
             ));
         }
 
-        // let _ = job_class.setattr(py, pyo3::intern!(py, "quebec"), self.clone());
-
         let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
         let _ = self.worker.register_job_class(py, job_class);
         Ok(dup)
-    }
-
-    fn print_classes(&self) {
-        // debug!("runnables: {:?}", self.worker.runnables);
     }
 
     fn setup_signal_handler(&self, py: Python) -> PyResult<Py<PyAny>> {
@@ -1303,13 +1268,6 @@ impl PyQuebec {
     }
 }
 
-// impl PyQuebec {
-//     // This method is private and won't be exposed to Python
-//     fn internal_method(&self) {
-//         println!("This is an internal method");
-//     }
-// }
-
 #[pyclass(name = "ActiveJob", subclass)]
 #[derive(Debug, Clone)]
 pub struct ActiveJob {
@@ -1328,36 +1286,10 @@ pub struct ActiveJob {
     pub concurrency_on_conflict: crate::context::ConcurrencyConflict,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
-    // pub rescue_strategies: Vec<RescueStrategy>,
 }
 
 #[pymethods]
 impl ActiveJob {
-    // #[new]
-    // pub fn new(
-    //     queue_name: String, class_name: String, arguments: String, priority: i32,
-    //     active_job_id: String, scheduled_at: chrono::NaiveDateTime, id: Option<i64>,
-    //     concurrency_key: Option<String>,
-    // ) -> Self {
-    //     let logger = ActiveLogger::new();
-    //     Self {
-    //         logger,
-    //         queue_name,
-    //         class_name,
-    //         arguments,
-    //         priority,
-    //         active_job_id,
-    //         scheduled_at,
-    //         id,
-    //         finished_at: None,
-    //         concurrency_key: concurrency_key,
-    //         created_at: None,
-    //         updated_at: None,
-    //     }
-    // }
-
-    // #[classattr]
-    // rescue_strategies: Vec<RescueStrategy> = vec![];
     #[classattr]
     fn rescue_strategies() -> Vec<RescueStrategy> {
         vec![]
@@ -1382,7 +1314,6 @@ impl ActiveJob {
             concurrency_on_conflict: crate::context::ConcurrencyConflict::default(),
             created_at: None,
             updated_at: None,
-            // rescue_strategies: vec![],
         }
     }
 
@@ -1466,11 +1397,6 @@ impl ActiveJob {
         self.updated_at
     }
 
-    // #[getter]
-    // pub fn get_rescue_strategies(&self) -> Vec<RescueStrategy> {
-    //     self.rescue_strategies.clone()
-    // }
-
     #[classmethod]
     pub fn register_rescue_strategy(
         cls: &Bound<'_, PyType>,
@@ -1481,8 +1407,6 @@ impl ActiveJob {
         let rescue_strategies = cls.getattr("rescue_strategies")?;
         rescue_strategies.call_method1("append", (strategy.clone(),))?;
         Ok(())
-        // debug!("register_rescue_strategy: {:?}", rescue_strategies);
-        // debug!("register_rescue_strategy: {:?}", strategy);
     }
 
     pub fn __repr__(&self) -> PyResult<String> {
@@ -1507,11 +1431,6 @@ impl ActiveJob {
     fn after_perform(&self) {
         debug!("after_perform");
     }
-
-    // #[pyo3(signature = (*args, **kwargs))]
-    // fn perform(&self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyDict>>) {
-    //     debug!("perform");
-    // }
 
     #[getter]
     fn get_logger(&self) -> PyResult<ActiveLogger> {
@@ -1539,17 +1458,6 @@ impl ActiveJob {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-        // debug!("------------ {:?}", quebec);
         quebec.perform_later(py, cls, args, kwargs)
     }
-
-    // #[classmethod]
-    // #[pyo3(signature = (*args))]
-    // fn rescue_from(cls: &PyType, py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Py<PyAny>> {
-    //     debug!("----------------------- rescue_from: {:?}", args);
-    //     // get last item
-    //     let last = args.get_item(args.len() - 1);
-    //     debug!("----------------------- last: {:?}", last);
-    //     Ok(last?.unbind())
-    // }
 }
