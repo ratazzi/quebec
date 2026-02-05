@@ -949,9 +949,35 @@ impl PyQuebec {
     }
 
     fn spawn_all(&mut self) -> PyResult<()> {
-        // Call start handlers before spawning components
+        // Call start handlers first (they may create tables or do migrations)
         if let Err(e) = self.invoke_start_handlers() {
             error!("Error calling start handlers: {:?}", e);
+        }
+
+        // Check if database tables exist after start handlers have run
+        let ctx = self.ctx.clone();
+        let check_result = self.rt.block_on(async {
+            let db = ctx.get_db().await;
+            crate::schema_builder::check_tables_exist(db.as_ref(), &ctx.table_config).await
+        });
+
+        match check_result {
+            Ok(true) => {}
+            Ok(false) => {
+                error!(
+                    "Database tables not found! Run create_tables() or set create_tables=True before starting."
+                );
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Database tables not found. Run create_tables() or set create_tables=True before starting.",
+                ));
+            }
+            Err(e) => {
+                error!("Database error while checking tables: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Database error: {}",
+                    e
+                )));
+            }
         }
 
         // Spawn all components

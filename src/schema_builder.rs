@@ -538,3 +538,35 @@ where
     create_indexes(db, table_config).await?;
     Ok(())
 }
+
+/// Check if the required tables exist by probing the jobs table.
+/// Returns Ok(true) if tables exist, Ok(false) if table doesn't exist,
+/// or Err for other database errors (connection, auth, etc.).
+pub async fn check_tables_exist<C>(db: &C, table_config: &TableConfig) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let sql = format!("SELECT 1 FROM {} LIMIT 1", table_config.jobs);
+    match db
+        .execute(Statement::from_string(db.get_database_backend(), sql))
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            let err_str = e.to_string().to_lowercase();
+            // Check for table/relation not found errors across different databases
+            // Each pattern is specific to avoid false positives (e.g., "database does not exist")
+            if err_str.contains("no such table")  // SQLite: "no such table: xxx"
+                || (err_str.contains("relation") && err_str.contains("does not exist"))  // PostgreSQL: "relation \"xxx\" does not exist"
+                || (err_str.contains("table") && err_str.contains("doesn't exist"))  // MySQL: "Table 'xxx' doesn't exist"
+                || (err_str.contains("table") && err_str.contains("not found"))
+            // Generic fallback
+            {
+                Ok(false)
+            } else {
+                // Connection, auth, or other errors should propagate
+                Err(e)
+            }
+        }
+    }
+}
