@@ -509,6 +509,7 @@ impl AppContext {
             });
         }
 
+        crate::set_silence_polling(ctx.silence_polling);
         ctx
     }
 
@@ -518,7 +519,9 @@ impl AppContext {
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
-        Self::new_inner(dsn, db, connect_options)
+        let ctx = Self::new_inner(dsn, db, connect_options);
+        crate::set_silence_polling(ctx.silence_polling);
+        ctx
     }
 
     fn new_inner(

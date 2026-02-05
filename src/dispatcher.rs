@@ -207,7 +207,7 @@ impl Dispatcher {
                           Ok(notified_queues)
                         })
                     })
-                    .instrument(tracing::info_span!("dispatcher",))
+                    .instrument(tracing::info_span!("polling", component = "dispatcher"))
                     .await;
 
                     // Send NOTIFY for each unique queue after transaction commits

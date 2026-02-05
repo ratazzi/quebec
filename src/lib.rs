@@ -72,6 +72,41 @@ fn init_proctitle() {
     // No initialization needed for other platforms
 }
 
+/// Global flag for `silence_polling` — checked by [`SilencePollingFilter`].
+/// Defaults to `true`; [`AppContext`] syncs it on init.
+static SILENCE_POLLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Update the global silence_polling flag (called from AppContext init).
+pub fn set_silence_polling(enabled: bool) {
+    SILENCE_POLLING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Filter that suppresses sqlx/sea_orm query logging inside "polling" spans.
+/// Similar to Solid Queue's `silence_polling` option.
+struct SilencePollingFilter;
+
+impl<S> tracing_subscriber::layer::Filter<S> for SilencePollingFilter
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn enabled(
+        &self,
+        meta: &tracing::Metadata<'_>,
+        cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        if !SILENCE_POLLING.load(std::sync::atomic::Ordering::Relaxed) {
+            return true;
+        }
+        if !meta.target().starts_with("sqlx") && !meta.target().starts_with("sea_orm") {
+            return true;
+        }
+        let Some(current) = cx.lookup_current() else {
+            return true;
+        };
+        !current.scope().any(|span| span.name() == "polling")
+    }
+}
+
 /// Initialize logging with format support via QUEBEC_LOG_FORMAT environment variable.
 ///
 /// Supported formats:
@@ -95,32 +130,35 @@ fn init_logging() {
 
     let result = match format.as_str() {
         "json" => {
-            // Disable colored crate output for machine-readable format
             colored::control::set_override(false);
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .json()
-                .flatten_event(true)
-                .with_current_span(false)
-                .with_line_number(true)
-                .finish();
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .flatten_event(true)
+                        .with_current_span(false)
+                        .with_line_number(true)
+                        .with_filter(SilencePollingFilter),
+                )
+                .with(env_filter);
             tracing::subscriber::set_global_default(subscriber)
         }
         "logfmt" => {
-            // Disable colored crate output - tracing-logfmt escapes ANSI codes
             colored::control::set_override(false);
             let subscriber = tracing_subscriber::registry()
-                .with(env_filter)
-                .with(tracing_logfmt::layer());
+                .with(tracing_logfmt::layer().with_filter(SilencePollingFilter))
+                .with(env_filter);
             tracing::subscriber::set_global_default(subscriber)
         }
         _ => {
-            // console (default)
-            let subscriber = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_line_number(true)
-                .with_ansi(use_ansi)
-                .finish();
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_line_number(true)
+                        .with_ansi(use_ansi)
+                        .with_filter(SilencePollingFilter),
+                )
+                .with(env_filter);
             tracing::subscriber::set_global_default(subscriber)
         }
     };
