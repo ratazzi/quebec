@@ -156,7 +156,7 @@ pub struct Runnable {
 #[derive(Debug, Clone)]
 pub(crate) struct RetryInfo {
     pub(crate) scheduled_at: chrono::NaiveDateTime,
-    pub(crate) failed_attempts: i32,
+    pub(crate) arguments: String,
 }
 
 impl Runnable {
@@ -297,7 +297,7 @@ impl Runnable {
         py: Python,
         bound: &Bound<PyAny>,
         error: &PyErr,
-        failed_attempts: i32,
+        executions: i32,
     ) -> PyResult<Option<RetryStrategy>> {
         if !bound.hasattr("retry_on")? {
             return Ok(None);
@@ -306,7 +306,7 @@ impl Runnable {
         let retry_strategies = bound.getattr("retry_on")?.extract::<Vec<RetryStrategy>>()?;
 
         for strategy in retry_strategies {
-            if i64::from(failed_attempts) >= strategy.attempts {
+            if i64::from(executions) >= strategy.attempts {
                 continue; // Exceeded maximum retry count
             }
 
@@ -467,7 +467,8 @@ impl Runnable {
         let bound = self.handler.bind(py);
         let instance = bound.call0()?;
         instance.setattr("id", job.id)?;
-        instance.setattr("failed_attempts", job.failed_attempts)?;
+        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        instance.setattr("executions", executions)?;
 
         let func = instance.getattr("perform")?;
         func.call(&args, Some(kwargs.bind(py)))?;
@@ -538,8 +539,14 @@ impl Runnable {
         // Check error handling strategies by priority
 
         // 1. Check if should retry
-        if let Some(retry_strategy) = self.should_retry(py, &bound, error, job.failed_attempts)? {
-            return self.apply_retry_strategy(job, retry_strategy);
+        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        if let Some(retry_strategy) = self.should_retry(py, &bound, error, executions)? {
+            let error_type = error
+                .get_type(py)
+                .qualname()
+                .map(|q| q.to_string())
+                .unwrap_or_else(|_| "Unknown".to_string());
+            return self.apply_retry_strategy(job, retry_strategy, &error_type);
         }
 
         // 2. Check if should discard
@@ -562,19 +569,22 @@ impl Runnable {
         &mut self,
         job: &quebec_jobs::Model,
         strategy: RetryStrategy,
+        error_type: &str,
     ) -> Result<quebec_jobs::Model> {
-        warn!("Job will be retried (attempt #{})", job.failed_attempts + 1);
+        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        warn!("Job will be retried (attempt #{})", executions + 1);
 
         let delay = strategy.wait;
         let scheduled_at = chrono::Utc::now().naive_utc()
             + chrono::Duration::from_std(delay)
                 .map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
-        let failed_attempts = job.failed_attempts + 1;
+        let new_arguments =
+            crate::utils::increment_executions(job.arguments.as_deref(), Some(error_type));
 
         // Set retry information to runnable
         self.retry_info = Some(RetryInfo {
             scheduled_at,
-            failed_attempts,
+            arguments: new_arguments,
         });
 
         Ok(job.clone())
@@ -608,7 +618,15 @@ impl Runnable {
         job: &mut quebec_jobs::Model,
         error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
-        job.failed_attempts += 1;
+        let error_type = error
+            .get_type(py)
+            .qualname()
+            .map(|q| q.to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
+        job.arguments = Some(crate::utils::increment_executions(
+            job.arguments.as_deref(),
+            Some(&error_type),
+        ));
         let error_payload = self.create_error_payload(py, error);
         Err(anyhow::anyhow!(error_payload))
     }
@@ -738,6 +756,9 @@ impl Execution {
         .await;
 
         let failed = result.is_err();
+        // Sync updated arguments (e.g. incremented executions) back to self.job
+        // so after_executed can persist them to the database
+        self.job.arguments = job.arguments.clone();
         let ret = self.after_executed(result).instrument(span).await;
 
         if failed {
@@ -753,16 +774,15 @@ impl Execution {
         table_config: &crate::context::TableConfig,
         job: &quebec_jobs::Model,
         scheduled_at: chrono::NaiveDateTime,
-        failed_attempts: i32,
+        arguments: &str,
     ) -> Result<(), DbErr> {
-        let new_job_id = query_builder::jobs::insert_with_failed_attempts(
+        let new_job_id = query_builder::jobs::insert(
             txn,
             table_config,
             &job.queue_name,
             &job.class_name,
-            job.arguments.as_deref(),
+            Some(arguments),
             job.priority,
-            failed_attempts,
             job.active_job_id.as_deref(),
             Some(scheduled_at),
             job.concurrency_key.as_deref(),
@@ -825,7 +845,7 @@ impl Execution {
         let retry_job_data = self
             .retry_info
             .as_ref()
-            .map(|info| (info.scheduled_at, info.failed_attempts));
+            .map(|info| (info.scheduled_at, info.arguments.clone()));
 
         // Capture concurrency info for semaphore release
         let concurrency_key = job.concurrency_key.clone();
@@ -841,22 +861,18 @@ impl Execution {
             Box::pin(async move {
                 let claimed_id = claimed.id;
 
-                if let Some((scheduled_at, failed_attempts)) = retry_job_data {
-                    Self::schedule_retry_job(
-                        txn,
-                        &table_config,
-                        &job,
-                        scheduled_at,
-                        failed_attempts,
-                    )
-                    .await?;
+                if let Some((scheduled_at, ref arguments)) = retry_job_data {
+                    Self::schedule_retry_job(txn, &table_config, &job, scheduled_at, arguments)
+                        .await?;
                 }
 
                 if failed {
                     error!("Job failed: {:?}", err);
-                    // SolidQueue strategy: pass exception info as arguments to create a new Job
-                    // My strategy: increase failed_attempts field, stop execution if attempts exceed limit
-
+                    // Persist updated arguments (executions/exception_executions counters)
+                    if let Some(ref args) = job.arguments {
+                        query_builder::jobs::update_arguments(txn, &table_config, job_id, args)
+                            .await?;
+                    }
                     // Write to failed_executions table
                     // Note: Like Solid Queue, failed jobs do NOT get finished_at set
                     query_builder::failed_executions::insert(
@@ -1064,17 +1080,6 @@ impl Execution {
     ) -> PyResult<()> {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-        let args: serde_json::Value = serde_json::from_str(
-            job.arguments
-                .as_ref()
-                .ok_or_else(|| {
-                    PyErr::new::<pyo3::exceptions::PyValueError, _>("Job arguments missing")
-                })?
-                .as_str(),
-        )
-        .map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid job arguments: {}", e))
-        })?;
         let e = exc.downcast::<PyException>()?;
         let error_type = e
             .get_type()
@@ -1082,22 +1087,9 @@ impl Execution {
             .map(|q| q.to_string())
             .unwrap_or_else(|_| "Unknown".to_string());
 
-        let params = serde_json::json!({
-            "job_class": job.class_name,
-            "job_id": job.id,
-            "provider_job_id": "",
-            "queue_name": job.queue_name,
-            "priority": job.priority,
-            "arguments": args["arguments"],
-            "executions": job.failed_attempts + 1,
-            "exception_executions": {
-              format!("[{}]", error_type): job.failed_attempts + 1
-            },
-            "locale": "en",
-            "timezone": "UTC",
-            "scheduled_at": scheduled_at,
-            "enqueued_at": scheduled_at,
-        });
+        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        let new_arguments =
+            crate::utils::increment_executions(job.arguments.as_deref(), Some(&error_type));
 
         let jid = job.active_job_id.clone().unwrap_or_default();
         let span = tracing::info_span!(
@@ -1108,10 +1100,10 @@ impl Execution {
         );
         let _enter = span.enter();
 
-        if (job.failed_attempts as i64) >= strategy.attempts {
+        if (executions as i64) >= strategy.attempts {
             error!(
                 "Job `{}' failed after {} attempts",
-                job.class_name, job.failed_attempts
+                job.class_name, executions
             );
             return Ok(());
         }
@@ -1120,7 +1112,7 @@ impl Execution {
             let retry_future = async {
                 warn!(
                     "Attempt {} scheduled due to `{}' on {:?}",
-                    format!("#{}", job.failed_attempts + 1).bright_purple(),
+                    format!("#{}", executions + 1).bright_purple(),
                     error_type,
                     scheduled_at
                 );
@@ -1131,21 +1123,19 @@ impl Execution {
                     let table_config = table_config.clone();
                     let queue_name = job.queue_name.clone();
                     let class_name = job.class_name.clone();
-                    let params_str = params.to_string();
+                    let new_arguments = new_arguments.clone();
                     let priority = job.priority;
-                    let failed_attempts = job.failed_attempts + 1;
                     let active_job_id = job.active_job_id.clone();
                     let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
 
                     Box::pin(async move {
-                        let job_id = query_builder::jobs::insert_with_failed_attempts(
+                        let job_id = query_builder::jobs::insert(
                             txn,
                             &table_config,
                             &queue_name,
                             &class_name,
-                            Some(&params_str),
+                            Some(&new_arguments),
                             priority,
-                            failed_attempts,
                             active_job_id.as_deref(),
                             Some(scheduled_at),
                             Some(&concurrency_key),

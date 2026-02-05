@@ -256,38 +256,6 @@ pub mod jobs {
     where
         C: ConnectionTrait,
     {
-        insert_with_failed_attempts(
-            db,
-            table_config,
-            queue_name,
-            class_name,
-            arguments,
-            priority,
-            0, // default failed_attempts
-            active_job_id,
-            scheduled_at,
-            concurrency_key,
-        )
-        .await
-    }
-
-    /// Insert a new job with specific failed_attempts count (for retry jobs)
-    #[allow(clippy::too_many_arguments)]
-    pub async fn insert_with_failed_attempts<C>(
-        db: &C,
-        table_config: &TableConfig,
-        queue_name: &str,
-        class_name: &str,
-        arguments: Option<&str>,
-        priority: i32,
-        failed_attempts: i32,
-        active_job_id: Option<&str>,
-        scheduled_at: Option<chrono::NaiveDateTime>,
-        concurrency_key: Option<&str>,
-    ) -> Result<i64, DbErr>
-    where
-        C: ConnectionTrait,
-    {
         let table = Alias::new(&table_config.jobs);
         let now = chrono::Utc::now().naive_utc();
 
@@ -298,7 +266,6 @@ pub mod jobs {
                 col("class_name"),
                 col("arguments"),
                 col("priority"),
-                col("failed_attempts"),
                 col("active_job_id"),
                 col("scheduled_at"),
                 col("concurrency_key"),
@@ -310,7 +277,6 @@ pub mod jobs {
                 class_name.into(),
                 arguments.into(),
                 priority.into(),
-                failed_attempts.into(),
                 active_job_id.into(),
                 scheduled_at.into(),
                 concurrency_key.into(),
@@ -354,7 +320,6 @@ pub mod jobs {
                 col("class_name"),
                 col("arguments"),
                 col("priority"),
-                col("failed_attempts"),
                 col("active_job_id"),
                 col("scheduled_at"),
                 col("concurrency_key"),
@@ -366,7 +331,6 @@ pub mod jobs {
                 class_name.into(),
                 arguments.into(),
                 priority.into(),
-                0i32.into(), // failed_attempts default
                 active_job_id.into(),
                 scheduled_at.into(),
                 concurrency_key.into(),
@@ -407,11 +371,12 @@ pub mod jobs {
         execute_update(db, query).await
     }
 
-    /// Increment failed_attempts counter
-    pub async fn increment_failed_attempts<C>(
+    /// Update arguments JSON for a job
+    pub async fn update_arguments<C>(
         db: &C,
         table_config: &TableConfig,
         id: i64,
+        arguments: &str,
     ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
@@ -421,11 +386,10 @@ pub mod jobs {
 
         let query = Query::update()
             .table(table)
-            .value(
-                col("failed_attempts"),
-                Expr::col(col("failed_attempts")).add(1),
-            )
-            .value(col("updated_at"), Expr::val(now))
+            .values([
+                (col("arguments"), arguments.into()),
+                (col("updated_at"), now.into()),
+            ])
             .and_where(Expr::col(col("id")).eq(id))
             .to_owned();
 

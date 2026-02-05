@@ -63,9 +63,6 @@ class Job(Base):
     priority: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
-    failed_attempts: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
     active_job_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

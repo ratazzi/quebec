@@ -1303,7 +1303,7 @@ pub struct ActiveJob {
     pub class_name: String,
     pub arguments: String,
     pub priority: i32,
-    pub failed_attempts: i32,
+    pub executions: i32,
     pub active_job_id: String,
     pub scheduled_at: chrono::NaiveDateTime,
     pub finished_at: Option<chrono::NaiveDateTime>,
@@ -1331,7 +1331,7 @@ impl ActiveJob {
             class_name: "".to_string(),
             arguments: "[]".to_string(),
             priority: 0,
-            failed_attempts: 0,
+            executions: 0,
             active_job_id: "".to_string(),
             scheduled_at: chrono::Utc::now().naive_utc(),
             finished_at: None,
@@ -1374,13 +1374,13 @@ impl ActiveJob {
     }
 
     #[getter]
-    pub fn get_failed_attempts(&self) -> i32 {
-        self.failed_attempts
+    pub fn get_executions(&self) -> i32 {
+        self.executions
     }
 
     #[setter]
-    fn set_failed_attempts(&mut self, failed_attempts: i32) {
-        self.failed_attempts = failed_attempts;
+    fn set_executions(&mut self, executions: i32) {
+        self.executions = executions;
     }
 
     #[getter]
@@ -1437,8 +1437,8 @@ impl ActiveJob {
 
     pub fn __repr__(&self) -> PyResult<String> {
         Ok(format!(
-            "ActiveJob(id={:?}, queue_name={}, class_name={}, arguments={}, priority={}, failed_attempts={}, active_job_id={}, scheduled_at={})",
-            self.id, self.queue_name, self.class_name, self.arguments, self.priority, self.failed_attempts, self.active_job_id, self.scheduled_at
+            "ActiveJob(id={:?}, queue_name={}, class_name={}, arguments={}, priority={}, active_job_id={}, scheduled_at={})",
+            self.id, self.queue_name, self.class_name, self.arguments, self.priority, self.active_job_id, self.scheduled_at
         ))
     }
 

@@ -22,7 +22,7 @@ pub mod schema_builder;
 pub mod semaphore;
 mod supervisor;
 mod types;
-mod utils;
+pub mod utils;
 mod worker;
 
 use context::*;

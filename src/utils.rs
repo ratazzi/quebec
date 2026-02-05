@@ -236,6 +236,62 @@ pub fn python_object<'a>(obj: &'a Bound<'a, PyAny>) -> PythonObject<'a> {
     PythonObject(obj)
 }
 
+/// Extract the `executions` count from an arguments JSON string.
+/// Handles both the wrapped format `{"arguments": [...], "executions": N, ...}`
+/// and legacy plain arrays `[...]` (returns 0).
+pub fn get_executions(arguments: Option<&str>) -> i32 {
+    arguments
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("executions")?.as_i64())
+        .unwrap_or(0) as i32
+}
+
+/// Return a new arguments JSON string with `executions` incremented by 1
+/// and `error_type` accumulated into `exception_executions`.
+/// If the input is a plain array, wraps it first.
+pub fn increment_executions(arguments: Option<&str>, error_type: Option<&str>) -> String {
+    let mut obj = arguments
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or(Value::Array(vec![]));
+
+    // Wrap non-object values into the canonical format
+    if !obj.is_object() {
+        let args = if obj.is_array() {
+            obj
+        } else {
+            Value::Array(vec![])
+        };
+        obj = serde_json::json!({
+            "arguments": args,
+            "executions": 0,
+            "exception_executions": {},
+        });
+    }
+
+    // Increment executions
+    let executions = obj.get("executions").and_then(|v| v.as_i64()).unwrap_or(0) + 1;
+    obj["executions"] = Value::from(executions);
+
+    // Accumulate exception_executions
+    if let Some(et) = error_type {
+        let key = format!("[{}]", et);
+        // Ensure exception_executions is an object (reset if missing/wrong type)
+        if !obj
+            .get("exception_executions")
+            .is_some_and(|v| v.is_object())
+        {
+            obj["exception_executions"] = serde_json::json!({});
+        }
+        let current = obj["exception_executions"]
+            .get(&key)
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        obj["exception_executions"][&key] = Value::from(current + 1);
+    }
+
+    serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
+}
+
 /// Parse environment-specific configuration from a HashMap with fallback behavior
 ///
 /// This is a generic helper for parsing environment-based YAML configs like:

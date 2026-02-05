@@ -61,12 +61,6 @@ pub fn create_jobs_table(table_config: &TableConfig) -> TableCreateStatement {
                 .not_null()
                 .default(0),
         )
-        .col(
-            ColumnDef::new(col("failed_attempts"))
-                .integer()
-                .not_null()
-                .default(0),
-        )
         .col(ColumnDef::new(col("active_job_id")).string())
         .col(ColumnDef::new(col("scheduled_at")).timestamp())
         .col(ColumnDef::new(col("finished_at")).timestamp())
