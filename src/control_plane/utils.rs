@@ -289,6 +289,7 @@ impl ControlPlane {
             "dsn": connection_info
         });
         context.insert("db_info", &db_info);
+        context.insert("version", env!("CARGO_PKG_VERSION"));
 
         // Add navigation stats
         if let Err(e) = self.populate_nav_stats(context).await {
