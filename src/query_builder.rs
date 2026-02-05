@@ -93,13 +93,9 @@ where
         DbBackend::Postgres => {
             // PostgreSQL returns the ID via RETURNING clause as a query result
             let row = db.query_one(stmt).await?;
-            match row {
-                Some(row) => {
-                    let id: i64 = row.try_get("", "id")?;
-                    Ok(id)
-                }
-                None => Err(DbErr::Custom("Insert did not return an ID".to_string())),
-            }
+            row.map(|r| r.try_get::<i64>("", "id"))
+                .transpose()?
+                .ok_or_else(|| DbErr::Custom("Insert did not return an ID".to_string()))
         }
         DbBackend::Sqlite | DbBackend::MySql => {
             let result = db.execute(stmt).await?;
