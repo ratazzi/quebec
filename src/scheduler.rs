@@ -14,6 +14,23 @@ use std::time::Instant;
 
 use tracing::{error, info, trace, warn};
 
+/// Wrap the last dict in an array as kwargs (Solid Queue convention)
+/// `[1, 2, {"foo": "bar"}]` -> `[1, 2, {"_kwargs": {"foo": "bar"}}]`
+fn wrap_last_dict_as_kwargs(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Array(mut arr) = value else {
+        return value;
+    };
+
+    let should_wrap = arr.len() > 1 && arr.last().is_some_and(|v| v.is_object());
+
+    if should_wrap {
+        let last_obj = arr.pop().unwrap();
+        arr.push(json!({"_kwargs": last_obj}));
+    }
+
+    serde_json::Value::Array(arr)
+}
+
 /// Upsert a recurring task into the database.
 /// Supports PostgreSQL, SQLite, and MySQL with database-specific syntax.
 /// Uses NULL-safe comparison (IS NOT DISTINCT FROM / <=> / IS) to correctly handle nullable columns.
@@ -180,8 +197,21 @@ where
     let priority = entry.priority.unwrap_or(0);
 
     let now = chrono::Utc::now().naive_utc();
-    // Use empty array if args is None, to avoid "arguments is not an array" error
-    let args = entry.args.as_ref().cloned().unwrap_or_default();
+
+    // Convert YAML args to JSON and wrap last dict as kwargs (Solid Queue convention)
+    let args = match &entry.args {
+        Some(a) => {
+            let json_value = serde_json::to_value(a).map_err(|e| {
+                DbErr::Custom(format!(
+                    "Failed to serialize args for task '{}': {}",
+                    task_key, e
+                ))
+            })?;
+            wrap_last_dict_as_kwargs(json_value)
+        }
+        None => serde_json::Value::Array(vec![]),
+    };
+
     let params = serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
@@ -195,17 +225,20 @@ where
         "timezone": "UTC",
         "scheduled_at": scheduled_at,
         "enqueued_at": now,
+        "continuation": {},
+        "resumptions": 0
     });
 
     // Get concurrency constraint using runnable
     // Use normalized args (consistent with what's stored in the job)
+    let args_is_empty = matches!(&args, serde_json::Value::Array(arr) if arr.is_empty());
     #[cfg(feature = "python")]
     let concurrency_constraint = ctx
         .has_concurrency_control(&entry.class.to_string())
         .then(|| ctx.get_runnable(&entry.class).ok())
         .flatten()
         .and_then(|runnable| {
-            let args_ref = if args.is_empty() { None } else { Some(&args) };
+            let args_ref = if args_is_empty { None } else { Some(&args) };
             runnable
                 .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
                 .unwrap_or(None)

@@ -5,6 +5,7 @@ use crate::query_builder;
 use crate::semaphore::release_semaphore;
 use anyhow::Result;
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, error, info, trace, warn};
 
@@ -151,6 +152,15 @@ pub struct Runnable {
     pub(crate) retry_info: Option<RetryInfo>,
     pub concurrency_limit: Option<i32>,
     pub concurrency_duration: Option<i32>, // in seconds
+    /// Continuation info for interrupted jobs (step name, cursor, original args)
+    pub(crate) continuation_info: Option<ContinuationInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ContinuationInfo {
+    pub(crate) state: crate::continuation::ContinuationState,
+    pub(crate) resumptions: i32,
+    pub(crate) original_args: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +179,7 @@ impl Runnable {
             retry_info: None,
             concurrency_limit: None,
             concurrency_duration: None,
+            continuation_info: None,
         }
     }
 
@@ -182,6 +193,7 @@ impl Runnable {
             retry_info: self.retry_info.clone(),
             concurrency_limit: self.concurrency_limit,
             concurrency_duration: self.concurrency_duration,
+            continuation_info: self.continuation_info.clone(),
         }
     }
 
@@ -443,11 +455,15 @@ impl Runnable {
             .unwrap_or_else(|_| "Failed to serialize error".to_string())
     }
 
-    fn invoke(&mut self, job: &mut quebec_jobs::Model) -> Result<quebec_jobs::Model> {
+    fn invoke(
+        &mut self,
+        job: &mut quebec_jobs::Model,
+        cancellation_token: Option<CancellationToken>,
+    ) -> Result<quebec_jobs::Model> {
         // Execute Python task and handle any errors in a single GIL acquisition
         Python::with_gil(|py| {
             // Execute Python task within the same GIL session
-            match self.execute_python_task(py, job) {
+            match self.execute_python_task(py, job, cancellation_token) {
                 Ok(_) => Ok(job.clone()),
                 Err(error) => {
                     // Handle execution error within the same GIL session
@@ -459,9 +475,27 @@ impl Runnable {
     }
 
     /// Execute Python task (parameter parsing + invocation)
-    fn execute_python_task(&self, py: Python, job: &quebec_jobs::Model) -> PyResult<()> {
-        // Parse task parameters
-        let (args, kwargs) = self.parse_job_arguments(py, job)?;
+    fn execute_python_task(
+        &mut self,
+        py: Python,
+        job: &quebec_jobs::Model,
+        cancellation_token: Option<CancellationToken>,
+    ) -> PyResult<()> {
+        use crate::continuation::{parse_continuation_from_arguments, Continuable};
+
+        // Parse continuation state from arguments
+        let (cont_state, resumptions, original_args) =
+            parse_continuation_from_arguments(job.arguments.as_deref());
+
+        // Store original args for potential re-enqueue
+        self.continuation_info = Some(ContinuationInfo {
+            state: cont_state.clone(),
+            resumptions,
+            original_args: original_args.clone(),
+        });
+
+        // Parse task parameters from original args (without continuation metadata)
+        let (args, kwargs) = self.parse_job_arguments_from_json(py, &original_args)?;
 
         // Create Python instance and invoke
         let bound = self.handler.bind(py);
@@ -470,31 +504,82 @@ impl Runnable {
         let executions = crate::utils::get_executions(job.arguments.as_deref());
         instance.setattr("executions", executions)?;
 
+        // Check if the job class inherits from Continuable mixin
+        // We check for _continuation attribute (defined in Continuable class) and verify it's None
+        // (indicating it's from the class definition, not accidentally set)
+        let is_continuable = if let Ok(cont_attr) = instance.getattr("_continuation") {
+            // Has _continuation attribute - check if it's the class default (None)
+            // This is a reliable indicator that the class inherits from Continuable
+            cont_attr.is_none()
+        } else {
+            false
+        };
+
+        if is_continuable {
+            // Create a Continuable instance with the restored state
+            // Pass the cancellation token so checkpoint() can detect SIGTERM
+            let continuable = Continuable::with_state(cont_state, resumptions, cancellation_token);
+
+            // Inject the continuation context into the instance
+            let cont_py = continuable.into_pyobject(py)?;
+            instance.setattr("_continuation", cont_py.clone())?;
+
+            // Make step method available on instance (delegates to _continuation.step)
+            // This is handled by the Python Continuable mixin
+        }
+
         let func = instance.getattr("perform")?;
-        func.call(&args, Some(kwargs.bind(py)))?;
+        let result = func.call(&args, Some(kwargs.bind(py)));
+
+        // On error (including JobInterrupted), capture continuation state from the instance
+        // BEFORE the instance goes out of scope
+        if result.is_err() {
+            if let Ok(cont_attr) = instance.getattr("_continuation") {
+                if let Ok(continuable) = cont_attr.extract::<crate::continuation::Continuable>() {
+                    if let Ok((state, resump, dirty)) = continuable.get_state() {
+                        if dirty {
+                            // Update continuation_info with the actual state from the running job
+                            if let Some(ref mut info) = self.continuation_info {
+                                info.state = state;
+                                info.resumptions = resump;
+                                debug!(
+                                    "Captured continuation state: completed={:?}, current={:?}",
+                                    info.state.completed, info.state.current
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Propagate the result (error or success)
+        result.map(|_| ())?;
+
+        // After successful execution, clear continuation info
+        self.continuation_info = None;
 
         Ok(())
     }
 
-    /// Parse task parameters
-    fn parse_job_arguments(
+    /// Parse job arguments from JSON value (used for continuation support)
+    fn parse_job_arguments_from_json(
         &self,
         py: Python,
-        job: &quebec_jobs::Model,
+        json_args: &serde_json::Value,
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
-        // Deserialize JSON parameters
-        let mut v = serde_json::Value::Array(vec![]);
-        if let Some(arguments) = job.arguments.as_ref() {
-            v = serde_json::from_str(arguments)
-                .map_err(|e| PyException::new_err(format!("Failed to parse arguments: {}", e)))?;
-        }
+        let mut v = json_args.clone();
 
+        // Handle wrapped format: {"arguments": [...]}
         if let serde_json::Value::Object(ref o) = v {
             if let Some(serde_json::Value::Array(_)) = o.get("arguments") {
                 v = o["arguments"].clone();
-            } else {
-                return Err(PyException::new_err("'arguments' is not an array"));
             }
+        }
+
+        // If not an array, wrap it
+        if !v.is_array() {
+            v = serde_json::Value::Array(vec![]);
         }
 
         let binding = json_to_py(py, &v)?;
@@ -507,17 +592,27 @@ impl Runnable {
         // Initialize kwargs
         let kwargs = PyDict::new(py);
 
-        // Handle the last parameter as kwargs if it's a dictionary
-        if args.len() > 1 {
+        // Check for "_kwargs" marker in the last element
+        // Format: [arg1, arg2, {"_kwargs": {"key": "value"}}]
+        // This distinguishes kwargs from positional dict arguments
+        if !args.is_empty() {
             let last_index = args.len() - 1;
             let last = args.get_item(last_index)?;
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
                 let last_dict = last.downcast::<pyo3::types::PyDict>()?;
-                for (key, value) in last_dict {
-                    kwargs.set_item(key, value)?;
+
+                // Check for "_kwargs" marker
+                if let Ok(Some(kwargs_value)) = last_dict.get_item("_kwargs") {
+                    // Found "_kwargs" marker - extract the actual kwargs
+                    if let Ok(inner_dict) = kwargs_value.downcast::<pyo3::types::PyDict>() {
+                        for (key, value) in inner_dict {
+                            kwargs.set_item(key, value)?;
+                        }
+                    }
+                    args.del_item(last_index)?;
                 }
-                args.del_item(last_index)?;
+                // If no "_kwargs" marker, treat as positional dict argument (don't extract)
             }
         }
 
@@ -532,9 +627,68 @@ impl Runnable {
         job: &mut quebec_jobs::Model,
         error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
+        // Check for JobInterrupted first (continuation checkpoint)
+        let job_interrupted = py.get_type::<crate::continuation::JobInterrupted>();
+        if error.is_instance(py, &job_interrupted) {
+            info!(
+                "Job `{}' interrupted for continuation, will be re-enqueued",
+                self.class_name
+            );
+            return self.handle_job_interrupted(py, job);
+        }
+
         error!("Job execution error: {:?}", error);
 
+        // Check if continuation has made progress (like Rails' resume_errors_after_advancing)
+        // If the job has advanced, treat it like an interruption - resume from checkpoint
+        // Read class attributes for configuration (like Rails' class attributes)
         let bound = self.handler.bind(py);
+
+        // Get max_resumptions from class attribute (default None = use 25)
+        let max_resumptions: i32 = bound
+            .getattr("max_resumptions")
+            .ok()
+            .and_then(|attr| {
+                if attr.is_none() {
+                    None
+                } else {
+                    attr.extract::<i32>().ok()
+                }
+            })
+            .unwrap_or(25); // Default to 25 like Rails
+
+        // Get resume_errors_after_advancing from class attribute (default True)
+        let resume_errors_after_advancing: bool = bound
+            .getattr("resume_errors_after_advancing")
+            .ok()
+            .and_then(|attr| attr.extract::<bool>().ok())
+            .unwrap_or(true);
+
+        let (has_continuation_progress, current_resumptions) = self
+            .continuation_info
+            .as_ref()
+            .map(|info| {
+                // Check if state has any completed steps or current step with cursor
+                let has_progress = !info.state.completed.is_empty() || info.state.current.is_some();
+                (has_progress, info.resumptions)
+            })
+            .unwrap_or((false, 0));
+
+        if resume_errors_after_advancing && has_continuation_progress {
+            if current_resumptions >= max_resumptions {
+                error!(
+                    "Job `{}' exceeded max resumptions ({}), will not retry",
+                    self.class_name, max_resumptions
+                );
+                // Fall through to normal error handling
+            } else {
+                info!(
+                    "Job `{}' failed but has continuation progress (resumptions: {}), will resume from checkpoint",
+                    self.class_name, current_resumptions
+                );
+                return self.handle_job_interrupted(py, job);
+            }
+        }
 
         // Check error handling strategies by priority
 
@@ -562,6 +716,54 @@ impl Runnable {
 
         // 4. Default failure handling
         self.handle_job_failure(py, job, error)
+    }
+
+    /// Handle JobInterrupted - re-enqueue with continuation state
+    fn handle_job_interrupted(
+        &mut self,
+        _py: Python,
+        job: &quebec_jobs::Model,
+    ) -> Result<quebec_jobs::Model> {
+        use crate::continuation::serialize_continuation_to_arguments;
+
+        // Get the continuation state from the stored info (already updated by execute_python_task)
+        let Some(cont_info) = self.continuation_info.take() else {
+            warn!("JobInterrupted raised but no continuation info available");
+            return Ok(job.clone());
+        };
+
+        // State was already captured in execute_python_task before the instance went out of scope
+        // Just increment resumptions for the next run
+        let final_state = cont_info.state;
+        let resumptions = cont_info.resumptions + 1;
+
+        // Serialize the updated continuation state back to arguments
+        let new_arguments = serialize_continuation_to_arguments(
+            &cont_info.original_args,
+            &final_state,
+            resumptions,
+        );
+
+        debug!(
+            "Job will be re-enqueued with continuation state: completed={:?}, current={:?}",
+            final_state.completed, final_state.current
+        );
+
+        // Set retry_info to trigger immediate re-enqueue (scheduled_at = now)
+        // Don't increment executions for interruption - keep current arguments
+        self.retry_info = Some(RetryInfo {
+            scheduled_at: chrono::Utc::now().naive_utc(),
+            arguments: job.arguments.clone().unwrap_or_default(),
+        });
+
+        // Update the continuation_info with new arguments for the re-enqueue
+        self.continuation_info = Some(ContinuationInfo {
+            state: final_state,
+            resumptions,
+            original_args: new_arguments,
+        });
+
+        Ok(job.clone())
     }
 
     /// Apply retry strategy
@@ -640,7 +842,8 @@ impl Runnable {
     }
 
     fn perform(&mut self, job: &mut quebec_jobs::Model) -> Result<quebec_jobs::Model> {
-        self.invoke(job)
+        // Direct Python invocation doesn't have cancellation context
+        self.invoke(job, None)
     }
 
     fn __repr__(&self) -> String {
@@ -685,6 +888,8 @@ pub struct Execution {
     runnable: Runnable,
     metric: Option<Metric>,
     retry_info: Option<RetryInfo>,
+    /// Continuation info for interrupted jobs
+    continuation_info: Option<ContinuationInfo>,
     /// Direct reference to idle notifier - avoids RwLock access in async context
     idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
@@ -717,6 +922,7 @@ impl Execution {
             runnable,
             metric: None,
             retry_info: None,
+            continuation_info: None,
             idle_notify: None,
         }
     }
@@ -744,11 +950,17 @@ impl Execution {
             jid = jid,
             tid = self.tid.clone()
         );
+        // Get cancellation token from context for continuation support
+        let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
-            let invoke_result = self.runnable.invoke(&mut job);
+            let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
                 self.retry_info = Some(retry_info);
+            }
+            // Move continuation information from runnable to execution
+            if let Some(cont_info) = self.runnable.continuation_info.take() {
+                self.continuation_info = Some(cont_info);
             }
             invoke_result
         }
@@ -769,13 +981,18 @@ impl Execution {
     }
 
     /// Schedule a retry job with the given parameters
+    /// If `override_arguments` is provided, it will be used instead of the job's original arguments
+    /// (used for continuation support)
     async fn schedule_retry_job<C: ConnectionTrait>(
         txn: &C,
         table_config: &crate::context::TableConfig,
         job: &quebec_jobs::Model,
         scheduled_at: chrono::NaiveDateTime,
         arguments: &str,
+        override_arguments: Option<&str>,
     ) -> Result<(), DbErr> {
+        let arguments = override_arguments.unwrap_or(arguments);
+
         let new_job_id = query_builder::jobs::insert(
             txn,
             table_config,
@@ -847,6 +1064,12 @@ impl Execution {
             .as_ref()
             .map(|info| (info.scheduled_at, info.arguments.clone()));
 
+        // Get continuation arguments if available (for interrupted jobs)
+        let continuation_arguments = self
+            .continuation_info
+            .as_ref()
+            .map(|info| serde_json::to_string(&info.original_args).unwrap_or_default());
+
         // Capture concurrency info for semaphore release
         let concurrency_key = job.concurrency_key.clone();
         let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
@@ -857,103 +1080,120 @@ impl Execution {
         let table_config = self.ctx.table_config.clone();
         let ctx = self.ctx.clone();
 
-        db.transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
-            Box::pin(async move {
-                let claimed_id = claimed.id;
+        let transaction_result = db
+            .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
+                let continuation_arguments = continuation_arguments.clone();
+                Box::pin(async move {
+                    let claimed_id = claimed.id;
 
-                if let Some((scheduled_at, ref arguments)) = retry_job_data {
-                    Self::schedule_retry_job(txn, &table_config, &job, scheduled_at, arguments)
+                    if let Some((scheduled_at, ref arguments)) = retry_job_data {
+                        Self::schedule_retry_job(
+                            txn,
+                            &table_config,
+                            &job,
+                            scheduled_at,
+                            arguments,
+                            continuation_arguments.as_deref(),
+                        )
                         .await?;
-                }
-
-                if failed {
-                    error!("Job failed: {:?}", err);
-                    // Persist updated arguments (executions/exception_executions counters)
-                    if let Some(ref args) = job.arguments {
-                        query_builder::jobs::update_arguments(txn, &table_config, job_id, args)
-                            .await?;
                     }
-                    // Write to failed_executions table
-                    // Note: Like Solid Queue, failed jobs do NOT get finished_at set
-                    query_builder::failed_executions::insert(
+
+                    if failed {
+                        error!("Job failed: {:?}", err);
+                        // Persist updated arguments (executions/exception_executions counters)
+                        if let Some(ref args) = job.arguments {
+                            query_builder::jobs::update_arguments(txn, &table_config, job_id, args)
+                                .await?;
+                        }
+                        // Write to failed_executions table
+                        // Note: Like Solid Queue, failed jobs do NOT get finished_at set
+                        query_builder::failed_executions::insert(
+                            txn,
+                            &table_config,
+                            job_id,
+                            err.map(|e| e.to_string()).as_deref(),
+                        )
+                        .await?;
+                    } else {
+                        // Only mark as finished for successful jobs (like Solid Queue)
+                        query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
+                    }
+
+                    // Directly delete record from claimed_executions table
+                    let delete_result = query_builder::claimed_executions::delete_by_id(
                         txn,
                         &table_config,
-                        job_id,
-                        err.map(|e| e.to_string()).as_deref(),
+                        claimed_id,
                     )
                     .await?;
-                } else {
-                    // Only mark as finished for successful jobs (like Solid Queue)
-                    query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
-                }
 
-                // Directly delete record from claimed_executions table
-                let delete_result =
-                    query_builder::claimed_executions::delete_by_id(txn, &table_config, claimed_id)
-                        .await?;
+                    if delete_result == 0 {
+                        return Err(DbErr::Custom("Claimed job not found".into()));
+                    }
 
-                if delete_result == 0 {
-                    return Err(DbErr::Custom("Claimed job not found".into()));
-                }
+                    // Fetch updated job model
+                    let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
+                        .await?
+                        .ok_or_else(|| DbErr::Custom("Job not found after update".to_string()))?;
 
-                // Fetch updated job model
-                let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
-                    .await?
-                    .ok_or_else(|| DbErr::Custom("Job not found after update".to_string()))?;
+                    // Release semaphore and unblock next job if job has concurrency control
+                    // This must happen AFTER job execution completes (ensure block in Solid Queue)
+                    if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
+                        // Step 1: Release semaphore (increment value)
+                        let released = release_semaphore(
+                            txn,
+                            &table_config,
+                            key.clone(),
+                            concurrency_limit,
+                            concurrency_duration,
+                        )
+                        .await
+                        .inspect(|&released| {
+                            if released {
+                                trace!("Released semaphore for key: {}", key);
+                            }
+                        })
+                        .inspect_err(|e| {
+                            warn!("Failed to release semaphore for key {}: {:?}", key, e)
+                        })
+                        .unwrap_or(false);
 
-                // Release semaphore and unblock next job if job has concurrency control
-                // This must happen AFTER job execution completes (ensure block in Solid Queue)
-                if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
-                    // Step 1: Release semaphore (increment value)
-                    let released = release_semaphore(
-                        txn,
-                        &table_config,
-                        key.clone(),
-                        concurrency_limit,
-                        concurrency_duration,
-                    )
-                    .await
-                    .inspect(|&released| {
+                        // Step 2: Immediately try to release next blocked job (like Solid Queue)
                         if released {
-                            trace!("Released semaphore for key: {}", key);
+                            Worker::release_next_blocked_job(&ctx, txn, key, concurrency_limit)
+                                .await
+                                .inspect_err(|e| {
+                                    warn!(
+                                        "Failed to release next blocked job for key {}: {:?}",
+                                        key, e
+                                    )
+                                })
+                                .ok();
                         }
-                    })
-                    .inspect_err(|e| warn!("Failed to release semaphore for key {}: {:?}", key, e))
-                    .unwrap_or(false);
+                    }
 
-                    // Step 2: Immediately try to release next blocked job (like Solid Queue)
-                    if released {
-                        Worker::release_next_blocked_job(&ctx, txn, key, concurrency_limit)
-                            .await
-                            .inspect_err(|e| {
-                                warn!(
-                                    "Failed to release next blocked job for key {}: {:?}",
-                                    key, e
-                                )
-                            })
-                            .ok();
+                    Ok(updated)
+                })
+            })
+            .await;
+
+        // Log the result
+        let transaction_result = transaction_result
+            .map(|job| {
+                let duration = self.timer.elapsed();
+                if let Ok(job_model) = job.try_into_model() {
+                    if job_model.finished_at.is_none() {
+                        error!("Job `{}' processed in: {:?}", class_name, duration);
+                    } else {
+                        debug!("Job `{}' processed in: {:?}", class_name, duration)
                     }
                 }
-
-                Ok(updated)
             })
-        })
-        .await
-        .map(|job| {
-            let duration = self.timer.elapsed();
-            if let Ok(job_model) = job.try_into_model() {
-                if job_model.finished_at.is_none() {
-                    error!("Job `{}' processed in: {:?}", class_name, duration);
-                } else {
-                    debug!("Job `{}' processed in: {:?}", class_name, duration)
-                }
-            }
-        })
-        .map_err(|e| {
-            let duration = self.timer.elapsed();
-            error!("Job processing failed in {:?}: {:?}", duration, e)
-        })
-        .ok();
+            .map_err(|e| {
+                let duration = self.timer.elapsed();
+                error!("Job processing failed in {:?}: {:?}", duration, e);
+                e
+            });
 
         // Notify main loop that this thread is now idle and ready for new jobs
         // Uses direct Arc<Notify> reference to avoid RwLock access in async context
@@ -962,7 +1202,16 @@ impl Execution {
             notify.notify_one();
         }
 
-        result
+        // Return success after processing, even if the job failed
+        // Job failures are recorded in failed_executions, not propagated as errors
+        // Only return error if the database transaction failed
+        match transaction_result {
+            Ok(_) => Ok(self.job.clone()),
+            Err(e) => Err(anyhow::anyhow!(
+                "Database error during job processing: {}",
+                e
+            )),
+        }
     }
 }
 
@@ -1312,6 +1561,7 @@ impl Worker {
                 retry_info: None,
                 concurrency_limit,
                 concurrency_duration,
+                continuation_info: None,
             };
             info!("Registered job: {:?}", runnable);
 

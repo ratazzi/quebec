@@ -779,28 +779,54 @@ impl PyQuebec {
             (None, None)
         };
 
-        // Convert Python args and kwargs to JSON only for job arguments storage
+        // Convert Python args and kwargs to JSON for job arguments storage
         let args_json = crate::utils::python_object(&args).into_json()?;
         let kwargs_json = kwargs
             .map(|k| crate::utils::python_object(&k).into_json())
             .transpose()?;
 
-        // Merge args and kwargs for job arguments storage
-        // Filter out internal parameters (prefixed with _) like _scheduled_at
-        let mut combined_args_json = args_json.clone();
-        if let (Some(Value::Object(kwargs_map)), Value::Array(ref mut args_array)) =
-            (&kwargs_json, &mut combined_args_json)
-        {
-            for (key, value) in kwargs_map {
-                if key.starts_with('_') {
-                    continue;
-                }
-                args_array.push(Value::Object(serde_json::Map::from_iter(vec![(
-                    key.clone(),
-                    value.clone(),
+        // Build arguments array with kwargs marker if needed
+        let mut arguments_array = if let Value::Array(arr) = args_json {
+            arr
+        } else {
+            vec![]
+        };
+
+        // Filter out internal parameters (prefixed with _) and add kwargs marker
+        if let Some(Value::Object(kwargs_map)) = &kwargs_json {
+            let real_kwargs: serde_json::Map<String, Value> = kwargs_map
+                .iter()
+                .filter(|(key, _)| !key.starts_with('_'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            if !real_kwargs.is_empty() {
+                // Wrap kwargs in a "_kwargs" marker to distinguish from positional dicts
+                arguments_array.push(Value::Object(serde_json::Map::from_iter(vec![(
+                    "_kwargs".to_string(),
+                    Value::Object(real_kwargs),
                 )])));
             }
         }
+
+        // Generate job_id early so we can include it in the serialization
+        let job_id = crate::utils::generate_job_id();
+
+        // Convert Python strings to Rust strings for serialization
+        let class_name_str = class_name.to_string();
+        let queue_name_str = queue_name.clone();
+
+        // Build complete job serialization (like Solid Queue format)
+        // This ensures arguments column is always a dict with known structure
+        let job_data = serde_json::json!({
+            "job_class": class_name_str,
+            "job_id": job_id,
+            "queue_name": queue_name_str,
+            "priority": priority,
+            "arguments": arguments_array,
+            "continuation": {},
+            "resumptions": 0
+        });
 
         if let Some(ref key) = concurrency_key {
             debug!("concurrency_key: {:?} for {}", key, class_name);
@@ -809,10 +835,9 @@ impl PyQuebec {
             debug!("concurrency_limit: {:?}", limit);
         }
 
-        // debug!("combined_args_json: {:?}", combined_args_json);
-        let arguments = serde_json::to_string(&combined_args_json).map_err(|e| {
+        let arguments = serde_json::to_string(&job_data).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Failed to serialize arguments: {}",
+                "Failed to serialize job data: {}",
                 e
             ))
         })?;
@@ -820,7 +845,7 @@ impl PyQuebec {
         let mut obj = instance.clone().extract::<ActiveJob>()?;
         obj.class_name = class_name.to_string();
         obj.arguments = arguments;
-        obj.active_job_id = crate::utils::generate_job_id();
+        obj.active_job_id = job_id; // Use the same job_id from serialization
         obj.queue_name = queue_name;
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;
