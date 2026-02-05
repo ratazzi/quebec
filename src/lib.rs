@@ -1,6 +1,7 @@
 mod config;
 pub mod context;
 mod control_plane;
+#[cfg(feature = "python")]
 mod core;
 mod dispatcher;
 pub mod entities;
@@ -21,19 +22,27 @@ mod scheduler;
 pub mod schema_builder;
 pub mod semaphore;
 mod supervisor;
+#[cfg(feature = "python")]
 mod types;
 pub mod utils;
+#[cfg(feature = "python")]
 mod worker;
 
+#[cfg(feature = "python")]
 use context::*;
 pub use control_plane::ControlPlaneExt;
+#[cfg(feature = "python")]
 use entities::quebec_claimed_executions;
+#[cfg(feature = "python")]
 use entities::quebec_jobs;
 pub use error::{QuebecError, Result};
 
+#[cfg(feature = "python")]
 use types::*;
+#[cfg(feature = "python")]
 use worker::{Execution, Runnable};
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 // Initialize process title system early based on platform
@@ -127,6 +136,7 @@ fn init_logging() {
 /// A Python module implemented in Rust. The name of this function must match
 /// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
 /// import the module.
+#[cfg(feature = "python")]
 #[pymodule]
 fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize process title system early

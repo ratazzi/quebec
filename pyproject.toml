@@ -52,6 +52,7 @@ dev = [
     "sqlalchemy>=2.0.40",
     "pytest>=7.0.0",
     "pytest-cov",
+    "structlog>=25.5.0",
 ]
 
 [tool.pytest.ini_options]

@@ -202,15 +202,31 @@ mod tests {
     use super::*;
     use url::Url;
 
+    /// Helper to create AppContext for tests (handles cfg-gated signature)
+    fn make_ctx(dsn: Url) -> Arc<AppContext> {
+        #[cfg(feature = "python")]
+        {
+            Arc::new(AppContext::new(
+                dsn,
+                None,
+                sea_orm::ConnectOptions::new("test".to_string()),
+                None,
+            ))
+        }
+        #[cfg(not(feature = "python"))]
+        {
+            Arc::new(AppContext::new(
+                dsn,
+                None,
+                sea_orm::ConnectOptions::new("test".to_string()),
+            ))
+        }
+    }
+
     #[test]
     fn test_channel_name_generation() {
         let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
-        let ctx = Arc::new(AppContext::new(
-            dsn,
-            None,
-            sea_orm::ConnectOptions::new("test".to_string()),
-            None,
-        ));
+        let ctx = make_ctx(dsn);
         let manager = NotifyManager::new(ctx);
         assert_eq!(manager.get_channel_name(), "quebec_jobs");
     }
@@ -219,21 +235,11 @@ mod tests {
     fn test_is_postgres_detection() {
         let postgres_dsn =
             Url::parse("postgres://user:pass@localhost/test").expect("Valid postgres test URL");
-        let postgres_ctx = Arc::new(AppContext::new(
-            postgres_dsn,
-            None,
-            sea_orm::ConnectOptions::new("test".to_string()),
-            None,
-        ));
+        let postgres_ctx = make_ctx(postgres_dsn);
         assert!(postgres_ctx.is_postgres());
 
         let sqlite_dsn = Url::parse("sqlite://test.db").expect("Valid sqlite test URL");
-        let sqlite_ctx = Arc::new(AppContext::new(
-            sqlite_dsn,
-            None,
-            sea_orm::ConnectOptions::new("test".to_string()),
-            None,
-        ));
+        let sqlite_ctx = make_ctx(sqlite_dsn);
         assert!(!sqlite_ctx.is_postgres());
     }
 }

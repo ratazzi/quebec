@@ -199,6 +199,7 @@ where
 
     // Get concurrency constraint using runnable
     // Use normalized args (consistent with what's stored in the job)
+    #[cfg(feature = "python")]
     let concurrency_constraint = ctx
         .has_concurrency_control(&entry.class.to_string())
         .then(|| ctx.get_runnable(&entry.class).ok())
@@ -209,6 +210,8 @@ where
                 .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
                 .unwrap_or(None)
         });
+    #[cfg(not(feature = "python"))]
+    let concurrency_constraint: Option<crate::context::ConcurrencyConstraint> = None;
 
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
     let active_job_id = crate::utils::generate_job_id();

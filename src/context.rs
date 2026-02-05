@@ -3,7 +3,9 @@ use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+#[cfg(feature = "python")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -13,8 +15,11 @@ use url::Url;
 
 use tracing::{debug, error, trace, warn};
 
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyException;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 pyo3::create_exception!(quebec, CustomError, PyException);
 
 #[derive(Debug, Clone)]
@@ -26,7 +31,7 @@ pub struct ConcurrencyConstraint {
 
 /// Concurrency conflict strategy - what to do when concurrency limit is reached
 /// Matches Solid Queue's concurrency_on_conflict option
-#[pyclass(eq, eq_int)]
+#[cfg_attr(feature = "python", pyclass(eq, eq_int))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConcurrencyConflict {
     /// Block the job until a slot becomes available (default behavior)
@@ -36,6 +41,7 @@ pub enum ConcurrencyConflict {
     Discard = 1,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl ConcurrencyConflict {
     #[staticmethod]
@@ -109,6 +115,7 @@ impl TableConfig {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct ConcurrencyStrategy {
@@ -117,6 +124,7 @@ pub struct ConcurrencyStrategy {
     pub key: Py<PyAny>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl ConcurrencyStrategy {
     #[new]
@@ -144,6 +152,7 @@ impl ConcurrencyStrategy {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct RescueStrategy {
@@ -151,6 +160,7 @@ pub struct RescueStrategy {
     pub handler: Py<PyAny>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl RescueStrategy {
     #[new]
@@ -172,6 +182,7 @@ impl RescueStrategy {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct RetryStrategy {
@@ -181,6 +192,7 @@ pub struct RetryStrategy {
     pub handler: Option<Py<PyAny>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl RetryStrategy {
     #[new]
@@ -221,6 +233,7 @@ impl RetryStrategy {
     }
 }
 
+#[cfg(feature = "python")]
 #[pyclass]
 #[derive(Debug, Clone)]
 pub struct DiscardStrategy {
@@ -228,6 +241,7 @@ pub struct DiscardStrategy {
     pub handler: Option<Py<PyAny>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl DiscardStrategy {
     #[new]
@@ -274,6 +288,7 @@ pub struct AppContext {
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
+    #[cfg(feature = "python")]
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
     pub runtime_handle: Option<Handle>,
@@ -301,42 +316,14 @@ fn parse_duration_f64_env(s: &str) -> Option<Duration> {
 }
 
 impl AppContext {
+    #[cfg(feature = "python")]
     pub fn new(
         dsn: Url,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
         options: Option<HashMap<String, PyObject>>,
     ) -> Self {
-        let mut ctx = Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            dsn,
-            db,
-            connect_options,
-            name: std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string()),
-            use_skip_locked: true,
-            process_heartbeat_interval: Duration::from_secs(60),
-            process_alive_threshold: Duration::from_secs(300),
-            shutdown_timeout: Duration::from_secs(5),
-            silence_polling: true,
-            preserve_finished_jobs: true,
-            clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
-            cleanup_batch_size: 500,
-            cleanup_interval: Duration::ZERO, // disabled by default, set to enable (e.g. 3600s)
-            default_concurrency_control_period: Duration::from_secs(60), // 1 minute
-            dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
-            dispatcher_batch_size: 500,
-            dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
-            worker_polling_interval: Duration::from_millis(100),
-            worker_threads: 3,
-            worker_queues: None, // Default to all queues
-            graceful_shutdown: CancellationToken::new(),
-            force_quit: CancellationToken::new(),
-            runnables: Arc::new(RwLock::new(HashMap::new())),
-            concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
-            runtime_handle: None,
-            table_config: TableConfig::default(),
-            idle_notify: Arc::new(RwLock::new(None)),
-        };
+        let mut ctx = Self::new_inner(dsn, db, connect_options);
 
         // Override default configuration if options are provided
         if let Some(options) = options {
@@ -525,6 +512,53 @@ impl AppContext {
         ctx
     }
 
+    #[cfg(not(feature = "python"))]
+    pub fn new(
+        dsn: Url,
+        db: Option<Arc<DatabaseConnection>>,
+        connect_options: ConnectOptions,
+    ) -> Self {
+        Self::new_inner(dsn, db, connect_options)
+    }
+
+    fn new_inner(
+        dsn: Url,
+        db: Option<Arc<DatabaseConnection>>,
+        connect_options: ConnectOptions,
+    ) -> Self {
+        Self {
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            dsn,
+            db,
+            connect_options,
+            name: std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string()),
+            use_skip_locked: true,
+            process_heartbeat_interval: Duration::from_secs(60),
+            process_alive_threshold: Duration::from_secs(300),
+            shutdown_timeout: Duration::from_secs(5),
+            silence_polling: true,
+            preserve_finished_jobs: true,
+            clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
+            cleanup_batch_size: 500,
+            cleanup_interval: Duration::ZERO, // disabled by default, set to enable (e.g. 3600s)
+            default_concurrency_control_period: Duration::from_secs(60), // 1 minute
+            dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
+            dispatcher_batch_size: 500,
+            dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
+            worker_polling_interval: Duration::from_millis(100),
+            worker_threads: 3,
+            worker_queues: None, // Default to all queues
+            graceful_shutdown: CancellationToken::new(),
+            force_quit: CancellationToken::new(),
+            #[cfg(feature = "python")]
+            runnables: Arc::new(RwLock::new(HashMap::new())),
+            concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
+            runtime_handle: None,
+            table_config: TableConfig::default(),
+            idle_notify: Arc::new(RwLock::new(None)),
+        }
+    }
+
     pub fn set_runtime_handle(&mut self, handle: Handle) {
         self.runtime_handle = Some(handle);
     }
@@ -584,6 +618,7 @@ impl AppContext {
     }
 
     /// Get a runnable by class name
+    #[cfg(feature = "python")]
     pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable, anyhow::Error> {
         let runnables = self
             .runnables
@@ -598,6 +633,7 @@ impl AppContext {
     }
 
     /// Get all registered runnable class names
+    #[cfg(feature = "python")]
     pub fn get_runnable_names(&self) -> Vec<String> {
         self.runnables
             .read()

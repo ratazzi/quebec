@@ -1,6 +1,9 @@
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::{PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
+#[cfg(feature = "python")]
 use serde_yaml;
 
 /// Alphabet for generating lowercase alphanumeric nanoid (a-z, 0-9)
@@ -15,6 +18,7 @@ pub fn generate_job_id() -> String {
 }
 
 /// Convert YAML value to Python object
+#[cfg(feature = "python")]
 pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<PyObject> {
     match value {
         serde_yaml::Value::Null => Ok(py.None()),
@@ -51,6 +55,7 @@ pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResu
 }
 
 /// Convert Python object to JSON value
+#[cfg(feature = "python")]
 pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyInt>() {
         Ok(Value::Number(obj.extract::<i64>()?.into()))
@@ -94,6 +99,7 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 /// Convert JSON value to Python object
+#[cfg(feature = "python")]
 pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     match value {
         Value::Null => Ok(py.None()),
@@ -132,42 +138,33 @@ pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject>
 // These provide a more idiomatic Rust API for type conversions
 
 /// Wrapper for Python objects that provides idiomatic conversion methods
-///
-/// # Example
-/// ```rust,ignore
-/// use quebec::utils::{python_object, PythonObject};
-///
-/// Python::with_gil(|py| {
-///     let py_str = py.eval("'hello'", None, None)?;
-///     let wrapper = python_object(&py_str);
-///     let json_val = wrapper.into_json(py);
-///     // json_val is now a JSON string
-/// });
-/// ```
+#[cfg(feature = "python")]
 #[derive(Debug)]
 pub struct PythonObject<'a>(pub &'a Bound<'a, PyAny>);
 
+#[cfg(feature = "python")]
 impl<'a> PythonObject<'a> {
     /// Convert Python object to JSON value using idiomatic Rust pattern
-    ///
-    /// This method provides a more ergonomic API compared to the standalone function
     pub fn into_json(self) -> PyResult<Value> {
         python_to_json_value(self.0)
     }
 }
 
 // Trait for types that can be converted to Python objects
+#[cfg(feature = "python")]
 pub trait IntoPython {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject>;
 }
 
 // Implement for direct value references
+#[cfg(feature = "python")]
 impl IntoPython for &serde_yaml::Value {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
         yaml_value_to_python(py, self)
     }
 }
 
+#[cfg(feature = "python")]
 impl IntoPython for &serde_json::Value {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
         json_value_to_python(py, self)
@@ -175,6 +172,7 @@ impl IntoPython for &serde_json::Value {
 }
 
 // Implement for Vec<serde_yaml::Value> and Vec<serde_json::Value>
+#[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_yaml::Value> {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
         let py_list = pyo3::types::PyList::empty(py);
@@ -186,6 +184,7 @@ impl IntoPython for &Vec<serde_yaml::Value> {
     }
 }
 
+#[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_json::Value> {
     fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
         let py_list = pyo3::types::PyList::empty(py);
@@ -198,24 +197,28 @@ impl IntoPython for &Vec<serde_json::Value> {
 }
 
 // Implement for Python Bound types (already Python objects)
+#[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyTuple> {
     fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
+#[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyDict> {
     fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
+#[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyList> {
     fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
+#[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
     fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
         Ok(self.clone().unbind())
@@ -223,15 +226,7 @@ impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
 }
 
 /// Create a PythonObject wrapper for idiomatic conversions
-///
-/// # Example
-/// ```rust,ignore
-/// Python::with_gil(|py| {
-///     let py_str = py.eval("'test'", None, None)?;
-///     let wrapper = python_object(&py_str);
-///     let json_val = wrapper.into_json(py);
-/// });
-/// ```
+#[cfg(feature = "python")]
 pub fn python_object<'a>(obj: &'a Bound<'a, PyAny>) -> PythonObject<'a> {
     PythonObject(obj)
 }

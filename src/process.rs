@@ -7,10 +7,14 @@ use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
 use std::sync::Arc;
 
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-use tracing::{info, trace};
+use tracing::info;
+#[cfg(feature = "python")]
+use tracing::trace;
 
+#[cfg(feature = "python")]
 pub fn is_running_in_pyo3() -> bool {
     let result = std::panic::catch_unwind(|| {
         Python::with_gil(|_py| {
@@ -114,20 +118,24 @@ pub trait ProcessTrait: Send + Sync {
     }
 
     fn get_tid() -> String {
-        let mut tid = format!("{:?}", std::thread::current().id());
+        let tid = format!("{:?}", std::thread::current().id());
 
-        if is_running_in_pyo3() {
-            let mut thread_id: u64 = 0;
-            Python::with_gil(|py| {
-                thread_id = PyModule::import(py, "threading")
-                    .and_then(|threading| threading.getattr("get_ident"))
-                    .and_then(|bound| bound.call0())
-                    .and_then(|ident| ident.extract::<u64>())
-                    .unwrap_or(0);
-            });
+        #[cfg(feature = "python")]
+        {
+            if is_running_in_pyo3() {
+                let mut thread_id: u64 = 0;
+                Python::with_gil(|py| {
+                    thread_id = PyModule::import(py, "threading")
+                        .and_then(|threading| threading.getattr("get_ident"))
+                        .and_then(|bound| bound.call0())
+                        .and_then(|ident| ident.extract::<u64>())
+                        .unwrap_or(0);
+                });
 
-            tid = format!("{}", thread_id);
-            trace!("python thread_id: {:?}", tid)
+                let py_tid = format!("{}", thread_id);
+                trace!("python thread_id: {:?}", py_tid);
+                return py_tid;
+            }
         }
 
         tid

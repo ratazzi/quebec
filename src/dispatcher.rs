@@ -103,14 +103,19 @@ impl Dispatcher {
 
                               // Get concurrency_limit from registered runnable
                               let concurrency_limit = {
-                                  let Ok(runnables) = ctx.runnables.read()
-                                      .inspect_err(|e| warn!("Failed to acquire read lock: {}", e)) else {
-                                      continue;
-                                  };
-                                  runnables
-                                      .get(&job.class_name)
-                                      .and_then(|runnable| runnable.concurrency_limit)
-                                      .unwrap_or(1)
+                                  #[cfg(feature = "python")]
+                                  {
+                                      let Ok(runnables) = ctx.runnables.read()
+                                          .inspect_err(|e| warn!("Failed to acquire read lock: {}", e)) else {
+                                          continue;
+                                      };
+                                      runnables
+                                          .get(&job.class_name)
+                                          .and_then(|runnable| runnable.concurrency_limit)
+                                          .unwrap_or(1)
+                                  }
+                                  #[cfg(not(feature = "python"))]
+                                  { 1 }
                               };
 
                               // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release

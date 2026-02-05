@@ -106,6 +106,7 @@ impl From<anyhow::Error> for QuebecError {
 }
 
 /// Convert from pyo3::PyErr
+#[cfg(feature = "python")]
 impl From<pyo3::PyErr> for QuebecError {
     fn from(err: pyo3::PyErr) -> Self {
         Self::Python(err.to_string())
@@ -113,6 +114,7 @@ impl From<pyo3::PyErr> for QuebecError {
 }
 
 /// Convert to pyo3::PyErr
+#[cfg(feature = "python")]
 impl From<QuebecError> for pyo3::PyErr {
     fn from(err: QuebecError) -> pyo3::PyErr {
         use pyo3::exceptions::PyRuntimeError;

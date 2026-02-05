@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -7,27 +8,40 @@ use std::sync::LazyLock;
 /// Worker configuration
 /// Compatible with Solid Queue's worker config
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct WorkerConfig {
     /// Queue names to process (internal)
     #[serde(default)]
     pub queues: Option<QueueSelector>,
 
     /// Number of threads in worker pool
-    #[pyo3(get)]
     pub threads: Option<u32>,
 
     /// Polling interval in seconds
-    #[pyo3(get)]
     pub polling_interval: Option<f64>,
 
     /// Number of processes to fork (for compatibility, Quebec uses single process)
-    #[pyo3(get)]
     pub processes: Option<u32>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl WorkerConfig {
+    #[getter]
+    fn threads(&self) -> Option<u32> {
+        self.threads
+    }
+
+    #[getter]
+    fn polling_interval(&self) -> Option<f64> {
+        self.polling_interval
+    }
+
+    #[getter]
+    fn processes(&self) -> Option<u32> {
+        self.processes
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "WorkerConfig(queues={}, threads={:?}, polling_interval={:?})",
@@ -196,27 +210,44 @@ impl serde::Serialize for QueueSelector {
 /// Dispatcher configuration
 /// Compatible with Solid Queue's dispatcher config
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct DispatcherConfig {
     /// Polling interval in seconds
-    #[pyo3(get)]
     pub polling_interval: Option<f64>,
 
     /// Batch size for dispatching jobs
-    #[pyo3(get)]
     pub batch_size: Option<u64>,
 
     /// Concurrency maintenance interval in seconds
-    #[pyo3(get)]
     pub concurrency_maintenance_interval: Option<f64>,
 
     /// Whether to perform concurrency maintenance
-    #[pyo3(get)]
     pub concurrency_maintenance: Option<bool>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl DispatcherConfig {
+    #[getter]
+    fn polling_interval(&self) -> Option<f64> {
+        self.polling_interval
+    }
+
+    #[getter]
+    fn batch_size(&self) -> Option<u64> {
+        self.batch_size
+    }
+
+    #[getter]
+    fn concurrency_maintenance_interval(&self) -> Option<f64> {
+        self.concurrency_maintenance_interval
+    }
+
+    #[getter]
+    fn concurrency_maintenance(&self) -> Option<bool> {
+        self.concurrency_maintenance
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "DispatcherConfig(polling_interval={:?}, batch_size={:?})",
@@ -227,14 +258,19 @@ impl DispatcherConfig {
 
 /// Database configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct DatabaseConfig {
-    #[pyo3(get)]
     pub url: String,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl DatabaseConfig {
+    #[getter]
+    fn url(&self) -> &str {
+        &self.url
+    }
+
     fn __repr__(&self) -> String {
         // Don't print full URL (may contain password)
         "DatabaseConfig(url='***')".to_string()
@@ -244,22 +280,18 @@ impl DatabaseConfig {
 /// Main queue configuration
 /// Compatible with Solid Queue's queue.yml format
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[pyclass]
+#[cfg_attr(feature = "python", pyclass)]
 pub struct QueueConfig {
     /// Application name for NOTIFY channel isolation (default: "quebec")
-    #[pyo3(get)]
     pub name: Option<String>,
 
     /// Database configuration
-    #[pyo3(get)]
     pub database: Option<DatabaseConfig>,
 
     /// Worker configurations
-    #[pyo3(get)]
     pub workers: Option<Vec<WorkerConfig>>,
 
     /// Dispatcher configurations
-    #[pyo3(get)]
     pub dispatchers: Option<Vec<DispatcherConfig>>,
 }
 
@@ -399,8 +431,29 @@ impl QueueConfig {
 }
 
 // Python-exposed methods (only for data access, not loading)
+#[cfg(feature = "python")]
 #[pymethods]
 impl QueueConfig {
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    #[getter]
+    fn database(&self) -> Option<DatabaseConfig> {
+        self.database.clone()
+    }
+
+    #[getter]
+    fn workers(&self) -> Option<Vec<WorkerConfig>> {
+        self.workers.clone()
+    }
+
+    #[getter]
+    fn dispatchers(&self) -> Option<Vec<DispatcherConfig>> {
+        self.dispatchers.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "QueueConfig(name={}, database={}, workers={}, dispatchers={})",
