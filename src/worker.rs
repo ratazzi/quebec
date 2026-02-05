@@ -27,7 +27,7 @@ use pyo3::types::{PyBool, PyDict, PyList, PyModule, PyTuple, PyType};
 
 use crate::notify::NotifyManager;
 
-fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into()),
         serde_json::Value::Number(n) => {
@@ -61,7 +61,7 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
 }
 
 fn python_thread_ident() -> Option<u64> {
-    Python::with_gil(|py| -> PyResult<u64> {
+    Python::attach(|py| -> PyResult<u64> {
         let threading = PyModule::import(py, "threading")?;
         let get_ident = threading.getattr("get_ident")?;
         let ident = get_ident.call0()?;
@@ -184,10 +184,10 @@ impl Runnable {
     }
 
     /// Safe clone method that requires GIL
-    pub fn clone_with_gil(&self, py: Python<'_>) -> Self {
+    pub fn clone_with_gil(&self, _py: Python<'_>) -> Self {
         Self {
             class_name: self.class_name.clone(),
-            handler: self.handler.clone_ref(py),
+            handler: self.handler.clone(),
             queue_as: self.queue_as.clone(),
             priority: self.priority,
             retry_info: self.retry_info.clone(),
@@ -209,7 +209,7 @@ impl Runnable {
         T: crate::utils::IntoPython,
         K: crate::utils::IntoPython,
     {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let bound = self.handler.bind(py);
             let instance = bound.call0()?;
 
@@ -230,12 +230,9 @@ impl Runnable {
                 let args_bound = args_py.bind(py);
 
                 if args_bound.is_instance_of::<pyo3::types::PyTuple>() {
-                    args_bound
-                        .downcast::<pyo3::types::PyTuple>()?
-                        .clone()
-                        .into()
+                    args_bound.cast::<pyo3::types::PyTuple>()?.clone().into()
                 } else if args_bound.is_instance_of::<pyo3::types::PyList>() {
-                    let list = args_bound.downcast::<pyo3::types::PyList>()?;
+                    let list = args_bound.cast::<pyo3::types::PyList>()?;
                     pyo3::types::PyTuple::new(py, list)?.into()
                 } else {
                     // Single value - wrap in tuple
@@ -251,10 +248,7 @@ impl Runnable {
                 let kwargs_bound = kwargs_py.bind(py);
 
                 if kwargs_bound.is_instance_of::<pyo3::types::PyDict>() {
-                    kwargs_bound
-                        .downcast::<pyo3::types::PyDict>()?
-                        .clone()
-                        .into()
+                    kwargs_bound.cast::<pyo3::types::PyDict>()?.clone().into()
                 } else {
                     // If not a dict, create empty dict
                     pyo3::types::PyDict::new(py).into()
@@ -387,13 +381,13 @@ impl Runnable {
     ) -> PyResult<bool> {
         let exceptions_bound = exceptions.bind(py);
 
-        if let Ok(exception_type) = exceptions_bound.downcast::<PyType>() {
+        if let Ok(exception_type) = exceptions_bound.cast::<PyType>() {
             return Ok(error.is_instance(py, exception_type));
         }
 
-        if let Ok(exception_tuple) = exceptions_bound.downcast::<PyTuple>() {
+        if let Ok(exception_tuple) = exceptions_bound.cast::<PyTuple>() {
             let matched = exception_tuple.iter().any(|item| {
-                item.downcast::<PyType>()
+                item.cast::<PyType>()
                     .is_ok_and(|exception_type| error.is_instance(py, exception_type))
             });
             if matched {
@@ -461,7 +455,7 @@ impl Runnable {
         cancellation_token: Option<CancellationToken>,
     ) -> Result<quebec_jobs::Model> {
         // Execute Python task and handle any errors in a single GIL acquisition
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             // Execute Python task within the same GIL session
             match self.execute_python_task(py, job, cancellation_token) {
                 Ok(_) => Ok(job.clone()),
@@ -583,11 +577,9 @@ impl Runnable {
         }
 
         let binding = json_to_py(py, &v)?;
-        let args = binding
-            .downcast_bound::<pyo3::types::PyList>(py)
-            .map_err(|e| {
-                PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
-            })?;
+        let args = binding.cast_bound::<pyo3::types::PyList>(py).map_err(|e| {
+            PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
+        })?;
 
         // Initialize kwargs
         let kwargs = PyDict::new(py);
@@ -600,12 +592,12 @@ impl Runnable {
             let last = args.get_item(last_index)?;
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
-                let last_dict = last.downcast::<pyo3::types::PyDict>()?;
+                let last_dict = last.cast::<pyo3::types::PyDict>()?;
 
                 // Check for "_kwargs" marker
                 if let Ok(Some(kwargs_value)) = last_dict.get_item("_kwargs") {
                     // Found "_kwargs" marker - extract the actual kwargs
-                    if let Ok(inner_dict) = kwargs_value.downcast::<pyo3::types::PyDict>() {
+                    if let Ok(inner_dict) = kwargs_value.cast::<pyo3::types::PyDict>() {
                         for (key, value) in inner_dict {
                             kwargs.set_item(key, value)?;
                         }
@@ -854,7 +846,7 @@ impl Runnable {
     }
 }
 
-#[pyclass(name = "Metric", subclass)]
+#[pyclass(name = "Metric", subclass, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Metric {
     id: i64,
@@ -1254,7 +1246,7 @@ impl Execution {
 
     #[getter]
     fn get_runnable(&self) -> Runnable {
-        Python::with_gil(|py| self.runnable.clone_with_gil(py))
+        Python::attach(|py| self.runnable.clone_with_gil(py))
     }
 
     fn perform(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -1267,8 +1259,8 @@ impl Execution {
 
         // CRITICAL: Release GIL during block_on to avoid deadlock!
         // The async code calls notify_idle() which wakes the main loop,
-        // and the main loop needs GIL for Python::with_gil() calls.
-        let ret = py.allow_threads(|| handle.block_on(async { self.invoke().await }));
+        // and the main loop needs GIL for Python::attach() calls.
+        let ret = py.detach(|| handle.block_on(async { self.invoke().await }));
 
         if let Err(e) = ret {
             return Err(e.into());
@@ -1281,7 +1273,7 @@ impl Execution {
         let result = if !exc.is_instance_of::<PyException>() {
             Ok(self.job.clone())
         } else {
-            let Some(e) = exc.downcast::<PyException>().ok() else {
+            let Some(e) = exc.cast::<PyException>().ok() else {
                 error!("Failed to downcast exception");
                 return;
             };
@@ -1309,7 +1301,7 @@ impl Execution {
                 )))
         };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let Some(handle) = self.ctx.get_runtime_handle() else {
                 error!("Tokio runtime handle not initialized; cannot post job result");
                 return;
@@ -1329,7 +1321,7 @@ impl Execution {
     ) -> PyResult<()> {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-        let e = exc.downcast::<PyException>()?;
+        let e = exc.cast::<PyException>()?;
         let error_type = e
             .get_type()
             .qualname()
@@ -1357,7 +1349,7 @@ impl Execution {
             return Ok(());
         }
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let retry_future = async {
                 warn!(
                     "Attempt {} scheduled due to `{}' on {:?}",
@@ -1494,7 +1486,7 @@ impl Worker {
             )));
         }
         if let Ok(mut h) = handlers.write() {
-            h.push(handler.clone_ref(py));
+            h.push(handler.clone());
         }
         debug!("Worker {} handler: {:?} registered", handler_type, handler);
         Ok(())
@@ -1509,9 +1501,9 @@ impl Worker {
     }
 
     pub fn register_job_class(&self, _py: Python, klass: Py<PyAny>) -> PyResult<()> {
-        Python::with_gil(|py| -> PyResult<()> {
+        Python::attach(|py| -> PyResult<()> {
             let bound = klass.bind(py);
-            let class_name = bound.downcast::<PyType>()?.qualname()?;
+            let class_name = bound.cast::<PyType>()?.qualname()?;
             debug!("Registered job class: {:?}", class_name);
 
             let mut queue_name = "default".to_string();
@@ -2135,7 +2127,7 @@ impl Worker {
         };
 
         // Get concurrency_duration from the runnable (like Solid Queue's job.concurrency_duration)
-        let concurrency_duration = Python::with_gil(|_py| {
+        let concurrency_duration = Python::attach(|_py| {
             ctx.get_runnable(&job.class_name)
                 .ok()
                 .and_then(|r| r.concurrency_duration)
@@ -2267,7 +2259,7 @@ impl Worker {
         let idle_notify = self.idle_notify.clone();
 
         // Call worker start handlers before starting the main loop
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let handlers = self.start_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
@@ -2300,7 +2292,7 @@ impl Worker {
                     info!("Graceful shutdown, stop polling");
 
                     // Call worker stop handlers before exiting
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         let handlers = self.stop_handlers.read().expect("Lock poisoned");
                         for handler in handlers.iter() {
                             match handler.bind(py).call0() {
@@ -2441,7 +2433,7 @@ impl Worker {
             };
 
             // Get runnable with proper GIL handling
-            let runnable = Python::with_gil(|_py| self.ctx.get_runnable(&job.class_name));
+            let runnable = Python::attach(|_py| self.ctx.get_runnable(&job.class_name));
 
             if runnable.is_err() {
                 error!("Job handler not found: {:?}", &job.class_name);
@@ -2470,7 +2462,7 @@ impl Worker {
         debug!("Worker started: {:?}", tid);
 
         // Call worker start handlers
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let handlers = self.start_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {
@@ -2485,7 +2477,7 @@ impl Worker {
             .await;
 
         // Call worker stop handlers
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let handlers = self.stop_handlers.read().expect("Lock poisoned");
             for handler in handlers.iter() {
                 match handler.bind(py).call0() {

@@ -19,7 +19,7 @@ pub fn generate_job_id() -> String {
 
 /// Convert YAML value to Python object
 #[cfg(feature = "python")]
-pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<PyObject> {
+pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_yaml::Value::Null => Ok(py.None()),
         serde_yaml::Value::Bool(b) => Ok(b.into_pyobject(py)?.as_any().clone().unbind()),
@@ -67,7 +67,7 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     } else if obj.is_instance_of::<PyString>() {
         Ok(Value::String(obj.extract::<String>()?))
     } else if obj.is_instance_of::<PyDict>() {
-        let dict = obj.downcast::<PyDict>()?;
+        let dict = obj.cast::<PyDict>()?;
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (key, value) in dict {
             let key: String = key.extract()?;
@@ -76,14 +76,14 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         Ok(Value::Object(map))
     } else if obj.is_instance_of::<PyList>() {
-        let list = obj.downcast::<PyList>()?;
+        let list = obj.cast::<PyList>()?;
         let vec = list
             .iter()
             .map(|item| python_to_json_value(&item))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_instance_of::<PyTuple>() {
-        let tuple = obj.downcast::<PyTuple>()?;
+        let tuple = obj.cast::<PyTuple>()?;
         let vec = tuple
             .iter()
             .map(|item| python_to_json_value(&item))
@@ -100,7 +100,7 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 /// Convert JSON value to Python object
 #[cfg(feature = "python")]
-pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Bool(b) => Ok(b.into_pyobject(py)?.as_any().clone().unbind()),
@@ -153,20 +153,20 @@ impl<'a> PythonObject<'a> {
 // Trait for types that can be converted to Python objects
 #[cfg(feature = "python")]
 pub trait IntoPython {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject>;
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>>;
 }
 
 // Implement for direct value references
 #[cfg(feature = "python")]
 impl IntoPython for &serde_yaml::Value {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         yaml_value_to_python(py, self)
     }
 }
 
 #[cfg(feature = "python")]
 impl IntoPython for &serde_json::Value {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_value_to_python(py, self)
     }
 }
@@ -174,7 +174,7 @@ impl IntoPython for &serde_json::Value {
 // Implement for Vec<serde_yaml::Value> and Vec<serde_json::Value>
 #[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_yaml::Value> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let py_list = pyo3::types::PyList::empty(py);
         for item in self {
             let py_item = yaml_value_to_python(py, item)?;
@@ -186,7 +186,7 @@ impl IntoPython for &Vec<serde_yaml::Value> {
 
 #[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_json::Value> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let py_list = pyo3::types::PyList::empty(py);
         for item in self {
             let py_item = json_value_to_python(py, item)?;
@@ -199,28 +199,28 @@ impl IntoPython for &Vec<serde_json::Value> {
 // Implement for Python Bound types (already Python objects)
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyTuple> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyDict> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyList> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.clone().unbind())
     }
 }

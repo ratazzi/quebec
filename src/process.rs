@@ -17,7 +17,7 @@ use tracing::trace;
 #[cfg(feature = "python")]
 pub fn is_running_in_pyo3() -> bool {
     let result = std::panic::catch_unwind(|| {
-        Python::with_gil(|_py| {
+        Python::attach(|_py| {
             // If GIL can be acquired, assume running in PyO3 environment
             true
         })
@@ -124,7 +124,7 @@ pub trait ProcessTrait: Send + Sync {
         {
             if is_running_in_pyo3() {
                 let mut thread_id: u64 = 0;
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     thread_id = PyModule::import(py, "threading")
                         .and_then(|threading| threading.getattr("get_ident"))
                         .and_then(|bound| bound.call0())

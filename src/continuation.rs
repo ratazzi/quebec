@@ -17,9 +17,13 @@
 //! }
 //! ```
 
+#[cfg(feature = "python")]
 use pyo3::create_exception;
+#[cfg(feature = "python")]
 use pyo3::exceptions::PyException;
+#[cfg(feature = "python")]
 use pyo3::prelude::*;
+#[cfg(feature = "python")]
 use pyo3::types::PyDict;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -27,9 +31,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 // Exception raised when a job needs to be interrupted and resumed later
+#[cfg(feature = "python")]
 create_exception!(quebec, JobInterrupted, PyException);
 
 // Exception raised when step validation fails (like Rails' InvalidStepError)
+#[cfg(feature = "python")]
 create_exception!(quebec, InvalidStepError, PyException);
 
 /// State of a job's continuation progress
@@ -90,7 +96,8 @@ impl ContinuationState {
 }
 
 /// Context for a single step, exposed to Python
-#[pyclass(name = "StepContext")]
+#[cfg(feature = "python")]
+#[pyclass(name = "StepContext", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct StepContext {
     /// Name of this step
@@ -112,12 +119,13 @@ pub struct StepContext {
     continuation_ctx: Arc<Mutex<ContinuationContext>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl StepContext {
     /// Get the current cursor value
     /// Returns None on first execution, or the saved cursor value when resuming
     #[getter]
-    fn cursor(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn cursor(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         match &self.cursor {
             None => Ok(py.None()),
             Some(v) => json_to_pyobject(py, v),
@@ -284,6 +292,7 @@ impl StepContext {
     }
 }
 
+#[cfg(feature = "python")]
 impl StepContext {
     fn new(
         step_name: String,
@@ -383,13 +392,15 @@ impl ContinuationContext {
 }
 
 /// Main continuation manager, exposed to Python as a mixin
-#[pyclass(name = "Continuable")]
+#[cfg(feature = "python")]
+#[pyclass(name = "Continuable", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Continuable {
     /// Shared context for this continuation
     ctx: Arc<Mutex<ContinuationContext>>,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl Continuable {
     #[new]
@@ -444,7 +455,7 @@ impl Continuable {
         callback: Option<&Bound<'_, pyo3::PyAny>>,
         start: Option<&Bound<'_, pyo3::PyAny>>,
         isolated: bool,
-    ) -> PyResult<PyObject> {
+    ) -> PyResult<Py<PyAny>> {
         // Perform validation and get step state
         let (noop, cursor, resumed) = {
             let mut ctx = self
@@ -624,6 +635,7 @@ impl Continuable {
     }
 }
 
+#[cfg(feature = "python")]
 impl Continuable {
     /// Create a Continuable with existing state (for job restoration)
     pub fn with_state(
@@ -655,7 +667,8 @@ impl Continuable {
 }
 
 /// Context manager for step execution
-#[pyclass(name = "StepContextManager")]
+#[cfg(feature = "python")]
+#[pyclass(name = "StepContextManager", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct StepContextManager {
     step_ctx: StepContext,
@@ -664,6 +677,7 @@ pub struct StepContextManager {
     entered: bool,
 }
 
+#[cfg(feature = "python")]
 #[pymethods]
 impl StepContextManager {
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<StepContext> {
@@ -754,7 +768,8 @@ impl StepContextManager {
 
 // Helper functions for JSON <-> Python conversion
 
-fn json_to_pyobject(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
+#[cfg(feature = "python")]
+fn json_to_pyobject(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
         serde_json::Value::Bool(b) => Ok((*b).into_pyobject(py)?.to_owned().unbind().into()),
@@ -785,6 +800,7 @@ fn json_to_pyobject(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObj
     }
 }
 
+#[cfg(feature = "python")]
 fn pyobject_to_json(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<serde_json::Value> {
     if obj.is_none() {
         return Ok(serde_json::Value::Null);
@@ -801,14 +817,14 @@ fn pyobject_to_json(obj: &Bound<'_, pyo3::PyAny>) -> PyResult<serde_json::Value>
     if let Ok(s) = obj.extract::<String>() {
         return Ok(serde_json::Value::String(s));
     }
-    if let Ok(list) = obj.downcast::<pyo3::types::PyList>() {
+    if let Ok(list) = obj.cast::<pyo3::types::PyList>() {
         let mut arr = Vec::new();
         for item in list.iter() {
             arr.push(pyobject_to_json(&item)?);
         }
         return Ok(serde_json::Value::Array(arr));
     }
-    if let Ok(dict) = obj.downcast::<PyDict>() {
+    if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in dict.iter() {
             let key = k.extract::<String>()?;

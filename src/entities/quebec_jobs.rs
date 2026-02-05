@@ -4,7 +4,10 @@
 use pyo3::prelude::*;
 use sea_orm::entity::prelude::*;
 
-#[cfg_attr(feature = "python", pyclass(name = "QuebecJob", subclass))]
+#[cfg_attr(
+    feature = "python",
+    pyclass(name = "QuebecJob", subclass, from_py_object)
+)]
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "solid_queue_jobs")]
 pub struct Model {

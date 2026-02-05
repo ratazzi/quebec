@@ -3,7 +3,7 @@ use chrono::NaiveDateTime;
 
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
-use pyo3::sync::GILOnceCell;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyTuple, PyType};
 
 use sea_orm::*;
@@ -27,7 +27,7 @@ fn extract_kwarg_or_env<T>(
     default: T,
 ) -> T
 where
-    T: for<'py> FromPyObject<'py> + FromStr,
+    T: for<'a, 'py> FromPyObject<'a, 'py> + FromStr,
 {
     // 1. Try kwargs — warn on type mismatch when key is present
     if let Some(py_val) = kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
@@ -68,7 +68,7 @@ use tracing::{debug, error, info, trace, warn};
 fn signal_handler(
     py: Python<'_>,
     signum: i32,
-    _frame: PyObject,
+    _frame: Py<PyAny>,
     quebec: Py<PyAny>,
 ) -> PyResult<()> {
     info!("Received signal {}, initiating graceful shutdown", signum);
@@ -80,7 +80,7 @@ fn signal_handler(
     Ok(())
 }
 
-#[pyclass(name = "ActiveLogger", subclass)]
+#[pyclass(name = "ActiveLogger", subclass, from_py_object)]
 #[derive(Debug, Clone, Default)]
 pub struct ActiveLogger;
 
@@ -117,7 +117,7 @@ impl ActiveLogger {
     }
 }
 
-#[pyclass(name = "Quebec", subclass)]
+#[pyclass(name = "Quebec", subclass, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQuebec {
     pub ctx: Arc<AppContext>,
@@ -134,7 +134,7 @@ pub struct PyQuebec {
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
-static INSTANCE_MAP: GILOnceCell<RwLock<HashMap<String, Py<PyQuebec>>>> = GILOnceCell::new();
+static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
 
 #[pymethods]
 impl PyQuebec {
@@ -293,7 +293,7 @@ impl PyQuebec {
         });
         let db_option = Some(Arc::new(db));
 
-        // Convert kwargs to HashMap<String, PyObject>
+        // Convert kwargs to HashMap<String, Py<PyAny>>
         let options = kwargs
             .map(|kw| -> PyResult<_> {
                 let py = kw.py();
@@ -305,7 +305,7 @@ impl PyQuebec {
                                 k
                             ))
                         })?;
-                        let obj: PyObject = v.into_pyobject(py)?.into();
+                        let obj: Py<PyAny> = v.into_pyobject(py)?.into();
                         Ok((key, obj))
                     })
                     .collect()
@@ -490,7 +490,7 @@ impl PyQuebec {
     fn pick_job(&self, py: Python<'_>) -> PyResult<Execution> {
         let worker = self.worker.clone();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let ret = self.rt.block_on(async move { worker.pick_job().await });
             ret.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -509,10 +509,10 @@ impl PyQuebec {
         Ok(())
     }
 
-    fn bind_queue(&self, py: Python<'_>, queue: PyObject) -> PyResult<()> {
+    fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
-        let queue = queue.clone_ref(py);
-        let queue1 = queue.clone_ref(py);
+        let queue = queue.clone();
+        let queue1 = queue.clone();
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
 
         self.pyqueue_mode.store(true, Ordering::Relaxed);
@@ -523,7 +523,7 @@ impl PyQuebec {
                 let result = worker.pick_job().await;
 
                 // Get GIL and send result to Python queue
-                Python::with_gil(|py| {
+                Python::attach(|py| {
                     let queue = queue.bind(py);
 
                     let Ok(res) = result else {
@@ -551,7 +551,7 @@ impl PyQuebec {
         let handle = self.rt.spawn(async move {
             graceful_shutdown.cancelled().await;
 
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 let queue = queue1.bind(py);
 
                 // Determine shutdown method based on queue type
@@ -665,7 +665,7 @@ impl PyQuebec {
                     "Failed to acquire lock for start handlers",
                 )
             })?;
-            handlers.push(handler.clone_ref(py));
+            handlers.push(handler.clone());
             trace!("Start handler registered");
         }
 
@@ -686,7 +686,7 @@ impl PyQuebec {
                     "Failed to acquire lock for stop handlers",
                 )
             })?;
-            handlers.push(handler.clone_ref(py));
+            handlers.push(handler.clone());
             trace!("Stop handler registered");
         }
 
@@ -725,7 +725,7 @@ impl PyQuebec {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<ActiveJob> {
         let bound = klass;
-        let class_name = bound.downcast::<PyType>()?.qualname()?;
+        let class_name = bound.cast::<PyType>()?.qualname()?;
 
         let queue_name = match bound.getattr("queue_as") {
             Ok(attr) => attr.extract::<String>()?,
@@ -895,7 +895,7 @@ impl PyQuebec {
 
         let start_time = Instant::now();
         // Release GIL during database operations to prevent blocking other Python threads
-        py.allow_threads(|| {
+        py.detach(|| {
             self.rt.block_on(async {
                 let job = self.quebec.perform_later(obj.clone()).await;
                 job
@@ -1043,7 +1043,7 @@ impl PyQuebec {
         let rt = self.rt.clone();
 
         // Temporarily release GIL
-        py.allow_threads(|| {
+        py.detach(|| {
             // block call would continuously occupy GIL preventing other threads from executing
             rt.block_on(async move {
                 let result = tokio::time::timeout(timeout, async {
@@ -1074,7 +1074,7 @@ impl PyQuebec {
     }
 
     pub fn invoke_start_handlers(&self) -> PyResult<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let handlers = self
                 .start_handlers
                 .read()
@@ -1089,7 +1089,7 @@ impl PyQuebec {
     }
 
     pub fn invoke_stop_handlers(&self) -> PyResult<()> {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             let handlers = self
                 .stop_handlers
                 .read()
@@ -1117,7 +1117,7 @@ impl PyQuebec {
                     "Failed to acquire lock for shutdown handlers",
                 )
             })?;
-            handlers.push(handler.clone_ref(py));
+            handlers.push(handler.clone());
             debug!("Shutdown handler: {:?} registered", handler);
         }
 
@@ -1215,7 +1215,7 @@ impl PyQuebec {
             }
         };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await;
                 let mut total_deleted: u64 = 0;
@@ -1299,7 +1299,7 @@ impl PyQuebec {
             }
         };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await;
                 crate::query_builder::jobs::count_finished_before(
@@ -1319,7 +1319,7 @@ impl PyQuebec {
     }
 }
 
-#[pyclass(name = "ActiveJob", subclass)]
+#[pyclass(name = "ActiveJob", subclass, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ActiveJob {
     pub logger: ActiveLogger,
