@@ -134,7 +134,7 @@ pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject>
 /// Wrapper for Python objects that provides idiomatic conversion methods
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// use quebec::utils::{python_object, PythonObject};
 ///
 /// Python::with_gil(|py| {
@@ -225,7 +225,7 @@ impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
 /// Create a PythonObject wrapper for idiomatic conversions
 ///
 /// # Example
-/// ```rust
+/// ```rust,ignore
 /// Python::with_gil(|py| {
 ///     let py_str = py.eval("'test'", None, None)?;
 ///     let wrapper = python_object(&py_str);

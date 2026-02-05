@@ -6,7 +6,7 @@ use sea_orm::entity::prelude::*;
 use sea_orm::{DatabaseTransaction, DbErr};
 use tracing::info;
 
-// Define the Retryable trait
+#[allow(async_fn_in_trait)]
 pub trait Retryable {
     /// Retry a failed job by moving it from failed_executions to ready_executions
     async fn retry(
@@ -23,7 +23,7 @@ pub trait Retryable {
     ) -> Result<u64, DbErr>;
 }
 
-// Define the Discardable trait
+#[allow(async_fn_in_trait)]
 pub trait Discardable {
     /// Discard a failed job by removing it from failed_executions and optionally marking the job as finished
     async fn discard(
