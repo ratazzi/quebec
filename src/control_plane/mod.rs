@@ -2,6 +2,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::{
+    extract::Path,
+    http::StatusCode,
     routing::{get, post},
     Router,
 };
@@ -69,8 +71,59 @@ impl ControlPlane {
         self
     }
 
+    async fn static_file(
+        Path(filename): Path<String>,
+    ) -> Result<([(http::header::HeaderName, &'static str); 2], Vec<u8>), StatusCode> {
+        debug!("static_file requested: {}", filename);
+
+        // Reject path traversal and non-alphanumeric filenames
+        if !filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')
+        {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        let content_type = if filename.ends_with(".js") {
+            "application/javascript"
+        } else if filename.ends_with(".css") {
+            "text/css"
+        } else {
+            "application/octet-stream"
+        };
+
+        let data = {
+            #[cfg(debug_assertions)]
+            {
+                let path = format!("src/control_plane/static/{}", filename);
+                tokio::fs::read(&path)
+                    .await
+                    .map_err(|_| StatusCode::NOT_FOUND)?
+            }
+
+            #[cfg(not(debug_assertions))]
+            {
+                templates::StaticAssets::get(&filename)
+                    .map(|asset| asset.data.to_vec())
+                    .ok_or(StatusCode::NOT_FOUND)?
+            }
+        };
+
+        Ok((
+            [
+                (http::header::CONTENT_TYPE, content_type),
+                (
+                    http::header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable",
+                ),
+            ],
+            data,
+        ))
+    }
+
     pub fn build_router(self: Arc<Self>) -> Router {
         Router::new()
+            .route("/static/:filename", get(Self::static_file))
             .route("/", get(Self::overview))
             .route("/queues", get(Self::queues))
             .route("/queues/:name", get(Self::queue_details))

@@ -11,6 +11,12 @@ use tracing::error;
 #[allow(dead_code)]
 pub struct Templates;
 
+// Static JS/CSS assets vendored from CDN (see scripts/download_assets.py)
+#[derive(RustEmbed)]
+#[folder = "src/control_plane/static/"]
+#[allow(dead_code)]
+pub struct StaticAssets;
+
 // Read templates from filesystem in development mode, use embedded resources in production mode
 pub fn get_template_content(template_name: &str) -> Option<String> {
     #[cfg(debug_assertions)]

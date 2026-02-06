@@ -5,13 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="base-path" content="{{ base_path }}">
   <title>{% block title %}Control Plane{% endblock %}</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
-  <script type="module" src="https://cdn.jsdelivr.net/npm/@hotwired/turbo@latest/dist/turbo.es2017-esm.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="{{ base_path }}/static/tailwindcss.js?v={{ version }}"></script>
+  <script type="module" src="{{ base_path }}/static/turbo.es2017-esm.min.js?v={{ version }}"></script>
+  <script src="{{ base_path }}/static/chart.min.js?v={{ version }}"></script>
 
   <script type="module">
-    import { Application, Controller } from "https://unpkg.com/@hotwired/stimulus/dist/stimulus.js"
+    import { Application, Controller } from "{{ base_path | safe }}/static/stimulus.min.js?v={{ version | safe }}"
     window.Stimulus = Application.start()
 
     // Auto-refresh controller
