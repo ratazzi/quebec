@@ -1831,40 +1831,29 @@ impl Worker {
             count
         );
 
-        // Process each orphaned execution in a transaction (like Solid Queue's failed_with)
         for execution in orphaned {
-            let table_config = table_config.clone();
+            let ctx = self.ctx.clone();
+            let tc = table_config.clone();
             let job_id = execution.job_id;
-            let execution_id = execution.id;
-            let process_id = execution.process_id;
 
             db.transaction::<_, (), DbErr>(|txn| {
                 Box::pin(async move {
-                    // Insert into failed_executions with error message
-                    query_builder::failed_executions::insert(
+                    Self::fail_claimed_execution(
+                        &ctx,
                         txn,
-                        &table_config,
+                        &tc,
                         job_id,
-                        Some("Process crashed or was killed before job completion"),
+                        execution.id,
+                        "Process crashed or was killed before job completion",
                     )
-                    .await?;
-
-                    // Delete from claimed_executions
-                    query_builder::claimed_executions::delete_by_id(
-                        txn,
-                        &table_config,
-                        execution_id,
-                    )
-                    .await?;
-
-                    Ok(())
+                    .await
                 })
             })
             .await?;
 
             debug!(
                 "Marked orphaned job {} as failed (was claimed by process {:?})",
-                job_id, process_id
+                job_id, execution.process_id
             );
         }
 
@@ -1880,10 +1869,9 @@ impl Worker {
         let db = self.ctx.get_db().await;
         let table_config = self.ctx.table_config.clone();
 
-        // Calculate threshold: processes with heartbeat older than this are considered dead
-        // Use 3x heartbeat interval as threshold (same as Solid Queue's default)
+        // Processes with heartbeat older than this are considered dead
         let threshold = chrono::Utc::now().naive_utc()
-            - chrono::Duration::from_std(self.ctx.process_heartbeat_interval * 3)?;
+            - chrono::Duration::from_std(self.ctx.process_alive_threshold)?;
 
         let stale_processes = query_builder::processes::find_prunable(
             db.as_ref(),
@@ -1913,43 +1901,32 @@ impl Worker {
                 process_id, process_pid, process_hostname
             );
 
-            // Wrap all operations for this process in a transaction
+            let ctx = self.ctx.clone();
+            let tc = table_config.clone();
             let deleted_count = db
                 .transaction::<_, u64, DbErr>(|txn| {
-                    let table_config = table_config.clone();
+                    let tc = tc.clone();
                     let error_msg = error_msg.clone();
                     Box::pin(async move {
-                        // Find all claimed executions for this process
                         let claimed = query_builder::claimed_executions::find_by_process_id(
-                            txn,
-                            &table_config,
-                            process_id,
+                            txn, &tc, process_id,
                         )
                         .await?;
+                        let deleted_count = claimed.len() as u64;
 
-                        // Fail each claimed execution
                         for execution in &claimed {
-                            query_builder::failed_executions::insert(
+                            Self::fail_claimed_execution(
+                                &ctx,
                                 txn,
-                                &table_config,
+                                &tc,
                                 execution.job_id,
-                                Some(&error_msg),
+                                execution.id,
+                                &error_msg,
                             )
                             .await?;
                         }
 
-                        // Delete all claimed executions for this process
-                        let deleted_count =
-                            query_builder::claimed_executions::delete_by_process_id(
-                                txn,
-                                &table_config,
-                                process_id,
-                            )
-                            .await?;
-
-                        // Delete the stale process
-                        query_builder::processes::prune(txn, &table_config, process_id).await?;
-
+                        query_builder::processes::prune(txn, &tc, process_id).await?;
                         Ok(deleted_count)
                     })
                 })
@@ -2029,9 +2006,9 @@ impl Worker {
     }
 
     /// Release all claimed executions for a process back to ready state.
-    /// Used for maintenance/admin purposes - re-queues jobs for other workers.
+    /// Called during graceful shutdown for jobs claimed but not yet started.
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
-    #[allow(dead_code)]
+    /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
     async fn release_all_claimed_executions(
         &self,
         process_id: i64,
@@ -2054,37 +2031,110 @@ impl Worker {
         info!("Releasing {} claimed job(s) back to ready state", count);
 
         for execution in claimed {
-            // Get the job to retrieve queue_name and priority
-            if let Some(job) =
-                query_builder::jobs::find_by_id(db.as_ref(), &table_config, execution.job_id)
-                    .await?
-            {
-                // Re-insert into ready_executions (bypass concurrency limits like Solid Queue)
-                query_builder::ready_executions::insert(
-                    db.as_ref(),
-                    &table_config,
-                    job.id,
-                    &job.queue_name,
-                    job.priority,
-                )
-                .await?;
+            let table_config = table_config.clone();
+            let job_id = execution.job_id;
+            let execution_id = execution.id;
 
-                debug!(
-                    "Released job {} back to ready state (queue: {})",
-                    job.id, job.queue_name
-                );
-            }
+            db.transaction::<_, (), DbErr>(|txn| {
+                Box::pin(async move {
+                    if let Some(job) =
+                        query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
+                    {
+                        // Bypass concurrency limits: the job already holds a semaphore
+                        // slot from when it was dispatched. Put it back to ready directly
+                        // so the dispatcher can re-claim it without re-acquiring the slot.
+                        // Matches Solid Queue's dispatch_bypassing_concurrency_limits.
+                        query_builder::ready_executions::insert(
+                            txn,
+                            &table_config,
+                            job.id,
+                            &job.queue_name,
+                            job.priority,
+                        )
+                        .await?;
+                    } else {
+                        warn!(
+                            "Job {} not found, dropping claimed execution {}",
+                            job_id, execution_id
+                        );
+                    }
 
-            // Delete from claimed_executions
-            query_builder::claimed_executions::delete_by_id(
-                db.as_ref(),
-                &table_config,
-                execution.id,
-            )
+                    query_builder::claimed_executions::delete_by_id(
+                        txn,
+                        &table_config,
+                        execution_id,
+                    )
+                    .await?;
+
+                    Ok(())
+                })
+            })
             .await?;
+
+            debug!("Released job {} back to ready state", job_id);
         }
 
         Ok(count)
+    }
+
+    /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
+    async fn fail_claimed_execution<C>(
+        ctx: &Arc<AppContext>,
+        db: &C,
+        table_config: &TableConfig,
+        job_id: i64,
+        execution_id: i64,
+        error_msg: &str,
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        query_builder::failed_executions::insert(db, table_config, job_id, Some(error_msg)).await?;
+        query_builder::claimed_executions::delete_by_id(db, table_config, execution_id).await?;
+        Self::unblock_next_job(ctx, db, table_config, job_id).await
+    }
+
+    /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.
+    /// Used during recovery (orphan/prune) to prevent blocked jobs from getting permanently stuck.
+    async fn unblock_next_job<C>(
+        ctx: &Arc<AppContext>,
+        db: &C,
+        table_config: &TableConfig,
+        job_id: i64,
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let Some(job) = query_builder::jobs::find_by_id(db, table_config, job_id).await? else {
+            return Ok(());
+        };
+        let Some(key) = job.concurrency_key.as_ref().filter(|k| !k.is_empty()) else {
+            return Ok(());
+        };
+
+        let (limit, duration) = Python::attach(|_py| {
+            ctx.get_runnable(&job.class_name)
+                .ok()
+                .map(|r| {
+                    (
+                        r.concurrency_limit.unwrap_or(1),
+                        r.concurrency_duration
+                            .map(|s| chrono::Duration::seconds(s as i64)),
+                    )
+                })
+                .unwrap_or((1, None))
+        });
+
+        if release_semaphore(db, table_config, key.clone(), limit, duration)
+            .await
+            .unwrap_or(false)
+        {
+            Worker::release_next_blocked_job(ctx, db, key, limit)
+                .await
+                .ok();
+        }
+
+        Ok(())
     }
 
     /// Release the next blocked job for a given concurrency key.
@@ -2302,11 +2352,15 @@ impl Worker {
                         }
                     });
 
-                    // NOTE: Do NOT release claimed executions here!
-                    // Like Solid Queue, we wait for runner threads to complete their current jobs.
-                    // Python side calls t.join() to wait for all runners.
-                    // Jobs complete normally via after_executed(), which cleans up claimed_executions.
-                    // Only orphaned executions (from crashed workers) are released via prune_dead_processes.
+                    // Release remaining claimed executions back to ready state BEFORE
+                    // deleting the process record, to avoid a race where another worker's
+                    // fail_orphaned_executions sees them as orphans and marks them failed.
+                    // Python side calls t.join() first, so actively-running jobs complete
+                    // normally via after_executed(). This handles jobs that were claimed
+                    // but not yet started (sitting in the mpsc channel).
+                    if let Err(e) = self.release_all_claimed_executions(process.id).await {
+                        warn!("Failed to release claimed executions on shutdown: {}", e);
+                    }
 
                     // Clean up process record
                     let stop_db = self.ctx.get_db().await;

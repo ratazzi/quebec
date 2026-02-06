@@ -301,6 +301,8 @@ async fn enqueue_all_jobs(
     let now = chrono::Utc::now().naive_utc();
 
     // Phase 1: bulk INSERT all jobs
+    // Default scheduled_at to now (matching Solid Queue's `scheduled_at ||= Time.current`
+    // and Quebec's own single-enqueue path)
     let bulk_rows: Vec<query_builder::jobs::BulkJobRow> = jobs
         .iter()
         .map(|j| query_builder::jobs::BulkJobRow {
@@ -309,7 +311,7 @@ async fn enqueue_all_jobs(
             arguments: Some(j.arguments.clone()),
             priority: j.priority,
             active_job_id: j.active_job_id.clone(),
-            scheduled_at: j.scheduled_at,
+            scheduled_at: Some(j.scheduled_at.unwrap_or(now)),
             concurrency_key: j.concurrency_key.clone(),
         })
         .collect();
