@@ -285,6 +285,7 @@ pub struct AppContext {
     pub dispatcher_concurrency_maintenance_interval: Duration,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
+    pub control_plane_sse_interval: Duration,
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
@@ -451,6 +452,9 @@ impl AppContext {
                 if let Some(v) = get_duration("dispatcher_concurrency_maintenance_interval") {
                     ctx.dispatcher_concurrency_maintenance_interval = v;
                 }
+                if let Some(v) = get_duration("control_plane_sse_interval") {
+                    ctx.control_plane_sse_interval = v;
+                }
                 // worker_polling_interval: also accepts f64 for sub-second precision
                 if let Some(val) = options.get("worker_polling_interval") {
                     let result = val
@@ -550,6 +554,7 @@ impl AppContext {
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
+            control_plane_sse_interval: Duration::from_secs(5),
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),

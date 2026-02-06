@@ -449,6 +449,21 @@ class ControlPlaneASGI:
         if root_path and path.startswith(root_path):
             path = path[len(root_path) :] or "/"
 
+        # SSE (/events) is not supported through the ASGI bridge because
+        # handle_request collects the full body, which blocks forever on
+        # infinite streams.  Reject with 204 so the frontend JS falls back
+        # to polling /stats automatically.
+        if path == "/events":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+            return
+
         # Call Rust handler (releases GIL internally via py.detach)
         # base_path is passed to Rust so templates generate correct prefixed URLs
         status, headers, response_body = self.qc.handle_control_plane_request(

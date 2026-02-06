@@ -132,7 +132,7 @@ pub struct PyQuebec {
     pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pyqueue_mode: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    control_plane_router: Arc<Mutex<Option<axum::Router>>>,
+    control_plane_router: Arc<tokio::sync::Mutex<Option<axum::Router>>>,
 }
 
 static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
@@ -451,7 +451,7 @@ impl PyQuebec {
             stop_handlers,
             pyqueue_mode: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
-            control_plane_router: Arc::new(Mutex::new(None)),
+            control_plane_router: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -1137,27 +1137,31 @@ impl PyQuebec {
         body: Vec<u8>,
         base_path: &str,
     ) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
-        // Lazy init router on first call
-        let mut router_guard = self.control_plane_router.lock().map_err(|_| {
-            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire router lock")
-        })?;
-        if router_guard.is_none() {
-            let cp =
-                Arc::new(ControlPlane::new(self.ctx.clone()).with_base_path(base_path.to_string()));
-            *router_guard = Some(cp.build_router());
-        }
-        let router = router_guard.as_mut().unwrap();
-
         let uri = if query_string.is_empty() {
             path
         } else {
             format!("{}?{}", path, query_string)
         };
 
+        let rt = self.rt.clone();
+        let router_lock = self.control_plane_router.clone();
+        let ctx = self.ctx.clone();
+        let base_path = base_path.to_string();
+
+        // Release GIL first, then clone the router for concurrent request handling.
+        // The mutex is only held briefly for init/clone, not for the entire request.
         Ok(py.detach(|| {
-            self.rt.block_on(ControlPlane::handle_request(
-                router, &method, &uri, headers, body,
-            ))
+            rt.block_on(async {
+                let mut router = {
+                    let mut guard = router_lock.lock().await;
+                    if guard.is_none() {
+                        let cp = Arc::new(ControlPlane::new(ctx).with_base_path(base_path));
+                        *guard = Some(cp.build_router());
+                    }
+                    guard.as_ref().unwrap().clone()
+                };
+                ControlPlane::handle_request(&mut router, &method, &uri, headers, body).await
+            })
         }))
     }
 

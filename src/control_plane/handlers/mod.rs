@@ -1,4 +1,5 @@
 pub mod blocked_jobs;
+pub mod events;
 pub mod failed_jobs;
 pub mod finished_jobs;
 pub mod health;

@@ -2005,6 +2005,7 @@ name = "quebec"
 version = "0.2.4"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "atty",
  "axum",

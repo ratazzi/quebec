@@ -30,6 +30,7 @@ pub struct ControlPlane {
     pub(crate) template_path: String,
     pub(crate) page_size: u64,
     pub(crate) base_path: String,
+    pub(crate) sse_interval: Duration,
 }
 
 impl ControlPlane {
@@ -56,6 +57,7 @@ impl ControlPlane {
         debug!("Available templates: {:?}", template_list);
         debug!("Tera template engine initialized in {:?}", start.elapsed());
 
+        let sse_interval = ctx.control_plane_sse_interval.max(Duration::from_secs(1));
         Self {
             ctx,
             tera: RwLock::new(tera),
@@ -63,6 +65,7 @@ impl ControlPlane {
             template_path: "src/templates/**/*".to_string(),
             page_size: 10,
             base_path: String::new(),
+            sse_interval,
         }
     }
 
@@ -166,6 +169,7 @@ impl ControlPlane {
             .route("/stats", get(Self::stats))
             .route("/workers", get(Self::workers))
             .route("/health", get(Self::health))
+            .route("/events", get(Self::events))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))

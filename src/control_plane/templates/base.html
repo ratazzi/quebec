@@ -491,6 +491,60 @@
         element.classList.remove(...classes)
       }
     })
+
+    Stimulus.register("stats-stream", class extends Controller {
+      static values = { interval: { type: Number, default: 5000 } }
+
+      connect() {
+        this.basePath = document.querySelector('meta[name="base-path"]')?.content || ''
+        this.startSSE()
+      }
+
+      disconnect() {
+        this.stop()
+      }
+
+      startSSE() {
+        const es = new EventSource(this.basePath + '/events')
+        this.eventSource = es
+        let received = false
+        es.onmessage = (e) => {
+          received = true
+          Turbo.renderStreamMessage(e.data)
+        }
+        es.onerror = () => {
+          // Never received a message (e.g. ASGI 204) — SSE unsupported,
+          // fall back to polling permanently. Otherwise let EventSource
+          // auto-reconnect on its own.
+          if (!received) {
+            this.stopSSE()
+            this.startPolling()
+          }
+        }
+      }
+
+      startPolling() {
+        if (this.timer) return
+        this.timer = setInterval(async () => {
+          try {
+            const resp = await fetch(this.basePath + '/stats')
+            if (resp.ok) Turbo.renderStreamMessage(await resp.text())
+          } catch(e) { console.debug('[stats-stream] polling error:', e) }
+        }, this.intervalValue)
+      }
+
+      stopSSE() {
+        if (this.eventSource) {
+          this.eventSource.close()
+          this.eventSource = null
+        }
+      }
+
+      stop() {
+        this.stopSSE()
+        if (this.timer) { clearInterval(this.timer); this.timer = null }
+      }
+    })
   </script>
 </head>
 <body class="bg-white text-black min-h-screen flex flex-col">
@@ -532,9 +586,7 @@
         </nav>
       </turbo-frame>
 
-      <div data-controller="reload" data-reload-interval-value="5000">
-        <turbo-frame id="stats-frame" src="{{ base_path }}/stats" data-reload-target="frame" class="hidden"></turbo-frame>
-      </div>
+      <div data-controller="stats-stream"></div>
 
       <turbo-frame id="content" data-nav-target="content" class="mb-4">
         {% block content %}{% endblock %}
