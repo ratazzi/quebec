@@ -188,6 +188,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyQuebec>()?;
     m.add_class::<ActiveJob>()?;
+    m.add_class::<AsgiRequest>()?;
     m.add_class::<ConcurrencyStrategy>()?;
     m.add_class::<ConcurrencyConflict>()?;
     m.add_class::<RescueStrategy>()?;

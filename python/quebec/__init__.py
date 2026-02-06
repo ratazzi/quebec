@@ -497,7 +497,7 @@ class ControlPlaneASGI:
 
         # Call Rust handler (releases GIL internally via py.detach)
         # base_path is passed to Rust so templates generate correct prefixed URLs
-        status, headers, response_body = self.qc.handle_control_plane_request(
+        req = quebec.AsgiRequest(
             scope["method"],
             path,
             (scope.get("query_string") or b"").decode("latin-1"),
@@ -505,6 +505,7 @@ class ControlPlaneASGI:
             body,
             root_path,
         )
+        status, headers, response_body = self.qc.handle_control_plane_request(req)
 
         # Rewrite Location headers for redirects (303 etc.)
         if root_path:

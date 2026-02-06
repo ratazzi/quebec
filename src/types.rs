@@ -117,6 +117,40 @@ impl ActiveLogger {
     }
 }
 
+#[pyclass(from_py_object)]
+#[derive(Debug, Clone)]
+pub struct AsgiRequest {
+    pub method: String,
+    pub path: String,
+    pub query_string: String,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+    pub body: Vec<u8>,
+    pub base_path: String,
+}
+
+#[pymethods]
+impl AsgiRequest {
+    #[new]
+    #[pyo3(signature = (method, path, query_string, headers, body, base_path="".to_string()))]
+    fn new(
+        method: String,
+        path: String,
+        query_string: String,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        body: Vec<u8>,
+        base_path: String,
+    ) -> Self {
+        Self {
+            method,
+            path,
+            query_string,
+            headers,
+            body,
+            base_path,
+        }
+    }
+}
+
 #[pyclass(name = "Quebec", subclass, from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQuebec {
@@ -1338,27 +1372,24 @@ impl PyQuebec {
         Ok(handler)
     }
 
-    #[pyo3(signature = (method, path, query_string, headers, body, base_path=""))]
     fn handle_control_plane_request(
         &self,
         py: Python<'_>,
-        method: String,
-        path: String,
-        query_string: String,
-        headers: Vec<(Vec<u8>, Vec<u8>)>,
-        body: Vec<u8>,
-        base_path: &str,
+        req: &AsgiRequest,
     ) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
-        let uri = if query_string.is_empty() {
-            path
+        let uri = if req.query_string.is_empty() {
+            req.path.clone()
         } else {
-            format!("{}?{}", path, query_string)
+            format!("{}?{}", req.path, req.query_string)
         };
 
         let rt = self.rt.clone();
         let router_lock = self.control_plane_router.clone();
         let ctx = self.ctx.clone();
-        let base_path = base_path.to_string();
+        let base_path = req.base_path.clone();
+        let method = req.method.clone();
+        let headers = req.headers.clone();
+        let body = req.body.clone();
 
         // Release GIL first, then clone the router for concurrent request handling.
         // The mutex is only held briefly for init/clone, not for the entire request.
