@@ -165,6 +165,7 @@ impl ControlPlane {
             .route("/jobs/:id", get(Self::job_details))
             .route("/stats", get(Self::stats))
             .route("/workers", get(Self::workers))
+            .route("/health", get(Self::health))
             .layer(
                 TraceLayer::new_for_http()
                     .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))

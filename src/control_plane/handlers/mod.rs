@@ -1,6 +1,7 @@
 pub mod blocked_jobs;
 pub mod failed_jobs;
 pub mod finished_jobs;
+pub mod health;
 pub mod in_progress_jobs;
 pub mod job_details;
 pub mod overview;
