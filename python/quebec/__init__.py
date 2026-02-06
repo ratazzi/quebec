@@ -133,6 +133,23 @@ class Continuable:
         return self._continuation.resumptions
 
 
+class JobDescriptor:
+    """Lightweight descriptor holding all data needed to enqueue a job.
+
+    Created via BaseClass.build() or JobBuilder.build(). Does not touch the
+    database – all Python-side preparation is done eagerly so that the Rust
+    bulk-insert path can release the GIL as early as possible.
+    """
+
+    __slots__ = ("job_class", "args", "kwargs", "options")
+
+    def __init__(self, job_class: Type, args: tuple, kwargs: dict, options: dict):
+        self.job_class = job_class
+        self.args = args
+        self.kwargs = kwargs
+        self.options = options  # queue, priority, wait, wait_until
+
+
 class JobBuilder:
     """Builder for configuring job options before enqueueing.
 
@@ -170,6 +187,10 @@ class JobBuilder:
 
         return None
 
+    def build(self, *args, **kwargs) -> "JobDescriptor":
+        """Create a JobDescriptor with configured options (for bulk enqueue)."""
+        return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
+
     def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
         """Enqueue the job with configured options."""
         scheduled_at = self._calculate_scheduled_at()
@@ -198,6 +219,16 @@ class NoNewOverrideMeta(type):
 
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
+    @classmethod
+    def build(cls, *args, **kwargs) -> "JobDescriptor":
+        """Create a JobDescriptor for bulk enqueue via perform_all_later.
+
+        Example:
+            jobs = [MyJob.build(i) for i in range(10000)]
+            qc.perform_all_later(jobs)
+        """
+        return JobDescriptor(cls, args, kwargs, {})
+
     @classmethod
     def set(
         cls,

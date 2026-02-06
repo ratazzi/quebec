@@ -4,7 +4,7 @@ use chrono::NaiveDateTime;
 use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use pyo3::types::{PyDict, PyTuple, PyType};
+use pyo3::types::{PyDict, PyList, PyTuple, PyType};
 
 use sea_orm::*;
 use serde_json::Value;
@@ -56,7 +56,7 @@ where
 use crate::control_plane::{ControlPlane, ControlPlaneExt};
 
 use crate::context::*;
-use crate::core::Quebec;
+use crate::core::{PreparedJob, Quebec};
 use crate::dispatcher::Dispatcher;
 use crate::scheduler::Scheduler;
 
@@ -133,6 +133,67 @@ pub struct PyQuebec {
     pyqueue_mode: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     control_plane_router: Arc<tokio::sync::Mutex<Option<axum::Router>>>,
+}
+
+/// Resolve `wait` / `wait_until` options from a Python dict into an optional
+/// `NaiveDateTime`.  Returns `None` when neither key is present.
+fn resolve_scheduled_at(
+    _py: Python<'_>,
+    options: &Bound<'_, PyDict>,
+) -> PyResult<Option<chrono::NaiveDateTime>> {
+    // wait_until takes precedence
+    if let Some(val) = options.get_item("wait_until")?.filter(|v| !v.is_none()) {
+        // If naive datetime (no tzinfo), treat as UTC — consistent with
+        // JobBuilder._calculate_scheduled_at() in Python
+        let val = if val.getattr("tzinfo")?.is_none() {
+            let tz_utc = val
+                .py()
+                .import("datetime")?
+                .getattr("timezone")?
+                .getattr("utc")?;
+            let kwargs = PyDict::new(val.py());
+            kwargs.set_item("tzinfo", tz_utc)?;
+            val.call_method("replace", (), Some(&kwargs))?
+        } else {
+            val
+        };
+        let ts: f64 = val
+            .call_method0("timestamp")
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err("wait_until must be a datetime object")
+            })?
+            .extract()?;
+        let secs = ts as i64;
+        let nsecs = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+        return chrono::DateTime::from_timestamp(secs, nsecs)
+            .map(|dt| Some(dt.naive_utc()))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "wait_until timestamp out of range: {}",
+                    ts
+                ))
+            });
+    }
+
+    if let Some(val) = options.get_item("wait")?.filter(|v| !v.is_none()) {
+        let now = chrono::Utc::now().naive_utc();
+        // Try as a number (seconds) first, then as timedelta
+        if let Ok(secs) = val.extract::<f64>() {
+            let duration = chrono::Duration::milliseconds((secs * 1000.0) as i64);
+            return Ok(Some(now + duration));
+        }
+        // timedelta — call .total_seconds()
+        if let Ok(total) = val.call_method0("total_seconds") {
+            let secs: f64 = total.extract()?;
+            let duration = chrono::Duration::milliseconds((secs * 1000.0) as i64);
+            return Ok(Some(now + duration));
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "wait must be a number (seconds) or timedelta",
+        ));
+    }
+
+    Ok(None)
 }
 
 static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
@@ -912,6 +973,157 @@ impl PyQuebec {
             error!("Error: {:?}", e);
             pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
         })
+    }
+
+    /// Bulk enqueue jobs from a list of JobDescriptor objects.
+    /// Each descriptor has: job_class, args, kwargs, options.
+    /// All class attribute extraction, JSON serialization and concurrency
+    /// resolution happens here (GIL held), then DB operations run with
+    /// GIL released.  Returns the number of enqueued jobs.
+    fn perform_all_later(&self, py: Python<'_>, descriptors: &Bound<'_, PyList>) -> PyResult<u64> {
+        let start_time = Instant::now();
+
+        // Phase 1 (GIL held): extract everything from Python JobDescriptor objects
+        let mut prepared: Vec<PreparedJob> = Vec::with_capacity(descriptors.len());
+        for item in descriptors.iter() {
+            let job_class = item.getattr("job_class")?;
+            let py_args = item.getattr("args")?;
+            let py_kwargs = item.getattr("kwargs")?;
+            let py_options = item.getattr("options")?;
+
+            // Extract class attributes (same as perform_later)
+            let class_name = job_class.cast::<PyType>()?.qualname()?.to_string();
+
+            let queue_name = match job_class.getattr("queue_as") {
+                Ok(attr) => attr.extract::<String>()?,
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+                    "default".to_string()
+                }
+                Err(e) => return Err(e),
+            };
+
+            let priority = match job_class.getattr("queue_with_priority") {
+                Ok(attr) => attr.extract::<i32>()?,
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
+                Err(e) => return Err(e),
+            };
+
+            // Apply option overrides
+            let options = py_options.cast::<PyDict>()?;
+            let queue_name = options
+                .get_item("queue")?
+                .and_then(|v| v.extract::<String>().ok())
+                .unwrap_or(queue_name);
+            let priority = options
+                .get_item("priority")?
+                .and_then(|v| v.extract::<i32>().ok())
+                .unwrap_or(priority);
+
+            // Calculate scheduled_at from wait/wait_until options
+            let scheduled_at = resolve_scheduled_at(py, &options)?;
+
+            // Serialize args/kwargs to JSON (reuse perform_later logic)
+            let args_bound = py_args.cast::<PyTuple>()?;
+            let args_json = crate::utils::python_object(&args_bound).into_json()?;
+
+            let kwargs_bound = py_kwargs.cast::<PyDict>()?;
+            let kwargs_json = if kwargs_bound.is_empty() {
+                None
+            } else {
+                Some(crate::utils::python_object(&kwargs_bound).into_json()?)
+            };
+
+            let mut arguments_array = if let Value::Array(arr) = args_json {
+                arr
+            } else {
+                vec![]
+            };
+
+            if let Some(Value::Object(kwargs_map)) = &kwargs_json {
+                let real_kwargs: serde_json::Map<String, Value> = kwargs_map
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with('_'))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if !real_kwargs.is_empty() {
+                    arguments_array.push(Value::Object(serde_json::Map::from_iter(vec![(
+                        "_kwargs".to_string(),
+                        Value::Object(real_kwargs),
+                    )])));
+                }
+            }
+
+            let job_id = crate::utils::generate_job_id();
+
+            let job_data = serde_json::json!({
+                "job_class": class_name,
+                "job_id": job_id,
+                "queue_name": queue_name,
+                "priority": priority,
+                "arguments": arguments_array,
+                "continuation": {},
+                "resumptions": 0
+            });
+
+            let arguments = serde_json::to_string(&job_data).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to serialize job data: {}",
+                    e
+                ))
+            })?;
+
+            // Resolve concurrency (if registered)
+            let (concurrency_key, concurrency_limit) =
+                if self.worker.ctx.has_concurrency_control(&class_name) {
+                    if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
+                        let kwargs_opt = if kwargs_bound.is_empty() {
+                            None
+                        } else {
+                            Some(kwargs_bound)
+                        };
+                        let constraint = runnable
+                            .get_concurrency_constraint(Some(args_bound), kwargs_opt)
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "Failed to get concurrency info: {:?}",
+                                    e
+                                ))
+                            })?;
+                        constraint.map_or((None, None), |c| (Some(c.key), Some(c.limit)))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
+            prepared.push(PreparedJob {
+                class_name,
+                queue_name,
+                priority,
+                active_job_id: job_id,
+                arguments,
+                scheduled_at,
+                concurrency_key,
+                concurrency_limit,
+                concurrency_on_conflict: ConcurrencyConflict::default(),
+            });
+        }
+
+        // Phase 2 (GIL released): perform database operations
+        let count = py
+            .detach(|| {
+                self.rt
+                    .block_on(async { self.quebec.perform_all_later(prepared).await })
+            })
+            .map(|models| models.len() as u64)
+            .map_err(|e| {
+                error!("perform_all_later error: {:?}", e);
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
+            })?;
+
+        debug!("Bulk enqueued {} jobs in {:?}", count, start_time.elapsed());
+        Ok(count)
     }
 
     fn __repr__(&self) -> PyResult<String> {
