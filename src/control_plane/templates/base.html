@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="base-path" content="{{ base_path }}">
   <title>{% block title %}Control Plane{% endblock %}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
@@ -330,10 +331,10 @@
       }
 
       connect() {
+        this.basePath = document.querySelector('meta[name="base-path"]')?.content || ''
         this.abortController = new AbortController()
         this.refresh()
         this.timer = setInterval(() => this.refresh(), this.intervalValue)
-        // Listen for timeago:due events (bubbles up from timeago controllers)
         this.boundOnDue = this.onDue.bind(this)
         this.element.addEventListener("timeago:due", this.boundOnDue)
       }
@@ -346,7 +347,6 @@
       }
 
       onDue() {
-        // Debounce: wait a bit for the job to complete, then refresh
         if (this.dueTimer) return
         this.dueTimer = setTimeout(() => {
           this.refresh()
@@ -356,7 +356,7 @@
 
       async refresh() {
         try {
-          const response = await fetch('/recurring-jobs/schedule', {
+          const response = await fetch(`${this.basePath}/recurring-jobs/schedule`, {
             signal: this.abortController?.signal
           })
           if (response.ok) {
@@ -501,40 +501,40 @@
     <div data-controller="nav" data-nav-active-class-value="border-b-2 border-black" class="flex flex-col flex-grow">
       <turbo-frame id="nav-frame">
         <nav class="flex flex-nowrap border-b mb-6">
-          <a href="/" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Overview
           </a>
-          <a href="/queues" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/queues" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Queues
           </a>
 
-          <a href="/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Failed jobs <span id="failed-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             In Progress jobs <span id="in-progress-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Blocked jobs <span id="blocked-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Scheduled jobs <span id="scheduled-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
-          <a href="/recurring-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/recurring-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Recurring jobs
           </a>
-          <a href="/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
           </a>
 
-          <a href="/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+          <a href="{{ base_path }}/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Workers
           </a>
         </nav>
       </turbo-frame>
 
       <div data-controller="reload" data-reload-interval-value="5000">
-        <turbo-frame id="stats-frame" src="/stats" data-reload-target="frame" class="hidden"></turbo-frame>
+        <turbo-frame id="stats-frame" src="{{ base_path }}/stats" data-reload-target="frame" class="hidden"></turbo-frame>
       </div>
 
       <turbo-frame id="content" data-nav-target="content" class="mb-4">

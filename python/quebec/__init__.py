@@ -425,7 +425,81 @@ def _quebec_run(
     self.wait()
 
 
+class ControlPlaneASGI:
+    """ASGI application bridging to Quebec's Rust control plane."""
+
+    def __init__(self, quebec_instance):
+        self.qc = quebec_instance
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return
+
+        # Read request body
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        # Strip mount prefix (root_path) from path for the Axum router
+        path = scope["path"]
+        root_path = scope.get("root_path", "")
+        if root_path and path.startswith(root_path):
+            path = path[len(root_path) :] or "/"
+
+        # Call Rust handler (releases GIL internally via py.detach)
+        # base_path is passed to Rust so templates generate correct prefixed URLs
+        status, headers, response_body = self.qc.handle_control_plane_request(
+            scope["method"],
+            path,
+            (scope.get("query_string") or b"").decode("latin-1"),
+            list(scope.get("headers", [])),
+            body,
+            root_path,
+        )
+
+        # Rewrite Location headers for redirects (303 etc.)
+        if root_path:
+            prefix = root_path.encode()
+            rewritten = []
+            for name, value in headers:
+                if name.lower() == b"location" and value.startswith(b"/"):
+                    value = prefix + value
+                rewritten.append((name, value))
+            headers = rewritten
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": response_body,
+            }
+        )
+
+
+def _quebec_asgi_app(self):
+    """Return an ASGI application for the control plane.
+
+    Mount this on a FastAPI/Starlette app to serve the control plane dashboard.
+
+    Example:
+        app = FastAPI()
+        qc = Quebec("postgres://localhost/mydb")
+        app.mount("/quebec", qc.asgi_app())
+    """
+    return ControlPlaneASGI(self)
+
+
 # Attach methods to Quebec class
 Quebec.start = _quebec_start
 Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
+Quebec.asgi_app = _quebec_asgi_app

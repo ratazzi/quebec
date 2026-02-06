@@ -53,7 +53,7 @@ where
     default
 }
 
-use crate::control_plane::ControlPlaneExt;
+use crate::control_plane::{ControlPlane, ControlPlaneExt};
 
 use crate::context::*;
 use crate::core::Quebec;
@@ -132,6 +132,7 @@ pub struct PyQuebec {
     pub stop_handlers: Arc<RwLock<Vec<Py<PyAny>>>>,
     pyqueue_mode: Arc<AtomicBool>,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    control_plane_router: Arc<Mutex<Option<axum::Router>>>,
 }
 
 static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
@@ -450,6 +451,7 @@ impl PyQuebec {
             stop_handlers,
             pyqueue_mode: Arc::new(AtomicBool::new(false)),
             handles: Arc::new(Mutex::new(Vec::new())),
+            control_plane_router: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1122,6 +1124,41 @@ impl PyQuebec {
         }
 
         Ok(handler)
+    }
+
+    #[pyo3(signature = (method, path, query_string, headers, body, base_path=""))]
+    fn handle_control_plane_request(
+        &self,
+        py: Python<'_>,
+        method: String,
+        path: String,
+        query_string: String,
+        headers: Vec<(Vec<u8>, Vec<u8>)>,
+        body: Vec<u8>,
+        base_path: &str,
+    ) -> PyResult<(u16, Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+        // Lazy init router on first call
+        let mut router_guard = self.control_plane_router.lock().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to acquire router lock")
+        })?;
+        if router_guard.is_none() {
+            let cp =
+                Arc::new(ControlPlane::new(self.ctx.clone()).with_base_path(base_path.to_string()));
+            *router_guard = Some(cp.build_router());
+        }
+        let router = router_guard.as_mut().unwrap();
+
+        let uri = if query_string.is_empty() {
+            path
+        } else {
+            format!("{}?{}", path, query_string)
+        };
+
+        Ok(py.detach(|| {
+            self.rt.block_on(ControlPlane::handle_request(
+                router, &method, &uri, headers, body,
+            ))
+        }))
     }
 
     fn start_control_plane(&self, addr: String) -> PyResult<()> {
