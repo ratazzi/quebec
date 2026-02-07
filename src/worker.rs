@@ -2556,8 +2556,65 @@ impl Worker {
         thread_id: &str,
         source: &str,
     ) {
+        // Only claim as many jobs as the channel can accept to prevent
+        // claimed execution leaks when the channel is full.
+        let available = tx.lock().await.capacity();
+        if available == 0 {
+            debug!("[{}] channel full, skipping claim", source);
+            return;
+        }
+
+        // Also enforce per-process in-flight limit based on claimed_executions.
+        // This is critical for Python queue mode: the bridge thread drains the
+        // Rust channel quickly, so channel capacity alone does not provide backpressure.
+        let process_id = *self.process_id.lock().await;
+        let Some(process_id) = process_id else {
+            debug!("[{}] process_id not initialized, skipping claim", source);
+            return;
+        };
+
+        let claim_count_db = ctx.get_db().await;
+        let in_flight = match query_builder::claimed_executions::count_by_process_id(
+            claim_count_db.as_ref(),
+            &ctx.table_config,
+            process_id,
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(e) => {
+                warn!(
+                    "[{}] failed to count claimed jobs for process {}: {:?}",
+                    source, process_id, e
+                );
+                return;
+            }
+        };
+
+        if in_flight >= worker_threads {
+            debug!(
+                "[{}] in-flight claimed jobs ({}) reached limit ({}), skipping claim",
+                source, in_flight, worker_threads
+            );
+            return;
+        }
+
+        let remaining_slots = worker_threads - in_flight;
+        let batch_size = (available as u64).min(remaining_slots);
+        if batch_size == 0 {
+            debug!(
+                "[{}] no remaining slots (available={}, in_flight={}, limit={})",
+                source, available, in_flight, worker_threads
+            );
+            return;
+        }
+        debug!(
+            "[{}] channel capacity={}, in_flight={}, limit={}, claiming up to {}",
+            source, available, in_flight, worker_threads, batch_size
+        );
+
         let claimed = self
-            .claim_jobs(worker_threads)
+            .claim_jobs(batch_size)
             .instrument(tracing::info_span!("polling", tid = thread_id))
             .await;
 
@@ -2657,13 +2714,19 @@ impl Worker {
                 self.idle_notify.clone(),
             );
 
-            // Send execution to worker thread - this may block but no database connections are held
-            if let Err(e) = tx.lock().await.send(execution).await {
-                error!("Failed to send execution to worker thread: {:?}", e);
-                // The Execution inside SendError is dropped, clean up the claimed record.
-                // Extract claimed info from the error's inner value.
-                let leaked = e.0;
-                Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+            // Send execution to worker thread using try_send to avoid blocking.
+            // We pre-checked channel capacity, so this should succeed unless the
+            // channel was closed.
+            match tx.lock().await.try_send(execution) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(leaked)) => {
+                    warn!("Channel unexpectedly full, releasing claimed execution back to ready");
+                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(leaked)) => {
+                    error!("Dispatch channel closed, releasing claimed execution");
+                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                }
             }
         }
     }

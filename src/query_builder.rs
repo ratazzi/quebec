@@ -1408,6 +1408,25 @@ pub mod claimed_executions {
         execute_select(db, query).await
     }
 
+    /// Count claimed executions by process_id
+    pub async fn count_by_process_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        process_id: i64,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .and_where(Expr::col(col("process_id")).eq(process_id))
+            .to_owned();
+
+        execute_count(db, query).await
+    }
+
     /// Find orphaned claimed executions (process_id is NULL or process doesn't exist)
     /// This uses a LEFT JOIN to find executions where the process record is missing
     pub async fn find_orphaned<C>(
