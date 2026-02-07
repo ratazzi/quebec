@@ -241,10 +241,22 @@ pub fn get_executions(arguments: Option<&str>) -> i32 {
         .unwrap_or(0) as i32
 }
 
+/// Get the per-exception-type execution count from `exception_executions`.
+/// Matches ActiveJob's `executions_for(exceptions)` which tracks retries independently
+/// per retry_on declaration.
+pub fn get_exception_executions(arguments: Option<&str>, key: &str) -> i32 {
+    arguments
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("exception_executions")?.get(key)?.as_i64())
+        .unwrap_or(0) as i32
+}
+
 /// Return a new arguments JSON string with `executions` incremented by 1
-/// and `error_type` accumulated into `exception_executions`.
+/// and `exception_key` accumulated into `exception_executions`.
+/// The key should be the strategy's exception list (e.g. "[RuntimeError, IOError]")
+/// matching ActiveJob's `executions_for(exceptions)` format.
 /// If the input is a plain array, wraps it first.
-pub fn increment_executions(arguments: Option<&str>, error_type: Option<&str>) -> String {
+pub fn increment_executions(arguments: Option<&str>, exception_key: Option<&str>) -> String {
     let mut obj = arguments
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Array(vec![]));
@@ -268,8 +280,7 @@ pub fn increment_executions(arguments: Option<&str>, error_type: Option<&str>) -
     obj["executions"] = Value::from(executions);
 
     // Accumulate exception_executions
-    if let Some(et) = error_type {
-        let key = format!("[{}]", et);
+    if let Some(key) = exception_key {
         // Ensure exception_executions is an object (reset if missing/wrong type)
         if !obj
             .get("exception_executions")

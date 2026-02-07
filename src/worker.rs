@@ -297,14 +297,16 @@ impl Runnable {
         .map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
     }
 
-    /// Check if should retry, return matching retry strategy
+    /// Check if should retry, return matching retry strategy and its exception key.
+    /// Matches ActiveJob's behavior: find the first matching exception declaration,
+    /// then check that declaration's per-exception counter (not the global executions).
     fn should_retry(
         &self,
         py: Python,
         bound: &Bound<PyAny>,
         error: &PyErr,
-        executions: i32,
-    ) -> PyResult<Option<RetryStrategy>> {
+        job_arguments: Option<&str>,
+    ) -> PyResult<Option<(RetryStrategy, String)>> {
         if !bound.hasattr("retry_on")? {
             return Ok(None);
         }
@@ -312,16 +314,42 @@ impl Runnable {
         let retry_strategies = bound.getattr("retry_on")?.extract::<Vec<RetryStrategy>>()?;
 
         for strategy in retry_strategies {
-            if i64::from(executions) + 1 >= strategy.attempts {
-                continue; // Exceeded maximum retry count (attempts includes original execution)
+            if !self.is_exception_match(py, &strategy.exceptions, error)? {
+                continue;
             }
 
-            if self.is_exception_match(py, &strategy.exceptions, error)? {
-                return Ok(Some(strategy));
+            // Found matching strategy — check per-exception counter
+            let key = Self::strategy_exception_key(py, &strategy.exceptions)?;
+            let count = crate::utils::get_exception_executions(job_arguments, &key);
+            if i64::from(count) + 1 >= strategy.attempts {
+                // Exhausted for this declaration — don't try other strategies
+                // (matches ActiveJob's rescue_from: first match wins)
+                return Ok(None);
             }
+
+            return Ok(Some((strategy, key)));
         }
 
         Ok(None)
+    }
+
+    /// Generate an exception key from a strategy's exception list.
+    /// Matches ActiveJob's `exceptions.to_s` format: "[RuntimeError, IOError]".
+    fn strategy_exception_key(py: Python, exceptions: &Py<PyAny>) -> PyResult<String> {
+        let bound = exceptions.bind(py);
+        let mut names = Vec::new();
+
+        if let Ok(exception_type) = bound.cast::<PyType>() {
+            names.push(exception_type.qualname()?.to_string());
+        } else if let Ok(exception_tuple) = bound.cast::<PyTuple>() {
+            for item in exception_tuple.iter() {
+                if let Ok(t) = item.cast::<PyType>() {
+                    names.push(t.qualname()?.to_string());
+                }
+            }
+        }
+
+        Ok(format!("[{}]", names.join(", ")))
     }
 
     /// Check if should discard, return matching discard strategy
@@ -688,14 +716,10 @@ impl Runnable {
         // Check error handling strategies by priority
 
         // 1. Check if should retry
-        let executions = crate::utils::get_executions(job.arguments.as_deref());
-        if let Some(retry_strategy) = self.should_retry(py, &bound, error, executions)? {
-            let error_type = error
-                .get_type(py)
-                .qualname()
-                .map(|q| q.to_string())
-                .unwrap_or_else(|_| "Unknown".to_string());
-            return self.apply_retry_strategy(job, retry_strategy, &error_type);
+        if let Some((retry_strategy, exception_key)) =
+            self.should_retry(py, &bound, error, job.arguments.as_deref())?
+        {
+            return self.apply_retry_strategy(job, retry_strategy, &exception_key);
         }
 
         // 2. Check if should discard
@@ -766,17 +790,18 @@ impl Runnable {
         &mut self,
         job: &quebec_jobs::Model,
         strategy: RetryStrategy,
-        error_type: &str,
+        exception_key: &str,
     ) -> Result<quebec_jobs::Model> {
-        let executions = crate::utils::get_executions(job.arguments.as_deref());
-        warn!("Job will be retried (attempt #{})", executions + 1);
+        let exception_count =
+            crate::utils::get_exception_executions(job.arguments.as_deref(), exception_key);
+        warn!("Job will be retried (attempt #{})", exception_count + 1);
 
         let delay = strategy.wait;
         let scheduled_at = chrono::Utc::now().naive_utc()
             + chrono::Duration::from_std(delay)
                 .map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
         let new_arguments =
-            crate::utils::increment_executions(job.arguments.as_deref(), Some(error_type));
+            crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
         // Set retry information to runnable
         self.retry_info = Some(RetryInfo {
@@ -820,9 +845,10 @@ impl Runnable {
             .qualname()
             .map(|q| q.to_string())
             .unwrap_or_else(|_| "Unknown".to_string());
+        let exception_key = format!("[{}]", error_type);
         job.arguments = Some(crate::utils::increment_executions(
             job.arguments.as_deref(),
-            Some(&error_type),
+            Some(&exception_key),
         ));
         let error_payload = self.create_error_payload(py, error);
         Err(anyhow::anyhow!(error_payload))
@@ -1320,20 +1346,14 @@ impl Execution {
         &mut self,
         py: Python,
         strategy: RetryStrategy,
-        exc: &Bound<'_, PyAny>,
+        _exc: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let job = self.job.clone();
         let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-        let e = exc.cast::<PyException>()?;
-        let error_type = e
-            .get_type()
-            .qualname()
-            .map(|q| q.to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
 
-        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        let exception_key = Runnable::strategy_exception_key(py, &strategy.exceptions)?;
         let new_arguments =
-            crate::utils::increment_executions(job.arguments.as_deref(), Some(&error_type));
+            crate::utils::increment_executions(job.arguments.as_deref(), Some(&exception_key));
 
         let jid = job.active_job_id.clone().unwrap_or_default();
         let span = tracing::info_span!(
@@ -1344,11 +1364,14 @@ impl Execution {
         );
         let _enter = span.enter();
 
-        if (executions as i64) + 1 >= strategy.attempts {
+        let exception_count =
+            crate::utils::get_exception_executions(job.arguments.as_deref(), &exception_key);
+        if i64::from(exception_count) + 1 >= strategy.attempts {
             error!(
-                "Job `{}' failed after {} attempts",
+                "Job `{}' failed after {} attempts for {}",
                 job.class_name,
-                executions + 1
+                exception_count + 1,
+                exception_key
             );
             return Ok(());
         }
@@ -1357,8 +1380,8 @@ impl Execution {
             let retry_future = async {
                 warn!(
                     "Attempt {} scheduled due to `{}' on {:?}",
-                    format!("#{}", executions + 1).bright_purple(),
-                    error_type,
+                    format!("#{}", exception_count + 1).bright_purple(),
+                    exception_key,
                     scheduled_at
                 );
 
