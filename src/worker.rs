@@ -312,8 +312,8 @@ impl Runnable {
         let retry_strategies = bound.getattr("retry_on")?.extract::<Vec<RetryStrategy>>()?;
 
         for strategy in retry_strategies {
-            if i64::from(executions) >= strategy.attempts {
-                continue; // Exceeded maximum retry count
+            if i64::from(executions) + 1 >= strategy.attempts {
+                continue; // Exceeded maximum retry count (attempts includes original execution)
             }
 
             if self.is_exception_match(py, &strategy.exceptions, error)? {
@@ -1056,10 +1056,13 @@ impl Execution {
             .as_ref()
             .map(|info| (info.scheduled_at, info.arguments.clone()));
 
-        // Get continuation arguments if available (for interrupted jobs)
+        // Get continuation arguments if available (for interrupted jobs with actual progress)
+        // Only override retry arguments when continuation has made progress,
+        // otherwise the incremented executions counter would be lost.
         let continuation_arguments = self
             .continuation_info
             .as_ref()
+            .filter(|info| !info.state.completed.is_empty() || info.state.current.is_some())
             .map(|info| serde_json::to_string(&info.original_args).unwrap_or_default());
 
         // Capture concurrency info for semaphore release
@@ -1341,10 +1344,11 @@ impl Execution {
         );
         let _enter = span.enter();
 
-        if (executions as i64) >= strategy.attempts {
+        if (executions as i64) + 1 >= strategy.attempts {
             error!(
                 "Job `{}' failed after {} attempts",
-                job.class_name, executions
+                job.class_name,
+                executions + 1
             );
             return Ok(());
         }
