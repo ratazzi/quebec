@@ -875,7 +875,7 @@ pub struct Execution {
     ctx: Arc<AppContext>,
     timer: Instant,
     tid: String,
-    claimed: quebec_claimed_executions::Model,
+    pub(crate) claimed: quebec_claimed_executions::Model,
     job: quebec_jobs::Model,
     runnable: Runnable,
     metric: Option<Metric>,
@@ -959,17 +959,14 @@ impl Execution {
         .instrument(span.clone())
         .await;
 
-        let failed = result.is_err();
         // Sync updated arguments (e.g. incremented executions) back to self.job
         // so after_executed can persist them to the database
         self.job.arguments = job.arguments.clone();
         let ret = self.after_executed(result).instrument(span).await;
 
-        if failed {
-            return ret;
-        }
-
-        Ok(job.clone())
+        // Always propagate after_executed errors (e.g. DB transaction failure)
+        // to avoid silently leaving claimed_executions records leaked
+        ret
     }
 
     /// Schedule a retry job with the given parameters
@@ -2077,6 +2074,117 @@ impl Worker {
         Ok(count)
     }
 
+    /// Release a batch of claimed executions back to ready state (best-effort).
+    /// Used when a transient error prevents dispatching claimed jobs to worker threads.
+    async fn release_claimed_batch(
+        ctx: &Arc<AppContext>,
+        claimed: &[quebec_claimed_executions::Model],
+    ) {
+        let db = ctx.get_db().await;
+        let table_config = ctx.table_config.clone();
+        let mut released = 0usize;
+        for row in claimed {
+            let table_config = table_config.clone();
+            let job_id = row.job_id;
+            let execution_id = row.id;
+            if let Err(e) = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        if let Some(job) =
+                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
+                        {
+                            query_builder::ready_executions::insert(
+                                txn,
+                                &table_config,
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                            )
+                            .await?;
+                        }
+                        query_builder::claimed_executions::delete_by_id(
+                            txn,
+                            &table_config,
+                            execution_id,
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .await
+            {
+                warn!(
+                    "Failed to release claimed execution {} back to ready: {:?}",
+                    execution_id, e
+                );
+            } else {
+                released += 1;
+            }
+        }
+        if released > 0 || !claimed.is_empty() {
+            info!(
+                "Released {}/{} claimed execution(s) back to ready state",
+                released,
+                claimed.len()
+            );
+        }
+    }
+
+    /// Delete a claimed execution record without writing to failed_executions.
+    /// Used when the job record itself is already gone (FK would prevent insert).
+    async fn delete_claimed_by_id(ctx: &Arc<AppContext>, execution_id: i64) {
+        let db = ctx.get_db().await;
+        let table_config = ctx.table_config.clone();
+        if let Err(e) = query_builder::claimed_executions::delete_by_id(
+            db.as_ref(),
+            &table_config,
+            execution_id,
+        )
+        .await
+        {
+            warn!(
+                "Failed to delete orphaned claimed execution {}: {:?}",
+                execution_id, e
+            );
+        }
+    }
+
+    /// Fail a claimed execution by ID (best-effort). Acquires its own DB connection.
+    async fn fail_claimed_by_id(
+        ctx: &Arc<AppContext>,
+        execution_id: i64,
+        job_id: i64,
+        error_msg: &str,
+    ) {
+        let db = ctx.get_db().await;
+        let table_config = ctx.table_config.clone();
+        let ctx = ctx.clone();
+        if let Err(e) = db
+            .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
+                let error_msg = error_msg.to_string();
+                Box::pin(async move {
+                    Self::fail_claimed_execution(
+                        &ctx,
+                        txn,
+                        &table_config,
+                        job_id,
+                        execution_id,
+                        &error_msg,
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+        {
+            warn!(
+                "Failed to clean up claimed execution {}: {:?}",
+                execution_id, e
+            );
+        }
+    }
+
     /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
     async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
@@ -2466,6 +2574,9 @@ impl Worker {
                 Ok(jobs) => jobs,
                 Err(e) => {
                     error!("Failed to fetch job data: {:?}", e);
+                    // Release all claimed executions back to ready state to avoid
+                    // leaving them permanently stuck in claimed_executions
+                    Self::release_claimed_batch(ctx, &claimed).await;
                     return;
                 }
             }
@@ -2482,6 +2593,10 @@ impl Worker {
                 Some(j) => j.clone(),
                 None => {
                     error!("Job not found for claimed execution: job_id={}", row.job_id);
+                    // Don't use fail_claimed_by_id here: the job record is gone, so
+                    // inserting into failed_executions would violate the FK constraint
+                    // and leave the claimed record leaked. Just delete the claim.
+                    Self::delete_claimed_by_id(ctx, row.id).await;
                     continue;
                 }
             };
@@ -2489,21 +2604,36 @@ impl Worker {
             // Get runnable with proper GIL handling
             let runnable = Python::attach(|_py| self.ctx.get_runnable(&job.class_name));
 
-            if runnable.is_err() {
-                error!("Job handler not found: {:?}", &job.class_name);
-                continue;
-            }
-
-            let execution = match runnable {
-                Ok(r) => {
-                    Execution::with_idle_notify(ctx.clone(), row, job, r, self.idle_notify.clone())
+            let runnable = match runnable {
+                Ok(r) => r,
+                Err(_) => {
+                    error!("Job handler not found: {:?}", &job.class_name);
+                    Self::fail_claimed_by_id(
+                        ctx,
+                        row.id,
+                        row.job_id,
+                        &format!("Job handler not found: {}", job.class_name),
+                    )
+                    .await;
+                    continue;
                 }
-                Err(_) => continue,
             };
+
+            let execution = Execution::with_idle_notify(
+                ctx.clone(),
+                row,
+                job,
+                runnable,
+                self.idle_notify.clone(),
+            );
 
             // Send execution to worker thread - this may block but no database connections are held
             if let Err(e) = tx.lock().await.send(execution).await {
                 error!("Failed to send execution to worker thread: {:?}", e);
+                // The Execution inside SendError is dropped, clean up the claimed record.
+                // Extract claimed info from the error's inner value.
+                let leaked = e.0;
+                Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
             }
         }
     }
