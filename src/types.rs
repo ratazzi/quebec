@@ -889,7 +889,8 @@ impl PyQuebec {
             vec![]
         };
 
-        // Filter out internal parameters (prefixed with _) and add kwargs marker
+        // Append kwargs as last dict element (Solid Queue convention).
+        // On the worker side, the last dict is extracted as kwargs.
         if let Some(Value::Object(kwargs_map)) = &kwargs_json {
             let real_kwargs: serde_json::Map<String, Value> = kwargs_map
                 .iter()
@@ -898,11 +899,7 @@ impl PyQuebec {
                 .collect();
 
             if !real_kwargs.is_empty() {
-                // Wrap kwargs in a "_kwargs" marker to distinguish from positional dicts
-                arguments_array.push(Value::Object(serde_json::Map::from_iter(vec![(
-                    "_kwargs".to_string(),
-                    Value::Object(real_kwargs),
-                )])));
+                arguments_array.push(Value::Object(real_kwargs));
             }
         }
 
@@ -1080,10 +1077,7 @@ impl PyQuebec {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 if !real_kwargs.is_empty() {
-                    arguments_array.push(Value::Object(serde_json::Map::from_iter(vec![(
-                        "_kwargs".to_string(),
-                        Value::Object(real_kwargs),
-                    )])));
+                    arguments_array.push(Value::Object(real_kwargs));
                 }
             }
 

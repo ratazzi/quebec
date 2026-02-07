@@ -564,10 +564,17 @@ impl Runnable {
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
         let mut v = json_args.clone();
 
-        // Handle wrapped format: {"arguments": [...]}
-        if let serde_json::Value::Object(ref o) = v {
-            if let Some(serde_json::Value::Array(_)) = o.get("arguments") {
-                v = o["arguments"].clone();
+        // Unwrap nested "arguments" key until we reach the actual Array.
+        // Flat (SQ/scheduler): {"arguments": [1, 2], ...}
+        // Double-nested (perform_later → enqueue_job): {"arguments": {"arguments": [1, 2], ...}, ...}
+        while let serde_json::Value::Object(ref o) = v {
+            match o.get("arguments") {
+                Some(serde_json::Value::Array(_)) => {
+                    v = o["arguments"].clone();
+                    break;
+                }
+                Some(serde_json::Value::Object(_)) => v = o["arguments"].clone(),
+                _ => break,
             }
         }
 
@@ -584,27 +591,23 @@ impl Runnable {
         // Initialize kwargs
         let kwargs = PyDict::new(py);
 
-        // Check for "_kwargs" marker in the last element
-        // Format: [arg1, arg2, {"_kwargs": {"key": "value"}}]
-        // This distinguishes kwargs from positional dict arguments
+        // Solid Queue convention: if the last argument is a dict, treat it as kwargs.
+        // Matches Ruby's Hash.ruby2_keywords_hash + splat in SQ's arguments_with_kwargs.
+        // Strip _aj_symbol_keys (ActiveJob internal marker).
         if !args.is_empty() {
             let last_index = args.len() - 1;
             let last = args.get_item(last_index)?;
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
                 let last_dict = last.cast::<pyo3::types::PyDict>()?;
-
-                // Check for "_kwargs" marker
-                if let Ok(Some(kwargs_value)) = last_dict.get_item("_kwargs") {
-                    // Found "_kwargs" marker - extract the actual kwargs
-                    if let Ok(inner_dict) = kwargs_value.cast::<pyo3::types::PyDict>() {
-                        for (key, value) in inner_dict {
-                            kwargs.set_item(key, value)?;
-                        }
+                for (key, value) in last_dict {
+                    let key_str: String = key.extract()?;
+                    if key_str == "_aj_symbol_keys" {
+                        continue;
                     }
-                    args.del_item(last_index)?;
+                    kwargs.set_item(key, value)?;
                 }
-                // If no "_kwargs" marker, treat as positional dict argument (don't extract)
+                args.del_item(last_index)?;
             }
         }
 
