@@ -231,6 +231,33 @@ pub fn python_object<'a>(obj: &'a Bound<'a, PyAny>) -> PythonObject<'a> {
     PythonObject(obj)
 }
 
+/// Build the ActiveJob-compatible job params JSON, merging caller-provided
+/// overrides on top of the default skeleton.
+pub fn build_job_params(overrides: Value) -> Value {
+    let mut params = serde_json::json!({
+        "job_class": "",
+        "job_id": null,
+        "provider_job_id": "",
+        "queue_name": "default",
+        "priority": 0,
+        "arguments": [],
+        "executions": 0,
+        "exception_executions": {},
+        "locale": "en",
+        "timezone": "UTC",
+        "scheduled_at": null,
+        "enqueued_at": null,
+    });
+
+    if let (Some(base), Some(over)) = (params.as_object_mut(), overrides.as_object()) {
+        for (k, v) in over {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+
+    params
+}
+
 /// Extract the `executions` count from an arguments JSON string.
 /// Handles both the wrapped format `{"arguments": [...], "executions": N, ...}`
 /// and legacy plain arrays `[...]` (returns 0).

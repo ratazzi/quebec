@@ -192,22 +192,17 @@ where
         None => serde_json::Value::Array(vec![]),
     };
 
-    let params = serde_json::json!({
+    let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
-        "provider_job_id": "",
         "queue_name": queue_name,
         "priority": priority,
         "arguments": args,
-        "executions": 0,
-        "exception_executions": {},
-        "locale": "en",
-        "timezone": "UTC",
         "scheduled_at": scheduled_at,
         "enqueued_at": now,
         "continuation": {},
         "resumptions": 0
-    });
+    }));
 
     // Get concurrency constraint using runnable
     // Use normalized args (consistent with what's stored in the job)

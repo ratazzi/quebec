@@ -129,20 +129,13 @@ async fn enqueue_job(
     let args: Box<serde_json::value::RawValue> = serde_json::from_str(&job.arguments)
         .map_err(|e| DbErr::Custom(format!("Invalid JSON in arguments: {}", e)))?;
 
-    let params = serde_json::json!({
+    let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": job.class_name,
-        "job_id": null,
-        "provider_job_id": "",
         "queue_name": job.queue_name,
         "priority": job.priority,
         "arguments": args,
-        "executions": 0,
-        "exception_executions": {},
-        "locale": "en",
-        "timezone": "UTC",
-        "scheduled_at": null,
         "enqueued_at": now,
-    });
+    }));
 
     let concurrency_key = job.concurrency_key.as_deref().unwrap_or_default();
 
