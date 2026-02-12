@@ -1072,7 +1072,7 @@ impl Execution {
         }
         .await;
 
-        let db = self.ctx.get_db().await;
+        let mut db = self.ctx.get_db().await;
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
@@ -1098,105 +1098,164 @@ impl Execution {
             .runnable
             .concurrency_duration
             .map(|s| chrono::Duration::seconds(s as i64));
-        let table_config = self.ctx.table_config.clone();
+        let table_config_orig = self.ctx.table_config.clone();
         let ctx = self.ctx.clone();
 
-        let transaction_result = db
-            .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
-                let continuation_arguments = continuation_arguments.clone();
-                Box::pin(async move {
-                    let claimed_id = claimed.id;
+        let claimed_id = claimed.id;
+        let max_retries = 3u32;
+        let mut transaction_result: Result<quebec_jobs::Model, TransactionError<DbErr>> = Err(
+            TransactionError::Transaction(DbErr::Custom("not attempted".into())),
+        );
 
-                    if let Some((scheduled_at, ref arguments)) = retry_job_data {
-                        Self::schedule_retry_job(
-                            txn,
-                            &table_config,
-                            &job,
-                            scheduled_at,
-                            arguments,
-                            continuation_arguments.as_deref(),
-                        )
-                        .await?;
-                    }
+        for attempt in 0..=max_retries {
+            if attempt > 0 {
+                let backoff = std::time::Duration::from_millis(200 * (attempt as u64));
+                warn!(
+                    "Retrying after_executed transaction for job {} (attempt {}/{})",
+                    job_id, attempt, max_retries
+                );
+                tokio::time::sleep(backoff).await;
+                // Re-acquire connection from pool for retry
+                db = self.ctx.get_db().await;
+            }
 
-                    if failed {
-                        error!("Job failed: {:?}", err);
-                        // Persist updated arguments (executions/exception_executions counters)
-                        if let Some(ref args) = job.arguments {
-                            query_builder::jobs::update_arguments(txn, &table_config, job_id, args)
+            let retry_job_data = retry_job_data.clone();
+            let continuation_arguments = continuation_arguments.clone();
+            let table_config = table_config_orig.clone();
+            let job = job.clone();
+            let err = err.clone();
+            let concurrency_key = concurrency_key.clone();
+            let ctx = ctx.clone();
+            let claimed = claimed.clone();
+
+            transaction_result = db
+                .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
+                    Box::pin(async move {
+                        if let Some((scheduled_at, ref arguments)) = retry_job_data {
+                            Self::schedule_retry_job(
+                                txn,
+                                &table_config,
+                                &job,
+                                scheduled_at,
+                                arguments,
+                                continuation_arguments.as_deref(),
+                            )
+                            .await?;
+                        }
+
+                        if failed {
+                            error!("Job failed: {:?}", err);
+                            // Persist updated arguments (executions/exception_executions counters)
+                            if let Some(ref args) = job.arguments {
+                                query_builder::jobs::update_arguments(
+                                    txn,
+                                    &table_config,
+                                    job_id,
+                                    args,
+                                )
                                 .await?;
+                            }
+                            // Write to failed_executions table
+                            // Note: Like Solid Queue, failed jobs do NOT get finished_at set
+                            query_builder::failed_executions::insert(
+                                txn,
+                                &table_config,
+                                job_id,
+                                err.map(|e| e.to_string()).as_deref(),
+                            )
+                            .await?;
+                        } else {
+                            // Only mark as finished for successful jobs (like Solid Queue)
+                            query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
                         }
-                        // Write to failed_executions table
-                        // Note: Like Solid Queue, failed jobs do NOT get finished_at set
-                        query_builder::failed_executions::insert(
+
+                        // Directly delete record from claimed_executions table
+                        let delete_result = query_builder::claimed_executions::delete_by_id(
                             txn,
                             &table_config,
-                            job_id,
-                            err.map(|e| e.to_string()).as_deref(),
+                            claimed.id,
                         )
                         .await?;
-                    } else {
-                        // Only mark as finished for successful jobs (like Solid Queue)
-                        query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
-                    }
 
-                    // Directly delete record from claimed_executions table
-                    let delete_result = query_builder::claimed_executions::delete_by_id(
-                        txn,
-                        &table_config,
-                        claimed_id,
-                    )
-                    .await?;
-
-                    if delete_result == 0 {
-                        return Err(DbErr::Custom("Claimed job not found".into()));
-                    }
-
-                    // Fetch updated job model
-                    let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
-                        .await?
-                        .ok_or_else(|| DbErr::Custom("Job not found after update".to_string()))?;
-
-                    // Release semaphore and unblock next job if job has concurrency control
-                    // This must happen AFTER job execution completes (ensure block in Solid Queue)
-                    if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
-                        // Step 1: Release semaphore (increment value)
-                        let released = release_semaphore(
-                            txn,
-                            &table_config,
-                            key.clone(),
-                            concurrency_limit,
-                            concurrency_duration,
-                        )
-                        .await
-                        .inspect(|&released| {
-                            if released {
-                                trace!("Released semaphore for key: {}", key);
-                            }
-                        })
-                        .inspect_err(|e| {
-                            warn!("Failed to release semaphore for key {}: {:?}", key, e)
-                        })
-                        .unwrap_or(false);
-
-                        // Step 2: Immediately try to release next blocked job (like Solid Queue)
-                        if released {
-                            Worker::release_next_blocked_job(&ctx, txn, key, concurrency_limit)
-                                .await
-                                .inspect_err(|e| {
-                                    warn!(
-                                        "Failed to release next blocked job for key {}: {:?}",
-                                        key, e
-                                    )
-                                })
-                                .ok();
+                        if delete_result == 0 {
+                            return Err(DbErr::Custom("Claimed job not found".into()));
                         }
-                    }
 
-                    Ok(updated)
+                        // Fetch updated job model
+                        let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
+                            .await?
+                            .ok_or_else(|| {
+                                DbErr::Custom("Job not found after update".to_string())
+                            })?;
+
+                        // Release semaphore and unblock next job if job has concurrency control
+                        // This must happen AFTER job execution completes (ensure block in Solid Queue)
+                        if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
+                            // Step 1: Release semaphore (increment value)
+                            let released = release_semaphore(
+                                txn,
+                                &table_config,
+                                key.clone(),
+                                concurrency_limit,
+                                concurrency_duration,
+                            )
+                            .await
+                            .inspect(|&released| {
+                                if released {
+                                    trace!("Released semaphore for key: {}", key);
+                                }
+                            })
+                            .inspect_err(|e| {
+                                warn!("Failed to release semaphore for key {}: {:?}", key, e)
+                            })
+                            .unwrap_or(false);
+
+                            // Step 2: Immediately try to release next blocked job (like Solid Queue)
+                            if released {
+                                Worker::release_next_blocked_job(&ctx, txn, key, concurrency_limit)
+                                    .await
+                                    .inspect_err(|e| {
+                                        warn!(
+                                            "Failed to release next blocked job for key {}: {:?}",
+                                            key, e
+                                        )
+                                    })
+                                    .ok();
+                            }
+                        }
+
+                        Ok(updated)
+                    })
                 })
-            })
-            .await;
+                .await;
+
+            if transaction_result.is_ok() {
+                break;
+            }
+        }
+
+        // Emergency cleanup: if the transaction failed after all retries, delete the
+        // claimed_execution to prevent permanent worker deadlock. The job result is
+        // lost (not marked finished/failed), but the worker can continue processing.
+        if transaction_result.is_err() {
+            error!(
+                "All {} retries exhausted for job {} cleanup, performing emergency release of claimed_execution {}",
+                max_retries, job_id, claimed_id
+            );
+            let cleanup_db = self.ctx.get_db().await;
+            let _ = query_builder::claimed_executions::delete_by_id(
+                cleanup_db.as_ref(),
+                &table_config_orig,
+                claimed_id,
+            )
+            .await
+            .inspect_err(|e| {
+                error!(
+                    "Emergency cleanup also failed for claimed_execution {}: {:?}",
+                    claimed_id, e
+                );
+            });
+        }
 
         // Log the result
         let transaction_result = transaction_result
