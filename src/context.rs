@@ -31,7 +31,7 @@ pub struct ConcurrencyConstraint {
 
 /// Concurrency conflict strategy - what to do when concurrency limit is reached
 /// Matches Solid Queue's concurrency_on_conflict option
-#[cfg_attr(feature = "python", pyclass(eq, eq_int))]
+#[cfg_attr(feature = "python", pyclass(eq, eq_int, from_py_object))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConcurrencyConflict {
     /// Block the job until a slot becomes available (default behavior)
@@ -116,7 +116,7 @@ impl TableConfig {
 }
 
 #[cfg(feature = "python")]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct ConcurrencyStrategy {
     pub to: i64,
@@ -153,7 +153,7 @@ impl ConcurrencyStrategy {
 }
 
 #[cfg(feature = "python")]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RescueStrategy {
     pub exceptions: Py<PyAny>,
@@ -183,7 +183,7 @@ impl RescueStrategy {
 }
 
 #[cfg(feature = "python")]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RetryStrategy {
     pub wait: Duration,
@@ -234,7 +234,7 @@ impl RetryStrategy {
 }
 
 #[cfg(feature = "python")]
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct DiscardStrategy {
     pub exceptions: Py<PyAny>,
@@ -285,6 +285,7 @@ pub struct AppContext {
     pub dispatcher_concurrency_maintenance_interval: Duration,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
+    pub control_plane_sse_interval: Duration,
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
@@ -321,13 +322,13 @@ impl AppContext {
         dsn: Url,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
-        options: Option<HashMap<String, PyObject>>,
+        options: Option<HashMap<String, Py<PyAny>>>,
     ) -> Self {
         let mut ctx = Self::new_inner(dsn, db, connect_options);
 
         // Override default configuration if options are provided
         if let Some(options) = options {
-            Python::with_gil(|py| {
+            Python::attach(|py| {
                 // Helper closures that warn on type mismatch
                 // Priority: kwargs > env var (QUEBEC_<KEY_UPPER>) > default (None)
                 let env_var = |key: &str| -> Option<String> {
@@ -451,6 +452,9 @@ impl AppContext {
                 if let Some(v) = get_duration("dispatcher_concurrency_maintenance_interval") {
                     ctx.dispatcher_concurrency_maintenance_interval = v;
                 }
+                if let Some(v) = get_duration("control_plane_sse_interval") {
+                    ctx.control_plane_sse_interval = v;
+                }
                 // worker_polling_interval: also accepts f64 for sub-second precision
                 if let Some(val) = options.get("worker_polling_interval") {
                     let result = val
@@ -550,6 +554,7 @@ impl AppContext {
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
+            control_plane_sse_interval: Duration::from_secs(5),
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
@@ -632,7 +637,7 @@ impl AppContext {
             .ok_or_else(|| anyhow::anyhow!("Runnable not found for class: {}", class_name))?;
 
         // Clone with GIL since Runnable contains Py<PyAny>
-        Python::with_gil(|py| Ok(runnable.clone_with_gil(py)))
+        Python::attach(|py| Ok(runnable.clone_with_gil(py)))
     }
 
     /// Get all registered runnable class names

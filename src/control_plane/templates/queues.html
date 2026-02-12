@@ -47,7 +47,7 @@
       {% for queue in queues %}
       <tr>
         <td class="px-6 py-4 whitespace-nowrap">
-          <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:text-blue-600 hover:underline">{{ queue.name }}</a>
+          <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:text-blue-600 hover:underline">{{ queue.name }}</a>
         </td>
         <td class="px-6 py-4 whitespace-nowrap">
           <div class="text-sm text-gray-900">{{ queue.jobs_count }}</div>
@@ -58,7 +58,7 @@
           </span>
         </td>
         <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-          <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium text-gray-900 underline-offset-4 hover:underline mr-3">
+          <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium text-gray-900 underline-offset-4 hover:underline mr-3">
             View
           </a>
           {% if queue.status == 'active' %}
@@ -96,7 +96,7 @@
       Previous page
     </button>
     {% else %}
-    <a href="/queues?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+    <a href="{{ base_path }}/queues?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
       Previous page
     </a>
     {% endif %}
@@ -106,7 +106,7 @@
       Next page
     </button>
     {% else %}
-    <a href="/queues?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+    <a href="{{ base_path }}/queues?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
       Next page
     </a>
     {% endif %}
@@ -119,7 +119,8 @@ async function toggleQueueStatus(button) {
   const action = button.dataset.action;
 
   try {
-    const response = await fetch(`/queues/${queueName}/${action}`, {
+    const basePath = document.querySelector('meta[name="base-path"]')?.content || '';
+    const response = await fetch(`${basePath}/queues/${queueName}/${action}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

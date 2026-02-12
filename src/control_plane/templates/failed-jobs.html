@@ -40,13 +40,13 @@
 
     <div class="flex-grow"></div>
 
-    <form action="/failed-jobs/all/delete" method="post">
+    <form action="{{ base_path }}/failed-jobs/all/delete" method="post">
       <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5 mr-2">
         Discard all
       </button>
     </form>
 
-    <form action="/failed-jobs/all/retry" method="post">
+    <form action="{{ base_path }}/failed-jobs/all/retry" method="post">
       <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
         Retry all
       </button>
@@ -75,7 +75,7 @@
         <tr>
           <td class="px-6 py-4 whitespace-nowrap">
             <div class="text-sm font-medium text-gray-900">
-              <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
+              <a href="{{ base_path }}/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
             </div>
             <div class="text-sm text-gray-500">ID: {{ job.id }}</div>
             <div class="text-xs text-gray-400">Queue: {{ job.queue_name }}</div>
@@ -90,12 +90,12 @@
             <div class="text-xs text-gray-400"><span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span></div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="/failed-jobs/{{ job.id }}/delete" method="post" class="inline">
+            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post" class="inline">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1 mr-2">
                 Discard
               </button>
             </form>
-            <form action="/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
+            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-3 py-1">
                 Retry
               </button>
@@ -121,7 +121,7 @@
     </div>
     <div class="flex space-x-2">
       {% if current_page_num > 1 %}
-      <a href="/failed-jobs?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+      <a href="{{ base_path }}/failed-jobs?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
         Previous page
       </a>
       {% else %}
@@ -131,7 +131,7 @@
       {% endif %}
 
       {% if current_page_num < total_pages %}
-      <a href="/failed-jobs?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
+      <a href="{{ base_path }}/failed-jobs?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
         Next page
       </a>
       {% else %}

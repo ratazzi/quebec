@@ -180,32 +180,40 @@ where
     let priority = entry.priority.unwrap_or(0);
 
     let now = chrono::Utc::now().naive_utc();
-    // Use empty array if args is None, to avoid "arguments is not an array" error
-    let args = entry.args.as_ref().cloned().unwrap_or_default();
-    let params = serde_json::json!({
+
+    // Convert YAML args to JSON (Solid Queue convention: last dict = kwargs)
+    let args = match &entry.args {
+        Some(a) => serde_json::to_value(a).map_err(|e| {
+            DbErr::Custom(format!(
+                "Failed to serialize args for task '{}': {}",
+                task_key, e
+            ))
+        })?,
+        None => serde_json::Value::Array(vec![]),
+    };
+
+    let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
-        "provider_job_id": "",
         "queue_name": queue_name,
         "priority": priority,
         "arguments": args,
-        "executions": 0,
-        "exception_executions": {},
-        "locale": "en",
-        "timezone": "UTC",
         "scheduled_at": scheduled_at,
         "enqueued_at": now,
-    });
+        "continuation": {},
+        "resumptions": 0
+    }));
 
     // Get concurrency constraint using runnable
     // Use normalized args (consistent with what's stored in the job)
+    let args_is_empty = matches!(&args, serde_json::Value::Array(arr) if arr.is_empty());
     #[cfg(feature = "python")]
     let concurrency_constraint = ctx
         .has_concurrency_control(&entry.class.to_string())
         .then(|| ctx.get_runnable(&entry.class).ok())
         .flatten()
         .and_then(|runnable| {
-            let args_ref = if args.is_empty() { None } else { Some(&args) };
+            let args_ref = if args_is_empty { None } else { Some(&args) };
             runnable
                 .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
                 .unwrap_or(None)

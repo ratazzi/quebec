@@ -13,7 +13,7 @@ impl ControlPlaneExt for Arc<AppContext> {
     fn start_control_plane(&self, addr: String) -> tokio::task::JoinHandle<()> {
         let ctx = self.clone();
         let addr = addr.clone();
-        let app = ControlPlane::new(ctx.clone()).router();
+        let app = Arc::new(ControlPlane::new(ctx.clone())).build_router();
         let graceful_shutdown = ctx.graceful_shutdown.clone();
         let force_quit = ctx.force_quit.clone();
 

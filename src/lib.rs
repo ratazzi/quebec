@@ -1,5 +1,6 @@
 mod config;
 pub mod context;
+pub mod continuation;
 mod control_plane;
 #[cfg(feature = "python")]
 mod core;
@@ -187,6 +188,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyQuebec>()?;
     m.add_class::<ActiveJob>()?;
+    m.add_class::<AsgiRequest>()?;
     m.add_class::<ConcurrencyStrategy>()?;
     m.add_class::<ConcurrencyConflict>()?;
     m.add_class::<RescueStrategy>()?;
@@ -196,6 +198,19 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<quebec_claimed_executions::Model>()?;
     m.add_class::<Runnable>()?;
     m.add_class::<Execution>()?;
+
+    // Continuation classes
+    m.add_class::<continuation::Continuable>()?;
+    m.add_class::<continuation::StepContext>()?;
+    m.add_class::<continuation::StepContextManager>()?;
+    m.add(
+        "JobInterrupted",
+        <continuation::JobInterrupted as pyo3::PyTypeInfo>::type_object(_py),
+    )?;
+    m.add(
+        "InvalidStepError",
+        <continuation::InvalidStepError as pyo3::PyTypeInfo>::type_object(_py),
+    )?;
 
     // Configuration classes
     m.add_class::<config::QueueConfig>()?;

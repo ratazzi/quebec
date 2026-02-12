@@ -1,13 +1,16 @@
 from .quebec import *  # NOQA
 from . import quebec
 from . import sqlalchemy  # NOQA
-from .quebec import Quebec, ActiveJob
+from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
+from .quebec import Continuable as _RustContinuable
+from .quebec import StepContext, StepContextManager
 import logging
 import time
 import queue
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import List, Type, Any, Optional, Union
+from typing import List, Type, Any, Optional, Union, Generator, Callable
 from .logger import job_id_var, queue_var
 
 __doc__ = quebec.__doc__
@@ -15,6 +18,136 @@ if hasattr(quebec, "__all__"):
     __all__ = quebec.__all__
 
 logger = logging.getLogger(__name__)
+
+
+class Continuable:
+    """Mixin class for jobs with resumable steps.
+
+    Jobs that inherit from this mixin can define resumable steps using the
+    `step()` context manager. If a job is interrupted (e.g., during shutdown),
+    it will resume from the last checkpoint when re-executed.
+
+    Example:
+        class ProcessImportJob(BaseClass, Continuable):
+            def perform(self, import_id):
+                import_obj = Import.find(import_id)
+
+                with self.step("initialize"):
+                    import_obj.initialize()
+
+                with self.step("process", start=0) as step:
+                    for record in import_obj.records[step.cursor:]:
+                        record.process()
+                        step.advance(from_=record.id)  # Auto-checkpoints!
+
+                with self.step("finalize"):
+                    import_obj.finalize()
+
+    Step API (matches Rails ActiveJob::Continuation::Step):
+        - step.cursor: Get current cursor value (None or start value on first run)
+        - step.resumed: Whether this step was resumed from a previous execution
+        - step.advanced: Whether the cursor has been advanced during this execution
+        - step.set(value): Set cursor and auto-checkpoint (like Rails Step#set!)
+        - step.advance(from_=value): Advance cursor (value + 1) and auto-checkpoint (like Rails Step#advance!)
+        - step.checkpoint(): Manually check if job should be interrupted
+
+    Step parameters (matches Rails):
+        - start: Initial cursor value (e.g., step("foo", start=0))
+        - isolated: Run step in its own execution (e.g., step("slow", isolated=True))
+
+    Class attributes (like Rails):
+        - max_resumptions: Maximum times a job can be resumed (default None = unlimited)
+        - resume_errors_after_advancing: Whether to resume on errors if progress made (default True)
+
+    IMPORTANT: `set()` and `advance()` automatically call `checkpoint()` after
+    updating the cursor - matching Rails' Solid Queue behavior. This means you
+    don't need to call `checkpoint()` manually after every advance.
+
+    The continuation state is automatically serialized to the job arguments and
+    restored when the job is resumed. The `resumptions` property indicates how
+    many times the job has been resumed.
+    """
+
+    # This will be set by the Rust runtime when the job is executed
+    _continuation: Optional[_RustContinuable] = None
+
+    # Class-level configuration (like Rails' class attributes)
+    max_resumptions: Optional[int] = None  # None means unlimited
+    resume_errors_after_advancing: bool = True
+
+    def step(
+        self,
+        name: str,
+        callback: Optional[Callable] = None,
+        *,
+        start: Any = None,
+        isolated: bool = False,
+    ) -> Union[StepContextManager, None]:
+        """Create a resumable step.
+
+        Can be used in two ways:
+
+        1. Context manager style (for complex steps with cursor):
+            ```python
+            with self.step("process", start=0) as step:
+                for i in range(step.cursor, 100):
+                    do_work(i)
+                    step.advance(from_=i)
+            ```
+
+        2. Callback style (for simple steps, more like Rails):
+            ```python
+            self.step("validate", self.do_validate)
+            self.step("prepare", lambda: prepare_data())
+            ```
+
+        Args:
+            name: Unique name for this step within the job
+            callback: Optional callable to execute. If provided, the callback
+                     is executed only if the step hasn't been completed yet.
+                     Can accept an optional step argument for cursor access.
+            start: Initial cursor value (like Rails' `start:` parameter).
+                   Used when cursor is None (first run or no saved cursor).
+            isolated: If True, ensures this step runs in its own execution.
+                     Useful for long-running steps that can't checkpoint within
+                     the job grace period (like Rails' `isolated: true`).
+
+        Returns:
+            If callback is None: A context manager that provides a StepContext
+            If callback is provided: None (callback is executed immediately)
+
+        Raises:
+            InvalidStepError: If step validation fails (nested, repeated, wrong order)
+        """
+        if self._continuation is None:
+            # Create a default continuation context if not set by runtime
+            # This allows testing without the full runtime
+            self._continuation = _RustContinuable()
+        return self._continuation.step(name, callback, start=start, isolated=isolated)
+
+    @property
+    def resumptions(self) -> int:
+        """Number of times this job has been resumed from a checkpoint."""
+        if self._continuation is None:
+            return 0
+        return self._continuation.resumptions
+
+
+class JobDescriptor:
+    """Lightweight descriptor holding all data needed to enqueue a job.
+
+    Created via BaseClass.build() or JobBuilder.build(). Does not touch the
+    database – all Python-side preparation is done eagerly so that the Rust
+    bulk-insert path can release the GIL as early as possible.
+    """
+
+    __slots__ = ("job_class", "args", "kwargs", "options")
+
+    def __init__(self, job_class: Type, args: tuple, kwargs: dict, options: dict):
+        self.job_class = job_class
+        self.args = args
+        self.kwargs = kwargs
+        self.options = options  # queue, priority, wait, wait_until
 
 
 class JobBuilder:
@@ -54,6 +187,10 @@ class JobBuilder:
 
         return None
 
+    def build(self, *args, **kwargs) -> "JobDescriptor":
+        """Create a JobDescriptor with configured options (for bulk enqueue)."""
+        return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
+
     def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
         """Enqueue the job with configured options."""
         scheduled_at = self._calculate_scheduled_at()
@@ -82,6 +219,16 @@ class NoNewOverrideMeta(type):
 
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
+    @classmethod
+    def build(cls, *args, **kwargs) -> "JobDescriptor":
+        """Create a JobDescriptor for bulk enqueue via perform_all_later.
+
+        Example:
+            jobs = [MyJob.build(i) for i in range(10000)]
+            qc.perform_all_later(jobs)
+        """
+        return JobDescriptor(cls, args, kwargs, {})
+
     @classmethod
     def set(
         cls,
@@ -309,7 +456,97 @@ def _quebec_run(
     self.wait()
 
 
+class ControlPlaneASGI:
+    """ASGI application bridging to Quebec's Rust control plane."""
+
+    def __init__(self, quebec_instance):
+        self.qc = quebec_instance
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return
+
+        # Read request body
+        body = b""
+        while True:
+            message = await receive()
+            body += message.get("body", b"")
+            if not message.get("more_body", False):
+                break
+
+        # Strip mount prefix (root_path) from path for the Axum router
+        path = scope["path"]
+        root_path = scope.get("root_path", "")
+        if root_path and path.startswith(root_path):
+            path = path[len(root_path) :] or "/"
+
+        # SSE (/events) is not supported through the ASGI bridge because
+        # handle_request collects the full body, which blocks forever on
+        # infinite streams.  Reject with 204 so the frontend JS falls back
+        # to polling /stats automatically.
+        if path == "/events":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        # Call Rust handler (releases GIL internally via py.detach)
+        # base_path is passed to Rust so templates generate correct prefixed URLs
+        req = quebec.AsgiRequest(
+            scope["method"],
+            path,
+            (scope.get("query_string") or b"").decode("latin-1"),
+            list(scope.get("headers", [])),
+            body,
+            root_path,
+        )
+        status, headers, response_body = self.qc.handle_control_plane_request(req)
+
+        # Rewrite Location headers for redirects (303 etc.)
+        if root_path:
+            prefix = root_path.encode()
+            rewritten = []
+            for name, value in headers:
+                if name.lower() == b"location" and value.startswith(b"/"):
+                    value = prefix + value
+                rewritten.append((name, value))
+            headers = rewritten
+
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": response_body,
+            }
+        )
+
+
+def _quebec_asgi_app(self):
+    """Return an ASGI application for the control plane.
+
+    Mount this on a FastAPI/Starlette app to serve the control plane dashboard.
+
+    Example:
+        app = FastAPI()
+        qc = Quebec("postgres://localhost/mydb")
+        app.mount("/quebec", qc.asgi_app())
+    """
+    return ControlPlaneASGI(self)
+
+
 # Attach methods to Quebec class
 Quebec.start = _quebec_start
 Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
+Quebec.asgi_app = _quebec_asgi_app

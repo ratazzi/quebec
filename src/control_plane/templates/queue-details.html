@@ -12,19 +12,19 @@
     </div>
     <div class="flex gap-2">
       {% if queue_status == 'active' %}
-        <form action="/queues/{{ queue_name }}/pause" method="post">
+        <form action="{{ base_path }}/queues/{{ queue_name }}/pause" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
             Pause Queue
           </button>
         </form>
       {% else %}
-        <form action="/queues/{{ queue_name }}/resume" method="post">
+        <form action="{{ base_path }}/queues/{{ queue_name }}/resume" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-9 px-4 py-2">
             Resume Queue
           </button>
         </form>
       {% endif %}
-      <a href="/queues" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
+      <a href="{{ base_path }}/queues" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
         Back to Queues
       </a>
     </div>
@@ -60,7 +60,7 @@
             <tr>
               <td class="px-6 py-4 whitespace-nowrap">
                 <div class="text-sm font-medium text-gray-900">
-                  <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
+                  <a href="{{ base_path }}/jobs/{{ job.id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
                 </div>
               </td>
               <td class="px-6 py-4 whitespace-nowrap">
@@ -86,11 +86,11 @@
               </td>
               <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                 {% if job.status == 'failed' %}
-                  <form action="/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
+                  <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
                     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-3 py-1">Retry</button>
                   </form>
                 {% elif job.status == 'processing' %}
-                  <form action="/in-progress-jobs/{{ job.execution_id }}/cancel" method="post" class="inline">
+                  <form action="{{ base_path }}/in-progress-jobs/{{ job.execution_id }}/cancel" method="post" class="inline">
                     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">Cancel</button>
                   </form>
                 {% endif %}
@@ -116,7 +116,7 @@
     </div>
     <div class="flex space-x-2">
       {% if current_page > 1 %}
-        <a href="/queues/{{ queue_name }}?page={{ current_page - 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+        <a href="{{ base_path }}/queues/{{ queue_name }}?page={{ current_page - 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
           Previous page
         </a>
       {% else %}
@@ -126,7 +126,7 @@
       {% endif %}
 
       {% if current_page < total_pages %}
-        <a href="/queues/{{ queue_name }}?page={{ current_page + 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+        <a href="{{ base_path }}/queues/{{ queue_name }}?page={{ current_page + 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
           Next page
         </a>
       {% else %}

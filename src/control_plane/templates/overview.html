@@ -124,7 +124,7 @@
             {% for queue in queue_stats %}
             <tr>
               <td class="px-6 py-4 whitespace-nowrap">
-                <a href="/queues/{{ queue.name }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-900">{{ queue.name }}</a>
+                <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-900">{{ queue.name }}</a>
               </td>
               <td class="px-6 py-4 whitespace-nowrap">{{ queue.jobs_processed }}</td>
               <td class="px-6 py-4 whitespace-nowrap">{{ queue.avg_duration }}</td>
@@ -181,7 +181,7 @@
                   </div>
                 </td>
                 <td class="px-6 py-4 whitespace-nowrap text-sm">
-                  <a href="/jobs/{{ job.id }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-800">Details</a>
+                  <a href="{{ base_path }}/jobs/{{ job.id }}" data-turbo-action="advance" class="text-blue-600 hover:text-blue-800">Details</a>
                 </td>
               </tr>
               {% endfor %}
@@ -197,7 +197,7 @@
       </div>
       {% if recent_failed_jobs|length > 0 %}
         <div class="mt-4 text-right">
-          <a href="/failed-jobs" data-turbo-action="advance" class="text-sm text-blue-600 hover:text-blue-800">View all failed jobs →</a>
+          <a href="{{ base_path }}/failed-jobs" data-turbo-action="advance" class="text-sm text-blue-600 hover:text-blue-800">View all failed jobs →</a>
         </div>
       {% endif %}
     </div>

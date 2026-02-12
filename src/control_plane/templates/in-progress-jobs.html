@@ -40,7 +40,7 @@
 
   <div class="flex-grow"></div>
 
-  <form action="/in-progress-jobs/all/cancel" method="post">
+  <form action="{{ base_path }}/in-progress-jobs/all/cancel" method="post">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
       Cancel all
     </button>
@@ -75,7 +75,7 @@
         <tr>
           <td class="px-6 py-4 whitespace-nowrap">
             <div class="text-sm font-medium text-gray-900">
-              <a href="/jobs/{{ job.job_id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
+              <a href="{{ base_path }}/jobs/{{ job.job_id }}" data-turbo-action="advance" class="hover:underline">{{ job.class_name }}</a>
             </div>
             <div class="text-sm text-gray-500">id: {{ job.job_id }}</div>
             <div class="text-xs text-gray-400">Started <span data-controller="localtime" data-localtime-datetime-value="{{ job.started_at }}">{{ job.started_at }}</span></div>
@@ -90,7 +90,7 @@
             <div class="text-sm text-gray-900">{{ job.runtime }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="/in-progress-jobs/{{ job.id }}/cancel" method="post" class="inline">
+            <form action="{{ base_path }}/in-progress-jobs/{{ job.id }}/cancel" method="post" class="inline">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
                 Cancel
               </button>
@@ -116,7 +116,7 @@
   </div>
   <div class="flex space-x-2">
     {% if current_page_num > 1 %}
-      <a href="/in-progress-jobs?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      <a href="{{ base_path }}/in-progress-jobs?page={{ current_page_num - 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
         Previous page
       </a>
     {% else %}
@@ -126,7 +126,7 @@
     {% endif %}
 
     {% if current_page_num < total_pages %}
-      <a href="/in-progress-jobs?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      <a href="{{ base_path }}/in-progress-jobs?page={{ current_page_num + 1 }}" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
         Next page
       </a>
     {% else %}

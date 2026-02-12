@@ -53,6 +53,8 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov",
     "structlog>=25.5.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
 ]
 
 [tool.pytest.ini_options]

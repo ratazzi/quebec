@@ -686,6 +686,112 @@ pub mod jobs {
             .collect()
     }
 
+    /// Data needed to bulk-insert a single job row.
+    pub struct BulkJobRow {
+        pub queue_name: String,
+        pub class_name: String,
+        pub arguments: Option<String>,
+        pub priority: i32,
+        pub active_job_id: String,
+        pub scheduled_at: Option<chrono::NaiveDateTime>,
+        pub concurrency_key: Option<String>,
+    }
+
+    /// Bulk insert jobs and return inserted models.
+    /// PostgreSQL/SQLite: uses RETURNING *.
+    /// MySQL: INSERT then SELECT by active_job_id batch.
+    /// SQLite: auto-chunks at 111 rows (9 cols * 111 = 999).
+    pub async fn insert_all_returning<C>(
+        db: &C,
+        table_config: &TableConfig,
+        rows: &[BulkJobRow],
+        now: chrono::NaiveDateTime,
+    ) -> Result<Vec<quebec_jobs::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let backend = db.get_database_backend();
+        let cols_per_row: usize = 9;
+        // SQLite: 999 bind vars → 111 rows; PostgreSQL: 65535 bind vars → 7281 rows
+        let max_params = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+        let chunk_size = max_params / cols_per_row;
+
+        let mut all_models: Vec<quebec_jobs::Model> = Vec::with_capacity(rows.len());
+
+        for chunk in rows.chunks(chunk_size) {
+            let table = Alias::new(&table_config.jobs);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([
+                    col("queue_name"),
+                    col("class_name"),
+                    col("arguments"),
+                    col("priority"),
+                    col("active_job_id"),
+                    col("scheduled_at"),
+                    col("concurrency_key"),
+                    col("created_at"),
+                    col("updated_at"),
+                ])
+                .to_owned();
+
+            for row in chunk {
+                query.values_panic([
+                    row.queue_name.as_str().into(),
+                    row.class_name.as_str().into(),
+                    row.arguments.as_deref().into(),
+                    row.priority.into(),
+                    row.active_job_id.as_str().into(),
+                    row.scheduled_at.into(),
+                    row.concurrency_key.as_deref().into(),
+                    now.into(),
+                    now.into(),
+                ]);
+            }
+
+            match backend {
+                DbBackend::Postgres | DbBackend::Sqlite => {
+                    query.returning(Returning::new().all());
+                    let (sql, values) = build_insert_sql(backend, &query);
+                    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                    let models: Vec<quebec_jobs::Model> =
+                        quebec_jobs::Model::find_by_statement(stmt).all(db).await?;
+                    all_models.extend(models);
+                }
+                DbBackend::MySql => {
+                    // MySQL doesn't support RETURNING.  SQLAlchemy's approach is
+                    // to refuse bulk INSERT+RETURNING entirely on MySQL (raises
+                    // InvalidRequestError).  We fall back to per-row insert_returning
+                    // which does INSERT then SELECT by last_insert_id().
+                    for row in chunk {
+                        let model = insert_returning(
+                            db,
+                            table_config,
+                            &row.queue_name,
+                            &row.class_name,
+                            row.arguments.as_deref(),
+                            row.priority,
+                            Some(&row.active_job_id),
+                            row.scheduled_at,
+                            row.concurrency_key.as_deref(),
+                        )
+                        .await?;
+                        all_models.push(model);
+                    }
+                }
+            }
+        }
+
+        Ok(all_models)
+    }
+
     /// Delete finished jobs older than the specified timestamp in batches.
     /// Uses subquery DELETE pattern to avoid SQLite's 999 bind variable limit.
     /// Returns the number of deleted rows.
@@ -793,6 +899,59 @@ pub mod ready_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Bulk insert ready execution records.
+    /// data: &[(job_id, queue_name, priority)]
+    /// SQLite: auto-chunks at 249 rows (4 cols * 249 = 996).
+    pub async fn insert_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, &str, i32)],
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let backend = db.get_database_backend();
+        let cols_per_row: usize = 4;
+        let max_params = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+        let chunk_size = max_params / cols_per_row;
+        let now = chrono::Utc::now().naive_utc();
+
+        for chunk in data.chunks(chunk_size) {
+            let table = Alias::new(&table_config.ready_executions);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([
+                    col("job_id"),
+                    col("queue_name"),
+                    col("priority"),
+                    col("created_at"),
+                ])
+                .to_owned();
+
+            for &(job_id, queue_name, priority) in chunk {
+                query.values_panic([
+                    job_id.into(),
+                    queue_name.into(),
+                    priority.into(),
+                    now.into(),
+                ]);
+            }
+
+            let (sql, values) = build_insert_sql(backend, &query);
+            let stmt = Statement::from_sql_and_values(backend, &sql, values);
+            db.execute(stmt).await?;
+        }
+
+        Ok(())
     }
 
     /// Find ready executions for a queue, ordered by priority
@@ -1247,6 +1406,25 @@ pub mod claimed_executions {
             .to_owned();
 
         execute_select(db, query).await
+    }
+
+    /// Count claimed executions by process_id
+    pub async fn count_by_process_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        process_id: i64,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .and_where(Expr::col(col("process_id")).eq(process_id))
+            .to_owned();
+
+        execute_count(db, query).await
     }
 
     /// Find orphaned claimed executions (process_id is NULL or process doesn't exist)
@@ -1790,6 +1968,61 @@ pub mod scheduled_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Bulk insert scheduled execution records.
+    /// data: &[(job_id, queue_name, priority, scheduled_at)]
+    /// SQLite: auto-chunks at 199 rows (5 cols * 199 = 995).
+    pub async fn insert_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, &str, i32, chrono::NaiveDateTime)],
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let backend = db.get_database_backend();
+        let cols_per_row: usize = 5;
+        let max_params = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+        let chunk_size = max_params / cols_per_row;
+        let now = chrono::Utc::now().naive_utc();
+
+        for chunk in data.chunks(chunk_size) {
+            let table = Alias::new(&table_config.scheduled_executions);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([
+                    col("job_id"),
+                    col("queue_name"),
+                    col("priority"),
+                    col("scheduled_at"),
+                    col("created_at"),
+                ])
+                .to_owned();
+
+            for &(job_id, queue_name, priority, scheduled_at) in chunk {
+                query.values_panic([
+                    job_id.into(),
+                    queue_name.into(),
+                    priority.into(),
+                    scheduled_at.into(),
+                    now.into(),
+                ]);
+            }
+
+            let (sql, values) = build_insert_sql(backend, &query);
+            let stmt = Statement::from_sql_and_values(backend, &sql, values);
+            db.execute(stmt).await?;
+        }
+
+        Ok(())
     }
 
     /// Find due scheduled executions (with FOR UPDATE SKIP LOCKED support)

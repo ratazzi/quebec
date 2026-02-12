@@ -19,7 +19,7 @@ pub fn generate_job_id() -> String {
 
 /// Convert YAML value to Python object
 #[cfg(feature = "python")]
-pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<PyObject> {
+pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_yaml::Value::Null => Ok(py.None()),
         serde_yaml::Value::Bool(b) => Ok(b.into_pyobject(py)?.as_any().clone().unbind()),
@@ -67,7 +67,7 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     } else if obj.is_instance_of::<PyString>() {
         Ok(Value::String(obj.extract::<String>()?))
     } else if obj.is_instance_of::<PyDict>() {
-        let dict = obj.downcast::<PyDict>()?;
+        let dict = obj.cast::<PyDict>()?;
         let mut map = serde_json::Map::with_capacity(dict.len());
         for (key, value) in dict {
             let key: String = key.extract()?;
@@ -76,14 +76,14 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         Ok(Value::Object(map))
     } else if obj.is_instance_of::<PyList>() {
-        let list = obj.downcast::<PyList>()?;
+        let list = obj.cast::<PyList>()?;
         let vec = list
             .iter()
             .map(|item| python_to_json_value(&item))
             .collect::<PyResult<Vec<_>>>()?;
         Ok(Value::Array(vec))
     } else if obj.is_instance_of::<PyTuple>() {
-        let tuple = obj.downcast::<PyTuple>()?;
+        let tuple = obj.cast::<PyTuple>()?;
         let vec = tuple
             .iter()
             .map(|item| python_to_json_value(&item))
@@ -100,7 +100,7 @@ pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 
 /// Convert JSON value to Python object
 #[cfg(feature = "python")]
-pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub fn json_value_to_python(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
         Value::Null => Ok(py.None()),
         Value::Bool(b) => Ok(b.into_pyobject(py)?.as_any().clone().unbind()),
@@ -153,20 +153,20 @@ impl<'a> PythonObject<'a> {
 // Trait for types that can be converted to Python objects
 #[cfg(feature = "python")]
 pub trait IntoPython {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject>;
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>>;
 }
 
 // Implement for direct value references
 #[cfg(feature = "python")]
 impl IntoPython for &serde_yaml::Value {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         yaml_value_to_python(py, self)
     }
 }
 
 #[cfg(feature = "python")]
 impl IntoPython for &serde_json::Value {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         json_value_to_python(py, self)
     }
 }
@@ -174,7 +174,7 @@ impl IntoPython for &serde_json::Value {
 // Implement for Vec<serde_yaml::Value> and Vec<serde_json::Value>
 #[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_yaml::Value> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let py_list = pyo3::types::PyList::empty(py);
         for item in self {
             let py_item = yaml_value_to_python(py, item)?;
@@ -186,7 +186,7 @@ impl IntoPython for &Vec<serde_yaml::Value> {
 
 #[cfg(feature = "python")]
 impl IntoPython for &Vec<serde_json::Value> {
-    fn into_python(self, py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let py_list = pyo3::types::PyList::empty(py);
         for item in self {
             let py_item = json_value_to_python(py, item)?;
@@ -199,28 +199,28 @@ impl IntoPython for &Vec<serde_json::Value> {
 // Implement for Python Bound types (already Python objects)
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyTuple> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyDict> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::types::PyList> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.as_any().clone().unbind())
     }
 }
 
 #[cfg(feature = "python")]
 impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
-    fn into_python(self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn into_python(self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.clone().unbind())
     }
 }
@@ -229,6 +229,33 @@ impl<'a> IntoPython for &Bound<'a, pyo3::PyAny> {
 #[cfg(feature = "python")]
 pub fn python_object<'a>(obj: &'a Bound<'a, PyAny>) -> PythonObject<'a> {
     PythonObject(obj)
+}
+
+/// Build the ActiveJob-compatible job params JSON, merging caller-provided
+/// overrides on top of the default skeleton.
+pub fn build_job_params(overrides: Value) -> Value {
+    let mut params = serde_json::json!({
+        "job_class": "",
+        "job_id": null,
+        "provider_job_id": "",
+        "queue_name": "default",
+        "priority": 0,
+        "arguments": [],
+        "executions": 0,
+        "exception_executions": {},
+        "locale": "en",
+        "timezone": "UTC",
+        "scheduled_at": null,
+        "enqueued_at": null,
+    });
+
+    if let (Some(base), Some(over)) = (params.as_object_mut(), overrides.as_object()) {
+        for (k, v) in over {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+
+    params
 }
 
 /// Extract the `executions` count from an arguments JSON string.
@@ -241,10 +268,22 @@ pub fn get_executions(arguments: Option<&str>) -> i32 {
         .unwrap_or(0) as i32
 }
 
+/// Get the per-exception-type execution count from `exception_executions`.
+/// Matches ActiveJob's `executions_for(exceptions)` which tracks retries independently
+/// per retry_on declaration.
+pub fn get_exception_executions(arguments: Option<&str>, key: &str) -> i32 {
+    arguments
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .and_then(|v| v.get("exception_executions")?.get(key)?.as_i64())
+        .unwrap_or(0) as i32
+}
+
 /// Return a new arguments JSON string with `executions` incremented by 1
-/// and `error_type` accumulated into `exception_executions`.
+/// and `exception_key` accumulated into `exception_executions`.
+/// The key should be the strategy's exception list (e.g. "[RuntimeError, IOError]")
+/// matching ActiveJob's `executions_for(exceptions)` format.
 /// If the input is a plain array, wraps it first.
-pub fn increment_executions(arguments: Option<&str>, error_type: Option<&str>) -> String {
+pub fn increment_executions(arguments: Option<&str>, exception_key: Option<&str>) -> String {
     let mut obj = arguments
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or(Value::Array(vec![]));
@@ -268,8 +307,7 @@ pub fn increment_executions(arguments: Option<&str>, error_type: Option<&str>) -
     obj["executions"] = Value::from(executions);
 
     // Accumulate exception_executions
-    if let Some(et) = error_type {
-        let key = format!("[{}]", et);
+    if let Some(key) = exception_key {
         // Ensure exception_executions is an object (reset if missing/wrong type)
         if !obj
             .get("exception_executions")

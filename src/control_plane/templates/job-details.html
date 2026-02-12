@@ -7,17 +7,17 @@
   <!-- Breadcrumb -->
   <div class="flex items-center text-sm text-gray-500 mb-6">
     {% if job.status == 'failed' %}
-      <a href="/failed-jobs" class="hover:text-black">Failed jobs</a>
+      <a href="{{ base_path }}/failed-jobs" class="hover:text-black">Failed jobs</a>
     {% elif job.status == 'scheduled' %}
-      <a href="/scheduled-jobs" class="hover:text-black">Scheduled jobs</a>
+      <a href="{{ base_path }}/scheduled-jobs" class="hover:text-black">Scheduled jobs</a>
     {% elif job.status == 'blocked' %}
-      <a href="/blocked-jobs" class="hover:text-black">Blocked jobs</a>
+      <a href="{{ base_path }}/blocked-jobs" class="hover:text-black">Blocked jobs</a>
     {% elif job.status == 'processing' %}
-      <a href="/in-progress-jobs" class="hover:text-black">In Progress jobs</a>
+      <a href="{{ base_path }}/in-progress-jobs" class="hover:text-black">In Progress jobs</a>
     {% elif job.status == 'finished' %}
-      <a href="/finished-jobs" class="hover:text-black">Finished jobs</a>
+      <a href="{{ base_path }}/finished-jobs" class="hover:text-black">Finished jobs</a>
     {% else %}
-      <a href="/queues/{{ job.queue_name }}" data-turbo-action="advance" class="hover:text-black">Queue: {{ job.queue_name }}</a>
+      <a href="{{ base_path }}/queues/{{ job.queue_name }}" data-turbo-action="advance" class="hover:text-black">Queue: {{ job.queue_name }}</a>
     {% endif %}
     <span class="mx-2">/</span>
     <span class="text-black">{{ job.class_name }} #{{ job.id }}</span>
@@ -31,24 +31,24 @@
     </div>
     <div class="flex mt-4 md:mt-0 space-x-3">
       {% if job.status == 'failed' %}
-        <form action="/failed-jobs/{{ job.id }}/delete" method="post">
+        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
             Discard
           </button>
         </form>
-        <form action="/failed-jobs/{{ job.id }}/retry" method="post">
+        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
             Retry
           </button>
         </form>
       {% elif job.status == 'scheduled' %}
-        <form action="/scheduled-jobs/{{ job.execution_id }}/cancel" method="post">
+        <form action="{{ base_path }}/scheduled-jobs/{{ job.execution_id }}/cancel" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
             Cancel
           </button>
         </form>
       {% elif job.status == 'blocked' %}
-        <form action="/blocked-jobs/{{ job.execution_id }}/unblock" method="post">
+        <form action="{{ base_path }}/blocked-jobs/{{ job.execution_id }}/unblock" method="post">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
             Unblock
           </button>

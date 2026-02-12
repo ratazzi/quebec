@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 /// Worker configuration
 /// Compatible with Solid Queue's worker config
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyclass)]
+#[cfg_attr(feature = "python", pyclass(from_py_object))]
 pub struct WorkerConfig {
     /// Queue names to process (internal)
     #[serde(default)]
@@ -210,7 +210,7 @@ impl serde::Serialize for QueueSelector {
 /// Dispatcher configuration
 /// Compatible with Solid Queue's dispatcher config
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyclass)]
+#[cfg_attr(feature = "python", pyclass(from_py_object))]
 pub struct DispatcherConfig {
     /// Polling interval in seconds
     pub polling_interval: Option<f64>,
@@ -258,7 +258,7 @@ impl DispatcherConfig {
 
 /// Database configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyclass)]
+#[cfg_attr(feature = "python", pyclass(from_py_object))]
 pub struct DatabaseConfig {
     pub url: String,
 }
@@ -280,7 +280,7 @@ impl DatabaseConfig {
 /// Main queue configuration
 /// Compatible with Solid Queue's queue.yml format
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "python", pyclass)]
+#[cfg_attr(feature = "python", pyclass(from_py_object))]
 pub struct QueueConfig {
     /// Application name for NOTIFY channel isolation (default: "quebec")
     pub name: Option<String>,
