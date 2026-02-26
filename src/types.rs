@@ -237,7 +237,16 @@ impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        info!("PyQuebec<{}>", url);
+        let redacted = Url::parse(&url)
+            .ok()
+            .map(|mut u| {
+                if u.password().is_some() {
+                    let _ = u.set_password(Some("***"));
+                }
+                u.to_string()
+            })
+            .unwrap_or_else(|| "<invalid url>".to_string());
+        info!("PyQuebec<{}>", redacted);
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
