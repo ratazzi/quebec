@@ -538,6 +538,7 @@ impl Continuable {
         };
 
         let step_ctx = StepContext::new(name.to_string(), cursor, noop, resumed, self.ctx.clone());
+        let step_ctx = Py::new(py, step_ctx)?;
 
         // If callback is provided, execute it directly (Rails style)
         if let Some(cb) = callback {
@@ -565,13 +566,14 @@ impl Continuable {
             // Call the callback
             let result = if param_count > 0 {
                 // Callback wants the step context
-                cb.call1((step_ctx.clone(),))
+                cb.call1((step_ctx.clone_ref(py),))
             } else {
                 // Callback takes no arguments
                 cb.call0()
             };
 
             // Clear running_step and handle result
+            let has_advanced = { step_ctx.borrow(py).has_advanced() };
             {
                 let mut ctx = self
                     .ctx
@@ -580,7 +582,7 @@ impl Continuable {
                 ctx.running_step = None;
 
                 // Track if step made progress
-                if step_ctx.has_advanced() {
+                if has_advanced {
                     ctx.mark_advanced();
                 }
             }
@@ -671,7 +673,7 @@ impl Continuable {
 #[pyclass(name = "StepContextManager", from_py_object)]
 #[derive(Debug, Clone)]
 pub struct StepContextManager {
-    step_ctx: StepContext,
+    step_ctx: Py<StepContext>,
     step_name: String,
     continuation_ctx: Arc<Mutex<ContinuationContext>>,
     entered: bool,
@@ -680,11 +682,13 @@ pub struct StepContextManager {
 #[cfg(feature = "python")]
 #[pymethods]
 impl StepContextManager {
-    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<StepContext> {
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<Py<StepContext>> {
         slf.entered = true;
+        let py = slf.py();
 
         // If step is already completed, we'll return a noop context
-        if slf.step_ctx.is_noop() {
+        let is_noop = slf.step_ctx.borrow(py).is_noop();
+        if is_noop {
             trace!("Step '{}' already completed, skipping", slf.step_name);
         } else {
             trace!("Entering step '{}'", slf.step_name);
@@ -697,7 +701,7 @@ impl StepContextManager {
             ctx.running_step = Some(slf.step_name.clone());
         }
 
-        Ok(slf.step_ctx.clone())
+        Ok(slf.step_ctx.clone_ref(py))
     }
 
     #[pyo3(signature = (exc_type, _exc_val, _exc_tb))]
@@ -709,6 +713,10 @@ impl StepContextManager {
         _exc_tb: Option<&Bound<'_, pyo3::PyAny>>,
     ) -> PyResult<bool> {
         // Clear running_step first
+        let (has_advanced, is_noop) = {
+            let step_ctx = self.step_ctx.borrow(py);
+            (step_ctx.has_advanced(), step_ctx.is_noop())
+        };
         {
             let mut ctx = self
                 .continuation_ctx
@@ -717,13 +725,13 @@ impl StepContextManager {
             ctx.running_step = None;
 
             // Track if step made progress
-            if self.step_ctx.has_advanced() {
+            if has_advanced {
                 ctx.mark_advanced();
             }
         }
 
         // If step was noop (already completed), just return
-        if self.step_ctx.is_noop() {
+        if is_noop {
             return Ok(false); // Don't suppress exceptions
         }
 
