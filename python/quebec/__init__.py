@@ -291,7 +291,10 @@ class ThreadedRunner:
                 job_id_var.reset(jid_token)
             except queue.Empty:
                 pass  # No job available, just continue waiting
-            except (queue.ShutDown, KeyboardInterrupt):
+            except (
+                getattr(queue, "ShutDown", None) or KeyboardInterrupt,
+                KeyboardInterrupt,
+            ):
                 break
             except Exception as e:
                 logger.error(
