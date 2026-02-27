@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use tera::Context;
 use tracing::{debug, error, info};
+use url::Url;
 
 use crate::query_builder;
 
@@ -229,57 +230,23 @@ impl ControlPlane {
         // Add database connection information
         let _db = self.ctx.get_db().await;
 
-        // Get database DSN information directly from AppContext
         let dsn = self.ctx.dsn.to_string();
-        debug!("Original DSN: {}", dsn);
-
-        // Handle different types of database connections
-        let (db_type, connection_info) = if dsn.starts_with("postgres:") {
-            // If it's a PostgreSQL database
-            let clean_dsn = if dsn.contains("@") {
-                // Contains username and password, need to remove
-                let parts: Vec<&str> = dsn.split("@").collect();
-                if parts.len() > 1 {
-                    // Get protocol part
-                    let protocol = if parts[0].contains("://") {
-                        parts[0].split("://").next().unwrap_or("postgres")
-                    } else {
-                        "postgres"
-                    };
-
-                    // Reconstruct URL, removing username and password
-                    let host_part = parts[1];
-                    format!("{0}://{1}", protocol, host_part)
-                } else {
-                    dsn.clone()
-                }
-            } else {
-                // Does not contain username and password
-                dsn.clone()
+        let (db_type, connection_info) = if let Ok(mut parsed) = Url::parse(&dsn) {
+            let db_type = match parsed.scheme() {
+                s if s.starts_with("postgres") => "PostgreSQL",
+                s if s.starts_with("mysql") => "MySQL",
+                s if s.starts_with("sqlite") => "SQLite",
+                _ => "Unknown",
             };
-
-            // If there are query parameters, remove them
-            let final_dsn = if clean_dsn.contains("?") {
-                clean_dsn
-                    .split("?")
-                    .next()
-                    .unwrap_or(&clean_dsn)
-                    .to_string()
-            } else {
-                clean_dsn
-            };
-
-            debug!("Cleaned PostgreSQL DSN: {}", final_dsn);
-            ("PostgreSQL", final_dsn)
-        } else if dsn.starts_with("sqlite:") {
-            // If it's a SQLite database
-            let path = dsn.replace("sqlite:", "").replace("//", "");
-            debug!("SQLite path: {}", path);
-            ("SQLite", format!("sqlite://{}", path))
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            // Remove empty userinfo marker (e.g. "postgres://@host" -> "postgres://host")
+            let display = parsed.to_string().replace("://@", "://");
+            (db_type, display)
         } else {
-            // Other types of databases
-            debug!("Unknown database type: {}", dsn);
-            ("Unknown", dsn)
+            ("Unknown", "<invalid url>".to_string())
         };
 
         let db_info = serde_json::json!({
