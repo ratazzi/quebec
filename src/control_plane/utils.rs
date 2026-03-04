@@ -100,11 +100,12 @@ impl ControlPlane {
 
         // Count in-progress jobs
         let in_progress_count =
-            query_builder::claimed_executions::count_all(db, table_config).await? as i64;
+            query_builder::claimed_executions::count_all(db, table_config, None, None).await?
+                as i64;
 
         // Count failed jobs
         let failed_count =
-            query_builder::failed_executions::count_all(db, table_config).await? as i64;
+            query_builder::failed_executions::count_all(db, table_config, None, None).await? as i64;
 
         // Count blocked jobs
         let blocked_count =

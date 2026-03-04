@@ -31,11 +31,17 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get claimed (in-progress) jobs using query_builder
-        let claimed_executions =
-            query_builder::claimed_executions::find_paginated(db, table_config, offset, page_size)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get claimed (in-progress) jobs using query_builder (with SQL-level filtering)
+        let claimed_executions = query_builder::claimed_executions::find_paginated(
+            db,
+            table_config,
+            offset,
+            page_size,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Get process information using query_builder
         let processes = query_builder::processes::find_all(db, table_config)
@@ -54,18 +60,6 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
-                // Apply filters
-                if let Some(ref filter_class) = pagination.class_name {
-                    if &job.class_name != filter_class {
-                        continue;
-                    }
-                }
-                if let Some(ref filter_queue) = pagination.queue_name {
-                    if &job.queue_name != filter_queue {
-                        continue;
-                    }
-                }
-
                 // Find process information
                 let worker_id = match execution.process_id {
                     Some(pid) => {
@@ -124,9 +118,14 @@ impl ControlPlane {
         // Get total number of in-progress jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = query_builder::claimed_executions::count_all(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_count: u64 = query_builder::claimed_executions::count_all(
+            db,
+            table_config,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         info!("Total in-progress jobs count: {}", total_count);
 

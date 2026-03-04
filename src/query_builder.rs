@@ -1309,17 +1309,38 @@ pub mod claimed_executions {
         execute_delete(db, query).await
     }
 
-    /// Count all claimed executions
-    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    /// Count claimed executions, optionally filtered by class_name/queue_name
+    pub async fn count_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.claimed_executions);
-        let query = Query::select()
-            .expr(Expr::col(Asterisk).count())
-            .from(table)
-            .to_owned();
+        let ce_table = Alias::new(&table_config.claimed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
 
+        let mut query = Query::select();
+        query.expr(Expr::col(Asterisk).count());
+        query.from(ce_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((ce_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        let query = query.to_owned();
         execute_count(db, query).await
     }
 
@@ -1337,21 +1358,47 @@ pub mod claimed_executions {
         execute_select(db, query).await
     }
 
-    /// Find claimed executions with pagination
+    /// Find claimed executions with pagination and optional filtering by class_name/queue_name
     pub async fn find_paginated<C>(
         db: &C,
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.claimed_executions);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .order_by(col("created_at"), Order::Desc)
+        let ce_table = Alias::new(&table_config.claimed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
+
+        let mut query = Query::select();
+        query.columns([
+            (ce_table.clone(), col("id")),
+            (ce_table.clone(), col("job_id")),
+            (ce_table.clone(), col("process_id")),
+            (ce_table.clone(), col("created_at")),
+        ]);
+        query.from(ce_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((ce_table.clone(), col("job_id")))
+                    .equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        let query = query
+            .order_by((ce_table, col("created_at")), Order::Desc)
             .offset(offset)
             .limit(limit)
             .to_owned();
@@ -1859,17 +1906,38 @@ pub mod failed_executions {
         execute_delete(db, query).await
     }
 
-    /// Count all failed executions
-    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    /// Count failed executions, optionally filtered by class_name/queue_name
+    pub async fn count_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.failed_executions);
-        let query = Query::select()
-            .expr(Expr::col(Asterisk).count())
-            .from(table)
-            .to_owned();
+        let fe_table = Alias::new(&table_config.failed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
 
+        let mut query = Query::select();
+        query.expr(Expr::col(Asterisk).count());
+        query.from(fe_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((fe_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        let query = query.to_owned();
         execute_count(db, query).await
     }
 
@@ -1899,21 +1967,47 @@ pub mod failed_executions {
         execute_count(db, query).await
     }
 
-    /// Find failed executions with pagination
+    /// Find failed executions with pagination and optional filtering by class_name/queue_name
     pub async fn find_paginated<C>(
         db: &C,
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_failed_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.failed_executions);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .order_by(col("created_at"), Order::Desc)
+        let fe_table = Alias::new(&table_config.failed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
+
+        let mut query = Query::select();
+        query.columns([
+            (fe_table.clone(), col("id")),
+            (fe_table.clone(), col("job_id")),
+            (fe_table.clone(), col("error")),
+            (fe_table.clone(), col("created_at")),
+        ]);
+        query.from(fe_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((fe_table.clone(), col("job_id")))
+                    .equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        let query = query
+            .order_by((fe_table, col("created_at")), Order::Desc)
             .offset(offset)
             .limit(limit)
             .to_owned();

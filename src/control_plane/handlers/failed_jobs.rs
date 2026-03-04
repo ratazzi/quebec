@@ -34,11 +34,17 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get failed execution records using query_builder
-        let failed_executions =
-            query_builder::failed_executions::find_paginated(db, table_config, offset, page_size)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get failed execution records using query_builder (with SQL-level filtering)
+        let failed_executions = query_builder::failed_executions::find_paginated(
+            db,
+            table_config,
+            offset,
+            page_size,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store failed job information
         let mut failed_jobs: Vec<FailedJobInfo> = Vec::with_capacity(failed_executions.len());
@@ -48,18 +54,6 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
-                // Apply filters
-                if let Some(ref filter_class) = pagination.class_name {
-                    if &job.class_name != filter_class {
-                        continue;
-                    }
-                }
-                if let Some(ref filter_queue) = pagination.queue_name {
-                    if &job.queue_name != filter_queue {
-                        continue;
-                    }
-                }
-
                 failed_jobs.push(FailedJobInfo {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
@@ -90,10 +84,15 @@ impl ControlPlane {
         // Get total count of failed jobs for pagination calculation
         let start = Instant::now();
 
-        // Execute count query using query_builder
-        let total_count: u64 = query_builder::failed_executions::count_all(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Execute count query using query_builder (with same filters)
+        let total_count: u64 = query_builder::failed_executions::count_all(
+            db,
+            table_config,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         info!("Total failed jobs count: {}", total_count);
 
