@@ -238,12 +238,12 @@ impl ControlPlane {
                 s if s.starts_with("sqlite") => "SQLite",
                 _ => "Unknown",
             };
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("***"));
+            }
             parsed.set_query(None);
             parsed.set_fragment(None);
-            // Remove empty userinfo marker (e.g. "postgres://@host" -> "postgres://host")
-            let display = parsed.to_string().replace("://@", "://");
+            let display = parsed.to_string();
             (db_type, display)
         } else {
             ("Unknown", "<invalid url>".to_string())
