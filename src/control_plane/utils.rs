@@ -1,4 +1,4 @@
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::Response;
 use chrono::{NaiveDateTime, Utc};
 use sea_orm::DbErr;
@@ -144,6 +144,36 @@ impl ControlPlane {
         let pause = query_builder::pauses::find_by_queue_name(db, table_config, queue_name).await?;
 
         Ok(pause.is_some())
+    }
+
+    /// Extract path+query from Referer header, falling back to default_path
+    pub fn referer_or(headers: &HeaderMap, default_path: &str) -> String {
+        headers
+            .get(header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| Url::parse(s).ok())
+            .and_then(|u| {
+                let path = u.path();
+                // Reject scheme-relative URLs (e.g. "//evil.example/x") to prevent open redirect
+                if path.starts_with("//") {
+                    return None;
+                }
+                let mut target = path.to_string();
+                if let Some(q) = u.query() {
+                    target.push('?');
+                    target.push_str(q);
+                }
+                Some(target)
+            })
+            .unwrap_or_else(|| default_path.to_string())
+    }
+
+    /// Return a 500 Internal Server Error response
+    pub fn error_response() -> Response {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::empty())
+            .unwrap()
     }
 
     /// Redirect back to the given URL with 303 See Other

@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{HeaderMap, StatusCode},
+    response::{Html, Response},
 };
 use sea_orm::{DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -157,99 +157,93 @@ impl ControlPlane {
     #[instrument(skip(state), fields(path = "/in-progress-jobs/:id/cancel"))]
     pub async fn cancel_in_progress_job(
         State(state): State<Arc<ControlPlane>>,
+        headers: HeaderMap,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/in-progress-jobs");
 
-        // Use transaction to operate
-        db.transaction::<_, (), DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // Find execution record to cancel using query_builder
-                let claimed_execution =
-                    query_builder::claimed_executions::find_by_id(txn, &table_config, id).await?;
+        match db
+            .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let claimed_execution =
+                        query_builder::claimed_executions::find_by_id(txn, &table_config, id)
+                            .await?;
 
-                if let Some(execution) = claimed_execution {
-                    // Mark job as finished using query_builder
-                    query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
-                        .await?;
+                    if let Some(execution) = claimed_execution {
+                        query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
+                            .await?;
+                        query_builder::claimed_executions::delete_by_id(txn, &table_config, id)
+                            .await?;
+                    } else {
+                        return Err(DbErr::Custom(format!(
+                            "In-progress job with ID {} not found",
+                            id
+                        )));
+                    }
 
-                    // Delete claimed_execution record using query_builder
-                    query_builder::claimed_executions::delete_by_id(txn, &table_config, id).await?;
-
-                    info!("Cancelled in-progress job ID: {}", id);
-                } else {
-                    return Err(DbErr::Custom(format!(
-                        "In-progress job with ID {} not found",
-                        id
-                    )));
-                }
-
-                Ok(())
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map(|_| {
-            info!("Cancelled in-progress job ID: {}", id);
-            (StatusCode::SEE_OTHER, [("Location", "/in-progress-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to cancel in-progress job {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/in-progress-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(_) => {
+                info!("Cancelled in-progress job ID: {}", id);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to cancel in-progress job {}: {}", id, e);
+                Self::error_response()
+            }
+        }
     }
 
     pub async fn cancel_all_in_progress_jobs(
         State(state): State<Arc<ControlPlane>>,
-    ) -> impl IntoResponse {
+        headers: HeaderMap,
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/in-progress-jobs");
 
-        // Use transaction to operate
-        db.transaction::<_, u64, DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // Get all in-progress jobs using query_builder
-                let claimed_executions =
-                    query_builder::claimed_executions::find_all(txn, &table_config).await?;
+        match db
+            .transaction::<_, u64, DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let claimed_executions =
+                        query_builder::claimed_executions::find_all(txn, &table_config).await?;
 
-                if claimed_executions.is_empty() {
-                    return Ok(0);
-                }
+                    if claimed_executions.is_empty() {
+                        return Ok(0);
+                    }
 
-                let job_ids: Vec<i64> = claimed_executions
-                    .iter()
-                    .map(|execution| execution.job_id)
-                    .collect();
+                    let job_ids: Vec<i64> = claimed_executions
+                        .iter()
+                        .map(|execution| execution.job_id)
+                        .collect();
 
-                // Update all related jobs to completed status using query_builder
-                query_builder::jobs::mark_finished_by_ids(txn, &table_config, job_ids).await?;
+                    query_builder::jobs::mark_finished_by_ids(txn, &table_config, job_ids).await?;
 
-                // Delete all claimed_execution records using query_builder
-                let count =
-                    query_builder::claimed_executions::delete_all(txn, &table_config).await?;
+                    let count =
+                        query_builder::claimed_executions::delete_all(txn, &table_config).await?;
 
-                info!("Cancelled all {} in-progress jobs", count);
-                Ok(count)
+                    Ok(count)
+                })
             })
-        })
-        .await
-        .map(|count| {
-            info!("Cancelled all {} in-progress jobs", count);
-            (StatusCode::SEE_OTHER, [("Location", "/in-progress-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to cancel all in-progress jobs: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/in-progress-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(count) => {
+                info!("Cancelled all {} in-progress jobs", count);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to cancel all in-progress jobs: {}", e);
+                Self::error_response()
+            }
+        }
     }
 }

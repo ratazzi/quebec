@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{HeaderMap, StatusCode},
+    response::{Html, Response},
 };
 use sea_orm::{DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -125,152 +125,150 @@ impl ControlPlane {
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/retry"))]
     pub async fn retry_failed_job(
         State(state): State<Arc<ControlPlane>>,
+        headers: HeaderMap,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/failed-jobs");
 
-        // Use transaction for operation
-        db.transaction::<_, (), DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // First get failed execution record using query_builder
-                let failed_execution =
-                    query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
-                        .await?;
+        match db
+            .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let failed_execution =
+                        query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
+                            .await?;
 
-                match failed_execution {
-                    Some(execution) => {
-                        // Use Retryable trait's retry method
-                        execution.retry(txn, &table_config).await?;
-                        Ok(())
+                    match failed_execution {
+                        Some(execution) => {
+                            execution.retry(txn, &table_config).await?;
+                            Ok(())
+                        }
+                        None => Err(DbErr::Custom(format!(
+                            "Failed execution for job {} not found",
+                            id
+                        ))),
                     }
-                    None => Err(DbErr::Custom(format!(
-                        "Failed execution for job {} not found",
-                        id
-                    ))),
-                }
+                })
             })
-        })
-        .await
-        .map(|_| {
-            info!("Retried failed job {}", id);
-            (StatusCode::SEE_OTHER, [("Location", "/failed-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to retry job {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/failed-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(_) => {
+                info!("Retried failed job {}", id);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to retry job {}: {}", id, e);
+                Self::error_response()
+            }
+        }
     }
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/delete"))]
     pub async fn delete_failed_job(
         State(state): State<Arc<ControlPlane>>,
+        headers: HeaderMap,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/failed-jobs");
 
-        // Use transaction for operation
-        db.transaction::<_, (), DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // First get failed execution record using query_builder
-                let failed_execution =
-                    query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
-                        .await?;
+        match db
+            .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let failed_execution =
+                        query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
+                            .await?;
 
-                match failed_execution {
-                    Some(execution) => {
-                        // Use Discardable trait's discard method
-                        execution.discard(txn, &table_config).await?;
-                        Ok(())
+                    match failed_execution {
+                        Some(execution) => {
+                            execution.discard(txn, &table_config).await?;
+                            Ok(())
+                        }
+                        None => Err(DbErr::Custom(format!(
+                            "Failed execution for job {} not found",
+                            id
+                        ))),
                     }
-                    None => Err(DbErr::Custom(format!(
-                        "Failed execution for job {} not found",
-                        id
-                    ))),
-                }
+                })
             })
-        })
-        .await
-        .map(|_| {
-            info!("Deleted failed job {}", id);
-            (StatusCode::SEE_OTHER, [("Location", "/failed-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to delete job {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/failed-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(_) => {
+                info!("Deleted failed job {}", id);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to delete job {}: {}", id, e);
+                Self::error_response()
+            }
+        }
     }
 
     #[instrument(skip(state), fields(path = "/failed-jobs/all/retry"))]
     pub async fn retry_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
-    ) -> impl IntoResponse {
+        headers: HeaderMap,
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/failed-jobs");
 
-        // Use transaction for operation
-        db.transaction::<_, u64, DbErr>(|txn| {
-            Box::pin(async move {
-                // Use Retryable trait's retry_all method
-                let count = FailedExecutionEntity.retry_all(txn, &table_config).await?;
-                Ok(count)
+        match db
+            .transaction::<_, u64, DbErr>(|txn| {
+                Box::pin(async move {
+                    let count = FailedExecutionEntity.retry_all(txn, &table_config).await?;
+                    Ok(count)
+                })
             })
-        })
-        .await
-        .map(|count| {
-            info!("Retried all {} failed jobs", count);
-            (StatusCode::SEE_OTHER, [("Location", "/failed-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to retry all jobs: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/failed-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(count) => {
+                info!("Retried all {} failed jobs", count);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to retry all jobs: {}", e);
+                Self::error_response()
+            }
+        }
     }
 
     #[instrument(skip(state), fields(path = "/failed-jobs/all/delete"))]
     pub async fn discard_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
-    ) -> impl IntoResponse {
+        headers: HeaderMap,
+    ) -> Response {
         let db = state.ctx.get_db().await;
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/failed-jobs");
 
-        // Use transaction for operation
-        db.transaction::<_, u64, DbErr>(|txn| {
-            Box::pin(async move {
-                // Use Discardable trait's discard_all method
-                let count = FailedExecutionEntity
-                    .discard_all(txn, &table_config)
-                    .await?;
-                Ok(count)
+        match db
+            .transaction::<_, u64, DbErr>(|txn| {
+                Box::pin(async move {
+                    let count = FailedExecutionEntity
+                        .discard_all(txn, &table_config)
+                        .await?;
+                    Ok(count)
+                })
             })
-        })
-        .await
-        .map(|count| {
-            info!("Discarded all {} failed jobs", count);
-            (StatusCode::SEE_OTHER, [("Location", "/failed-jobs")])
-        })
-        .map_err(|e| {
-            error!("Failed to discard all jobs: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("Location", "/failed-jobs")],
-            )
-        })
+            .await
+        {
+            Ok(count) => {
+                info!("Discarded all {} failed jobs", count);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to discard all jobs: {}", e);
+                Self::error_response()
+            }
+        }
     }
 }
