@@ -41,7 +41,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist
+          args: --release --out dist -i python3.9
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           before-script-linux: |
             if [ "${{ matrix.platform.target }}" = "aarch64" ]; then
@@ -103,7 +103,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.platform.target }}
-          args: --release --out dist
+          args: --release --out dist -i python3.9
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           before-script-linux: |
             if [ "${{ matrix.platform.target }}" = "aarch64" ]; then
