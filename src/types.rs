@@ -834,6 +834,32 @@ impl PyQuebec {
         let class_name = bound.cast::<PyType>()?.qualname()?;
 
         let queue_name = match bound.getattr("queue_as") {
+            Ok(attr) if attr.is_callable() => {
+                // Filter out internal _-prefixed kwargs (e.g. _queue, _priority, _scheduled_at)
+                // injected by JobBuilder.set() before passing to user's queue_as callable
+                let filtered = PyDict::new(py);
+                if let Some(k) = kwargs {
+                    for (key, value) in k.iter() {
+                        if let Ok(key_str) = key.extract::<String>() {
+                            if !key_str.starts_with('_') {
+                                filtered.set_item(key, value)?;
+                            }
+                        }
+                    }
+                }
+                let kwargs_arg: Option<&Bound<'_, PyDict>> = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(&filtered)
+                };
+                let result = attr.call(args, kwargs_arg)?;
+                let name = result.extract::<String>()?;
+                if name.is_empty() {
+                    "default".to_string()
+                } else {
+                    name
+                }
+            }
             Ok(attr) => attr.extract::<String>()?,
             Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
                 "default".to_string()
@@ -1034,7 +1060,33 @@ impl PyQuebec {
             // Extract class attributes (same as perform_later)
             let class_name = job_class.cast::<PyType>()?.qualname()?.to_string();
 
+            let args_bound = py_args.cast::<PyTuple>()?;
+            let kwargs_bound = py_kwargs.cast::<PyDict>()?;
+
             let queue_name = match job_class.getattr("queue_as") {
+                Ok(attr) if attr.is_callable() => {
+                    // Filter out internal _-prefixed kwargs for consistency with perform_later
+                    let filtered = PyDict::new(py);
+                    for (key, value) in kwargs_bound.iter() {
+                        if let Ok(key_str) = key.extract::<String>() {
+                            if !key_str.starts_with('_') {
+                                filtered.set_item(key, value)?;
+                            }
+                        }
+                    }
+                    let kwargs_arg: Option<&Bound<'_, PyDict>> = if filtered.is_empty() {
+                        None
+                    } else {
+                        Some(&filtered)
+                    };
+                    let result = attr.call(args_bound.clone(), kwargs_arg)?;
+                    let name = result.extract::<String>()?;
+                    if name.is_empty() {
+                        "default".to_string()
+                    } else {
+                        name
+                    }
+                }
                 Ok(attr) => attr.extract::<String>()?,
                 Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
                     "default".to_string()
@@ -1063,10 +1115,8 @@ impl PyQuebec {
             let scheduled_at = resolve_scheduled_at(py, &options)?;
 
             // Serialize args/kwargs to JSON (reuse perform_later logic)
-            let args_bound = py_args.cast::<PyTuple>()?;
             let args_json = crate::utils::python_object(&args_bound).into_json()?;
 
-            let kwargs_bound = py_kwargs.cast::<PyDict>()?;
             let kwargs_json = if kwargs_bound.is_empty() {
                 None
             } else {
