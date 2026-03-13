@@ -119,20 +119,23 @@ class TracingConsoleRenderer:
         timestamp = event_dict.pop("timestamp", "")
         level = event_dict.pop("level", "info").upper()
         event = event_dict.pop("event", "")
+        func_name = event_dict.pop("func_name", "")
+        filename = event_dict.pop("filename", "")
         lineno = event_dict.pop("lineno", "")
-        target = event_dict.pop("target", "quebec")
+        target = event_dict.pop("target", filename or "quebec")
 
         extra = self._format_kv(event_dict)
-        lineno_part = f"{lineno}: " if lineno else ""
+        loc_parts = [p for p in [func_name, str(lineno) if lineno else ""] if p]
+        origin = f"{target}:{':'.join(loc_parts)}:" if loc_parts else f"{target}:"
 
         if self._styles:
             s = self._styles
             ts = f"{s['dim']}{timestamp}{s['reset']}"
             lvl_style = s["levels"].get(method_name, "")
             lvl = f"{lvl_style}{level:>5}{s['reset']}"
-            return f"{ts} {lvl} {target}: {lineno_part}{event}{extra}"
+            return f"{ts} {lvl} {origin} {event}{extra}"
 
-        return f"{timestamp} {level:>5} {target}: {lineno_part}{event}{extra}"
+        return f"{timestamp} {level:>5} {origin} {event}{extra}"
 
     @staticmethod
     def _format_kv(event_dict: dict) -> str:
@@ -184,6 +187,8 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
         structlog.processors.add_log_level,
         structlog.processors.CallsiteParameterAdder(
             [
+                structlog.processors.CallsiteParameter.FUNC_NAME,
+                structlog.processors.CallsiteParameter.FILENAME,
                 structlog.processors.CallsiteParameter.LINENO,
             ]
         ),
