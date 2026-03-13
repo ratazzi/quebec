@@ -1235,27 +1235,43 @@ impl Execution {
             }
         }
 
-        // Emergency cleanup: if the transaction failed after all retries, delete the
-        // claimed_execution to prevent permanent worker deadlock. The job result is
-        // lost (not marked finished/failed), but the worker can continue processing.
+        // Emergency cleanup: if the transaction failed after all retries, mark the job
+        // as failed and release the concurrency semaphore to prevent permanent deadlock.
         if transaction_result.is_err() {
             error!(
                 "All {} retries exhausted for job {} cleanup, performing emergency release of claimed_execution {}",
                 max_retries, job_id, claimed_id
             );
             let cleanup_db = self.ctx.get_db().await;
-            let _ = query_builder::claimed_executions::delete_by_id(
+            // Try fail_claimed_execution first (marks failed + deletes claimed + releases semaphore)
+            let fail_result = Worker::fail_claimed_execution(
+                &self.ctx,
                 cleanup_db.as_ref(),
                 &table_config_orig,
+                job_id,
                 claimed_id,
+                "Emergency cleanup: after_executed transaction failed after all retries",
             )
-            .await
-            .inspect_err(|e| {
-                error!(
-                    "Emergency cleanup also failed for claimed_execution {}: {:?}",
-                    claimed_id, e
+            .await;
+            if let Err(e) = fail_result {
+                // Fallback: at minimum delete the claimed record to unblock the worker
+                warn!(
+                    "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
+                    job_id, e
                 );
-            });
+                let _ = query_builder::claimed_executions::delete_by_id(
+                    cleanup_db.as_ref(),
+                    &table_config_orig,
+                    claimed_id,
+                )
+                .await
+                .inspect_err(|e2| {
+                    error!(
+                        "Emergency cleanup also failed for claimed_execution {}: {:?}",
+                        claimed_id, e2
+                    );
+                });
+            }
         }
 
         // Log the result
