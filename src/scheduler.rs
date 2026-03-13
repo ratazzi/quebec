@@ -181,7 +181,7 @@ where
 
     let now = chrono::Utc::now().naive_utc();
 
-    // Convert YAML args to JSON (Solid Queue convention: last dict = kwargs)
+    // Convert YAML args to JSON (all values are positional arguments)
     let args = match &entry.args {
         Some(a) => serde_json::to_value(a).map_err(|e| {
             DbErr::Custom(format!(

@@ -924,16 +924,18 @@ impl PyQuebec {
             vec![]
         };
 
-        // Append kwargs as last dict element (Solid Queue convention).
-        // On the worker side, the last dict is extracted as kwargs.
+        // Append kwargs as last dict element with _quebec_kwargs marker.
+        // On the worker side, only dicts with this marker are extracted as kwargs;
+        // plain dict positional args are left untouched.
         if let Some(Value::Object(kwargs_map)) = &kwargs_json {
-            let real_kwargs: serde_json::Map<String, Value> = kwargs_map
+            let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
                 .iter()
                 .filter(|(key, _)| !key.starts_with('_'))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
             if !real_kwargs.is_empty() {
+                real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
                 arguments_array.push(Value::Object(real_kwargs));
             }
         }
@@ -1130,12 +1132,13 @@ impl PyQuebec {
             };
 
             if let Some(Value::Object(kwargs_map)) = &kwargs_json {
-                let real_kwargs: serde_json::Map<String, Value> = kwargs_map
+                let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
                     .iter()
                     .filter(|(key, _)| !key.starts_with('_'))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 if !real_kwargs.is_empty() {
+                    real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
                     arguments_array.push(Value::Object(real_kwargs));
                 }
             }

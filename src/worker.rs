@@ -619,23 +619,24 @@ impl Runnable {
         // Initialize kwargs
         let kwargs = PyDict::new(py);
 
-        // Solid Queue convention: if the last argument is a dict, treat it as kwargs.
-        // Matches Ruby's Hash.ruby2_keywords_hash + splat in SQ's arguments_with_kwargs.
-        // Strip _aj_symbol_keys (ActiveJob internal marker).
+        // Extract kwargs: only if the last argument is a dict with _quebec_kwargs marker.
+        // Plain dict positional args (without the marker) are left as-is.
         if !args.is_empty() {
             let last_index = args.len() - 1;
             let last = args.get_item(last_index)?;
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
                 let last_dict = last.cast::<pyo3::types::PyDict>()?;
-                for (key, value) in last_dict {
-                    let key_str: String = key.extract()?;
-                    if key_str == "_aj_symbol_keys" {
-                        continue;
+                if last_dict.contains("_quebec_kwargs")? {
+                    for (key, value) in last_dict {
+                        let key_str: String = key.extract()?;
+                        if key_str == "_quebec_kwargs" || key_str == "_aj_symbol_keys" {
+                            continue;
+                        }
+                        kwargs.set_item(key, value)?;
                     }
-                    kwargs.set_item(key, value)?;
+                    args.del_item(last_index)?;
                 }
-                args.del_item(last_index)?;
             }
         }
 
