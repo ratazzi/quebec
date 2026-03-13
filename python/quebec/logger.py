@@ -1,24 +1,27 @@
 import logging
 import contextvars
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-job_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "job_id", default=None
-)
-queue_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "queue", default=None
+
+@dataclass(frozen=True)
+class JobContext:
+    jid: str | None = None
+    queue: str | None = None
+    target: str | None = None
+
+
+job_context_var: contextvars.ContextVar[JobContext] = contextvars.ContextVar(
+    "job_context", default=JobContext()
 )
 
 
 class ContextFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            record.job_id = job_id_var.get(None)
-            record.queue = queue_var.get(None)
-        except Exception:
-            record.job_id = None
-            record.queue = None
+        ctx = job_context_var.get()
+        record.job_id = ctx.jid
+        record.queue = ctx.queue
         return True
 
 
@@ -53,11 +56,13 @@ def setup_logging(level: int = logging.INFO, *, replace_root: bool = True) -> No
     root.addHandler(handler)
 
 
-def _add_job_id(logger, method_name, event_dict):
-    """Processor to add job_id from contextvars."""
-    jid = job_id_var.get(None)
-    if jid:
-        event_dict["jid"] = jid
+def _add_job_context(logger, method_name, event_dict):
+    """Processor to add job context (jid, target) from contextvars."""
+    ctx = job_context_var.get()
+    if ctx.jid:
+        event_dict["jid"] = ctx.jid
+    if "target" not in event_dict and ctx.target:
+        event_dict["target"] = ctx.target
     return event_dict
 
 
@@ -183,7 +188,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,
-        _add_job_id,
+        _add_job_context,
         structlog.processors.add_log_level,
         structlog.processors.CallsiteParameterAdder(
             [

@@ -146,6 +146,7 @@ async fn runner(
 #[derive(Debug)]
 pub struct Runnable {
     pub class_name: String,
+    pub module_path: String,
     pub handler: Py<PyAny>,
     pub queue_as: String,
     pub priority: i64,
@@ -173,6 +174,7 @@ impl Runnable {
     pub fn new(class_name: String, handler: Py<PyAny>, queue_as: String, priority: i64) -> Self {
         Self {
             class_name,
+            module_path: String::new(),
             handler,
             queue_as,
             priority,
@@ -187,6 +189,7 @@ impl Runnable {
     pub fn clone_with_gil(&self, _py: Python<'_>) -> Self {
         Self {
             class_name: self.class_name.clone(),
+            module_path: self.module_path.clone(),
             handler: self.handler.clone(),
             queue_as: self.queue_as.clone(),
             priority: self.priority,
@@ -1335,6 +1338,16 @@ impl Execution {
     }
 
     #[getter]
+    fn get_class_name(&self) -> String {
+        self.job.class_name.clone()
+    }
+
+    #[getter]
+    fn get_module_path(&self) -> String {
+        self.runnable.module_path.clone()
+    }
+
+    #[getter]
     fn get_tid(&self) -> String {
         self.tid.clone()
     }
@@ -1648,8 +1661,14 @@ impl Worker {
             })()
             .unwrap_or(false);
 
+            let module_path = bound
+                .getattr("__module__")
+                .and_then(|m| m.extract::<String>())
+                .unwrap_or_default();
+
             let runnable = Runnable {
                 class_name: class_name.to_string(),
+                module_path,
                 handler: klass,
                 queue_as: queue_name,
                 priority: 0,

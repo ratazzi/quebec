@@ -11,7 +11,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Type, Any, Optional, Union, Generator, Callable
-from .logger import job_id_var, queue_var
+from .logger import JobContext, job_context_var
 
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
@@ -283,12 +283,18 @@ class ThreadedRunner:
                 self.execution.tid = str(threading.get_ident())
 
                 # Inject jid and queue into context before execution, clean up after
-                jid_token = job_id_var.set(self.execution.jid)
-                queue_token = queue_var.set(self.execution.queue)
-                self.execution.perform()
-                logger.debug(self.execution.metric)
-                queue_var.reset(queue_token)
-                job_id_var.reset(jid_token)
+                ctx_token = job_context_var.set(
+                    JobContext(
+                        jid=self.execution.jid,
+                        queue=self.execution.queue,
+                        target=self.execution.module_path,
+                    )
+                )
+                try:
+                    self.execution.perform()
+                    logger.debug(self.execution.metric)
+                finally:
+                    job_context_var.reset(ctx_token)
             except queue.Empty:
                 pass  # No job available, just continue waiting
             except (
