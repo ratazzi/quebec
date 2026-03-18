@@ -876,7 +876,7 @@ impl PyQuebec {
         let instance = bound.call0()?;
 
         // Check if this job class has concurrency control without needing GIL
-        let (concurrency_key, concurrency_limit) = if self
+        let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if self
             .worker
             .ctx
             .has_concurrency_control(&class_name.to_string())
@@ -893,6 +893,7 @@ impl PyQuebec {
                     ))
                 })?;
 
+            let on_conflict = runnable.concurrency_on_conflict;
             let concurrency_constraint = runnable
                 .get_concurrency_constraint(Some(args), kwargs)
                 .map_err(|e| {
@@ -903,12 +904,12 @@ impl PyQuebec {
                 })?;
 
             if let Some(constraint) = concurrency_constraint {
-                (Some(constraint.key), Some(constraint.limit))
+                (Some(constraint.key), Some(constraint.limit), on_conflict)
             } else {
-                (None, None)
+                (None, None, on_conflict)
             }
         } else {
-            (None, None)
+            (None, None, ConcurrencyConflict::default())
         };
 
         // Convert Python args and kwargs to JSON for job arguments storage
@@ -981,6 +982,7 @@ impl PyQuebec {
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;
         obj.concurrency_limit = concurrency_limit;
+        obj.concurrency_on_conflict = concurrency_on_conflict;
 
         // Check for internal options in kwargs (used by JobBuilder.set())
         // These are prefixed with _ and will be filtered out from job arguments
@@ -1163,9 +1165,10 @@ impl PyQuebec {
             })?;
 
             // Resolve concurrency (if registered)
-            let (concurrency_key, concurrency_limit) =
+            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
                 if self.worker.ctx.has_concurrency_control(&class_name) {
                     if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
+                        let on_conflict = runnable.concurrency_on_conflict;
                         let kwargs_opt = if kwargs_bound.is_empty() {
                             None
                         } else {
@@ -1179,12 +1182,14 @@ impl PyQuebec {
                                     e
                                 ))
                             })?;
-                        constraint.map_or((None, None), |c| (Some(c.key), Some(c.limit)))
+                        constraint.map_or((None, None, on_conflict), |c| {
+                            (Some(c.key), Some(c.limit), on_conflict)
+                        })
                     } else {
-                        (None, None)
+                        (None, None, ConcurrencyConflict::default())
                     }
                 } else {
-                    (None, None)
+                    (None, None, ConcurrencyConflict::default())
                 };
 
             prepared.push(PreparedJob {
@@ -1196,7 +1201,7 @@ impl PyQuebec {
                 scheduled_at,
                 concurrency_key,
                 concurrency_limit,
-                concurrency_on_conflict: ConcurrencyConflict::default(),
+                concurrency_on_conflict,
             });
         }
 

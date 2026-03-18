@@ -153,6 +153,7 @@ pub struct Runnable {
     pub(crate) retry_info: Option<RetryInfo>,
     pub concurrency_limit: Option<i32>,
     pub concurrency_duration: Option<i32>, // in seconds
+    pub concurrency_on_conflict: ConcurrencyConflict,
     /// Continuation info for interrupted jobs (step name, cursor, original args)
     pub(crate) continuation_info: Option<ContinuationInfo>,
 }
@@ -181,6 +182,7 @@ impl Runnable {
             retry_info: None,
             concurrency_limit: None,
             concurrency_duration: None,
+            concurrency_on_conflict: ConcurrencyConflict::default(),
             continuation_info: None,
         }
     }
@@ -196,6 +198,7 @@ impl Runnable {
             retry_info: self.retry_info.clone(),
             concurrency_limit: self.concurrency_limit,
             concurrency_duration: self.concurrency_duration,
+            concurrency_on_conflict: self.concurrency_on_conflict,
             continuation_info: self.continuation_info.clone(),
         }
     }
@@ -1629,6 +1632,7 @@ impl Worker {
 
             let mut concurrency_limit: Option<i32> = None;
             let mut concurrency_duration: Option<i32> = None;
+            let mut concurrency_on_conflict = ConcurrencyConflict::default();
 
             // Extract concurrency_limit if exists
             if bound.hasattr("concurrency_limit")? {
@@ -1639,6 +1643,13 @@ impl Worker {
             if bound.hasattr("concurrency_duration")? {
                 concurrency_duration =
                     Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
+            }
+
+            // Extract concurrency_on_conflict if exists
+            if bound.hasattr("concurrency_on_conflict")? {
+                concurrency_on_conflict = bound
+                    .getattr("concurrency_on_conflict")?
+                    .extract::<ConcurrencyConflict>()?;
             }
 
             // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)
@@ -1675,6 +1686,7 @@ impl Worker {
                 retry_info: None,
                 concurrency_limit,
                 concurrency_duration,
+                concurrency_on_conflict,
                 continuation_info: None,
             };
             info!("Registered job: {:?}", runnable);
