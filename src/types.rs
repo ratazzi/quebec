@@ -232,6 +232,34 @@ fn resolve_scheduled_at(
 
 static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
 
+impl PyQuebec {
+    /// Run an async future on the runtime, handling the case where we're already
+    /// inside the runtime (e.g. job calling perform_later from within perform).
+    fn block_on<F, T>(&self, future: F) -> T
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                // Already inside a runtime (e.g. called from job's perform),
+                // spawn and wait via channel to avoid nested block_on panic
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                handle.spawn(async move {
+                    let result = future.await;
+                    let _ = tx.send(result);
+                });
+                rx.recv()
+                    .expect("runtime task dropped without sending result")
+            }
+            Err(_) => {
+                // Not inside a runtime, safe to block_on directly
+                self.rt.block_on(future)
+            }
+        }
+    }
+}
+
 #[pymethods]
 impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
@@ -1025,21 +1053,18 @@ impl PyQuebec {
 
         let start_time = Instant::now();
         // Release GIL during database operations to prevent blocking other Python threads
-        py.detach(|| {
-            self.rt.block_on(async {
-                let job = self.quebec.perform_later(obj.clone()).await;
-                job
+        let quebec = self.quebec.clone();
+        let obj_clone = obj.clone();
+        py.detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
+            .map(|job| {
+                obj.id.replace(job.id);
+                debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
+                obj
             })
-        })
-        .map(|job| {
-            obj.id.replace(job.id);
-            debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
-            obj
-        })
-        .map_err(|e| {
-            error!("Error: {:?}", e);
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
-        })
+            .map_err(|e| {
+                error!("Error: {:?}", e);
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
+            })
     }
 
     /// Bulk enqueue jobs from a list of JobDescriptor objects.
@@ -1203,11 +1228,9 @@ impl PyQuebec {
         }
 
         // Phase 2 (GIL released): perform database operations
+        let quebec = self.quebec.clone();
         let count = py
-            .detach(|| {
-                self.rt
-                    .block_on(async { self.quebec.perform_all_later(prepared).await })
-            })
+            .detach(|| self.block_on(async move { quebec.perform_all_later(prepared).await }))
             .map(|models| models.len() as u64)
             .map_err(|e| {
                 error!("perform_all_later error: {:?}", e);
