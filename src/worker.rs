@@ -668,7 +668,15 @@ impl Runnable {
             return self.handle_job_interrupted(py, job);
         }
 
-        error!("Job execution error: {:?}", error);
+        if let Some(tb) = error.traceback(py) {
+            if let Ok(formatted) = tb.format() {
+                error!("Job execution error: {}\n{}", error, formatted.trim_end());
+            } else {
+                error!("Job execution error: {}", error);
+            }
+        } else {
+            error!("Job execution error: {}", error);
+        }
 
         // Check if continuation has made progress (like Rails' resume_errors_after_advancing)
         // If the job has advanced, treat it like an interruption - resume from checkpoint
@@ -1152,7 +1160,6 @@ impl Execution {
                         }
 
                         if failed {
-                            error!("Job failed: {:?}", err);
                             // Persist updated arguments (executions/exception_executions counters)
                             if let Some(ref args) = job.arguments {
                                 query_builder::jobs::update_arguments(
