@@ -254,9 +254,11 @@ async fn handle_concurrency_conflict(
         ConcurrencyConflict::Discard => {
             warn!(
                 job_id,
+                "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
+                job.class_name,
                 concurrency_key,
-                class_name = %job.class_name,
-                "Job discarded due to concurrency limit"
+                job.concurrency_limit.unwrap_or(1),
+                concurrency_duration.num_seconds()
             );
             query_builder::jobs::mark_finished(txn, table_config, job_id).await?;
             Ok(JobDestination::Discarded)
@@ -264,7 +266,11 @@ async fn handle_concurrency_conflict(
         ConcurrencyConflict::Block => {
             info!(
                 job_id,
-                concurrency_key, "Job blocked, adding to blocked queue"
+                "Job `{}' blocked due to: {{key={:?}, limit={}, duration={}s}}",
+                job.class_name,
+                concurrency_key,
+                job.concurrency_limit.unwrap_or(1),
+                concurrency_duration.num_seconds()
             );
             let expires_at = now + concurrency_duration;
             query_builder::blocked_executions::insert(

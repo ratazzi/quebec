@@ -298,6 +298,7 @@ impl Runnable {
                 key,
                 limit,
                 duration,
+                on_conflict: self.concurrency_on_conflict,
             }))
         })
         .map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
@@ -1645,11 +1646,18 @@ impl Worker {
                     Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
             }
 
-            // Extract concurrency_on_conflict if exists
-            if bound.hasattr("concurrency_on_conflict")? {
-                concurrency_on_conflict = bound
-                    .getattr("concurrency_on_conflict")?
-                    .extract::<ConcurrencyConflict>()?;
+            // Extract concurrency_on_conflict if explicitly set on the class
+            // Skip inherited getset_descriptor from pyclass (not a real value)
+            if let Ok(attr) = bound.getattr("concurrency_on_conflict") {
+                let is_descriptor = attr
+                    .get_type()
+                    .qualname()
+                    .map(|n| n.contains("descriptor"))
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(false);
+                if !is_descriptor {
+                    concurrency_on_conflict = attr.extract::<ConcurrencyConflict>()?;
+                }
             }
 
             // Check if job has concurrency control (concurrency_key attribute exists and is not None/empty)

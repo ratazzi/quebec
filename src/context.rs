@@ -27,6 +27,7 @@ pub struct ConcurrencyConstraint {
     pub key: String,
     pub limit: i32,
     pub duration: Option<chrono::Duration>,
+    pub on_conflict: ConcurrencyConflict,
 }
 
 /// Concurrency conflict strategy - what to do when concurrency limit is reached

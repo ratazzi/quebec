@@ -283,24 +283,39 @@ where
     };
 
     if let Some(constraint) = blocked_by {
-        // Create blocked execution - job must wait
-        let block_now = chrono::Utc::now().naive_utc();
-        let duration = constraint.duration.unwrap_or_else(|| {
-            chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                .unwrap_or_else(|_| chrono::Duration::seconds(60))
-        });
-        let expires_at = block_now + duration;
+        match constraint.on_conflict {
+            crate::context::ConcurrencyConflict::Discard => {
+                warn!(
+                    job_id = job.id,
+                    "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
+                    job.class_name,
+                    constraint.key,
+                    constraint.limit,
+                    constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
+                );
+                query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
+                return Ok(None);
+            }
+            crate::context::ConcurrencyConflict::Block => {
+                let block_now = chrono::Utc::now().naive_utc();
+                let duration = constraint.duration.unwrap_or_else(|| {
+                    chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                        .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                });
+                let expires_at = block_now + duration;
 
-        query_builder::blocked_executions::insert(
-            db,
-            &ctx.table_config,
-            job.id,
-            &job.queue_name,
-            job.priority,
-            &constraint.key,
-            expires_at,
-        )
-        .await?;
+                query_builder::blocked_executions::insert(
+                    db,
+                    &ctx.table_config,
+                    job.id,
+                    &job.queue_name,
+                    job.priority,
+                    &constraint.key,
+                    expires_at,
+                )
+                .await?;
+            }
+        }
     } else {
         // Job is ready to execute
         query_builder::ready_executions::insert(

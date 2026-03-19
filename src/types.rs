@@ -881,7 +881,6 @@ impl PyQuebec {
             .ctx
             .has_concurrency_control(&class_name.to_string())
         {
-            // If concurrency_info exists, concurrency control is definitely enabled
             let runnable = self
                 .worker
                 .ctx
@@ -893,8 +892,7 @@ impl PyQuebec {
                     ))
                 })?;
 
-            let on_conflict = runnable.concurrency_on_conflict;
-            let concurrency_constraint = runnable
+            let constraint = runnable
                 .get_concurrency_constraint(Some(args), kwargs)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -903,10 +901,9 @@ impl PyQuebec {
                     ))
                 })?;
 
-            if let Some(constraint) = concurrency_constraint {
-                (Some(constraint.key), Some(constraint.limit), on_conflict)
-            } else {
-                (None, None, on_conflict)
+            match constraint {
+                Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
+                None => (None, None, runnable.concurrency_on_conflict),
             }
         } else {
             (None, None, ConcurrencyConflict::default())
@@ -1168,7 +1165,6 @@ impl PyQuebec {
             let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
                 if self.worker.ctx.has_concurrency_control(&class_name) {
                     if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
-                        let on_conflict = runnable.concurrency_on_conflict;
                         let kwargs_opt = if kwargs_bound.is_empty() {
                             None
                         } else {
@@ -1182,9 +1178,10 @@ impl PyQuebec {
                                     e
                                 ))
                             })?;
-                        constraint.map_or((None, None, on_conflict), |c| {
-                            (Some(c.key), Some(c.limit), on_conflict)
-                        })
+                        match constraint {
+                            Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
+                            None => (None, None, runnable.concurrency_on_conflict),
+                        }
                     } else {
                         (None, None, ConcurrencyConflict::default())
                     }

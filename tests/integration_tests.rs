@@ -755,6 +755,7 @@ mod recurring_executions {
 
 mod semaphore {
     use super::*;
+    use quebec::context::ConcurrencyConflict;
 
     #[tokio::test]
     async fn test_concurrency_control() {
@@ -780,6 +781,7 @@ mod semaphore {
             key: "test_constraint_key".to_string(),
             limit: 1,
             duration: Some(chrono::Duration::minutes(5)),
+            on_conflict: ConcurrencyConflict::default(),
         };
 
         assert!(acquire_semaphore_with_constraint(&db, &tc, &constraint)
