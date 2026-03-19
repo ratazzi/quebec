@@ -38,16 +38,16 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let table_config = &state.ctx.table_config;
-        let jobs_table = Alias::new(&table_config.jobs);
+        let ready_table = Alias::new(&table_config.ready_executions);
 
+        // Count only ready executions per queue (matching Solid Queue's Queue#size)
         let query = SeaQuery::select()
             .column(Alias::new("queue_name"))
             .expr_as(
                 Expr::col(Alias::new("queue_name")).count(),
                 Alias::new("count"),
             )
-            .from(jobs_table)
-            .and_where(Expr::col(Alias::new("finished_at")).is_null())
+            .from(ready_table)
             .group_by_col(Alias::new("queue_name"))
             .to_owned();
 
