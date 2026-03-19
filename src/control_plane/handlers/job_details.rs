@@ -16,7 +16,11 @@ impl ControlPlane {
         Path(id): Path<i64>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
         let backend = db.get_database_backend();
         debug!("Database connection obtained in {:?}", start.elapsed());

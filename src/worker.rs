@@ -1088,7 +1088,7 @@ impl Execution {
         }
         .await;
 
-        let mut db = self.ctx.get_db().await;
+        let mut db = self.ctx.get_db().await?;
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
@@ -1132,7 +1132,13 @@ impl Execution {
                 );
                 tokio::time::sleep(backoff).await;
                 // Re-acquire connection from pool for retry
-                db = self.ctx.get_db().await;
+                db = match self.ctx.get_db().await {
+                    Ok(db) => db,
+                    Err(e) => {
+                        warn!("Failed to re-acquire connection: {}", e);
+                        continue;
+                    }
+                };
             }
 
             let retry_job_data = retry_job_data.clone();
@@ -1256,35 +1262,41 @@ impl Execution {
                 "All {} retries exhausted for job {} cleanup, performing emergency release of claimed_execution {}",
                 max_retries, job_id, claimed_id
             );
-            let cleanup_db = self.ctx.get_db().await;
-            // Try fail_claimed_execution first (marks failed + deletes claimed + releases semaphore)
-            let fail_result = Worker::fail_claimed_execution(
-                &self.ctx,
-                cleanup_db.as_ref(),
-                &table_config_orig,
-                job_id,
-                claimed_id,
-                "Emergency cleanup: after_executed transaction failed after all retries",
-            )
-            .await;
-            if let Err(e) = fail_result {
-                // Fallback: at minimum delete the claimed record to unblock the worker
-                warn!(
+            if let Ok(cleanup_db) = self.ctx.get_db().await.inspect_err(|e| {
+                error!(
+                    "Failed to get DB for emergency cleanup of job {}: {}",
+                    job_id, e
+                );
+            }) {
+                // Try fail_claimed_execution first (marks failed + deletes claimed + releases semaphore)
+                let fail_result = Worker::fail_claimed_execution(
+                    &self.ctx,
+                    cleanup_db.as_ref(),
+                    &table_config_orig,
+                    job_id,
+                    claimed_id,
+                    "Emergency cleanup: after_executed transaction failed after all retries",
+                )
+                .await;
+                if let Err(e) = fail_result {
+                    // Fallback: at minimum delete the claimed record to unblock the worker
+                    warn!(
                     "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
                     job_id, e
                 );
-                let _ = query_builder::claimed_executions::delete_by_id(
-                    cleanup_db.as_ref(),
-                    &table_config_orig,
-                    claimed_id,
-                )
-                .await
-                .inspect_err(|e2| {
-                    error!(
-                        "Emergency cleanup also failed for claimed_execution {}: {:?}",
-                        claimed_id, e2
-                    );
-                });
+                    let _ = query_builder::claimed_executions::delete_by_id(
+                        cleanup_db.as_ref(),
+                        &table_config_orig,
+                        claimed_id,
+                    )
+                    .await
+                    .inspect_err(|e2| {
+                        error!(
+                            "Emergency cleanup also failed for claimed_execution {}: {:?}",
+                            claimed_id, e2
+                        );
+                    });
+                }
             }
         }
 
@@ -1485,7 +1497,11 @@ impl Execution {
                     scheduled_at
                 );
 
-                let db = self.ctx.get_db().await;
+                let db = self
+                    .ctx
+                    .get_db()
+                    .await
+                    .map_err(sea_orm::TransactionError::Connection)?;
                 let table_config = self.ctx.table_config.clone();
                 db.transaction::<_, (), DbErr>(|txn| {
                     let table_config = table_config.clone();
@@ -1732,7 +1748,7 @@ impl Worker {
     }
 
     pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
         let use_skip_locked = self.ctx.use_skip_locked;
@@ -1817,7 +1833,7 @@ impl Worker {
         batch_size: u64,
     ) -> Result<Vec<quebec_claimed_executions::Model>, anyhow::Error> {
         let timer = Instant::now();
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let use_skip_locked = self.ctx.use_skip_locked;
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
@@ -1964,7 +1980,7 @@ impl Worker {
     /// Fail all orphaned claimed executions (jobs claimed by non-existent processes)
     /// Called at startup to clean up jobs left by crashed workers
     async fn fail_orphaned_executions(&self) -> Result<usize, anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
         let orphaned =
@@ -2015,7 +2031,7 @@ impl Worker {
         &self,
         exclude_process_id: Option<i64>,
     ) -> Result<usize, anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
         // Processes with heartbeat older than this are considered dead
@@ -2099,7 +2115,7 @@ impl Worker {
             return Ok(0);
         }
 
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
         let batch_size = self.ctx.cleanup_batch_size;
         let clear_after = self.ctx.clear_finished_jobs_after;
@@ -2162,7 +2178,7 @@ impl Worker {
         &self,
         process_id: i64,
     ) -> Result<usize, anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
         let claimed = query_builder::claimed_executions::find_by_process_id(
@@ -2232,7 +2248,11 @@ impl Worker {
         ctx: &Arc<AppContext>,
         claimed: &[quebec_claimed_executions::Model],
     ) {
-        let db = ctx.get_db().await;
+        let Ok(db) = ctx.get_db().await.inspect_err(|e| {
+            warn!("Failed to get DB for release_claimed_batch: {:?}", e);
+        }) else {
+            return;
+        };
         let table_config = ctx.table_config.clone();
         let mut released = 0usize;
         for row in claimed {
@@ -2285,7 +2305,11 @@ impl Worker {
     /// Delete a claimed execution record without writing to failed_executions.
     /// Used when the job record itself is already gone (FK would prevent insert).
     async fn delete_claimed_by_id(ctx: &Arc<AppContext>, execution_id: i64) {
-        let db = ctx.get_db().await;
+        let Ok(db) = ctx.get_db().await.inspect_err(|e| {
+            warn!("Failed to get DB for delete_claimed_by_id: {:?}", e);
+        }) else {
+            return;
+        };
         let table_config = ctx.table_config.clone();
         if let Err(e) = query_builder::claimed_executions::delete_by_id(
             db.as_ref(),
@@ -2308,7 +2332,11 @@ impl Worker {
         job_id: i64,
         error_msg: &str,
     ) {
-        let db = ctx.get_db().await;
+        let Ok(db) = ctx.get_db().await.inspect_err(|e| {
+            warn!("Failed to get DB for fail_claimed_by_id: {:?}", e);
+        }) else {
+            return;
+        };
         let table_config = ctx.table_config.clone();
         let ctx = ctx.clone();
         if let Err(e) = db
@@ -2545,7 +2573,7 @@ impl Worker {
             .set_proc_title("worker", Some(&format!("{}", worker_threads)));
 
         // Initialize process record
-        let init_db = self.ctx.get_db().await;
+        let init_db = self.ctx.get_db().await?;
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
 
@@ -2583,7 +2611,9 @@ impl Worker {
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    let heartbeat_db = self.ctx.get_db().await;
+                    let Ok(heartbeat_db) = self.ctx.get_db().await.inspect_err(|e| {
+                        warn!("Failed to get DB for heartbeat: {}", e);
+                    }) else { continue };
                     self.heartbeat(&heartbeat_db, &process).await?;
                 }
                 // Periodic maintenance: prune dead processes and fail their claimed jobs
@@ -2623,7 +2653,7 @@ impl Worker {
                     }
 
                     // Clean up process record
-                    let stop_db = self.ctx.get_db().await;
+                    let stop_db = self.ctx.get_db().await?;
                     self.on_stop(&stop_db, &process).await?;
 
                     return Ok(());
@@ -2695,7 +2725,11 @@ impl Worker {
             return;
         };
 
-        let claim_count_db = ctx.get_db().await;
+        let Ok(claim_count_db) = ctx.get_db().await.inspect_err(|e| {
+            warn!("[{}] failed to get DB for claim count: {:?}", source, e);
+        }) else {
+            return;
+        };
         let in_flight = match query_builder::claimed_executions::count_by_process_id(
             claim_count_db.as_ref(),
             &ctx.table_config,
@@ -2768,7 +2802,11 @@ impl Worker {
         let job_ids: Vec<i64> = claimed.iter().map(|row| row.job_id).collect();
         let table_config = ctx.table_config.clone();
         let job_data = {
-            let processing_db = ctx.get_db().await;
+            let Ok(processing_db) = ctx.get_db().await.inspect_err(|e| {
+                warn!("[{}] failed to get DB for processing jobs: {:?}", source, e);
+            }) else {
+                return;
+            };
             // Use a single quick transaction to fetch all job data
             let jobs_result = processing_db
                 .transaction::<_, Vec<quebec_jobs::Model>, DbErr>(|txn| {

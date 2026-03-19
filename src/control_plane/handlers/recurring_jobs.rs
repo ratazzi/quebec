@@ -18,7 +18,11 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
 
         let table_config = &state.ctx.table_config;
@@ -93,7 +97,7 @@ impl ControlPlane {
     }
 
     async fn do_run_recurring_job(state: &Arc<ControlPlane>, id: i64) -> Result<(), anyhow::Error> {
-        let db = state.ctx.get_db().await;
+        let db = state.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
@@ -171,7 +175,11 @@ impl ControlPlane {
     pub async fn recurring_jobs_schedule(
         State(state): State<Arc<ControlPlane>>,
     ) -> Result<Html<String>, (StatusCode, String)> {
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();

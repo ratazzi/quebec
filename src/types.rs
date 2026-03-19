@@ -348,30 +348,51 @@ impl PyQuebec {
         // Pre-create a connection for all database types
         // This connection will be wrapped in Arc and used when needed
         // For high concurrency operations, new connections will be obtained through get_connection method
-        let db = rt.block_on(async {
-            // Probe with a single connection first to surface real errors
-            // (pool timeout errors hide the actual cause)
-            let mut probe_opt = opt.clone();
-            probe_opt.min_connections(0).max_connections(1);
+        let db = rt
+            .block_on(async {
+                // Probe with a single connection first to surface real errors
+                // (pool timeout errors hide the actual cause)
+                let mut probe_opt = opt.clone();
+                probe_opt.min_connections(0).max_connections(1);
 
-            let mut retry_count = 0;
-            const MAX_RETRIES: usize = 3;
+                let mut retry_count = 0;
+                const MAX_RETRIES: usize = 3;
 
-            loop {
-                // Phase 1: probe connectivity with a single connection
-                let probe = match Database::connect(probe_opt.clone()).await {
-                    Ok(db) => db,
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= MAX_RETRIES {
-                            error!(
-                                "Failed to connect to database after {} retries: {}",
-                                MAX_RETRIES, e
+                loop {
+                    // Phase 1: probe connectivity with a single connection
+                    let probe = match Database::connect(probe_opt.clone()).await {
+                        Ok(db) => db,
+                        Err(e) => {
+                            retry_count += 1;
+                            if retry_count >= MAX_RETRIES {
+                                error!(
+                                    "Failed to connect to database after {} retries: {}",
+                                    MAX_RETRIES, e
+                                );
+                                return Err(e);
+                            }
+                            warn!(
+                                "Database connection attempt {}/{} failed: {}",
+                                retry_count, MAX_RETRIES, e
                             );
-                            panic!("Database connection failed: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1000 * retry_count as u64,
+                            ))
+                            .await;
+                            continue;
+                        }
+                    };
+
+                    // Phase 2: verify the connection actually works (ping)
+                    if let Err(e) = probe.ping().await {
+                        retry_count += 1;
+                        drop(probe);
+                        if retry_count >= MAX_RETRIES {
+                            error!("Database ping failed after {} retries: {}", MAX_RETRIES, e);
+                            return Err(e);
                         }
                         warn!(
-                            "Database connection attempt {}/{} failed: {}",
+                            "Database ping attempt {}/{} failed: {}",
                             retry_count, MAX_RETRIES, e
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -380,50 +401,38 @@ impl PyQuebec {
                         .await;
                         continue;
                     }
-                };
-
-                // Phase 2: verify the connection actually works (ping)
-                if let Err(e) = probe.ping().await {
-                    retry_count += 1;
                     drop(probe);
-                    if retry_count >= MAX_RETRIES {
-                        error!("Database ping failed after {} retries: {}", MAX_RETRIES, e);
-                        panic!("Database connection failed: {}", e);
-                    }
-                    warn!(
-                        "Database ping attempt {}/{} failed: {}",
-                        retry_count, MAX_RETRIES, e
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(1000 * retry_count as u64))
-                        .await;
-                    continue;
-                }
-                drop(probe);
 
-                // Phase 3: create the actual connection pool
-                match Database::connect(opt.clone()).await {
-                    Ok(db) => return db,
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= MAX_RETRIES {
-                            error!(
-                                "Failed to create connection pool after {} retries: {}",
-                                MAX_RETRIES, e
+                    // Phase 3: create the actual connection pool
+                    match Database::connect(opt.clone()).await {
+                        Ok(db) => return Ok(db),
+                        Err(e) => {
+                            retry_count += 1;
+                            if retry_count >= MAX_RETRIES {
+                                error!(
+                                    "Failed to create connection pool after {} retries: {}",
+                                    MAX_RETRIES, e
+                                );
+                                return Err(e);
+                            }
+                            warn!(
+                                "Connection pool creation attempt {}/{} failed: {}",
+                                retry_count, MAX_RETRIES, e
                             );
-                            panic!("Database connection failed: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                1000 * retry_count as u64,
+                            ))
+                            .await;
                         }
-                        warn!(
-                            "Connection pool creation attempt {}/{} failed: {}",
-                            retry_count, MAX_RETRIES, e
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            1000 * retry_count as u64,
-                        ))
-                        .await;
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| {
+                pyo3::exceptions::PyConnectionError::new_err(format!(
+                    "Database connection failed: {}",
+                    e
+                ))
+            })?;
         let db_option = Some(Arc::new(db));
 
         // Convert kwargs to HashMap<String, Py<PyAny>>
@@ -749,7 +758,12 @@ impl PyQuebec {
 
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
-            let db = self.ctx.get_db().await;
+            let db = self.ctx.get_db().await.map_err(|e| {
+                pyo3::exceptions::PyConnectionError::new_err(format!(
+                    "Database connection failed: {}",
+                    e
+                ))
+            })?;
             Ok(db
                 .ping()
                 .await
@@ -760,7 +774,12 @@ impl PyQuebec {
 
     fn create_tables(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
-            let db = self.ctx.get_db().await;
+            let db = self.ctx.get_db().await.map_err(|e| {
+                pyo3::exceptions::PyConnectionError::new_err(format!(
+                    "Database connection failed: {}",
+                    e
+                ))
+            })?;
 
             // Use schema_builder with dynamic table names from TableConfig
             let success =
@@ -1310,9 +1329,21 @@ impl PyQuebec {
 
         // Check if database tables exist after start handlers have run
         let ctx = self.ctx.clone();
-        let check_result = self.rt.block_on(async {
-            let db = ctx.get_db().await;
-            crate::schema_builder::check_tables_exist(db.as_ref(), &ctx.table_config).await
+        let check_result: PyResult<bool> = self.rt.block_on(async {
+            let db = ctx.get_db().await.map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
+                    "Database connection failed: {}",
+                    e
+                ))
+            })?;
+            crate::schema_builder::check_tables_exist(db.as_ref(), &ctx.table_config)
+                .await
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Database error: {}",
+                        e
+                    ))
+                })
         });
 
         match check_result {
@@ -1327,10 +1358,7 @@ impl PyQuebec {
             }
             Err(e) => {
                 error!("Database error while checking tables: {}", e);
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Database error: {}",
-                    e
-                )));
+                return Err(e);
             }
         }
 
@@ -1582,7 +1610,12 @@ impl PyQuebec {
 
         py.detach(|| {
             self.rt.block_on(async {
-                let db = self.ctx.get_db().await;
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {}",
+                        e
+                    ))
+                })?;
                 let mut total_deleted: u64 = 0;
 
                 loop {
@@ -1666,7 +1699,12 @@ impl PyQuebec {
 
         py.detach(|| {
             self.rt.block_on(async {
-                let db = self.ctx.get_db().await;
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {}",
+                        e
+                    ))
+                })?;
                 crate::query_builder::jobs::count_finished_before(
                     db.as_ref(),
                     &table_config,

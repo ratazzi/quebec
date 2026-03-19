@@ -23,7 +23,11 @@ impl ControlPlane {
         Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
@@ -128,7 +132,10 @@ impl ControlPlane {
         headers: HeaderMap,
         Path(id): Path<i64>,
     ) -> Response {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return Self::error_response(),
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
         let redirect = Self::referer_or(&headers, "/failed-jobs");
@@ -172,7 +179,10 @@ impl ControlPlane {
         headers: HeaderMap,
         Path(id): Path<i64>,
     ) -> Response {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return Self::error_response(),
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
         let redirect = Self::referer_or(&headers, "/failed-jobs");
@@ -215,7 +225,10 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         headers: HeaderMap,
     ) -> Response {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return Self::error_response(),
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
         let redirect = Self::referer_or(&headers, "/failed-jobs");
@@ -245,7 +258,10 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         headers: HeaderMap,
     ) -> Response {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return Self::error_response(),
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
         let redirect = Self::referer_or(&headers, "/failed-jobs");

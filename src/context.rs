@@ -576,29 +576,20 @@ impl AppContext {
         self.runtime_handle.clone()
     }
 
-    // New method that returns Result type, allowing callers to handle errors
-    pub async fn get_db_result(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
-        // Prefer shared connection pool when available (SQLite needs a shared connection).
-        // For PostgreSQL, this also avoids creating new connections each time.
+    async fn get_db_inner(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
         if let Some(db) = &self.db {
             return Ok(Arc::clone(db));
         }
-
-        // Fallback: create new connection if no shared connection available
         let conn = Database::connect(self.connect_options.clone()).await?;
         Ok(Arc::new(conn))
     }
 
-    // Keep original interface, but use new error handling internally
-    // If error occurs, log error and attempt retry
-    pub async fn get_db(&self) -> Arc<DatabaseConnection> {
-        // Try to get connection, retry if failed
+    pub async fn get_db(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
         for retry in 0..3 {
-            match self.get_db_result().await {
-                Ok(db) => return db,
+            match self.get_db_inner().await {
+                Ok(db) => return Ok(db),
                 Err(e) => {
                     if retry < 2 {
-                        // If there are retry attempts left, log error and wait before retrying
                         warn!(
                             "Failed to get database connection, retrying ({}/3): {}",
                             retry + 1,
@@ -609,15 +600,12 @@ impl AppContext {
                         ))
                         .await;
                     } else {
-                        // If all retries failed, log error and panic
                         error!("Failed to get database connection after 3 retries: {}", e);
-                        panic!("Failed to get database connection: {}", e);
+                        return Err(e);
                     }
                 }
             }
         }
-
-        // This should never be reached, as panic occurs in loop if all retries fail
         unreachable!()
     }
 

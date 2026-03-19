@@ -63,7 +63,7 @@ impl Quebec {
             return Ok(vec![]);
         }
 
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
 
         let (job_models, ready_queues) = db
@@ -90,7 +90,7 @@ impl Quebec {
     }
 
     pub async fn perform_later(&self, job: ActiveJob) -> Result<quebec_jobs::Model> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
         trace!("job: {:?}", job);
 

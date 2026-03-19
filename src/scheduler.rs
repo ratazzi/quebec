@@ -618,7 +618,7 @@ impl Scheduler {
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
 
@@ -641,7 +641,7 @@ impl Scheduler {
         let mut task_handles = Vec::new();
 
         for (i, entry) in scheduled.into_iter().enumerate() {
-            let db = self.ctx.get_db().await;
+            let db = self.ctx.get_db().await?;
             let graceful_shutdown = self.ctx.graceful_shutdown.clone();
             let ctx = self.ctx.clone();
             let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));

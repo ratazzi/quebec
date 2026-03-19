@@ -69,7 +69,7 @@ impl ControlPlane {
 
     /// Get queue names from database using query_builder
     pub async fn get_queue_names(&self) -> Result<Vec<String>, DbErr> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
 
@@ -78,7 +78,7 @@ impl ControlPlane {
 
     /// Get job class names from database using query_builder
     pub async fn get_job_classes(&self) -> Result<Vec<String>, DbErr> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
 
@@ -87,7 +87,7 @@ impl ControlPlane {
 
     /// Populate navigation statistics for templates using query_builder
     pub async fn populate_nav_stats(&self, context: &mut Context) -> Result<(), DbErr> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
 
@@ -137,7 +137,7 @@ impl ControlPlane {
 
     /// Check if a queue is paused using query_builder
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
-        let db = self.ctx.get_db().await;
+        let db = self.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
 
@@ -259,7 +259,11 @@ impl ControlPlane {
         }
 
         // Add database connection information
-        let _db = self.ctx.get_db().await;
+        let _db = self
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let dsn = self.ctx.dsn.to_string();
         let (db_type, connection_info) = if let Ok(mut parsed) = Url::parse(&dsn) {

@@ -19,7 +19,11 @@ impl ControlPlane {
         Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());

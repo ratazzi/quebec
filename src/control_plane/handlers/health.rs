@@ -11,7 +11,7 @@ impl ControlPlane {
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let db = state
             .ctx
-            .get_db_result()
+            .get_db()
             .await
             .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 

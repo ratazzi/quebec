@@ -20,7 +20,11 @@ impl ControlPlane {
         Query(pagination): Query<Pagination>,
     ) -> Result<Html<String>, (StatusCode, String)> {
         let start = Instant::now();
-        let db = state.ctx.get_db().await;
+        let db = state
+            .ctx
+            .get_db()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
@@ -146,7 +150,16 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                error!("Failed to get db connection: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "/blocked-jobs".to_string(),
+                ));
+            }
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
 
@@ -191,7 +204,16 @@ impl ControlPlane {
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
     ) -> impl IntoResponse {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                error!("Failed to get db connection: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "/blocked-jobs".to_string(),
+                ));
+            }
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
 
@@ -236,7 +258,16 @@ impl ControlPlane {
     }
 
     pub async fn unblock_all_jobs(State(state): State<Arc<ControlPlane>>) -> impl IntoResponse {
-        let db = state.ctx.get_db().await;
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(e) => {
+                error!("Failed to get db connection: {}", e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "/blocked-jobs".to_string(),
+                ));
+            }
+        };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
 

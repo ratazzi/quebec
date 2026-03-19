@@ -28,7 +28,7 @@ impl Dispatcher {
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         let batch_size = self.ctx.dispatcher_batch_size;
 
-        let init_db = self.ctx.get_db().await;
+        let init_db = self.ctx.get_db().await?;
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
 
@@ -37,17 +37,21 @@ impl Dispatcher {
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    let heartbeat_db = self.ctx.get_db().await;
+                    let Ok(heartbeat_db) = self.ctx.get_db().await.inspect_err(|e| {
+                        warn!("Failed to get DB for heartbeat: {}", e);
+                    }) else { continue };
                     self.heartbeat(&heartbeat_db, &process).await?;
                 }
                 _ = quit.cancelled() => {
                     info!("Stopped");
-                    let stop_db = self.ctx.get_db().await;
+                    let stop_db = self.ctx.get_db().await?;
                     self.on_stop(&stop_db, &process).await?;
                     return Ok(());
                 }
                 _ = polling_interval.tick() => {
-                    let polling_db = self.ctx.get_db().await;
+                    let Ok(polling_db) = self.ctx.get_db().await.inspect_err(|e| {
+                        warn!("Failed to get DB for polling: {}", e);
+                    }) else { continue };
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
                     let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
                         Box::pin(async move {
