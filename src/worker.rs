@@ -1663,10 +1663,39 @@ impl Worker {
                 concurrency_limit = Some(bound.getattr("concurrency_limit")?.extract::<i32>()?);
             }
 
-            // Extract concurrency_duration if exists (convert to seconds)
+            // Extract concurrency_duration if exists (supports int seconds or timedelta)
             if bound.hasattr("concurrency_duration")? {
-                concurrency_duration =
-                    Some(bound.getattr("concurrency_duration")?.extract::<i32>()?);
+                let attr = bound.getattr("concurrency_duration")?;
+                let secs: i64 = if let Ok(v) = attr.extract::<i64>() {
+                    v
+                } else if let Ok(dur) = attr.extract::<std::time::Duration>() {
+                    let s = dur.as_secs();
+                    if dur.subsec_nanos() > 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "concurrency_duration does not support sub-second precision, got {}.{:03}s",
+                            s, dur.subsec_millis()
+                        )));
+                    }
+                    s as i64
+                } else if attr.is_instance_of::<pyo3::types::PyDelta>() {
+                    // Negative timedelta: Duration extract fails but the type is correct
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "concurrency_duration must be a positive timedelta",
+                    ));
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "concurrency_duration must be int (seconds) or timedelta, got {}",
+                        attr.get_type().qualname()?
+                    )));
+                };
+                if secs <= 0 || secs > i32::MAX as i64 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "concurrency_duration must be between 1 and {} seconds, got {}",
+                        i32::MAX,
+                        secs
+                    )));
+                }
+                concurrency_duration = Some(secs as i32);
             }
 
             // Extract concurrency_on_conflict if explicitly set on the class
