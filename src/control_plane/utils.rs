@@ -221,14 +221,60 @@ impl ControlPlane {
         }
     }
 
-    /// Format error message with optional backtrace
-    #[allow(dead_code)]
-    pub fn format_error_with_backtrace(error: Option<String>, backtrace: Option<String>) -> String {
-        match (error, backtrace) {
-            (Some(err), Some(bt)) => format!("{}\n\nBacktrace:\n{}", err, bt),
-            (Some(err), None) => err,
-            (None, Some(bt)) => format!("Backtrace:\n{}", bt),
-            (None, None) => String::new(),
+    /// Parse error JSON and populate error/backtrace fields on JobDetailsInfo.
+    /// The error column stores JSON like:
+    /// {"backtrace":["line1","line2"],"exception_class":"Error","message":"..."}
+    pub fn parse_error_fields(job: &mut super::models::JobDetailsInfo) {
+        let raw = match &job.error {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => return,
+        };
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let exception_class = json
+                .get("exception_class")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Build readable error line
+            if !exception_class.is_empty() {
+                job.error = Some(format!("{}: {}", exception_class, message));
+            } else if !message.is_empty() {
+                job.error = Some(message.to_string());
+            }
+
+            // Extract backtrace array → newline-separated string
+            if let Some(bt) = json.get("backtrace").and_then(|v| v.as_array()) {
+                let lines: Vec<&str> = bt.iter().filter_map(|v| v.as_str()).collect();
+                if !lines.is_empty() {
+                    job.backtrace = Some(lines.join("\n"));
+                }
+            } else if let Some(bt) = json.get("backtrace").and_then(|v| v.as_str()) {
+                // backtrace may also be a plain string
+                job.backtrace = Some(bt.to_string());
+            }
+        }
+        // If not valid JSON, keep the original error string as-is
+
+        // Also parse error JSON in execution_history items
+        for item in &mut job.execution_history {
+            let raw = match &item.error {
+                Some(s) if !s.is_empty() => s.clone(),
+                _ => continue,
+            };
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let exception_class = json
+                    .get("exception_class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                if !exception_class.is_empty() {
+                    item.error = Some(format!("{}: {}", exception_class, message));
+                } else if !message.is_empty() {
+                    item.error = Some(message.to_string());
+                }
+            }
         }
     }
 

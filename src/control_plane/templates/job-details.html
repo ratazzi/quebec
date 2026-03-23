@@ -119,10 +119,10 @@
         </div>
         <div class="p-4 space-y-3">
           {% if job.error %}
-          <div class="text-sm text-red-600 font-medium">{{ job.error }}</div>
+          <div class="text-sm text-red-600 font-medium break-words">{{ job.error }}</div>
           {% if job.backtrace %}
-          <div class="bg-gray-50 rounded p-3 overflow-x-auto">
-            <pre class="text-xs text-gray-800 whitespace-pre-wrap">{{ job.backtrace }}</pre>
+          <div class="bg-gray-50 rounded p-3 overflow-x-auto max-h-96 overflow-y-auto">
+            <pre class="text-xs text-gray-700 whitespace-pre-wrap font-mono leading-5">{{ job.backtrace }}</pre>
           </div>
           {% endif %}
           {% else %}
@@ -176,23 +176,30 @@
           <h3 class="text-sm font-medium">Execution History</h3>
         </div>
         <div class="divide-y divide-gray-200">
+          {% if job.execution_history %}
+          {% for item in job.execution_history %}
           <div class="p-4">
             <div class="flex justify-between items-start">
               <div>
-                <div class="text-sm font-medium">Attempt #1</div>
-                <div class="text-xs text-gray-500">{% if job.failed_at %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span>{% elif job.finished_at %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.finished_at }}">{{ job.finished_at }}</span>{% else %}<span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span>{% endif %}</div>
+                <div class="text-sm font-medium">Attempt #{{ item.attempt }}</div>
+                <div class="text-xs text-gray-500"><span data-controller="localtime" data-localtime-datetime-value="{{ item.timestamp }}">{{ item.timestamp }}</span></div>
               </div>
-              <span class="px-2 py-1 text-xs font-medium rounded-full 
-                {% if job.status == 'failed' %}bg-red-100 text-red-800
-                {% elif job.status == 'finished' %}bg-green-100 text-green-800
+              <span class="px-2 py-1 text-xs font-medium rounded-full
+                {% if item.status == 'failed' %}bg-red-100 text-red-800
+                {% elif item.status == 'claimed' %}bg-blue-100 text-blue-800
+                {% elif item.status == 'scheduled' %}bg-purple-100 text-purple-800
                 {% else %}bg-gray-100 text-gray-800{% endif %}">
-                {{ job.status | title }}
+                {{ item.status | title }}
               </span>
             </div>
-            {% if job.error %}
-            <div class="mt-2 text-sm text-red-600">{{ job.error }}</div>
+            {% if item.error %}
+            <div class="mt-2 text-sm text-red-600 break-words">{{ item.error }}</div>
             {% endif %}
           </div>
+          {% endfor %}
+          {% else %}
+          <div class="p-4 text-sm text-gray-500">No execution history available.</div>
+          {% endif %}
         </div>
       </div>
     </div>

@@ -299,32 +299,13 @@ impl ControlPlane {
                 _ => {}
             }
 
-            // Get execution history using dynamic table names
+            // Get execution history: each failed_execution row is one attempt
             let history_sql = clean_sql(&format!(
-                "SELECT
-                'failed' as event_type,
-                created_at as timestamp,
-                error
-             FROM {}
-             WHERE job_id = {p}
-             UNION ALL
-             SELECT
-                'scheduled' as event_type,
-                created_at as timestamp,
-                NULL as error
-             FROM {}
-             WHERE job_id = {p}
-             UNION ALL
-             SELECT
-                'claimed' as event_type,
-                created_at as timestamp,
-                NULL as error
-             FROM {}
-             WHERE job_id = {p}
-             ORDER BY timestamp DESC",
+                "SELECT created_at as timestamp, error
+                 FROM {}
+                 WHERE job_id = {p}
+                 ORDER BY created_at ASC",
                 table_config.failed_executions,
-                table_config.scheduled_executions,
-                table_config.claimed_executions,
                 p = p1
             ));
 
@@ -339,7 +320,6 @@ impl ControlPlane {
 
             let mut attempt = 1;
             for row in history_result {
-                let event_type: String = row.try_get("", "event_type").unwrap_or_default();
                 let timestamp = match row.try_get::<chrono::NaiveDateTime>("", "timestamp") {
                     Ok(dt) => Self::format_naive_datetime(dt),
                     Err(_) => "Unknown".to_string(),
@@ -350,12 +330,15 @@ impl ControlPlane {
                     crate::control_plane::models::ExecutionHistoryItem {
                         attempt,
                         timestamp,
-                        status: event_type,
+                        status: "failed".to_string(),
                         error,
                     },
                 );
                 attempt += 1;
             }
+
+            // Parse error JSON to extract message and backtrace
+            Self::parse_error_fields(&mut job_details);
 
             // Format arguments for display
             job_details.arguments = Self::parse_arguments(&job_details.arguments);
