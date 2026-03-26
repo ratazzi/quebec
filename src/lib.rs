@@ -212,6 +212,11 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         <continuation::InvalidStepError as pyo3::PyTypeInfo>::type_object(_py),
     )?;
 
+    m.add(
+        "AbortEnqueue",
+        <context::AbortEnqueue as pyo3::PyTypeInfo>::type_object(_py),
+    )?;
+
     // Configuration classes
     m.add_class::<config::QueueConfig>()?;
     m.add_class::<config::WorkerConfig>()?;
