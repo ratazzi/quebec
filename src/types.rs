@@ -1070,20 +1070,110 @@ impl PyQuebec {
             }
         }
 
+        // Get hook flags (lightweight read, no GIL/clone)
+        let hooks = self.worker.ctx.get_hook_flags(&class_name.to_string());
+        let any_enqueue_hook = hooks.before_enqueue || hooks.around_enqueue || hooks.after_enqueue;
+
+        // Populate instance fields if any enqueue hook is overridden
+        if any_enqueue_hook {
+            let cell = instance.cast::<ActiveJob>()?;
+            let mut inner = cell.borrow_mut();
+            inner.queue_name = obj.queue_name.clone();
+            inner.arguments = obj.arguments.clone();
+            inner.active_job_id = obj.active_job_id.clone();
+            inner.priority = obj.priority;
+            drop(inner);
+        }
+
+        // before_enqueue — only if overridden; raise AbortEnqueue to skip
+        if hooks.before_enqueue {
+            match instance.call_method0("before_enqueue") {
+                Ok(_) => {} // proceed
+                Err(e) if e.is_instance_of::<crate::context::AbortEnqueue>(py) => {
+                    info!(
+                        "Job `{}' skipped due to before_enqueue hook",
+                        obj.class_name
+                    );
+                    return Ok(obj);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
         let start_time = Instant::now();
-        // Release GIL during database operations to prevent blocking other Python threads
-        let quebec = self.quebec.clone();
-        let obj_clone = obj.clone();
-        py.detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
-            .map(|job| {
-                obj.id.replace(job.id);
+
+        if hooks.around_enqueue {
+            // Yield-style around_enqueue: def around_enqueue(self): ... yield ...
+            let gen = instance.call_method0("around_enqueue")?;
+            let builtins = py.import("builtins")?;
+            let first_next = builtins.getattr("next")?.call1((&gen,));
+            if let Err(ref e) = first_next {
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    info!("Job `{}' skipped by around_enqueue hook", obj.class_name);
+                    return Ok(obj);
+                }
+            }
+            first_next?;
+
+            // Perform actual enqueue at the yield point
+            let quebec = self.quebec.clone();
+            let obj_clone = obj.clone();
+            let enqueue_result = py
+                .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e)));
+
+            let job_id_result;
+            match enqueue_result {
+                Ok(job) => {
+                    job_id_result = Some(job.id);
+                    // Resume generator (code after yield), ignore StopIteration
+                    if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
+                        if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Throw into generator so user code can observe the error
+                    let _ = gen.call_method1("throw", (e.get_type(py), e.value(py)));
+                    return Err(e);
+                }
+            }
+
+            if let Some(job_id) = job_id_result {
+                obj.id.replace(job_id);
                 debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
-                obj
-            })
-            .map_err(|e| {
-                error!("Error: {:?}", e);
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
-            })
+
+                if hooks.after_enqueue {
+                    let cell = instance.cast::<ActiveJob>()?;
+                    cell.borrow_mut().id = Some(job_id);
+                    if let Err(e) = instance.call_method0("after_enqueue") {
+                        error!("after_enqueue hook error: {:?}", e);
+                    }
+                }
+            }
+        } else {
+            // Direct enqueue path (no around_enqueue) — original fast path
+            let quebec = self.quebec.clone();
+            let obj_clone = obj.clone();
+            let job = py
+                .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
+                })?;
+            obj.id.replace(job.id);
+            debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
+
+            if hooks.after_enqueue {
+                let cell = instance.cast::<ActiveJob>()?;
+                cell.borrow_mut().id = Some(job.id);
+                if let Err(e) = instance.call_method0("after_enqueue") {
+                    error!("after_enqueue hook error: {:?}", e);
+                }
+            }
+        }
+
+        Ok(obj)
     }
 
     /// Bulk enqueue jobs from a list of JobDescriptor objects.
@@ -1232,6 +1322,10 @@ impl PyQuebec {
                 } else {
                     (None, None, ConcurrencyConflict::default())
                 };
+
+            // Note: perform_all_later does NOT run enqueue callbacks, matching
+            // ActiveJob's documented behavior: "Push many jobs onto the queue at
+            // once without running enqueue callbacks."
 
             prepared.push(PreparedJob {
                 class_name,
@@ -1870,21 +1964,16 @@ impl ActiveJob {
         ))
     }
 
-    fn before_enqueue(&self) {
-        debug!("before_enqueue");
-    }
+    /// Raise AbortEnqueue to skip enqueueing.
+    fn before_enqueue(&self) {}
 
-    fn after_enqueue(&self) {
-        debug!("after_enqueue");
-    }
+    fn after_enqueue(&self) {}
 
-    fn before_perform(&self) {
-        debug!("before_perform");
-    }
+    fn before_perform(&self) {}
 
-    fn after_perform(&self) {
-        debug!("after_perform");
-    }
+    fn after_perform(&self) {}
+
+    fn after_discard(&self) {}
 
     #[getter]
     fn get_logger(&self) -> PyResult<ActiveLogger> {

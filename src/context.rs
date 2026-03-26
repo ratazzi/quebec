@@ -21,6 +21,13 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
 pyo3::create_exception!(quebec, CustomError, PyException);
+#[cfg(feature = "python")]
+pyo3::create_exception!(
+    quebec,
+    AbortEnqueue,
+    PyException,
+    "Raise in before_enqueue to abort enqueueing (like Rails throw :abort)."
+);
 
 #[derive(Debug, Clone)]
 pub struct ConcurrencyConstraint {
@@ -627,6 +634,16 @@ impl AppContext {
 
         // Clone with GIL since Runnable contains Py<PyAny>
         Python::attach(|py| Ok(runnable.clone_with_gil(py)))
+    }
+
+    /// Get hook flags for a job class without cloning the full Runnable.
+    #[cfg(feature = "python")]
+    pub fn get_hook_flags(&self, class_name: &str) -> crate::worker::HookFlags {
+        self.runnables
+            .read()
+            .ok()
+            .and_then(|r| r.get(class_name).map(|r| r.hooks.clone()))
+            .unwrap_or_default()
     }
 
     /// Get all registered runnable class names

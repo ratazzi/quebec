@@ -12,6 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "python")]
+use pyo3::prelude::*;
 use tracing::{error, info, trace, warn};
 
 /// Upsert a recurring task into the database.
@@ -221,111 +223,276 @@ where
     #[cfg(not(feature = "python"))]
     let concurrency_constraint: Option<crate::context::ConcurrencyConstraint> = None;
 
-    let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
-    let active_job_id = crate::utils::generate_job_id();
-    let job_id = query_builder::jobs::insert(
-        db,
-        &ctx.table_config,
-        queue_name,
-        &entry.class,
-        Some(params.to_string()).as_deref(),
-        priority,
-        Some(active_job_id.as_str()),
-        Some(scheduled_at),
-        concurrency_key_str,
-    )
-    .await?;
+    // Call enqueue hooks if overridden (before/around/after)
+    #[cfg(feature = "python")]
+    let hooks = ctx.get_hook_flags(&entry.class);
 
-    let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id)
-        .await?
-        .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
+    // Hold the around_enqueue generator across GIL boundaries
+    #[cfg(feature = "python")]
+    let mut around_gen: Option<pyo3::Py<pyo3::PyAny>> = None;
+    #[cfg(feature = "python")]
+    let mut hook_instance: Option<pyo3::Py<pyo3::PyAny>> = None;
 
-    // Step 2: Try to claim this execution slot using optimistic locking
-    // If another scheduler already claimed it, we delete the job and skip
-    let claimed = query_builder::recurring_executions::try_insert(
-        db,
-        &ctx.table_config,
-        job.id,
-        &task_key,
-        scheduled_at,
-    )
-    .await?;
+    #[cfg(feature = "python")]
+    {
+        let any_enqueue_hook = hooks.before_enqueue || hooks.around_enqueue || hooks.after_enqueue;
+        if any_enqueue_hook {
+            let skip = pyo3::Python::attach(|py| -> Result<bool, DbErr> {
+                let runnable = ctx
+                    .get_runnable(&entry.class)
+                    .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {}", e)))?;
+                let bound = runnable.handler.bind(py);
+                let instance = bound
+                    .call0()
+                    .map_err(|e| DbErr::Custom(format!("Failed to create instance: {}", e)))?;
+                if let Ok(cell) = instance.cast::<crate::types::ActiveJob>() {
+                    let mut inner = cell.borrow_mut();
+                    inner.queue_name = queue_name.to_string();
+                    inner.arguments = params.to_string();
+                    inner.active_job_id = task_key.clone();
+                    inner.priority = priority;
+                }
 
-    if !claimed {
-        // Another scheduler instance already claimed this execution
-        // Delete the job we just created and return None
-        query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
-        trace!(
-            "Skipping job {} at {} - already claimed by another scheduler",
-            task_key,
-            scheduled_at
-        );
-        return Ok(None);
-    }
+                // before_enqueue — raise AbortEnqueue to skip
+                if hooks.before_enqueue {
+                    match instance.call_method0("before_enqueue") {
+                        Ok(_) => {}
+                        Err(e) if e.is_instance_of::<crate::context::AbortEnqueue>(py) => {
+                            return Ok(true); // skip
+                        }
+                        Err(e) => {
+                            return Err(DbErr::Custom(format!("before_enqueue hook error: {}", e)));
+                        }
+                    }
+                }
 
-    // Apply concurrency control logic
-    // Returns Some(constraint) if blocked, None if ready to execute
-    let blocked_by = if let Some(constraint) = &concurrency_constraint {
-        use crate::semaphore::acquire_semaphore_with_constraint;
+                // around_enqueue: advance generator to yield, unbind to keep alive
+                if hooks.around_enqueue {
+                    let gen = instance
+                        .call_method0("around_enqueue")
+                        .map_err(|e| DbErr::Custom(format!("around_enqueue hook error: {}", e)))?;
+                    let builtins = py
+                        .import("builtins")
+                        .map_err(|e| DbErr::Custom(format!("Failed to import builtins: {}", e)))?;
+                    let first_next = builtins
+                        .getattr("next")
+                        .and_then(|next_fn| next_fn.call1((&gen,)));
+                    match first_next {
+                        Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                            // Generator returned without yielding — skip enqueue
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            return Err(DbErr::Custom(format!(
+                                "around_enqueue before-yield error: {}",
+                                e
+                            )));
+                        }
+                        Ok(_) => {}
+                    }
+                    around_gen = Some(gen.unbind());
+                }
 
-        if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
-            info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
-            None
-        } else {
-            warn!(
-                "Scheduler: Failed to acquire semaphore for key: {}",
-                constraint.key
-            );
-            Some(constraint)
-        }
-    } else {
-        None
-    };
+                // Keep instance alive for post-enqueue hooks (around resume + after)
+                hook_instance = Some(instance.unbind());
 
-    if let Some(constraint) = blocked_by {
-        match constraint.on_conflict {
-            crate::context::ConcurrencyConflict::Discard => {
-                warn!(
-                    job_id = job.id,
-                    "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
-                    job.class_name,
-                    constraint.key,
-                    constraint.limit,
-                    constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
-                );
-                query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
+                Ok(false) // don't skip
+            })?;
+            if skip {
+                tracing::info!("Job `{}' skipped due to before_enqueue hook", task_key);
                 return Ok(None);
             }
-            crate::context::ConcurrencyConflict::Block => {
-                let block_now = chrono::Utc::now().naive_utc();
-                let duration = constraint.duration.unwrap_or_else(|| {
-                    chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                });
-                let expires_at = block_now + duration;
-
-                query_builder::blocked_executions::insert(
-                    db,
-                    &ctx.table_config,
-                    job.id,
-                    &job.queue_name,
-                    job.priority,
-                    &constraint.key,
-                    expires_at,
-                )
-                .await?;
-            }
         }
-    } else {
-        // Job is ready to execute
-        query_builder::ready_executions::insert(
+    }
+
+    // Run the actual DB enqueue; on any error, close the around_enqueue generator
+    let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
+    let active_job_id = crate::utils::generate_job_id();
+    let db_result: Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = async {
+        let job_id = query_builder::jobs::insert(
+            db,
+            &ctx.table_config,
+            queue_name,
+            &entry.class,
+            Some(params.to_string()).as_deref(),
+            priority,
+            Some(active_job_id.as_str()),
+            Some(scheduled_at),
+            concurrency_key_str,
+        )
+        .await?;
+
+        let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
+
+        let claimed = query_builder::recurring_executions::try_insert(
             db,
             &ctx.table_config,
             job.id,
-            &job.queue_name,
-            job.priority,
+            &task_key,
+            scheduled_at,
         )
         .await?;
+
+        if !claimed {
+            query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
+            trace!(
+                "Skipping job {} at {} - already claimed by another scheduler",
+                task_key,
+                scheduled_at
+            );
+            return Ok((job, false)); // not claimed
+        }
+
+        let blocked_by = if let Some(constraint) = &concurrency_constraint {
+            use crate::semaphore::acquire_semaphore_with_constraint;
+            if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
+                info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
+                None
+            } else {
+                warn!(
+                    "Scheduler: Failed to acquire semaphore for key: {}",
+                    constraint.key
+                );
+                Some(constraint)
+            }
+        } else {
+            None
+        };
+
+        if let Some(constraint) = blocked_by {
+            match constraint.on_conflict {
+                crate::context::ConcurrencyConflict::Discard => {
+                    warn!(
+                        job_id = job.id,
+                        "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
+                        job.class_name,
+                        constraint.key,
+                        constraint.limit,
+                        constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
+                    );
+                    query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
+                    return Ok((job, false)); // discarded
+                }
+                crate::context::ConcurrencyConflict::Block => {
+                    let block_now = chrono::Utc::now().naive_utc();
+                    let duration = constraint.duration.unwrap_or_else(|| {
+                        chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                    });
+                    let expires_at = block_now + duration;
+                    query_builder::blocked_executions::insert(
+                        db,
+                        &ctx.table_config,
+                        job.id,
+                        &job.queue_name,
+                        job.priority,
+                        &constraint.key,
+                        expires_at,
+                    )
+                    .await?;
+                }
+            }
+        } else {
+            query_builder::ready_executions::insert(
+                db,
+                &ctx.table_config,
+                job.id,
+                &job.queue_name,
+                job.priority,
+            )
+            .await?;
+        }
+
+        Ok((job, true)) // success
+    }
+    .await;
+
+    // On any DB error or early exit, throw into generator before propagating
+    let (job, enqueued) = match db_result {
+        Ok(result) => result,
+        Err(ref e) => {
+            #[cfg(feature = "python")]
+            if let Some(gen) = around_gen.take() {
+                pyo3::Python::attach(|py| {
+                    let err_msg = format!("{}", e);
+                    let exc = pyo3::exceptions::PyRuntimeError::new_err(err_msg);
+                    gen.bind(py)
+                        .call_method1("throw", (exc.get_type(py), exc.value(py)))
+                        .ok();
+                });
+            }
+            return db_result.map(|_| None);
+        }
+    };
+
+    if !enqueued {
+        #[cfg(feature = "python")]
+        if let Some(gen) = around_gen.take() {
+            pyo3::Python::attach(|py| {
+                gen.bind(py).call_method0("close").ok();
+            });
+        }
+        return Ok(None);
+    }
+
+    // Resume around_enqueue generator (after yield) + call after_enqueue
+    #[cfg(feature = "python")]
+    {
+        let needs_post_hooks = around_gen.is_some() || hooks.after_enqueue;
+        if needs_post_hooks {
+            pyo3::Python::attach(|py| {
+                // Update instance id now that job is inserted
+                if let Some(ref inst) = hook_instance {
+                    if let Ok(cell) = inst.bind(py).cast::<crate::types::ActiveJob>() {
+                        let mut inner = cell.borrow_mut();
+                        inner.id = Some(job.id);
+                        inner.active_job_id = job.active_job_id.clone().unwrap_or_default();
+                    }
+                }
+
+                // Resume around_enqueue generator (code after yield)
+                if let Some(gen) = around_gen.take() {
+                    if let Ok(builtins) = py.import("builtins") {
+                        if let Err(e) = builtins
+                            .getattr("next")
+                            .and_then(|n| n.call1((gen.bind(py),)))
+                        {
+                            if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                                tracing::error!("around_enqueue after-yield error: {:?}", e);
+                            }
+                        }
+                    }
+                }
+
+                // after_enqueue — reuse saved instance if available, otherwise create fresh
+                if hooks.after_enqueue {
+                    let instance = if let Some(ref inst) = hook_instance {
+                        Some(inst.bind(py).clone())
+                    } else if let Ok(runnable) = ctx.get_runnable(&entry.class) {
+                        let bound = runnable.handler.bind(py);
+                        bound.call0().ok().inspect(|inst| {
+                            if let Ok(cell) = inst.cast::<crate::types::ActiveJob>() {
+                                let mut inner = cell.borrow_mut();
+                                inner.id = Some(job.id);
+                                inner.queue_name = job.queue_name.clone();
+                                inner.arguments = job.arguments.clone().unwrap_or_default();
+                                inner.active_job_id = job.active_job_id.clone().unwrap_or_default();
+                                inner.priority = job.priority;
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(inst) = instance {
+                        if let Err(e) = inst.call_method0("after_enqueue") {
+                            tracing::error!("after_enqueue hook error: {:?}", e);
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Return queue name so caller can send NOTIFY after transaction commits

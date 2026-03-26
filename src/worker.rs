@@ -142,6 +142,17 @@ async fn runner(
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HookFlags {
+    pub before_enqueue: bool,
+    pub around_enqueue: bool,
+    pub after_enqueue: bool,
+    pub before_perform: bool,
+    pub around_perform: bool,
+    pub after_perform: bool,
+    pub after_discard: bool,
+}
+
 #[pyclass(name = "Runnable", subclass)]
 #[derive(Debug)]
 pub struct Runnable {
@@ -156,6 +167,7 @@ pub struct Runnable {
     pub concurrency_on_conflict: ConcurrencyConflict,
     /// Continuation info for interrupted jobs (step name, cursor, original args)
     pub(crate) continuation_info: Option<ContinuationInfo>,
+    pub hooks: HookFlags,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +196,7 @@ impl Runnable {
             concurrency_duration: None,
             concurrency_on_conflict: ConcurrencyConflict::default(),
             continuation_info: None,
+            hooks: HookFlags::default(),
         }
     }
 
@@ -200,6 +213,7 @@ impl Runnable {
             concurrency_duration: self.concurrency_duration,
             concurrency_on_conflict: self.concurrency_on_conflict,
             continuation_info: self.continuation_info.clone(),
+            hooks: self.hooks.clone(),
         }
     }
 
@@ -455,6 +469,18 @@ impl Runnable {
             .unwrap_or_else(|_| "unknown error".to_string());
         info!("Job discarded due to {}", error_name);
 
+        // Call after_discard hook on the job instance — only if overridden
+        if !self.hooks.after_discard {
+            return Ok(job);
+        }
+        let bound = self.handler.bind(py);
+        if let Ok(instance) = bound.call0() {
+            instance.setattr("id", job.id).ok();
+            if let Err(e) = instance.call_method0("after_discard") {
+                error!("after_discard hook error: {:?}", e);
+            }
+        }
+
         // Return success directly, indicating task was discarded and marked as completed
         Ok(job)
     }
@@ -557,8 +583,65 @@ impl Runnable {
             // This is handled by the Python Continuable mixin
         }
 
-        let func = instance.getattr("perform")?;
-        let result = func.call(&args, Some(kwargs.bind(py)));
+        // before_perform — only if overridden
+        if self.hooks.before_perform {
+            instance.call_method0("before_perform")?;
+        }
+
+        let mut result;
+        let performed = true;
+
+        if self.hooks.around_perform {
+            // Yield-style: def around_perform(self): ... yield ... perform runs at yield
+            let gen = instance.call_method0("around_perform")?;
+            let builtins = py.import("builtins")?;
+            let first_next = builtins.getattr("next")?.call1((&gen,));
+            if let Err(ref e) = first_next {
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    // Generator returned without yielding — skip perform (job completes normally)
+                    info!("Job `{}' skipped by around_perform hook", self.class_name);
+                    return Ok(());
+                }
+            }
+            first_next?;
+            // Execute perform() at the yield point
+            let func = instance.getattr("perform")?;
+            result = func
+                .call(&args, Some(kwargs.bind(py)))
+                .map(|r| r.into_any());
+            // Resume or throw: if perform failed, propagate into generator
+            if let Err(ref err) = result {
+                let throw_result = gen.call_method1("throw", (err.get_type(py), err.value(py)));
+                match &throw_result {
+                    Ok(_) => {
+                        result = throw_result.map(|r| r.into_any());
+                    }
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
+                        result = Ok(py.None().into_bound(py));
+                    }
+                    Err(_) => {}
+                }
+            } else {
+                if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
+                    if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                        return Err(e);
+                    }
+                }
+            }
+        } else {
+            // Direct path: call perform() without wrapper
+            let func = instance.getattr("perform")?;
+            result = func
+                .call(&args, Some(kwargs.bind(py)))
+                .map(|r| r.into_any());
+        }
+
+        // after_perform — only if overridden and perform() actually ran
+        if self.hooks.after_perform && result.is_ok() && performed {
+            if let Err(e) = instance.call_method0("after_perform") {
+                error!("after_perform hook error: {:?}", e);
+            }
+        }
 
         // On error (including JobInterrupted), capture continuation state from the instance
         // BEFORE the instance goes out of scope
@@ -1635,6 +1718,16 @@ impl Worker {
         Ok(())
     }
 
+    /// Check if a job class overrides a hook method from ActiveJob base class.
+    /// Check if a Python subclass overrides a hook method from ActiveJob.
+    /// PyO3 builtin methods (ActiveJob stubs) have no __code__ attribute;
+    /// Python-defined overrides always have __code__.
+    fn has_hook_override(cls: &Bound<'_, PyAny>, method: &str) -> bool {
+        cls.getattr(method)
+            .map(|func| func.hasattr("__code__").unwrap_or(false))
+            .unwrap_or(false)
+    }
+
     pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
         self.register_handler(py, handler, &self.start_handlers, "start")
     }
@@ -1737,6 +1830,27 @@ impl Worker {
                 .and_then(|m| m.extract::<String>())
                 .unwrap_or_default();
 
+            // Detect which hooks are overridden (vs ActiveJob base stubs)
+            let hooks = HookFlags {
+                before_enqueue: Self::has_hook_override(&bound, "before_enqueue"),
+                around_enqueue: Self::has_hook_override(&bound, "around_enqueue"),
+                after_enqueue: Self::has_hook_override(&bound, "after_enqueue"),
+                before_perform: Self::has_hook_override(&bound, "before_perform"),
+                around_perform: Self::has_hook_override(&bound, "around_perform"),
+                after_perform: Self::has_hook_override(&bound, "after_perform"),
+                after_discard: Self::has_hook_override(&bound, "after_discard"),
+            };
+            if hooks.before_enqueue
+                || hooks.around_enqueue
+                || hooks.after_enqueue
+                || hooks.before_perform
+                || hooks.around_perform
+                || hooks.after_perform
+                || hooks.after_discard
+            {
+                debug!("Job {} has hooks: {:?}", class_name, hooks);
+            }
+
             let runnable = Runnable {
                 class_name: class_name.to_string(),
                 module_path,
@@ -1748,6 +1862,7 @@ impl Worker {
                 concurrency_duration,
                 concurrency_on_conflict,
                 continuation_info: None,
+                hooks,
             };
             info!("Registered job: {:?}", runnable);
 
