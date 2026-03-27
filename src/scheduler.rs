@@ -237,7 +237,7 @@ where
     {
         let any_enqueue_hook = hooks.before_enqueue || hooks.around_enqueue || hooks.after_enqueue;
         if any_enqueue_hook {
-            let skip = pyo3::Python::attach(|py| -> Result<bool, DbErr> {
+            let skip_reason = pyo3::Python::attach(|py| -> Result<Option<&str>, DbErr> {
                 let runnable = ctx
                     .get_runnable(&entry.class)
                     .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {}", e)))?;
@@ -258,7 +258,7 @@ where
                     match instance.call_method0("before_enqueue") {
                         Ok(_) => {}
                         Err(e) if e.is_instance_of::<crate::context::AbortEnqueue>(py) => {
-                            return Ok(true); // skip
+                            return Ok(Some("before_enqueue"));
                         }
                         Err(e) => {
                             return Err(DbErr::Custom(format!("before_enqueue hook error: {}", e)));
@@ -280,7 +280,7 @@ where
                     match first_next {
                         Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
                             // Generator returned without yielding — skip enqueue
-                            return Ok(true);
+                            return Ok(Some("around_enqueue"));
                         }
                         Err(e) => {
                             return Err(DbErr::Custom(format!(
@@ -296,10 +296,10 @@ where
                 // Keep instance alive for post-enqueue hooks (around resume + after)
                 hook_instance = Some(instance.unbind());
 
-                Ok(false) // don't skip
+                Ok(None) // don't skip
             })?;
-            if skip {
-                tracing::info!("Job `{}' skipped due to before_enqueue hook", task_key);
+            if let Some(hook) = skip_reason {
+                tracing::info!("Job `{}' skipped by {} hook", task_key, hook);
                 return Ok(None);
             }
         }
