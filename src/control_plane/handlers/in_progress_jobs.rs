@@ -64,13 +64,18 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
-                // Find process information
-                let worker_id = match execution.process_id {
+                // Find process information (hostname:pid)
+                let worker_info = match execution.process_id {
                     Some(pid) => {
                         let process = processes.iter().find(|p| p.id == pid);
-                        process.map_or(pid, |p| p.id)
+                        match process {
+                            Some(p) => {
+                                format!("{}:{}", p.hostname.as_deref().unwrap_or("unknown"), p.pid)
+                            }
+                            None => format!("pid:{}", pid),
+                        }
                     }
-                    None => 0,
+                    None => "unknown".to_string(),
                 };
 
                 // Calculate runtime
@@ -95,7 +100,7 @@ impl ControlPlane {
                     job_id: execution.job_id,
                     queue_name: job.queue_name.clone(),
                     class_name: job.class_name.clone(),
-                    worker_id,
+                    worker_info,
                     started_at: Self::format_naive_datetime(execution.created_at),
                     runtime,
                 });

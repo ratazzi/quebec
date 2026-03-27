@@ -53,7 +53,7 @@ pub struct InProgressJobInfo {
     pub job_id: i64,
     pub queue_name: String,
     pub class_name: String,
-    pub worker_id: i64,
+    pub worker_info: String,
     pub started_at: String,
     pub runtime: String,
 }
