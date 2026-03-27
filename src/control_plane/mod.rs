@@ -130,6 +130,8 @@ impl ControlPlane {
             .route("/", get(Self::overview))
             .route("/queues", get(Self::queues))
             .route("/queues/:name", get(Self::queue_details))
+            .route("/queues/all/pause", post(Self::pause_all_queues))
+            .route("/queues/all/resume", post(Self::resume_all_queues))
             .route("/queues/:name/pause", post(Self::pause_queue))
             .route("/queues/:name/resume", post(Self::resume_queue))
             .route("/failed-jobs", get(Self::failed_jobs))

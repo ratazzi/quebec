@@ -2737,6 +2737,17 @@ pub mod pauses {
         execute_delete(db, query).await
     }
 
+    /// Delete all pause records (resume all queues)
+    pub async fn delete_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.pauses);
+        let query = Query::delete().from_table(table).to_owned();
+
+        execute_delete(db, query).await
+    }
+
     /// Find a pause by queue name
     pub async fn find_by_queue_name<C>(
         db: &C,

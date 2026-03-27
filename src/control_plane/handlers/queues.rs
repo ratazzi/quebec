@@ -183,6 +183,54 @@ impl ControlPlane {
         Self::redirect_back(&format!("/queues/{}", queue_name))
     }
 
+    pub async fn pause_all_queues(State(state): State<Arc<ControlPlane>>) -> Response {
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
+
+        let queue_names = match state.get_queue_names().await {
+            Ok(names) => names,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        let paused = match query_builder::pauses::find_all_queue_names(db, table_config).await {
+            Ok(names) => names,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+
+        let now = chrono::Utc::now().naive_utc();
+        for name in &queue_names {
+            if paused.contains(name) {
+                continue;
+            }
+            if let Err(e) = query_builder::pauses::insert(db, table_config, name, now).await {
+                error!("Failed to pause queue {}: {}", name, e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+
+        Self::redirect_back("/queues")
+    }
+
+    pub async fn resume_all_queues(State(state): State<Arc<ControlPlane>>) -> Response {
+        let db = match state.ctx.get_db().await {
+            Ok(db) => db,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let db = db.as_ref();
+        let table_config = &state.ctx.table_config;
+
+        if let Err(e) = query_builder::pauses::delete_all(db, table_config).await {
+            error!("Failed to resume all queues: {}", e);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        Self::redirect_back("/queues")
+    }
+
     pub async fn queue_details(
         State(state): State<Arc<ControlPlane>>,
         Path(queue_name): Path<String>,
