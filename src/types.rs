@@ -1964,17 +1964,6 @@ impl ActiveJob {
         ))
     }
 
-    /// Raise AbortEnqueue to skip enqueueing.
-    fn before_enqueue(&self) {}
-
-    fn after_enqueue(&self) {}
-
-    fn before_perform(&self) {}
-
-    fn after_perform(&self) {}
-
-    fn after_discard(&self) {}
-
     #[getter]
     fn get_logger(&self) -> PyResult<ActiveLogger> {
         Ok(self.logger.clone())
