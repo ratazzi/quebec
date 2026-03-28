@@ -545,19 +545,20 @@ impl Scheduler {
                     anyhow::anyhow!("Failed to parse schedule file: {}", e)
                 })?;
 
-        // Use shared environment config parser
-        let tasks = crate::utils::parse_env_config_cloneable(env_config)?;
+        // Use strict environment parser — refuse to fall back to wrong environment,
+        // because stale-row deletion would wipe the correct environment's tasks.
+        let tasks = crate::utils::parse_env_config_strict(env_config, None)?;
         info!("Loaded {} scheduled tasks", tasks.len());
         Ok(vec![tasks])
     }
 
-    /// Load schedule from file path, returns empty vec if no path provided
+    /// Load schedule from file path, returns None if no path provided
     fn load_schedule(
         path: Option<String>,
-    ) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+    ) -> Result<Option<Vec<HashMap<String, ScheduledEntry>>>, anyhow::Error> {
         let Some(path) = path else {
             info!("No schedule file found, running without scheduled tasks");
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         info!("Loading schedule from: {}", path);
@@ -566,7 +567,7 @@ impl Scheduler {
             anyhow::anyhow!("Failed to read schedule file: {}", e)
         })?;
 
-        Self::parse_schedule_file(&contents)
+        Self::parse_schedule_file(&contents).map(Some)
     }
 
     /// Sync scheduled tasks to database (upsert recurring_tasks table)
@@ -870,7 +871,13 @@ impl Scheduler {
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
 
-        let scheduled = Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?;
+        // Only sync tasks (and delete stale rows) when a schedule file was found.
+        // Without a file, skip sync to avoid wiping tasks written by other schedulers.
+        let scheduled = if let Some(schedule) = schedule {
+            Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?
+        } else {
+            Vec::new()
+        };
 
         let mut task_handles = Vec::new();
 
