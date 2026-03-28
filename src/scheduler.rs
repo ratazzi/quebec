@@ -868,16 +868,20 @@ impl Scheduler {
         let schedule = Self::load_schedule(Self::find_schedule_path())?;
         trace!("Schedule: {:?}", schedule);
 
+        // Match Solid Queue: when recurring_tasks is empty, don't start Scheduler.
+        let has_tasks = schedule
+            .as_ref()
+            .is_some_and(|s| s.iter().any(|m| !m.is_empty()));
+        if !has_tasks {
+            info!("No recurring tasks found, skipping scheduler");
+            return Ok(());
+        }
+
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
 
-        // Only sync tasks (and delete stale rows) when a schedule file was found.
-        // Without a file, skip sync to avoid wiping tasks written by other schedulers.
-        let scheduled = if let Some(schedule) = schedule {
-            Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?
-        } else {
-            Vec::new()
-        };
+        let scheduled =
+            Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule.unwrap()).await?;
 
         let mut task_handles = Vec::new();
 
