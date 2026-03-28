@@ -7,17 +7,17 @@
   <!-- Breadcrumb -->
   <div class="flex items-center text-sm text-gray-500 mb-6">
     {% if job.status == 'failed' %}
-      <a href="{{ base_path }}/failed-jobs" class="hover:text-black">Failed jobs</a>
+      <a href="{{ base_path }}/failed-jobs" class="hover:underline">Failed jobs</a>
     {% elif job.status == 'scheduled' %}
-      <a href="{{ base_path }}/scheduled-jobs" class="hover:text-black">Scheduled jobs</a>
+      <a href="{{ base_path }}/scheduled-jobs" class="hover:underline">Scheduled jobs</a>
     {% elif job.status == 'blocked' %}
-      <a href="{{ base_path }}/blocked-jobs" class="hover:text-black">Blocked jobs</a>
+      <a href="{{ base_path }}/blocked-jobs" class="hover:underline">Blocked jobs</a>
     {% elif job.status == 'processing' %}
-      <a href="{{ base_path }}/in-progress-jobs" class="hover:text-black">In Progress jobs</a>
+      <a href="{{ base_path }}/in-progress-jobs" class="hover:underline">In Progress jobs</a>
     {% elif job.status == 'finished' %}
-      <a href="{{ base_path }}/finished-jobs" class="hover:text-black">Finished jobs</a>
+      <a href="{{ base_path }}/finished-jobs" class="hover:underline">Finished jobs</a>
     {% else %}
-      <a href="{{ base_path }}/queues/{{ job.queue_name }}" data-turbo-action="advance" class="hover:text-black">Queue: {{ job.queue_name }}</a>
+      <a href="{{ base_path }}/queues/{{ job.queue_name }}" data-turbo-action="advance" class="hover:underline">Queue: {{ job.queue_name }}</a>
     {% endif %}
     <span class="mx-2">/</span>
     <span class="text-black">{{ job.class_name }} #{{ job.id }}</span>

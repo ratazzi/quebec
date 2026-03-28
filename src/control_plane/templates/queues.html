@@ -61,7 +61,7 @@
       {% for queue in queues %}
       <tr>
         <td class="px-6 py-4 whitespace-nowrap">
-          <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:text-blue-600 hover:underline">{{ queue.name }}</a>
+          <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:underline">{{ queue.name }}</a>
         </td>
         <td class="px-6 py-4 whitespace-nowrap">
           <div class="text-sm text-gray-900">{{ queue.jobs_count }}</div>
@@ -72,9 +72,6 @@
           </span>
         </td>
         <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-          <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium text-gray-900 underline-offset-4 hover:underline mr-3">
-            View
-          </a>
           {% if queue.status == 'active' %}
           <button
             data-queue-name="{{ queue.name }}"
@@ -88,7 +85,7 @@
             data-queue-name="{{ queue.name }}"
             data-action="resume"
             onclick="toggleQueueStatus(this)"
-            class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-3 py-1">
+            class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
             Resume
           </button>
           {% endif %}
