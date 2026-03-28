@@ -2694,7 +2694,7 @@ pub mod pauses {
         execute_select(db, query).await
     }
 
-    /// Insert a pause record
+    /// Insert a pause record (idempotent - uses ON CONFLICT DO NOTHING / INSERT OR IGNORE)
     pub async fn insert<C>(
         db: &C,
         table_config: &TableConfig,
@@ -2704,19 +2704,68 @@ pub mod pauses {
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.pauses);
+        let backend = db.get_database_backend();
+        let table = &table_config.pauses;
 
-        let mut query = Query::insert()
-            .into_table(table)
-            .columns([col("queue_name"), col("created_at")])
-            .values_panic([queue_name.into(), created_at.into()])
-            .to_owned();
-
-        if db.get_database_backend() == DbBackend::Postgres {
-            query.returning_col(col("id"));
+        match backend {
+            DbBackend::Postgres => {
+                let sql = format!(
+                    r#"INSERT INTO "{}" ("queue_name", "created_at")
+                       VALUES ($1, $2)
+                       ON CONFLICT ("queue_name") DO NOTHING
+                       RETURNING "id""#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                match db.query_one(stmt).await? {
+                    Some(row) => {
+                        let id: i64 = row.try_get("", "id")?;
+                        Ok(id)
+                    }
+                    None => Ok(0), // already paused
+                }
+            }
+            DbBackend::Sqlite => {
+                let sql = format!(
+                    r#"INSERT OR IGNORE INTO "{}" ("queue_name", "created_at")
+                       VALUES (?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                let result = db.execute(stmt).await?;
+                if result.rows_affected() == 0 {
+                    Ok(0) // already paused
+                } else {
+                    Ok(result.last_insert_id() as i64)
+                }
+            }
+            DbBackend::MySql => {
+                let sql = format!(
+                    r#"INSERT IGNORE INTO `{}` (`queue_name`, `created_at`)
+                       VALUES (?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                let result = db.execute(stmt).await?;
+                if result.rows_affected() == 0 {
+                    Ok(0) // already paused
+                } else {
+                    Ok(result.last_insert_id() as i64)
+                }
+            }
         }
-
-        execute_insert(db, query).await
     }
 
     /// Delete a pause by queue name
