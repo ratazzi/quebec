@@ -597,35 +597,59 @@ impl Scheduler {
         // Delete tasks that exist in DB but no longer in the config
         let synced_keys: Vec<String> = scheduled.iter().filter_map(|e| e.key.clone()).collect();
 
-        if !synced_keys.is_empty() {
+        {
             let backend = db.get_database_backend();
             let table = &table_config.recurring_tasks;
 
-            let placeholders: String = match backend {
-                sea_orm::DbBackend::Postgres => synced_keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("${}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                _ => synced_keys
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", "),
+            let (sql, values): (String, Vec<Value>) = if synced_keys.is_empty() {
+                // All tasks removed from config — delete all static rows
+                let sql = match backend {
+                    sea_orm::DbBackend::Postgres => {
+                        format!(r#"DELETE FROM "{}" WHERE "static" = TRUE"#, table)
+                    }
+                    sea_orm::DbBackend::MySql => {
+                        format!(r#"DELETE FROM `{}` WHERE `static` = 1"#, table)
+                    }
+                    sea_orm::DbBackend::Sqlite => {
+                        format!(r#"DELETE FROM "{}" WHERE "static" = 1"#, table)
+                    }
+                };
+                (sql, vec![])
+            } else {
+                let placeholders: String = match backend {
+                    sea_orm::DbBackend::Postgres => synced_keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("${}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => synced_keys
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+
+                let sql = match backend {
+                    sea_orm::DbBackend::Postgres => format!(
+                        r#"DELETE FROM "{}" WHERE "static" = TRUE AND "key" NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                    sea_orm::DbBackend::MySql => format!(
+                        r#"DELETE FROM `{}` WHERE `static` = 1 AND `key` NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                    sea_orm::DbBackend::Sqlite => format!(
+                        r#"DELETE FROM "{}" WHERE "static" = 1 AND "key" NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                };
+
+                let values: Vec<Value> =
+                    synced_keys.iter().map(|k| Value::from(k.clone())).collect();
+                (sql, values)
             };
 
-            let sql = format!(
-                r#"DELETE FROM "{}" WHERE "static" = {} AND "key" NOT IN ({})"#,
-                table,
-                match backend {
-                    sea_orm::DbBackend::Postgres => "TRUE",
-                    _ => "1",
-                },
-                placeholders,
-            );
-
-            let values: Vec<Value> = synced_keys.iter().map(|k| Value::from(k.clone())).collect();
             let stmt = sea_orm::Statement::from_sql_and_values(backend, &sql, values);
 
             let deleted = db.execute(stmt).await?;
