@@ -109,7 +109,8 @@ impl ControlPlane {
 
         // Count blocked jobs
         let blocked_count =
-            query_builder::blocked_executions::count_all(db, table_config).await? as i64;
+            query_builder::blocked_executions::count_all(db, table_config, None, None).await?
+                as i64;
 
         // Count active workers
         let active_workers = query_builder::processes::count_all(db, table_config).await?;

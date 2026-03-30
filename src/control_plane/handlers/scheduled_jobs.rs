@@ -39,12 +39,38 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
 
-        // Use database-specific placeholders
+        // Build WHERE clause with optional filters
+        let mut conditions = vec!["j.finished_at IS NULL".to_string()];
+        let mut values: Vec<Value> = Vec::new();
+        let mut param_idx = 0usize;
+
+        if let Some(ref cn) = pagination.class_name {
+            param_idx += 1;
+            let placeholder = match backend {
+                sea_orm::DbBackend::Postgres => format!("${}", param_idx),
+                _ => "?".to_string(),
+            };
+            conditions.push(format!("j.class_name = {}", placeholder));
+            values.push(Value::from(cn.clone()));
+        }
+        if let Some(ref qn) = pagination.queue_name {
+            param_idx += 1;
+            let placeholder = match backend {
+                sea_orm::DbBackend::Postgres => format!("${}", param_idx),
+                _ => "?".to_string(),
+            };
+            conditions.push(format!("j.queue_name = {}", placeholder));
+            values.push(Value::from(qn.clone()));
+        }
+
+        let where_clause = conditions.join(" AND ");
+
+        // LIMIT/OFFSET placeholders
         let (p1, p2) = match backend {
-            sea_orm::DbBackend::Postgres => ("$1".to_string(), "$2".to_string()),
-            sea_orm::DbBackend::MySql | sea_orm::DbBackend::Sqlite => {
-                ("?".to_string(), "?".to_string())
+            sea_orm::DbBackend::Postgres => {
+                (format!("${}", param_idx + 1), format!("${}", param_idx + 2))
             }
+            _ => ("?".to_string(), "?".to_string()),
         };
 
         let scheduled_jobs_sql = clean_sql(&format!(
@@ -57,17 +83,20 @@ impl ControlPlane {
             j.created_at
         FROM {} s
         JOIN {} j ON s.job_id = j.id
-        WHERE j.finished_at IS NULL
+        WHERE {}
         ORDER BY s.scheduled_at ASC
         LIMIT {} OFFSET {}",
-            table_config.scheduled_executions, table_config.jobs, p1, p2
+            table_config.scheduled_executions, table_config.jobs, where_clause, p1, p2
         ));
+
+        values.push(Value::from(page_size as i32));
+        values.push(Value::from(offset as i32));
 
         let scheduled_jobs_result = db
             .query_all(Statement::from_sql_and_values(
                 backend,
                 &scheduled_jobs_sql,
-                [Value::from(page_size as i32), Value::from(offset as i32)],
+                values,
             ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -81,18 +110,6 @@ impl ControlPlane {
             let job_id: i64 = row.try_get("", "job_id").unwrap_or_default();
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
-
-            // Apply filters
-            if let Some(ref filter_class) = pagination.class_name {
-                if &class_name != filter_class {
-                    continue;
-                }
-            }
-            if let Some(ref filter_queue) = pagination.queue_name {
-                if &queue_name != filter_queue {
-                    continue;
-                }
-            }
 
             // Parse creation time
             let created_at_str =
@@ -156,17 +173,46 @@ impl ControlPlane {
 
         debug!("Fetched scheduled jobs in {:?}", start.elapsed());
 
-        // Get total number of scheduled jobs for pagination
+        // Get total number of scheduled jobs for pagination (with same filters)
+        let mut count_conditions = vec!["j.finished_at IS NULL".to_string()];
+        let mut count_values: Vec<Value> = Vec::new();
+        let mut count_idx = 0usize;
+
+        if let Some(ref cn) = pagination.class_name {
+            count_idx += 1;
+            let placeholder = match backend {
+                sea_orm::DbBackend::Postgres => format!("${}", count_idx),
+                _ => "?".to_string(),
+            };
+            count_conditions.push(format!("j.class_name = {}", placeholder));
+            count_values.push(Value::from(cn.clone()));
+        }
+        if let Some(ref qn) = pagination.queue_name {
+            count_idx += 1;
+            let placeholder = match backend {
+                sea_orm::DbBackend::Postgres => format!("${}", count_idx),
+                _ => "?".to_string(),
+            };
+            count_conditions.push(format!("j.queue_name = {}", placeholder));
+            count_values.push(Value::from(qn.clone()));
+        }
+        let _ = count_idx;
+
+        let count_where = count_conditions.join(" AND ");
         let count_sql = clean_sql(&format!(
             "SELECT COUNT(*) AS count
          FROM {} s
          JOIN {} j ON s.job_id = j.id
-         WHERE j.finished_at IS NULL",
-            table_config.scheduled_executions, table_config.jobs
+         WHERE {}",
+            table_config.scheduled_executions, table_config.jobs, count_where
         ));
 
         let total_count = db
-            .query_one(Statement::from_sql_and_values(backend, &count_sql, []))
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                &count_sql,
+                count_values,
+            ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))

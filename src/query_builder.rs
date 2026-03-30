@@ -501,16 +501,28 @@ pub mod jobs {
     }
 
     /// Count finished jobs
-    pub async fn count_finished<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    pub async fn count_finished<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
+        let mut query = Query::select()
             .expr(Expr::col(Asterisk).count())
             .from(table)
             .and_where(Expr::col(col("finished_at")).is_not_null())
             .to_owned();
+
+        if let Some(cn) = class_name {
+            query.and_where(Expr::col(col("class_name")).eq(cn));
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col(col("queue_name")).eq(qn));
+        }
 
         execute_count(db, query).await
     }
@@ -521,12 +533,14 @@ pub mod jobs {
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_jobs::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
+        let mut query = Query::select()
             .column(Asterisk)
             .from(table)
             .and_where(Expr::col(col("finished_at")).is_not_null())
@@ -534,6 +548,13 @@ pub mod jobs {
             .offset(offset)
             .limit(limit)
             .to_owned();
+
+        if let Some(cn) = class_name {
+            query.and_where(Expr::col(col("class_name")).eq(cn));
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col(col("queue_name")).eq(qn));
+        }
 
         execute_select(db, query).await
     }
@@ -1673,15 +1694,36 @@ pub mod blocked_executions {
     }
 
     /// Count all blocked executions
-    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    pub async fn count_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::select()
+        let jobs = Alias::new(&table_config.jobs);
+        let mut query = Query::select()
             .expr(Expr::col(Asterisk).count())
-            .from(table)
+            .from(table.clone())
             .to_owned();
+
+        if class_name.is_some() {
+            query.inner_join(
+                jobs,
+                Expr::col((table.clone(), col("job_id")))
+                    .equals((Alias::new(&table_config.jobs), col("id"))),
+            );
+            query.and_where(
+                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
+                    .eq(class_name.unwrap()),
+            );
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col((table, col("queue_name"))).eq(qn));
+        }
 
         execute_count(db, query).await
     }
@@ -1706,18 +1748,36 @@ pub mod blocked_executions {
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_blocked_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .order_by(col("created_at"), Order::Desc)
+        let jobs = Alias::new(&table_config.jobs);
+        let mut query = Query::select()
+            .column((table.clone(), Asterisk))
+            .from(table.clone())
+            .order_by((table.clone(), col("created_at")), Order::Desc)
             .offset(offset)
             .limit(limit)
             .to_owned();
+
+        if class_name.is_some() {
+            query.inner_join(
+                jobs,
+                Expr::col((table.clone(), col("job_id")))
+                    .equals((Alias::new(&table_config.jobs), col("id"))),
+            );
+            query.and_where(
+                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
+                    .eq(class_name.unwrap()),
+            );
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col((table, col("queue_name"))).eq(qn));
+        }
 
         execute_select(db, query).await
     }

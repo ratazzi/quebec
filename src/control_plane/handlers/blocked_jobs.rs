@@ -35,11 +35,17 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get blocked jobs using query_builder
-        let blocked_executions =
-            query_builder::blocked_executions::find_paginated(db, table_config, offset, page_size)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get blocked jobs using query_builder (filters applied at SQL level)
+        let blocked_executions = query_builder::blocked_executions::find_paginated(
+            db,
+            table_config,
+            offset,
+            page_size,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store blocked job information
         let mut blocked_jobs: Vec<BlockedJobInfo> = Vec::with_capacity(blocked_executions.len());
@@ -52,18 +58,6 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
-                // Apply filters
-                if let Some(ref filter_class) = pagination.class_name {
-                    if &job.class_name != filter_class {
-                        continue;
-                    }
-                }
-                if let Some(ref filter_queue) = pagination.queue_name {
-                    if &execution.queue_name != filter_queue {
-                        continue;
-                    }
-                }
-
                 // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
@@ -114,9 +108,14 @@ impl ControlPlane {
         // Get total number of blocked jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = query_builder::blocked_executions::count_all(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_count: u64 = query_builder::blocked_executions::count_all(
+            db,
+            table_config,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         info!("Total blocked jobs count: {}", total_count);
 

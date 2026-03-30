@@ -34,11 +34,17 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get completed jobs using query_builder
-        let finished_jobs_models =
-            query_builder::jobs::find_finished_paginated(db, table_config, offset, page_size)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get completed jobs using query_builder (filters applied at SQL level)
+        let finished_jobs_models = query_builder::jobs::find_finished_paginated(
+            db,
+            table_config,
+            offset,
+            page_size,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store completed job information
         let mut finished_jobs: Vec<FinishedJobInfo> =
@@ -46,17 +52,6 @@ impl ControlPlane {
 
         // Get information for each completed job
         for job in finished_jobs_models {
-            // Apply filters
-            if let Some(ref filter_class) = pagination.class_name {
-                if &job.class_name != filter_class {
-                    continue;
-                }
-            }
-            if let Some(ref filter_queue) = pagination.queue_name {
-                if &job.queue_name != filter_queue {
-                    continue;
-                }
-            }
             if let Some(finished_at) = job.finished_at {
                 // Calculate runtime
                 let runtime = match finished_at.signed_duration_since(job.created_at) {
@@ -106,9 +101,14 @@ impl ControlPlane {
         // Get total number of completed jobs for pagination using query_builder
         let start = Instant::now();
 
-        let total_count: u64 = query_builder::jobs::count_finished(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_count: u64 = query_builder::jobs::count_finished(
+            db,
+            table_config,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         info!("Total finished jobs count: {}", total_count);
 

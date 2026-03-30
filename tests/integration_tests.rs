@@ -34,7 +34,7 @@ mod schema {
             0
         );
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             0
@@ -156,7 +156,9 @@ mod jobs {
         assert!(job.finished_at.is_some());
 
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc).await.unwrap(),
+            query_builder::jobs::count_finished(&db, &tc, None, None)
+                .await
+                .unwrap(),
             1
         );
     }
@@ -180,7 +182,9 @@ mod jobs {
             .unwrap();
         assert_eq!(rows, 2);
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc).await.unwrap(),
+            query_builder::jobs::count_finished(&db, &tc, None, None)
+                .await
+                .unwrap(),
             2
         );
     }
@@ -546,7 +550,7 @@ mod blocked_executions {
         assert_eq!(found[0].job_id, job_id);
 
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             1
@@ -556,7 +560,7 @@ mod blocked_executions {
             .await
             .unwrap();
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             0
