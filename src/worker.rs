@@ -1885,10 +1885,21 @@ impl Worker {
         execution: &quebec_ready_executions::Model,
         process_id: Option<i64>,
     ) -> Result<Option<quebec_claimed_executions::Model>, DbErr> {
-        query_builder::claimed_executions::insert(txn, table_config, execution.job_id, process_id)
-            .await?;
+        let now = chrono::Utc::now().naive_utc();
+        let id = query_builder::claimed_executions::insert(
+            txn,
+            table_config,
+            execution.job_id,
+            process_id,
+        )
+        .await?;
         query_builder::ready_executions::delete_by_id(txn, table_config, execution.id).await?;
-        query_builder::claimed_executions::find_by_job_id(txn, table_config, execution.job_id).await
+        Ok(Some(quebec_claimed_executions::Model {
+            id,
+            job_id: execution.job_id,
+            process_id,
+            created_at: now,
+        }))
     }
 
     pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
