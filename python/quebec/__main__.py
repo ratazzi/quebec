@@ -8,7 +8,7 @@ Usage:
 All configuration via environment variables:
 
     QUEBEC_DATABASE_URL or DATABASE_URL  — database connection string (required)
-    QUEBEC_THREADS          — Python worker threads (default: 1)
+    QUEBEC_THREADS          — worker threads (maps to worker_threads, default from queue.yml or 3)
     QUEBEC_CREATE_TABLES    — create tables on startup (default: true, set false/0/no to disable)
     QUEBEC_CONTROL_PLANE    — control plane address, e.g. "127.0.0.1:5006"
     QUEBEC_SPAWN            — comma-separated components: worker,dispatcher,scheduler
@@ -63,8 +63,13 @@ def main():
         logger.error("Set QUEBEC_DATABASE_URL or DATABASE_URL environment variable")
         sys.exit(1)
 
-    # Create Quebec instance (QUEBEC_* env vars are read by Rust core)
-    qc = Quebec(database_url)
+    # Create Quebec instance (QUEBEC_* env vars are read by Rust core).
+    # QUEBEC_THREADS maps to worker_threads for backward compat.
+    kwargs = {}
+    threads_env = os.environ.get("QUEBEC_THREADS")
+    if threads_env:
+        kwargs["worker_threads"] = int(threads_env)
+    qc = Quebec(database_url, **kwargs)
 
     # Discover and register job classes
     total = 0
@@ -92,7 +97,6 @@ def main():
     logger.info(f"Discovered {total} job class(es), starting Quebec")
 
     # Run options
-    threads = int(os.environ.get("QUEBEC_THREADS", "1"))
     create_tables_env = os.environ.get("QUEBEC_CREATE_TABLES")
     create_tables = (
         create_tables_env.lower() not in ("false", "0", "no")
@@ -109,7 +113,6 @@ def main():
         create_tables=create_tables,
         control_plane=control_plane,
         spawn=spawn,
-        threads=threads,
     )
 
 

@@ -330,9 +330,12 @@ def _quebec_start(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
-    threads: int = 1,
 ):
     """Non-blocking start. Returns immediately after all components are started.
+
+    Worker thread count is determined by queue.yml (workers.threads) or the
+    worker_threads constructor parameter. There is a single source of truth
+    on the Rust side; Python reads it via self.worker_threads.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -340,7 +343,6 @@ def _quebec_start(
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
                None means spawn all components.
-        threads: Number of worker threads to run jobs (default 1).
 
     Example:
         qc.start()
@@ -354,6 +356,9 @@ def _quebec_start(
 
     if control_plane:
         self.start_control_plane(control_plane)
+
+    # Thread count comes from Rust (queue.yml / constructor parameter)
+    threads = self.worker_threads
 
     # Spawn components based on spawn parameter
     if spawn is None:
@@ -372,11 +377,6 @@ def _quebec_start(
     # Set up threading infrastructure
     shutdown_event = threading.Event()
     job_queue = queue.Queue()
-
-    # Register internal shutdown handler to signal the event
-    @self.on_shutdown
-    def _internal_shutdown_handler():
-        shutdown_event.set()
 
     if threads > 0:
         self.bind_queue(job_queue)
@@ -435,11 +435,12 @@ def _quebec_run(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
-    threads: int = 1,
 ):
     """Blocking run. Starts all components and waits until shutdown.
 
     This is equivalent to calling start() followed by wait().
+    Worker thread count is determined by queue.yml (workers.threads)
+    or the worker_threads constructor parameter.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -447,20 +448,17 @@ def _quebec_run(
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
                None means spawn all components.
-        threads: Number of worker threads to run jobs (default 1).
 
     Example:
         qc.run()  # Start all components and block
         qc.run(create_tables=True)  # Create tables and start all
         qc.run(spawn=['worker'])  # Only start worker
         qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
-        qc.run(threads=4)  # Run with 4 worker threads
     """
     self.start(
         create_tables=create_tables,
         control_plane=control_plane,
         spawn=spawn,
-        threads=threads,
     )
     self.wait()
 

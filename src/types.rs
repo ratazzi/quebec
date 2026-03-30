@@ -474,7 +474,39 @@ impl PyQuebec {
             })
             .ok();
 
+        // Check if worker config was explicitly set via code/env before options is moved
+        // Verify the value is actually extractable, not just present
+        let has_explicit_threads = kwargs
+            .and_then(|k| k.get_item("worker_threads").ok().flatten())
+            .and_then(|v| v.extract::<u64>().ok())
+            .is_some()
+            || std::env::var("QUEBEC_WORKER_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some();
+        let has_explicit_polling = kwargs
+            .and_then(|k| k.get_item("worker_polling_interval").ok().flatten())
+            .filter(|v| {
+                v.extract::<Duration>().is_ok()
+                    || v.extract::<u64>().is_ok()
+                    || v.extract::<f64>()
+                        .map(|f| f.is_finite() && f >= 0.0)
+                        .unwrap_or(false)
+            })
+            .is_some()
+            || std::env::var("QUEBEC_WORKER_POLLING_INTERVAL")
+                .ok()
+                .and_then(|s| parse_duration_f64_env(&s))
+                .is_some();
+
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
+
+        if _ctx.worker_threads == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker_threads must be >= 1",
+            ));
+        }
+
         // Bind the runtime handle so other parts can reuse the single runtime
         _ctx.set_runtime_handle(rt.handle().clone());
 
@@ -502,16 +534,19 @@ impl PyQuebec {
                 }
 
                 if let Some(worker) = workers.first() {
-                    // Only apply if still at default value
+                    // Code/env parameters take precedence over config file
                     if let Some(threads) = worker.threads {
-                        if _ctx.worker_threads == 3 {
-                            // default value
+                        if !has_explicit_threads {
+                            if threads == 0 {
+                                return Err(pyo3::exceptions::PyValueError::new_err(
+                                    "worker_threads must be >= 1 (set via queue.yml workers.threads)",
+                                ));
+                            }
                             _ctx.worker_threads = threads as u64;
                         }
                     }
                     if let Some(polling_interval) = worker.polling_interval {
-                        if _ctx.worker_polling_interval == Duration::from_millis(100) {
-                            // default value
+                        if !has_explicit_polling {
                             _ctx.worker_polling_interval =
                                 Duration::from_secs_f64(polling_interval);
                         }
@@ -754,6 +789,11 @@ impl PyQuebec {
         });
 
         Ok(())
+    }
+
+    #[getter]
+    fn worker_threads(&self) -> u64 {
+        self.ctx.worker_threads
     }
 
     fn ping(&self) -> PyResult<bool> {
