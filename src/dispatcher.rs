@@ -86,59 +86,64 @@ impl Dispatcher {
                               info!("Found {} expired concurrency keys to unblock", expired_keys_result.len());
                           }
 
-                          for row in expired_keys_result {
-                              let concurrency_key = row.try_get::<String>("", "concurrency_key")
-                                  .map_err(|e| DbErr::Custom(format!("Failed to get concurrency_key: {}", e)))?;
+                          // Collect expired concurrency keys
+                          let expired_keys: Vec<String> = expired_keys_result
+                              .iter()
+                              .filter_map(|row| row.try_get::<String>("", "concurrency_key").ok())
+                              .collect();
 
+                          // Pre-filter: batch check semaphores (like Solid Queue's releasable)
+                          // Keys without semaphore OR with value > 0 are releasable
+                          let semaphore_map = query_builder::semaphores::find_values_by_keys(
+                              txn, &ctx.table_config, &expired_keys,
+                          ).await?;
+                          let releasable_keys: Vec<&String> = expired_keys.iter().filter(|k| {
+                              semaphore_map.get(*k).map_or(true, |&v| v > 0)
+                          }).collect();
+
+                          for concurrency_key in releasable_keys {
                               let blocked_execution = query_builder::blocked_executions::find_one_by_key_for_update(
                                   txn,
                                   &ctx.table_config,
-                                  &concurrency_key,
+                                  concurrency_key,
                               ).await?;
 
                               let Some(execution) = blocked_execution else { continue };
 
-                              // Get the job to access concurrency information (like original Solid Queue)
-                              let Some(job) = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
-                                  .await? else {
-                                  warn!("Job {} not found for blocked execution", execution.job_id);
-                                  continue;
-                              };
-
-                              // Get concurrency_limit from registered runnable
+                              // Get concurrency_limit from registered runnable via job's class_name
                               let concurrency_limit = {
                                   #[cfg(feature = "python")]
                                   {
-                                      let Ok(runnables) = ctx.runnables.read()
-                                          .inspect_err(|e| warn!("Failed to acquire read lock: {}", e)) else {
-                                          continue;
-                                      };
-                                      runnables
-                                          .get(&job.class_name)
-                                          .and_then(|runnable| runnable.concurrency_limit)
-                                          .unwrap_or(1)
+                                      let limit = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
+                                          .await?
+                                          .and_then(|job| {
+                                              ctx.runnables.read().ok().and_then(|runnables| {
+                                                  runnables.get(&job.class_name)
+                                                      .and_then(|r| r.concurrency_limit)
+                                              })
+                                          })
+                                          .unwrap_or(1);
+                                      limit
                                   }
                                   #[cfg(not(feature = "python"))]
                                   { 1 }
                               };
 
-                              // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
+                              // Try to acquire semaphore (like Solid Queue's BlockedExecution.release)
                               match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
                                   Ok(true) => {
                                       info!("Semaphore acquired for key: {}", concurrency_key);
 
-                                      // Move blocked execution to ready execution
-                                      // Use job's queue_name and priority (inherit from job like Solid Queue)
+                                      // Use queue_name and priority from blocked_execution (already stored)
                                       query_builder::ready_executions::insert(
                                           txn,
                                           &ctx.table_config,
                                           execution.job_id,
-                                          &job.queue_name,
-                                          job.priority,
+                                          &execution.queue_name,
+                                          execution.priority,
                                       )
                                       .await?;
 
-                                      // Remove from blocked executions
                                       query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
                                           .await?;
 

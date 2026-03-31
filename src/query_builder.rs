@@ -2728,6 +2728,47 @@ pub mod semaphores {
         execute_select(db, query).await
     }
 
+    /// Batch fetch semaphore (key, value) pairs by keys
+    /// Used for pre-filtering releasable concurrency keys (like Solid Queue's releasable)
+    pub async fn find_values_by_keys<C>(
+        db: &C,
+        table_config: &TableConfig,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, i32>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let backend = db.get_database_backend();
+        let chunk_size = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut map = std::collections::HashMap::with_capacity(keys.len());
+        for chunk in keys.chunks(chunk_size) {
+            let table = Alias::new(&table_config.semaphores);
+            let query = Query::select()
+                .columns([col("key"), col("value")])
+                .from(table)
+                .and_where(Expr::col(col("key")).is_in(chunk.iter().map(|s| s.as_str())))
+                .to_owned();
+
+            let (sql, values) = build_select_sql(backend, &query);
+            let stmt = Statement::from_sql_and_values(backend, &sql, values);
+            let rows = db.query_all(stmt).await?;
+            for row in rows {
+                let key: String = row.try_get("", "key")?;
+                let value: i32 = row.try_get("", "value")?;
+                map.insert(key, value);
+            }
+        }
+        Ok(map)
+    }
+
     /// Delete expired semaphores
     pub async fn delete_expired<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
     where
