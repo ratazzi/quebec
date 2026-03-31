@@ -461,7 +461,36 @@ where
             .col(col("priority"))
             .col(col("job_id"))
             .to_owned(),
+        // Poll-all index: ORDER BY priority, job_id (no queue filter)
+        Index::create()
+            .if_not_exists()
+            .name(&format!(
+                "idx_{}_priority_job",
+                table_config.ready_executions
+            ))
+            .table(tbl(&table_config.ready_executions))
+            .col(col("priority"))
+            .col(col("job_id"))
+            .to_owned(),
+        // Claimed executions: process cleanup index
+        Index::create()
+            .if_not_exists()
+            .name(&format!(
+                "idx_{}_process_job",
+                table_config.claimed_executions
+            ))
+            .table(tbl(&table_config.claimed_executions))
+            .col(col("process_id"))
+            .col(col("job_id"))
+            .to_owned(),
         // Semaphores indexes
+        Index::create()
+            .if_not_exists()
+            .name(&format!("idx_{}_key_value", table_config.semaphores))
+            .table(tbl(&table_config.semaphores))
+            .col(col("key"))
+            .col(col("value"))
+            .to_owned(),
         Index::create()
             .if_not_exists()
             .name(&format!("idx_{}_expires_at", table_config.semaphores))
