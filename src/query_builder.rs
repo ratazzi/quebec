@@ -1282,6 +1282,49 @@ pub mod ready_executions {
             .map(|row| row.try_get("", "queue_name"))
             .collect()
     }
+
+    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .to_owned();
+
+        execute_count(db, query).await
+    }
+
+    /// Get the oldest ready execution's created_at for pending latency calculation
+    pub async fn oldest_created_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Option<chrono::NaiveDateTime>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .expr(Expr::col(col("created_at")).min())
+            .from(table)
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        let row = db.query_one(stmt).await?;
+        Ok(row
+            .and_then(|r| {
+                r.try_get("", "MIN(\"created_at\")")
+                    .ok()
+                    .or_else(|| r.try_get_by_index(0).ok())
+            })
+            .flatten())
+    }
 }
 
 // =============================================================================
@@ -1683,6 +1726,36 @@ pub mod claimed_executions {
             .to_owned();
 
         execute_delete(db, query).await
+    }
+
+    /// Get the oldest claimed execution's created_at for processing latency calculation
+    pub async fn oldest_created_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Option<chrono::NaiveDateTime>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::select()
+            .expr(Expr::col(col("created_at")).min())
+            .from(table)
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        let row = db.query_one(stmt).await?;
+        Ok(row
+            .and_then(|r| {
+                r.try_get("", "MIN(\"created_at\")")
+                    .ok()
+                    .or_else(|| r.try_get_by_index(0).ok())
+            })
+            .flatten())
     }
 }
 
