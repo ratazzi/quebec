@@ -143,14 +143,6 @@ impl ControlPlane {
                 post(Self::discard_all_failed_jobs),
             )
             .route("/in-progress-jobs", get(Self::in_progress_jobs))
-            .route(
-                "/in-progress-jobs/:id/cancel",
-                post(Self::cancel_in_progress_job),
-            )
-            .route(
-                "/in-progress-jobs/all/cancel",
-                post(Self::cancel_all_in_progress_jobs),
-            )
             .route("/blocked-jobs", get(Self::blocked_jobs))
             .route("/blocked-jobs/:id/unblock", post(Self::unblock_job))
             .route("/blocked-jobs/:id/cancel", post(Self::cancel_blocked_job))

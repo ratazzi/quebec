@@ -39,12 +39,6 @@
   </button>
 
   <div class="flex-grow"></div>
-
-  <form action="{{ base_path }}/in-progress-jobs/all/cancel" method="post">
-    <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
-      Cancel all
-    </button>
-  </form>
 </div>
 
 <!-- Table -->
@@ -65,7 +59,6 @@
           Runtime
         </th>
         <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-          Actions
         </th>
       </tr>
     </thead>
@@ -90,11 +83,6 @@
             <div class="text-sm text-gray-900">{{ job.runtime }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="{{ base_path }}/in-progress-jobs/{{ job.id }}/cancel" method="post" class="inline">
-              <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
-                Cancel
-              </button>
-            </form>
           </td>
         </tr>
         {% endfor %}
