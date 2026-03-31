@@ -1039,6 +1039,36 @@ pub mod ready_executions {
         execute_delete(db, query).await
     }
 
+    /// Batch delete ready executions by IDs
+    pub async fn delete_by_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        ids: &[i64],
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut total = 0u64;
+        for chunk in ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.ready_executions);
+            let query = Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(col("id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            total += execute_delete(db, query).await?;
+        }
+        Ok(total)
+    }
+
     /// Find one ready execution with FOR UPDATE SKIP LOCKED (for job claiming)
     /// Returns None if no execution found or all are locked
     pub async fn find_one_for_update<C>(
@@ -1286,6 +1316,101 @@ pub mod claimed_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Batch insert claimed execution records and return inserted models.
+    /// PostgreSQL/SQLite: uses RETURNING *.
+    /// MySQL: fallback to INSERT then SELECT.
+    /// SQLite: auto-chunks at 333 rows (3 cols * 333 = 999).
+    pub async fn insert_all_returning<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, Option<i64>, chrono::NaiveDateTime)],
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let backend = db.get_database_backend();
+        let cols_per_row: usize = 3;
+        let max_params = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+        let chunk_size = max_params / cols_per_row;
+
+        let mut all_models: Vec<quebec_claimed_executions::Model> = Vec::with_capacity(data.len());
+
+        for chunk in data.chunks(chunk_size) {
+            let table = Alias::new(&table_config.claimed_executions);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([col("job_id"), col("process_id"), col("created_at")])
+                .to_owned();
+
+            for &(job_id, process_id, created_at) in chunk {
+                query.values_panic([job_id.into(), process_id.into(), created_at.into()]);
+            }
+
+            match backend {
+                DbBackend::Postgres | DbBackend::Sqlite => {
+                    query.returning(Returning::new().all());
+                    let (sql, values) = build_insert_sql(backend, &query);
+                    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                    let models: Vec<quebec_claimed_executions::Model> =
+                        quebec_claimed_executions::Model::find_by_statement(stmt)
+                            .all(db)
+                            .await?;
+                    all_models.extend(models);
+                }
+                DbBackend::MySql => {
+                    let (sql, values) = build_insert_sql(backend, &query);
+                    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                    db.execute(stmt).await?;
+                    // Fallback: fetch by job_ids
+                    let job_ids: Vec<i64> = chunk.iter().map(|&(jid, _, _)| jid).collect();
+                    let fetched = find_by_job_ids(db, table_config, &job_ids).await?;
+                    all_models.extend(fetched);
+                }
+            }
+        }
+
+        Ok(all_models)
+    }
+
+    /// Batch fetch claimed executions by job_ids
+    pub async fn find_by_job_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_ids: &[i64],
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if job_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut results = Vec::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.claimed_executions);
+            let query = Query::select()
+                .column(Asterisk)
+                .from(table)
+                .and_where(Expr::col(col("job_id")).is_in(chunk.iter().copied()))
+                .order_by(col("job_id"), Order::Asc)
+                .to_owned();
+            results.extend(execute_select::<quebec_claimed_executions::Model, _>(db, query).await?);
+        }
+        Ok(results)
     }
 
     /// Find a claimed execution by job_id

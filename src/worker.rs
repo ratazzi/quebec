@@ -1202,7 +1202,7 @@ impl Execution {
 
         let claimed_id = claimed.id;
         let max_retries = 3u32;
-        let mut transaction_result: Result<quebec_jobs::Model, TransactionError<DbErr>> = Err(
+        let mut transaction_result: Result<bool, TransactionError<DbErr>> = Err(
             TransactionError::Transaction(DbErr::Custom("not attempted".into())),
         );
 
@@ -1234,7 +1234,7 @@ impl Execution {
             let claimed = claimed.clone();
 
             transaction_result = db
-                .transaction::<_, quebec_jobs::Model, DbErr>(|txn| {
+                .transaction::<_, bool, DbErr>(|txn| {
                     Box::pin(async move {
                         if let Some((scheduled_at, ref arguments)) = retry_job_data {
                             Self::schedule_retry_job(
@@ -1285,13 +1285,6 @@ impl Execution {
                             return Err(DbErr::Custom("Claimed job not found".into()));
                         }
 
-                        // Fetch updated job model
-                        let updated = query_builder::jobs::find_by_id(txn, &table_config, job_id)
-                            .await?
-                            .ok_or_else(|| {
-                                DbErr::Custom("Job not found after update".to_string())
-                            })?;
-
                         // Release semaphore and unblock next job if job has concurrency control
                         // This must happen AFTER job execution completes (ensure block in Solid Queue)
                         if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
@@ -1328,7 +1321,7 @@ impl Execution {
                             }
                         }
 
-                        Ok(updated)
+                        Ok(failed)
                     })
                 })
                 .await;
@@ -1385,14 +1378,12 @@ impl Execution {
 
         // Log the result
         let transaction_result = transaction_result
-            .map(|job| {
+            .map(|failed| {
                 let duration = self.timer.elapsed();
-                if let Ok(job_model) = job.try_into_model() {
-                    if job_model.finished_at.is_none() {
-                        error!("Job `{}' processed in: {:?}", class_name, duration);
-                    } else {
-                        debug!("Job `{}' processed in: {:?}", class_name, duration)
-                    }
+                if failed {
+                    error!("Job `{}' processed in: {:?}", class_name, duration);
+                } else {
+                    debug!("Job `{}' processed in: {:?}", class_name, duration);
                 }
             })
             .map_err(|e| {
@@ -2017,7 +2008,7 @@ impl Worker {
                         .map(|q| q.ordered_patterns())
                         .unwrap_or_else(|| vec![(false, "*".to_string())]); // Default to all
 
-                    // Helper macro to claim jobs from a queue
+                    // Helper macro to claim jobs from a queue (batch insert + batch delete)
                     macro_rules! claim_from_queue {
                         ($filter:expr, $exclude:expr) => {{
                             let records = query_builder::ready_executions::find_many_for_update(
@@ -2030,18 +2021,39 @@ impl Worker {
                             )
                             .await?;
 
-                            for execution in records {
-                                if let Some(claimed) = Self::claim_execution(
+                            if !records.is_empty() {
+                                let now = chrono::Utc::now().naive_utc();
+                                let insert_data: Vec<(i64, Option<i64>, chrono::NaiveDateTime)> =
+                                    records
+                                        .iter()
+                                        .map(|r| (r.job_id, process_id, now))
+                                        .collect();
+                                let ready_ids: Vec<i64> = records.iter().map(|r| r.id).collect();
+                                let job_ids: Vec<i64> = records.iter().map(|r| r.job_id).collect();
+
+                                // Batch insert claimed (RETURNING *) + batch delete ready
+                                let mut claimed =
+                                    query_builder::claimed_executions::insert_all_returning(
+                                        txn,
+                                        &table_config,
+                                        &insert_data,
+                                    )
+                                    .await?;
+                                query_builder::ready_executions::delete_by_ids(
                                     txn,
                                     &table_config,
-                                    &execution,
-                                    process_id,
+                                    &ready_ids,
                                 )
-                                .await?
-                                {
-                                    claimed_jobs.push(claimed);
-                                }
-                                remaining = remaining.saturating_sub(1);
+                                .await?;
+
+                                // Reorder to match original priority/job_id selection order
+                                let order_map: std::collections::HashMap<i64, usize> =
+                                    job_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+                                claimed.sort_by_key(|c| {
+                                    order_map.get(&c.job_id).copied().unwrap_or(usize::MAX)
+                                });
+                                claimed_jobs.extend(claimed);
+                                remaining = remaining.saturating_sub(records.len() as u64);
                             }
                         }};
                     }
