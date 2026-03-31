@@ -398,9 +398,15 @@ mod claimed_executions {
             .await
             .unwrap();
 
-        let ce_id = query_builder::claimed_executions::insert(&db, &tc, job_id, Some(12345))
-            .await
-            .unwrap();
+        let ce_id = query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(12345),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         assert!(ce_id > 0);
 
         let found = query_builder::claimed_executions::find_by_job_id(&db, &tc, job_id)
@@ -443,12 +449,24 @@ mod claimed_executions {
             .await
             .unwrap();
 
-        query_builder::claimed_executions::insert(&db, &tc, j1, Some(100))
-            .await
-            .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, j2, Some(100))
-            .await
-            .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            j1,
+            Some(100),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            j2,
+            Some(100),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
 
         let deleted = query_builder::claimed_executions::delete_by_process_id(&db, &tc, 100)
             .await
@@ -893,9 +911,15 @@ mod lifecycle {
         query_builder::ready_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, job_id, Some(9999))
-            .await
-            .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(9999),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             query_builder::claimed_executions::count_all(&db, &tc, None, None)
                 .await
@@ -928,9 +952,15 @@ mod lifecycle {
         query_builder::ready_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, job_id, Some(9999))
-            .await
-            .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(9999),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         query_builder::claimed_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();

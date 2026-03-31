@@ -226,14 +226,23 @@ pub mod jobs {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .and_where(Expr::col(col("id")).is_in(ids))
-            .to_owned();
 
-        execute_select(db, query).await
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut results = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.jobs);
+            let query = Query::select()
+                .column(Asterisk)
+                .from(table)
+                .and_where(Expr::col(col("id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            results.extend(execute_select::<quebec_jobs::Model, _>(db, query).await?);
+        }
+        Ok(results)
     }
 
     /// Insert a new job and return its ID
@@ -1259,17 +1268,17 @@ pub mod claimed_executions {
         table_config: &TableConfig,
         job_id: i64,
         process_id: Option<i64>,
+        created_at: chrono::NaiveDateTime,
     ) -> Result<i64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.claimed_executions);
-        let now = chrono::Utc::now().naive_utc();
 
         let mut query = Query::insert()
             .into_table(table)
             .columns([col("job_id"), col("process_id"), col("created_at")])
-            .values_panic([job_id.into(), process_id.into(), now.into()])
+            .values_panic([job_id.into(), process_id.into(), created_at.into()])
             .to_owned();
 
         if db.get_database_backend() == DbBackend::Postgres {
@@ -2250,6 +2259,36 @@ pub mod scheduled_executions {
             .to_owned();
 
         execute_delete(db, query).await
+    }
+
+    /// Delete scheduled executions by job_ids (batch)
+    pub async fn delete_by_job_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_ids: &[i64],
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if job_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut total = 0u64;
+        for chunk in job_ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.scheduled_executions);
+            let query = Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(col("job_id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            total += execute_delete(db, query).await?;
+        }
+        Ok(total)
     }
 
     /// Find a scheduled execution by ID

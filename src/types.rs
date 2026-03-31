@@ -547,6 +547,11 @@ impl PyQuebec {
                     }
                     if let Some(polling_interval) = worker.polling_interval {
                         if !has_explicit_polling {
+                            if !polling_interval.is_finite() || polling_interval < 0.0 {
+                                return Err(pyo3::exceptions::PyValueError::new_err(
+                                    format!("worker_polling_interval must be finite and >= 0 (set via queue.yml workers.polling_interval, got {})", polling_interval),
+                                ));
+                            }
                             _ctx.worker_polling_interval =
                                 Duration::from_secs_f64(polling_interval);
                         }

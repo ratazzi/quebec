@@ -1891,6 +1891,7 @@ impl Worker {
             table_config,
             execution.job_id,
             process_id,
+            now,
         )
         .await?;
         query_builder::ready_executions::delete_by_id(txn, table_config, execution.id).await?;

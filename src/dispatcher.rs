@@ -173,36 +173,25 @@ impl Dispatcher {
                           // Collect queue names for NOTIFY
                           let mut notified_queues = std::collections::HashSet::new();
 
-                          for scheduled_execution in scheduled_executions {
-                              // Get job details to retrieve queue_name and priority
-                              let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, scheduled_execution.job_id)
-                                  .await?;
+                          // Batch fetch all jobs at once (eliminates N+1)
+                          let job_ids: Vec<i64> = scheduled_executions.iter().map(|se| se.job_id).collect();
+                          let jobs = query_builder::jobs::find_by_ids(txn, &ctx.table_config, job_ids.clone()).await?;
+                          let job_map: std::collections::HashMap<i64, _> = jobs.into_iter().map(|j| (j.id, j)).collect();
 
-                              let Some(job) = job else {
-                                  warn!("Job {} not found for scheduled execution {}", scheduled_execution.job_id, scheduled_execution.id);
+                          // Prepare batch data for ready_executions insert
+                          let mut ready_data: Vec<(i64, &str, i32)> = Vec::with_capacity(scheduled_executions.len());
+                          for se in &scheduled_executions {
+                              let Some(job) = job_map.get(&se.job_id) else {
+                                  warn!("Job {} not found for scheduled execution {}", se.job_id, se.id);
                                   continue;
                               };
-
-                              let queue_name = job.queue_name.clone();
-
-                              query_builder::ready_executions::insert(
-                                  txn,
-                                  &ctx.table_config,
-                                  scheduled_execution.job_id,
-                                  &job.queue_name,
-                                  job.priority,
-                              )
-                              .await?;
-
-                              query_builder::scheduled_executions::delete_by_job_id(
-                                  txn,
-                                  &ctx.table_config,
-                                  scheduled_execution.job_id,
-                              )
-                              .await?;
-
-                              notified_queues.insert(queue_name);
+                              ready_data.push((se.job_id, &job.queue_name, job.priority));
+                              notified_queues.insert(job.queue_name.clone());
                           }
+
+                          // Batch insert ready_executions + batch delete scheduled_executions
+                          query_builder::ready_executions::insert_all(txn, &ctx.table_config, &ready_data).await?;
+                          query_builder::scheduled_executions::delete_by_job_ids(txn, &ctx.table_config, &job_ids).await?;
 
                           if size > 0 {
                               info!("Dispatch scheduled jobs size: {}", size);
