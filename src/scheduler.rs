@@ -194,9 +194,12 @@ where
         None => serde_json::Value::Array(vec![]),
     };
 
+    let active_job_id = crate::utils::generate_job_id();
+
     let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
+        "provider_job_id": active_job_id,
         "queue_name": queue_name,
         "priority": priority,
         "arguments": args,
@@ -307,7 +310,6 @@ where
 
     // Run the actual DB enqueue; on any error, close the around_enqueue generator
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
-    let active_job_id = crate::utils::generate_job_id();
     let db_result: Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = async {
         let job_id = query_builder::jobs::insert(
             db,
