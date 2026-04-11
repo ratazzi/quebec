@@ -23,14 +23,21 @@
       static targets = ["frame"]
 
       connect() {
-        this.startReloading()
+        this._onVisibility = () => {
+          if (document.hidden) { this.stopReloading() }
+          else { this.refresh(); this.startReloading() }
+        }
+        document.addEventListener("visibilitychange", this._onVisibility)
+        if (!document.hidden) this.startReloading()
       }
 
       disconnect() {
+        document.removeEventListener("visibilitychange", this._onVisibility)
         this.stopReloading()
       }
 
       startReloading() {
+        if (this.refreshTimer) return
         this.refreshTimer = setInterval(() => {
           this.refresh()
         }, this.intervalValue)
@@ -39,6 +46,7 @@
       stopReloading() {
         if (this.refreshTimer) {
           clearInterval(this.refreshTimer)
+          this.refreshTimer = null
         }
       }
 
@@ -332,17 +340,31 @@
       connect() {
         this.basePath = document.querySelector('meta[name="base-path"]')?.content || ''
         this.abortController = new AbortController()
-        this.refresh()
-        this.timer = setInterval(() => this.refresh(), this.intervalValue)
         this.boundOnDue = this.onDue.bind(this)
         this.element.addEventListener("timeago:due", this.boundOnDue)
+        this._onVisibility = () => {
+          if (document.hidden) { this.stopTimer() }
+          else { this.refresh(); this.startTimer() }
+        }
+        document.addEventListener("visibilitychange", this._onVisibility)
+        if (!document.hidden) { this.refresh(); this.startTimer() }
       }
 
       disconnect() {
-        if (this.timer) clearInterval(this.timer)
+        document.removeEventListener("visibilitychange", this._onVisibility)
+        this.stopTimer()
         if (this.dueTimer) clearTimeout(this.dueTimer)
         if (this.abortController) this.abortController.abort()
         this.element.removeEventListener("timeago:due", this.boundOnDue)
+      }
+
+      startTimer() {
+        if (this.timer) return
+        this.timer = setInterval(() => this.refresh(), this.intervalValue)
+      }
+
+      stopTimer() {
+        if (this.timer) { clearInterval(this.timer); this.timer = null }
       }
 
       onDue() {
@@ -497,14 +519,40 @@
 
       connect() {
         this.basePath = document.querySelector('meta[name="base-path"]')?.content || ''
-        this.startSSE()
+        this._usePolling = false
+        this._onVisibility = () => {
+          if (document.hidden) {
+            this.stop()
+          } else if (this._usePolling) {
+            // Polling waits a full interval before the next tick; fetch now
+            // so stale badges don't linger.
+            this.fetchSnapshot()
+            this.startPolling()
+          } else {
+            // SSE's first tick fires immediately on connect — no explicit
+            // snapshot needed, and skipping it avoids a render race where
+            // a stale fetch response could overwrite fresher SSE data.
+            this.startSSE()
+          }
+        }
+        document.addEventListener("visibilitychange", this._onVisibility)
+        if (!document.hidden) this.startSSE()
+      }
+
+      async fetchSnapshot() {
+        try {
+          const resp = await fetch(this.basePath + '/stats')
+          if (resp.ok) Turbo.renderStreamMessage(await resp.text())
+        } catch (e) { console.debug('[stats-stream] snapshot error:', e) }
       }
 
       disconnect() {
+        document.removeEventListener("visibilitychange", this._onVisibility)
         this.stop()
       }
 
       startSSE() {
+        if (this.eventSource) return
         const es = new EventSource(this.basePath + '/events')
         this.eventSource = es
         let received = false
@@ -513,11 +561,9 @@
           Turbo.renderStreamMessage(e.data)
         }
         es.onerror = () => {
-          // Never received a message (e.g. ASGI 204) — SSE unsupported,
-          // fall back to polling permanently. Otherwise let EventSource
-          // auto-reconnect on its own.
           if (!received) {
             this.stopSSE()
+            this._usePolling = true
             this.startPolling()
           }
         }
