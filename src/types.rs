@@ -617,8 +617,6 @@ impl PyQuebec {
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
 
-        ctx.set_proc_title("worker", Some(&ctx.worker_threads.to_string()));
-
         Ok(PyQuebec {
             ctx,
             rt,
@@ -1500,6 +1498,10 @@ impl PyQuebec {
                 return Err(e);
             }
         }
+
+        // Set process title on the main thread where it takes effect
+        self.ctx
+            .set_proc_title("worker", Some(&self.ctx.worker_threads.to_string()));
 
         // Spawn all components
         self.spawn_dispatcher()?;
