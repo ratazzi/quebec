@@ -149,6 +149,16 @@ impl ControlPlane {
 
     /// Extract path+query from Referer header, falling back to default_path
     pub fn referer_or(headers: &HeaderMap, default_path: &str) -> String {
+        Self::referer_or_inner(headers, default_path, false)
+    }
+
+    /// Like [`referer_or`] but strips any `page` query parameter, so bulk actions
+    /// that shrink the result set won't bounce the user onto an out-of-range page.
+    pub fn referer_without_page_or(headers: &HeaderMap, default_path: &str) -> String {
+        Self::referer_or_inner(headers, default_path, true)
+    }
+
+    fn referer_or_inner(headers: &HeaderMap, default_path: &str, drop_page: bool) -> String {
         headers
             .get(header::REFERER)
             .and_then(|v| v.to_str().ok())
@@ -160,7 +170,21 @@ impl ControlPlane {
                     return None;
                 }
                 let mut target = path.to_string();
-                if let Some(q) = u.query() {
+                if drop_page {
+                    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                    let mut any = false;
+                    for (k, v) in u.query_pairs() {
+                        if k == "page" {
+                            continue;
+                        }
+                        ser.append_pair(&k, &v);
+                        any = true;
+                    }
+                    if any {
+                        target.push('?');
+                        target.push_str(&ser.finish());
+                    }
+                } else if let Some(q) = u.query() {
                     target.push('?');
                     target.push_str(q);
                 }
@@ -173,6 +197,14 @@ impl ControlPlane {
     pub fn error_response() -> Response {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Return a 404 Not Found response (for stale/missing rows)
+    pub fn not_found_response() -> Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::empty())
             .unwrap()
     }

@@ -2008,14 +2008,52 @@ pub mod blocked_executions {
         execute_select_one(db, query).await
     }
 
-    /// Delete all blocked executions
-    pub async fn delete_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    /// Delete all blocked executions, optionally filtered by class_name/queue_name
+    pub async fn delete_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::delete().from_table(table).to_owned();
 
+        // No filters: simple bulk delete
+        if class_name.is_none() && queue_name.is_none() {
+            let query = Query::delete().from_table(table).to_owned();
+            return execute_delete(db, query).await;
+        }
+
+        // With filters: collect matching ids, then delete by id
+        let jobs_table = Alias::new(&table_config.jobs);
+        let mut select = Query::select();
+        select.column((table.clone(), Asterisk));
+        select.from(table.clone());
+        if class_name.is_some() {
+            select.inner_join(
+                jobs_table.clone(),
+                Expr::col((table.clone(), col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                select.and_where(Expr::col((jobs_table, col("class_name"))).eq(cn));
+            }
+        }
+        if let Some(qn) = queue_name {
+            select.and_where(Expr::col((table.clone(), col("queue_name"))).eq(qn));
+        }
+
+        let rows = execute_select::<quebec_blocked_executions::Model, C>(db, select).await?;
+        let ids: Vec<i64> = rows.into_iter().map(|m| m.id).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let query = Query::delete()
+            .from_table(table)
+            .and_where(Expr::col(col("id")).is_in(ids))
+            .to_owned();
         execute_delete(db, query).await
     }
 }
@@ -2101,18 +2139,43 @@ pub mod failed_executions {
         }
     }
 
-    /// Find all failed executions
+    /// Find all failed executions, optionally filtered by class_name/queue_name
     pub async fn find_all<C>(
         db: &C,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_failed_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.failed_executions);
-        let query = Query::select().column(Asterisk).from(table).to_owned();
+        let fe_table = Alias::new(&table_config.failed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
 
-        execute_select(db, query).await
+        let mut query = Query::select();
+        query.columns([
+            (fe_table.clone(), col("id")),
+            (fe_table.clone(), col("job_id")),
+            (fe_table.clone(), col("error")),
+            (fe_table.clone(), col("created_at")),
+        ]);
+        query.from(fe_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((fe_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        execute_select(db, query.to_owned()).await
     }
 
     /// Find a failed execution by job_id
