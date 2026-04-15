@@ -115,7 +115,9 @@ uv run quickstart.py
 | `create_tables` | `bool` | `False` | Create database tables (requires DDL permissions) |
 | `control_plane` | `str` | `None` | Web dashboard address, e.g. `'127.0.0.1:5006'` |
 | `spawn` | `list[str]` | `None` | Components to spawn: `['worker', 'dispatcher', 'scheduler']`. `None` = all |
-| `threads` | `int` | `1` | Number of worker threads to run jobs |
+
+Recommended: configure worker thread count in `queue.yml` via `workers.threads`.
+If you need a one-off override, `Quebec(..., worker_threads=3)` is also supported.
 
 ### Delayed Jobs
 

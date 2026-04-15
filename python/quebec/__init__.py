@@ -333,9 +333,10 @@ def _quebec_start(
 ):
     """Non-blocking start. Returns immediately after all components are started.
 
-    Worker thread count is determined by queue.yml (workers.threads) or the
-    worker_threads constructor parameter. There is a single source of truth
-    on the Rust side; Python reads it via self.worker_threads.
+    Worker thread count is normally configured via queue.yml
+    (workers.threads). The worker_threads constructor parameter can be used
+    as an explicit override. There is a single source of truth on the Rust
+    side; Python reads it via self.worker_threads.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -357,7 +358,7 @@ def _quebec_start(
     if control_plane:
         self.start_control_plane(control_plane)
 
-    # Thread count comes from Rust (queue.yml / constructor parameter)
+    # Thread count comes from Rust (typically queue.yml, optionally constructor override)
     threads = self.worker_threads
 
     # Spawn components based on spawn parameter
@@ -439,8 +440,9 @@ def _quebec_run(
     """Blocking run. Starts all components and waits until shutdown.
 
     This is equivalent to calling start() followed by wait().
-    Worker thread count is determined by queue.yml (workers.threads)
-    or the worker_threads constructor parameter.
+    Worker thread count is normally configured via queue.yml
+    (workers.threads). The worker_threads constructor parameter can be used
+    as an explicit override.
 
     Args:
         create_tables: Whether to create database tables (default False).
