@@ -10,9 +10,7 @@ use url::Url;
 
 use crate::query_builder;
 
-#[cfg(debug_assertions)]
-use super::templates;
-use super::ControlPlane;
+use super::{templates, ControlPlane};
 
 /// Clean SQL string by removing extra whitespace and joining lines
 pub fn clean_sql(sql: &str) -> String {
@@ -317,26 +315,6 @@ impl ControlPlane {
         template_name: &str,
         context: &mut Context,
     ) -> Result<String, (StatusCode, String)> {
-        // In debug compilation mode, reload templates
-        #[cfg(debug_assertions)]
-        {
-            debug!("Debug mode detected, reloading templates");
-            match tera::Tera::new(&self.template_path) {
-                Ok(new_tera) => {
-                    // Successfully loaded new templates, replace existing Tera instance
-                    match self.tera.write() {
-                        Ok(mut tera) => {
-                            *tera = new_tera;
-                            tera.autoescape_on(vec!["html"]);
-                            debug!("Templates reloaded successfully");
-                        }
-                        Err(e) => error!("Failed to acquire write lock: {}", e),
-                    }
-                }
-                Err(e) => error!("Error reloading templates: {}", e),
-            }
-        }
-
         // Add database connection information
         let _db = self
             .ctx
@@ -451,15 +429,25 @@ impl ControlPlane {
                 error!("Detailed error: {}", error_detail);
 
                 // Output source template content
-                let template_path = format!("src/templates/{}", template_name);
-                match std::fs::read_to_string(&template_path) {
-                    Ok(content) => {
-                        info!(
-                            "Template content preview (first 100 chars): {}",
-                            content.chars().take(100).collect::<String>()
-                        );
+                if let Some(template_path) = templates::template_file_path(template_name) {
+                    match std::fs::read_to_string(&template_path) {
+                        Ok(content) => {
+                            info!(
+                                "Template content preview (first 100 chars): {}",
+                                content.chars().take(100).collect::<String>()
+                            );
+                        }
+                        Err(e) => error!(
+                            "Could not read template file {}: {}",
+                            template_path.display(),
+                            e
+                        ),
                     }
-                    Err(e) => error!("Could not read template file {}: {}", template_path, e),
+                } else {
+                    debug!(
+                        "No filesystem template path available for {}, skipping source preview",
+                        template_name
+                    );
                 }
 
                 Err((
