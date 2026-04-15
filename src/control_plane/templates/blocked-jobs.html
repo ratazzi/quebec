@@ -41,8 +41,8 @@
   <div class="flex-grow"></div>
 
   {% set filter_args = "" %}
-  {% if filter_class_name %}{% set filter_args = filter_args ~ "class_name=" ~ filter_class_name | urlencode %}{% endif %}
-  {% if filter_queue_name %}{% if filter_args %}{% set filter_args = filter_args ~ "&" %}{% endif %}{% set filter_args = filter_args ~ "queue_name=" ~ filter_queue_name | urlencode %}{% endif %}
+  {% if filter_class_name %}{% set encoded_cn = filter_class_name | urlencode %}{% set filter_args = filter_args ~ "class_name=" ~ encoded_cn %}{% endif %}
+  {% if filter_queue_name %}{% if filter_args %}{% set filter_args = filter_args ~ "&" %}{% endif %}{% set encoded_qn = filter_queue_name | urlencode %}{% set filter_args = filter_args ~ "queue_name=" ~ encoded_qn %}{% endif %}
   {% set filter_qs = "" %}
   {% if filter_args %}{% set filter_qs = "?" ~ filter_args %}{% endif %}
 
