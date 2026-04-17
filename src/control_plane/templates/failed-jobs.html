@@ -46,13 +46,13 @@
     {% set filter_qs = "" %}
     {% if filter_args %}{% set filter_qs = "?" ~ filter_args %}{% endif %}
 
-    <form action="{{ base_path }}/failed-jobs/all/delete{{ filter_qs }}" method="post" data-turbo-confirm="{% if filter_class_name or filter_queue_name %}Discard all filtered failed jobs?{% else %}Discard all failed jobs?{% endif %}">
+    <form action="{{ base_path }}/failed-jobs/all/delete{{ filter_qs }}" method="post" data-turbo-frame="_top" data-turbo-confirm="{% if filter_class_name or filter_queue_name %}Discard all filtered failed jobs?{% else %}Discard all failed jobs?{% endif %}">
       <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5 mr-2">
         {% if filter_class_name or filter_queue_name %}Discard filtered{% else %}Discard all{% endif %}
       </button>
     </form>
 
-    <form action="{{ base_path }}/failed-jobs/all/retry{{ filter_qs }}" method="post">
+    <form action="{{ base_path }}/failed-jobs/all/retry{{ filter_qs }}" method="post" data-turbo-frame="_top">
       <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
         {% if filter_class_name or filter_queue_name %}Retry filtered{% else %}Retry all{% endif %}
       </button>
@@ -96,12 +96,12 @@
             <div class="text-xs text-gray-400"><span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span></div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post" class="inline">
+            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post" class="inline" data-turbo-frame="_top">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1 mr-2">
                 Discard
               </button>
             </form>
-            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
+            <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline" data-turbo-frame="_top">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
                 Retry
               </button>

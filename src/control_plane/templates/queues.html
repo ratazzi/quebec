@@ -133,12 +133,10 @@ async function toggleQueueStatus(button) {
     const basePath = document.querySelector('meta[name="base-path"]')?.content || '';
     const response = await fetch(`${basePath}/queues/${queueName}/${action}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      redirect: 'manual',
     });
 
-    if (!response.ok) {
+    if (!response.ok && response.type !== 'opaqueredirect') {
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 

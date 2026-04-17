@@ -46,7 +46,7 @@
   {% set filter_qs = "" %}
   {% if filter_args %}{% set filter_qs = "?" ~ filter_args %}{% endif %}
 
-  <form action="{{ base_path }}/blocked-jobs/all/unblock{{ filter_qs }}" method="post">
+  <form action="{{ base_path }}/blocked-jobs/all/unblock{{ filter_qs }}" method="post" data-turbo-frame="_top">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
       {% if filter_class_name or filter_queue_name %}Unblock filtered{% else %}Unblock all{% endif %}
     </button>
@@ -96,12 +96,12 @@
             <div class="text-sm text-gray-900">{{ job.waiting_time }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/unblock" method="post" class="inline">
+            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/unblock" method="post" class="inline" data-turbo-frame="_top">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1 mr-2">
                 Unblock
               </button>
             </form>
-            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/cancel" method="post" class="inline">
+            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/cancel" method="post" class="inline" data-turbo-frame="_top">
               <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
                 Cancel
               </button>
