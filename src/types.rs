@@ -1430,20 +1430,18 @@ impl PyQuebec {
             .getattr("partial")?
             .call((handler_func,), Some(&kwargs))?;
 
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGINT")?, wrapped_handler.clone()),
-        )?;
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGTERM")?, wrapped_handler.clone()),
-        )?;
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGQUIT")?, wrapped_handler.clone()),
-        )?;
+        let mut registered: Vec<&str> = Vec::with_capacity(3);
+        for name in ["SIGINT", "SIGTERM", "SIGQUIT"] {
+            if !signal.hasattr(name)? {
+                // SIGQUIT (and in theory others) is missing on Windows; skip
+                // rather than aborting startup.
+                continue;
+            }
+            signal.call_method1("signal", (signal.getattr(name)?, wrapped_handler.clone()))?;
+            registered.push(name);
+        }
 
-        info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
+        info!("Signal handlers registered: {}", registered.join(", "));
         Ok(wrapped_handler.into_pyobject(py)?.into())
     }
 
