@@ -31,24 +31,24 @@
     </div>
     <div class="flex mt-4 md:mt-0 space-x-3">
       {% if job.status == 'failed' %}
-        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post">
+        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/delete" method="post" data-turbo-frame="_top">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
             Discard
           </button>
         </form>
-        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post">
+        <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" data-turbo-frame="_top">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
             Retry
           </button>
         </form>
       {% elif job.status == 'scheduled' %}
-        <form action="{{ base_path }}/scheduled-jobs/{{ job.execution_id }}/cancel" method="post">
+        <form action="{{ base_path }}/scheduled-jobs/{{ job.execution_id }}/cancel" method="post" data-turbo-frame="_top">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-4 py-1.5">
             Cancel
           </button>
         </form>
       {% elif job.status == 'blocked' %}
-        <form action="{{ base_path }}/blocked-jobs/{{ job.execution_id }}/unblock" method="post">
+        <form action="{{ base_path }}/blocked-jobs/{{ job.execution_id }}/unblock" method="post" data-turbo-frame="_top">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
             Unblock
           </button>
