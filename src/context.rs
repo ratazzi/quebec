@@ -11,7 +11,8 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use url::Url;
+
+use crate::database_url::DatabaseUrl;
 
 use tracing::{debug, error, trace, warn};
 
@@ -274,7 +275,7 @@ impl DiscardStrategy {
 #[derive(Debug)]
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
-    pub dsn: Url,
+    pub dsn: DatabaseUrl,
     pub db: Option<Arc<DatabaseConnection>>, // Use shared connection for SQLite
     pub connect_options: ConnectOptions,     // For creating new connections
     pub name: String, // Application name for NOTIFY channel (default: "quebec")
@@ -327,7 +328,7 @@ pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
 impl AppContext {
     #[cfg(feature = "python")]
     pub fn new(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
         options: Option<HashMap<String, Py<PyAny>>>,
@@ -523,7 +524,7 @@ impl AppContext {
 
     #[cfg(not(feature = "python"))]
     pub fn new(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
@@ -533,7 +534,7 @@ impl AppContext {
     }
 
     fn new_inner(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
@@ -614,7 +615,7 @@ impl AppContext {
 
     /// Check if the database is PostgreSQL
     pub fn is_postgres(&self) -> bool {
-        self.dsn.scheme().starts_with("postgres")
+        self.dsn.is_postgres()
     }
 
     /// Get a runnable by class name
