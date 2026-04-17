@@ -4,6 +4,7 @@ pub mod continuation;
 mod control_plane;
 #[cfg(feature = "python")]
 mod core;
+pub mod database_url;
 mod dispatcher;
 pub mod entities;
 mod error;
