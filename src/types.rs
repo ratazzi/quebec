@@ -16,8 +16,6 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
-use url::Url;
-
 /// Extract a value from kwargs, falling back to an environment variable, then to a default.
 /// Priority: kwargs > env var > default
 fn extract_kwarg_or_env<T>(
@@ -265,16 +263,10 @@ impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let redacted = Url::parse(&url)
-            .ok()
-            .map(|mut u| {
-                if u.password().is_some() {
-                    let _ = u.set_password(Some("***"));
-                }
-                u.to_string()
-            })
-            .unwrap_or_else(|| "<invalid url>".to_string());
-        info!("PyQuebec<{}>", redacted);
+        let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
+        })?;
+        info!("PyQuebec<{}>", dsn);
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -289,11 +281,8 @@ impl PyQuebec {
                 })?,
         );
 
-        let dsn = Url::parse(&url).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
-        })?;
-        let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
-        let is_sqlite = url.contains("sqlite");
+        let mut opt: ConnectOptions = ConnectOptions::new(dsn.as_connect_str().to_string());
+        let is_sqlite = dsn.is_sqlite();
         let min_conns: u32 = extract_kwarg_or_env(
             kwargs,
             "db_min_connections",

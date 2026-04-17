@@ -322,30 +322,11 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let dsn = self.ctx.dsn.to_string();
-        let (db_type, connection_info) = if let Ok(mut parsed) = Url::parse(&dsn) {
-            let db_type = match parsed.scheme() {
-                s if s.starts_with("postgres") => "PostgreSQL",
-                s if s.starts_with("mysql") => "MySQL",
-                s if s.starts_with("sqlite") => "SQLite",
-                _ => "Unknown",
-            };
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("***"));
-            }
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            let display = parsed.to_string();
-            (db_type, display)
-        } else {
-            ("Unknown", "<invalid url>".to_string())
-        };
-
         let db_info = serde_json::json!({
-            "database_type": db_type,
+            "database_type": self.ctx.dsn.kind().as_str(),
             "connection_type": "Pool",
             "status": "Connected",
-            "dsn": connection_info
+            "dsn": self.ctx.dsn.masked(),
         });
         context.insert("db_info", &db_info);
         context.insert("version", env!("CARGO_PKG_VERSION"));
