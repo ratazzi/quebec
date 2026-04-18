@@ -108,6 +108,40 @@ curl -O https://raw.githubusercontent.com/ratazzi/quebec/refs/heads/master/quick
 uv run quickstart.py
 ```
 
+### Auto-Discovering Jobs
+
+If your jobs are organized in a package (e.g. `app.jobs.*`), call
+`Quebec.discover_jobs()` instead of decorating each class with
+`@qc.register_job` or calling `qc.register_job_class(...)` one by one:
+
+```python
+# app/jobs/cleanup.py
+class CleanupJob(quebec.BaseClass):
+    def perform(self, *args, **kwargs): ...
+
+# main.py
+qc = quebec.Quebec(dsn)
+qc.discover_jobs("app.jobs", "worker.tasks")   # recursively scans each
+qc.run()
+```
+
+`discover_jobs` takes one or more dotted package paths as positional
+arguments (varargs) — no need to wrap a single package in a list.
+
+`discover_jobs(*packages, recursive=True, on_error="raise")`:
+
+- Registers every `BaseClass` subclass whose `__module__` falls under one of
+  the given packages. Classes imported from elsewhere (e.g. `from
+  some.lib import JobMixin`) are ignored.
+- Raises `ValueError` if two discovered classes share the same
+  `__qualname__`, since Quebec's worker registry is keyed by qualname and
+  the later registration would otherwise silently replace the earlier one.
+- `on_error="raise"` (default) propagates submodule `ImportError`. Pass
+  `on_error="warn"` to emit a `RuntimeWarning` and keep scanning —
+  useful when a package contains optional-integration modules that may
+  fail to import in some environments. The top-level package is always
+  imported strictly.
+
 ### `qc.run()` Options
 
 | Parameter | Type | Default | Description |

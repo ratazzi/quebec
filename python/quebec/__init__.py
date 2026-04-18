@@ -554,8 +554,134 @@ def _quebec_asgi_app(self):
     return ControlPlaneASGI(self)
 
 
+def _quebec_discover_jobs(
+    self,
+    *packages: str,
+    recursive: bool = True,
+    on_error: str = "raise",
+) -> List[Type]:
+    """Import the given packages and register every ``BaseClass`` subclass found.
+
+    This is a thin wrapper around ``importlib`` + ``pkgutil`` that replaces the
+    hand-rolled job-discovery loops most projects end up writing (scan a
+    ``jobs`` package, ``issubclass(..., BaseClass)``, call ``register_job``).
+
+    A class is only registered once, even if it is re-exported from multiple
+    modules. Classes whose ``__module__`` does not fall under one of the given
+    packages are ignored, so ``from some.lib import JobMixin`` will not leak
+    unrelated classes into the worker registry.
+
+    The worker registry is currently keyed by each class's ``__qualname__``, so
+    two jobs sharing a qualified name (e.g. ``foo.jobs.CleanupJob`` and
+    ``bar.jobs.CleanupJob``) would silently clobber each other. ``discover_jobs``
+    raises ``ValueError`` on such collisions rather than letting them through.
+
+    Args:
+        *packages: Dotted package paths to scan (e.g. ``"app.services.jobs"``).
+        recursive: When ``True`` (default), walk nested subpackages as well.
+        on_error: How to handle import failures in submodules. ``"raise"``
+            (default) re-raises the first ``ImportError``; ``"warn"`` emits a
+            ``RuntimeWarning`` and continues with the remaining modules. The
+            top-level package is always imported strictly — if the root fails
+            to import, there is nothing to discover.
+
+    Returns:
+        The list of ``BaseClass`` subclasses that were registered, in discovery
+        order.
+
+    Raises:
+        ValueError: If no packages are given, if ``on_error`` is not one of the
+            supported values, or if two discovered classes collide on
+            ``__qualname__``.
+        ImportError: Propagated from submodule imports when ``on_error="raise"``.
+
+    Example:
+        qc = quebec.Quebec(dsn)
+        qc.discover_jobs("app.services.jobs")
+        qc.run()
+    """
+    import importlib
+    import pkgutil
+    import warnings
+
+    if not packages:
+        raise ValueError("discover_jobs() requires at least one package name")
+    if on_error not in ("raise", "warn"):
+        raise ValueError(
+            f"discover_jobs() on_error must be 'raise' or 'warn', got {on_error!r}"
+        )
+
+    registered: List[Type] = []
+    seen: set = set()
+    by_qualname: dict = {}
+
+    def _scan_module(module) -> None:
+        for obj in module.__dict__.values():
+            if not isinstance(obj, type):
+                continue
+            if not issubclass(obj, BaseClass) or obj is BaseClass:
+                continue
+            if obj in seen:
+                continue
+            if not any(
+                obj.__module__ == pkg or obj.__module__.startswith(pkg + ".")
+                for pkg in packages
+            ):
+                continue
+            existing = by_qualname.get(obj.__qualname__)
+            if existing is not None and existing is not obj:
+                raise ValueError(
+                    f"discover_jobs() found two classes sharing qualname "
+                    f"{obj.__qualname__!r}: {existing.__module__}.{existing.__qualname__} "
+                    f"and {obj.__module__}.{obj.__qualname__}. Quebec's worker "
+                    "registry is keyed by qualname, so the later registration "
+                    "would silently replace the earlier one. Rename one of the "
+                    "classes or skip this package."
+                )
+            seen.add(obj)
+            by_qualname[obj.__qualname__] = obj
+            self.register_job(obj)
+            registered.append(obj)
+
+    def _safe_import(module_name: str):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as exc:
+            if on_error == "raise":
+                raise
+            warnings.warn(
+                f"discover_jobs: skipping {module_name!r} (import failed: {exc})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+
+    for pkg_name in packages:
+        # Top-level package must import cleanly — we cannot walk a missing package.
+        package = importlib.import_module(pkg_name)
+        _scan_module(package)
+
+        pkg_path = getattr(package, "__path__", None)
+        if pkg_path is None:
+            # Plain module, not a package — nothing else to walk.
+            continue
+
+        walker = pkgutil.walk_packages if recursive else pkgutil.iter_modules
+        for info in walker(pkg_path, prefix=f"{pkg_name}."):
+            module_name = info.name
+            if any(part.startswith("_") for part in module_name.split(".")):
+                continue
+            submodule = _safe_import(module_name)
+            if submodule is None:
+                continue
+            _scan_module(submodule)
+
+    return registered
+
+
 # Attach methods to Quebec class
 Quebec.start = _quebec_start
 Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
 Quebec.asgi_app = _quebec_asgi_app
+Quebec.discover_jobs = _quebec_discover_jobs
