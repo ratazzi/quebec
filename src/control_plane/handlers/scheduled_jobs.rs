@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait, Value};
 use std::sync::Arc;
@@ -244,14 +244,12 @@ impl ControlPlane {
     pub async fn cancel_scheduled_job(
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
-            Err(_) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/scheduled-jobs".to_string(),
-                )
+            Err(e) => {
+                error!("Failed to obtain db for scheduled job {} cancel: {}", id, e);
+                return Self::error_response();
             }
         };
         let db = db.as_ref();
@@ -290,13 +288,10 @@ impl ControlPlane {
             .await;
 
         match txn_result {
-            Ok(_) => (StatusCode::SEE_OTHER, "/scheduled-jobs".to_string()),
+            Ok(_) => Redirect::to("/scheduled-jobs").into_response(),
             Err(e) => {
                 error!("Failed to cancel scheduled job {}: {}", id, e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/scheduled-jobs".to_string(),
-                )
+                Self::error_response()
             }
         }
     }
