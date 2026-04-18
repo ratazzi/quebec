@@ -965,7 +965,20 @@ impl PyQuebec {
     }
 
     fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
-        // Register with worker (this will store in AppContext.runnables)
+        if !job_class.bind(py).is_instance_of::<PyType>() {
+            return Err(PyTypeError::new_err(
+                "Expected a class, but got an instance",
+            ));
+        }
+
+        let instance = job_class.bind(py).call0()?;
+        if !instance.is_instance_of::<ActiveJob>() {
+            return Err(PyTypeError::new_err(
+                "Job class must be a subclass of ActiveJob",
+            ));
+        }
+
+        job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?)?;
         self.worker.register_job_class(py, job_class)?;
         Ok(())
     }
@@ -1468,26 +1481,8 @@ impl PyQuebec {
 
     // implment a decorator to register job class
     fn register_job(&self, py: Python, job_class: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        // Check if the passed object is a class
-        if !job_class.bind(py).is_instance_of::<PyType>() {
-            return Err(PyTypeError::new_err(
-                "Expected a class, but got an instance",
-            ));
-        }
-
-        let binding = job_class.clone();
-        let bound = binding.bind(py);
-
-        let instance = bound.call0()?;
-        if !instance.is_instance_of::<ActiveJob>() {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Job class must be a subclass of ActiveJob",
-            ));
-        }
-
-        let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
-        let _ = self.worker.register_job_class(py, job_class);
+        self.register_job_class(py, job_class)?;
         Ok(dup)
     }
 
