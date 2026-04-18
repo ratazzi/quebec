@@ -212,6 +212,47 @@ class ReportJob(quebec.BaseClass):
 
 The actual concurrency key is `"ClassName/key"` (e.g. `"ReportJob/123"`), so different job classes never conflict. When the limit is reached, new jobs are blocked until a slot becomes available. The `concurrency_duration` acts as a safety TTL — the semaphore is released automatically if a worker crashes.
 
+### TLS Configuration (PostgreSQL)
+
+Quebec links `sqlx` against `rustls` + `webpki-roots`. Public CAs (AWS RDS,
+Neon, Google Cloud SQL, Supabase, etc.) are trusted out of the box — no OS
+trust store is consulted.
+
+Pass libpq-style SSL options as `Quebec(...)` kwargs, as DSN query params, or
+via `QUEBEC_SSL*` environment variables:
+
+```python
+qc = quebec.Quebec(
+    "postgresql://user:pass@host:5432/db",
+    sslmode="verify-full",             # or QUEBEC_SSLMODE
+    sslrootcert="/etc/ssl/certs/ca.pem",  # internal CAs only
+)
+```
+
+Priority is **kwargs > env > DSN query**. Passing any `ssl*` kwarg/env against
+a non-postgres URL raises `ValueError`.
+
+| `sslmode`     | Transport              | Certificate verification | Hostname verification |
+|---------------|------------------------|--------------------------|-----------------------|
+| `disable`     | plaintext              | —                        | —                     |
+| `prefer`      | TLS if offered, else plaintext | —                | —                     |
+| `require`     | TLS (fails if unsupported) | — (accepts any cert)  | —                     |
+| `verify-ca`   | TLS                    | CA-signed                | —                     |
+| `verify-full` | TLS                    | CA-signed                | hostname matches CN/SAN |
+
+For public CAs, `verify-full` works zero-config. Use `sslrootcert` for
+internal/self-signed CAs. `sslcert` + `sslkey` enable client certificate
+(mTLS) auth.
+
+> `sslmode=allow` is **rejected** with a `ValueError`. Upstream `sqlx-postgres`
+> 0.8 treats `allow` identically to `disable` (plaintext, marked `FIXME` in
+> the driver); to avoid a silent downgrade, Quebec refuses it. Use `prefer`
+> for opportunistic TLS, or `require`/`verify-*` to enforce it.
+
+> Note: some managed Postgres services (e.g. Neon) terminate TLS at a proxy
+> layer. In those cases `pg_stat_ssl.ssl` may report `false` because the
+> backend sees plaintext from the proxy — not the client.
+
 ## Lifecycle Hooks
 
 Quebec provides several lifecycle hooks that you can use to execute code at different stages of the application lifecycle:

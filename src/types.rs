@@ -51,6 +51,32 @@ where
     default
 }
 
+/// Like `extract_kwarg_or_env` but returns `None` when neither kwargs nor env
+/// supplies a value. Use for optional config where an absent value must be
+/// distinguished from a typed default.
+fn extract_kwarg_or_env_opt<T>(
+    kwargs: Option<&Bound<'_, PyDict>>,
+    key: &str,
+    env_key: &str,
+) -> Option<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py> + FromStr,
+{
+    if let Some(py_val) = kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
+        match py_val.extract::<T>() {
+            Ok(val) => return Some(val),
+            Err(_) => warn!("Config '{}': type mismatch, falling back to env", key),
+        }
+    }
+    if let Ok(raw) = std::env::var(env_key) {
+        match raw.parse::<T>() {
+            Ok(parsed) => return Some(parsed),
+            Err(_) => warn!("Env '{}': failed to parse '{}', ignoring", env_key, raw),
+        }
+    }
+    None
+}
+
 use crate::control_plane::{ControlPlane, ControlPlaneExt};
 
 use crate::context::*;
@@ -266,6 +292,56 @@ impl PyQuebec {
         let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
         })?;
+
+        let sslmode: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslmode", "QUEBEC_SSLMODE");
+        let sslrootcert: Option<String> =
+            extract_kwarg_or_env_opt(kwargs, "sslrootcert", "QUEBEC_SSLROOTCERT");
+        let sslcert: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslcert", "QUEBEC_SSLCERT");
+        let sslkey: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslkey", "QUEBEC_SSLKEY");
+        let dsn = if sslmode.is_some()
+            || sslrootcert.is_some()
+            || sslcert.is_some()
+            || sslkey.is_some()
+        {
+            if !dsn.is_postgres() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "SSL parameters (sslmode/sslrootcert/sslcert/sslkey) require a postgres:// URL",
+                ));
+            }
+            dsn.with_ssl_params(
+                sslmode.as_deref(),
+                sslrootcert.as_deref(),
+                sslcert.as_deref(),
+                sslkey.as_deref(),
+            )
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to apply SSL params: {}",
+                    e
+                ))
+            })?
+        } else {
+            dsn
+        };
+
+        // sqlx-postgres 0.8 treats `sslmode=allow` identically to `disable`
+        // (plaintext, marked FIXME upstream). Reject it from any source
+        // (kwargs, env, or DSN query string) so callers don't silently get
+        // cleartext while expecting opportunistic TLS. sqlx also accepts
+        // `ssl-mode` as an alias of `sslmode`, so both spellings are scanned.
+        if dsn.is_postgres() {
+            let aliases = crate::database_url::ssl_param_aliases("sslmode");
+            let offender = dsn
+                .url()
+                .query_pairs()
+                .find(|(k, v)| aliases.contains(&k.as_ref()) && v.eq_ignore_ascii_case("allow"));
+            if offender.is_some() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "sslmode=allow is not supported: sqlx-postgres treats it as disable (plaintext). Use 'prefer' for opportunistic TLS or 'require'/'verify-*' to enforce it.",
+                ));
+            }
+        }
+
         info!("PyQuebec<{}>", dsn);
 
         let rt = Arc::new(
