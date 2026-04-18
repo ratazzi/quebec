@@ -2074,27 +2074,41 @@ impl ActiveJob {
         Ok(self.logger.clone())
     }
 
+    /// Enqueue the job.
+    ///
+    /// The Quebec instance may be passed explicitly as the first argument
+    /// (legacy style) or omitted entirely when the class has been registered
+    /// via ``@qc.register_job``, ``qc.register_job_class`` or
+    /// ``qc.discover_jobs`` — all three paths bind the instance onto
+    /// ``cls.quebec``, so ``MyJob.perform_later(arg1, arg2)`` works.
     #[classmethod]
-    #[pyo3(signature = ( quebec, *args, **kwargs))]
-    fn perform_later(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        quebec: &PyQuebec,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
+    #[pyo3(signature = (quebec=None, *args, **kwargs))]
+    fn perform_later<'py>(
+        cls: &Bound<'py, PyType>,
+        py: Python<'py>,
+        quebec: Option<Bound<'py, PyAny>>,
+        args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<ActiveJob> {
-        quebec.perform_later(py, cls, args, kwargs)
-    }
-
-    #[classmethod]
-    #[pyo3(signature = (*args, **kwargs))]
-    fn perform_later1(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<ActiveJob> {
-        let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-        quebec.perform_later(py, cls, args, kwargs)
+        match quebec {
+            Some(first) if first.is_instance_of::<PyQuebec>() => {
+                let qc = first.extract::<PyQuebec>()?;
+                qc.perform_later(py, cls, args, kwargs)
+            }
+            Some(first) => {
+                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(args.len() + 1);
+                items.push(first);
+                for item in args.iter() {
+                    items.push(item);
+                }
+                let combined = PyTuple::new(py, items)?;
+                let qc = cls.getattr("quebec")?.extract::<PyQuebec>()?;
+                qc.perform_later(py, cls, &combined, kwargs)
+            }
+            None => {
+                let qc = cls.getattr("quebec")?.extract::<PyQuebec>()?;
+                qc.perform_later(py, cls, args, kwargs)
+            }
+        }
     }
 }

@@ -191,8 +191,18 @@ class JobBuilder:
         """Create a JobDescriptor with configured options (for bulk enqueue)."""
         return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
 
-    def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
-        """Enqueue the job with configured options."""
+    def perform_later(self, qc=None, *args, **kwargs) -> "ActiveJob":
+        """Enqueue the job with configured options.
+
+        ``qc`` may be passed explicitly (legacy) or omitted when the job
+        class has been registered with a Quebec instance (all three
+        registration paths bind ``cls.quebec``). If the first positional
+        argument is not a ``Quebec`` instance it is treated as job data.
+        """
+        if qc is not None and not isinstance(qc, Quebec):
+            args = (qc, *args)
+            qc = None
+
         scheduled_at = self._calculate_scheduled_at()
 
         # Pass internal options via kwargs (will be filtered out before serialization)
@@ -205,7 +215,8 @@ class JobBuilder:
         if "priority" in self.options:
             kwargs["_priority"] = self.options["priority"]
 
-        # Call the original perform_later
+        if qc is None:
+            return self.job_class.perform_later(*args, **kwargs)
         return self.job_class.perform_later(qc, *args, **kwargs)
 
 
