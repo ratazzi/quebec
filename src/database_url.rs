@@ -76,6 +76,62 @@ impl DatabaseUrl {
         matches!(self.kind, DatabaseKind::Mysql)
     }
 
+    /// Upsert libpq-style SSL query parameters into the DSN.
+    ///
+    /// Each provided value replaces an existing query param of the same name
+    /// *and any accepted alias*; `None` leaves the existing value (if any)
+    /// untouched. Param order is preserved for non-SSL pairs. sqlx-postgres
+    /// accepts both canonical (`sslmode`, `sslrootcert`, `sslcert`, `sslkey`)
+    /// and aliased (`ssl-mode`, `ssl-root-cert`, `ssl-ca`, `ssl-cert`,
+    /// `ssl-key`) spellings — all are scrubbed when the matching override is
+    /// supplied so the caller's value is the only effective one.
+    pub fn with_ssl_params(
+        &self,
+        sslmode: Option<&str>,
+        sslrootcert: Option<&str>,
+        sslcert: Option<&str>,
+        sslkey: Option<&str>,
+    ) -> Result<Self> {
+        let overrides: &[(&str, Option<&str>)] = &[
+            ("sslmode", sslmode),
+            ("sslrootcert", sslrootcert),
+            ("sslcert", sslcert),
+            ("sslkey", sslkey),
+        ];
+        if overrides.iter().all(|(_, v)| v.is_none()) {
+            return Ok(self.clone());
+        }
+
+        let existing: Vec<(String, String)> = self
+            .parsed
+            .query_pairs()
+            .filter(|(k, _)| {
+                !overrides.iter().any(|(name, val)| {
+                    val.is_some() && ssl_param_aliases(name).iter().any(|a| *a == k.as_ref())
+                })
+            })
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        let mut u = self.parsed.clone();
+        {
+            let mut qp = u.query_pairs_mut();
+            qp.clear();
+            for (k, v) in &existing {
+                qp.append_pair(k, v);
+            }
+            for (name, val) in overrides {
+                if let Some(v) = val {
+                    qp.append_pair(name, v);
+                }
+            }
+        }
+        if u.query().is_some_and(|q| q.is_empty()) {
+            u.set_query(None);
+        }
+        Self::parse(u.as_str())
+    }
+
     /// Password redacted, query/fragment stripped.
     pub fn masked(&self) -> String {
         let mut u = self.parsed.clone();
@@ -99,6 +155,18 @@ impl std::str::FromStr for DatabaseUrl {
 
     fn from_str(s: &str) -> Result<Self> {
         Self::parse(s)
+    }
+}
+
+/// Aliases sqlx-postgres accepts for a given canonical libpq SSL query param.
+/// See `sqlx-postgres` `options/parse.rs` `parse_from_url`.
+pub fn ssl_param_aliases(canonical: &str) -> &'static [&'static str] {
+    match canonical {
+        "sslmode" => &["sslmode", "ssl-mode"],
+        "sslrootcert" => &["sslrootcert", "ssl-root-cert", "ssl-ca"],
+        "sslcert" => &["sslcert", "ssl-cert"],
+        "sslkey" => &["sslkey", "ssl-key"],
+        _ => &[],
     }
 }
 
@@ -220,5 +288,87 @@ mod tests {
         let url = DatabaseUrl::parse("postgres://alice:secret@h:5432/db?sslmode=require").unwrap();
         assert_eq!(url.masked(), "postgres://alice:***@h:5432/db");
         assert_eq!(url.to_string(), "postgres://alice:***@h:5432/db");
+    }
+
+    #[test]
+    fn ssl_params_all_none_returns_clone() {
+        let url = DatabaseUrl::parse("postgres://h/db?application_name=x").unwrap();
+        let out = url.with_ssl_params(None, None, None, None).unwrap();
+        assert_eq!(out.as_connect_str(), "postgres://h/db?application_name=x");
+    }
+
+    #[test]
+    fn ssl_params_inserts_into_empty_query() {
+        let url = DatabaseUrl::parse("postgres://h/db").unwrap();
+        let out = url
+            .with_ssl_params(Some("require"), None, None, None)
+            .unwrap();
+        assert_eq!(out.as_connect_str(), "postgres://h/db?sslmode=require");
+    }
+
+    #[test]
+    fn ssl_params_override_existing_sslmode() {
+        let url = DatabaseUrl::parse("postgres://h/db?sslmode=disable&application_name=x").unwrap();
+        let out = url
+            .with_ssl_params(Some("require"), None, None, None)
+            .unwrap();
+        // Existing non-ssl params preserved; sslmode replaced.
+        assert!(out.as_connect_str().contains("application_name=x"));
+        assert!(out.as_connect_str().contains("sslmode=require"));
+        assert!(!out.as_connect_str().contains("sslmode=disable"));
+    }
+
+    #[test]
+    fn ssl_params_leaves_existing_when_override_is_none() {
+        let url = DatabaseUrl::parse("postgres://h/db?sslmode=require").unwrap();
+        let out = url
+            .with_ssl_params(None, Some("/etc/ca.pem"), None, None)
+            .unwrap();
+        assert!(out.as_connect_str().contains("sslmode=require"));
+        assert!(out.as_connect_str().contains("sslrootcert=%2Fetc%2Fca.pem"));
+    }
+
+    #[test]
+    fn ssl_params_override_strips_sqlx_aliases() {
+        // sqlx accepts `ssl-mode` as alias; overriding `sslmode` should also
+        // strip the alias form so the caller's value is the only effective one.
+        let url = DatabaseUrl::parse("postgres://h/db?ssl-mode=allow").unwrap();
+        let out = url
+            .with_ssl_params(Some("require"), None, None, None)
+            .unwrap();
+        assert!(out.as_connect_str().contains("sslmode=require"));
+        assert!(!out.as_connect_str().contains("ssl-mode"));
+        assert!(!out.as_connect_str().contains("allow"));
+    }
+
+    #[test]
+    fn ssl_params_override_strips_sqlx_rootcert_aliases() {
+        // sqlx accepts `ssl-ca` and `ssl-root-cert` as aliases of sslrootcert.
+        let url =
+            DatabaseUrl::parse("postgres://h/db?ssl-ca=/old/ca.pem&ssl-root-cert=/older/ca.pem")
+                .unwrap();
+        let out = url
+            .with_ssl_params(None, Some("/new/ca.pem"), None, None)
+            .unwrap();
+        assert!(out.as_connect_str().contains("sslrootcert=%2Fnew%2Fca.pem"));
+        assert!(!out.as_connect_str().contains("ssl-ca"));
+        assert!(!out.as_connect_str().contains("ssl-root-cert"));
+    }
+
+    #[test]
+    fn ssl_params_percent_encodes_paths() {
+        let url = DatabaseUrl::parse("postgres://h/db").unwrap();
+        let out = url
+            .with_ssl_params(
+                Some("verify-full"),
+                Some("/path/with space/ca.pem"),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(out.as_connect_str().contains("sslmode=verify-full"));
+        assert!(out
+            .as_connect_str()
+            .contains("sslrootcert=%2Fpath%2Fwith+space%2Fca.pem"));
     }
 }
