@@ -6,12 +6,14 @@ import os
 import tempfile
 import uuid
 
-import maturin_import_hook
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-maturin_import_hook.install()
+if os.environ.get("QUEBEC_SKIP_IMPORT_HOOK", "0") != "1":
+    import maturin_import_hook
+
+    maturin_import_hook.install()
 
 import quebec  # noqa: E402
 
