@@ -45,7 +45,7 @@ test:
             os.environ["QUEBEC_ENV"] = "test"
 
             # Create Quebec instance with unique prefix
-            db_url = f"sqlite://{temp_db_path}?mode=rwc"
+            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 
@@ -125,7 +125,7 @@ test:
             os.environ["QUEBEC_RECURRING_SCHEDULE"] = recurring_path
             os.environ["QUEBEC_ENV"] = "test"
 
-            db_url = f"sqlite://{temp_db_path}?mode=rwc"
+            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 
@@ -209,7 +209,7 @@ test:
             os.environ["QUEBEC_RECURRING_SCHEDULE"] = recurring_path
             os.environ["QUEBEC_ENV"] = "production"
 
-            db_url = f"sqlite://{temp_db_path}?mode=rwc"
+            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 

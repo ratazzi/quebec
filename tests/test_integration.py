@@ -188,11 +188,7 @@ class TestTablePrefix:
         # We can verify by trying to query them
         from sqlalchemy import create_engine
 
-        if "sqlite://" in db_url:
-            path = db_url.replace("sqlite://", "").split("?")[0]
-            sa_url = f"sqlite:///{path}"
-        else:
-            sa_url = db_url
+        sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
 
         engine = create_engine(sa_url)
         with engine.connect() as conn:
@@ -250,11 +246,7 @@ class TestTablePrefix:
         # Verify isolation
         from sqlalchemy import create_engine
 
-        if "sqlite://" in db_url:
-            path = db_url.replace("sqlite://", "").split("?")[0]
-            sa_url = f"sqlite:///{path}"
-        else:
-            sa_url = db_url
+        sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
 
         engine = create_engine(sa_url)
         with engine.connect() as conn:

@@ -45,8 +45,8 @@ def temp_db_path():
 # Database URL fixtures
 @pytest.fixture
 def sqlite_url(temp_db_path):
-    """SQLite database URL (file-based)."""
-    return f"sqlite://{temp_db_path}?mode=rwc"
+    """SQLite database URL (file-based, SQLAlchemy 4-slash absolute form)."""
+    return f"sqlite:///{temp_db_path}?mode=rwc"
 
 
 @pytest.fixture
@@ -68,7 +68,7 @@ def db_url(request, temp_db_path):
     - TEST_MYSQL_URL=mysql://user:pass@localhost/test_db
     """
     if request.param == "sqlite":
-        return f"sqlite://{temp_db_path}?mode=rwc"
+        return f"sqlite:///{temp_db_path}?mode=rwc"
     elif request.param == "postgresql":
         url = os.environ.get("TEST_POSTGRESQL_URL")
         if not url:
@@ -109,14 +109,10 @@ def qc_with_sqlalchemy(db_url, test_prefix, temp_db_path):
     instance = quebec.Quebec(db_url, table_name_prefix=test_prefix)
     assert instance.create_tables() is True
 
-    # Create SQLAlchemy engine for test verification
-    # Convert Quebec URL format to SQLAlchemy format
-    if "sqlite://" in db_url:
-        # sqlite:///path -> sqlite:////path for SQLAlchemy
-        path = db_url.replace("sqlite://", "").split("?")[0]
-        sa_url = f"sqlite:///{path}"
-    else:
-        sa_url = db_url
+    # Create SQLAlchemy engine for test verification.
+    # db_url already uses SQLAlchemy's 4-slash absolute form; just drop
+    # any sqlx-only query params (e.g. ?mode=rwc) that SA doesn't parse.
+    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
 
     engine = create_engine(sa_url)
     Session = sessionmaker(bind=engine)
