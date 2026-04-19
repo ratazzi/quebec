@@ -154,8 +154,14 @@ class JobBuilder:
     """Builder for configuring job options before enqueueing.
 
     This allows chaining configuration like:
-        MyJob.set(wait=3600).perform_later(qc, arg1, arg2)
-        MyJob.set(queue='high', priority=10).perform_later(qc, arg1)
+        MyJob.set(wait=3600).perform_later(arg1, arg2)
+        MyJob.set(queue='high', priority=10).perform_later(arg1)
+
+    The Quebec instance is inferred from the class binding set by
+    ``@qc.register_job`` / ``qc.register_job_class`` / ``qc.discover_jobs``.
+    If the same job class is registered to more than one Quebec instance,
+    the most recent registration wins; pass the target instance explicitly
+    as the first positional argument to ``perform_later`` to disambiguate.
     """
 
     def __init__(self, job_class: Type, **options):
@@ -271,9 +277,9 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
             JobBuilder instance for chaining with perform_later
 
         Example:
-            MyJob.set(wait=3600).perform_later(qc, arg1)  # Run in 1 hour
-            MyJob.set(wait_until=tomorrow).perform_later(qc, arg1)
-            MyJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+            MyJob.set(wait=3600).perform_later(arg1)  # Run in 1 hour
+            MyJob.set(wait_until=tomorrow).perform_later(arg1)
+            MyJob.set(queue='critical', priority=1).perform_later(arg1)
         """
         options = {}
         if wait is not None:
