@@ -134,6 +134,15 @@ impl DatabaseUrl {
 
     /// Password redacted, query/fragment stripped.
     pub fn masked(&self) -> String {
+        // SQLite DSNs carry no credentials and the normalized form may contain
+        // characters (e.g. Windows drive letter `C:`) that `Url::to_string()`
+        // would silently rewrite (`sqlite://C:/data` -> `sqlite://C/data`).
+        // Slice the raw string instead so the displayed DSN round-trips.
+        if self.is_sqlite() {
+            let s = &self.raw;
+            let end = s.find(['?', '#']).unwrap_or(s.len());
+            return s[..end].to_string();
+        }
         let mut u = self.parsed.clone();
         if u.password().is_some() {
             let _ = u.set_password(Some("***"));
@@ -187,20 +196,33 @@ fn strip_driver_suffix(url: &str) -> String {
     format!("{}{}", &scheme[..plus], &url[scheme_end..])
 }
 
-/// Handle unambiguous SQLAlchemy sqlite quirks:
-///   - `sqlite:///:memory:`   → `sqlite::memory:`
-///   - `sqlite:////abs/path`  → `sqlite:///abs/path`
-/// The 3-slash `sqlite:///relative.db` form is ambiguous (SQLAlchemy: relative,
-/// sqlx: absolute) and is left untouched — sqlx semantics win.
+/// Rewrite SQLAlchemy-style sqlite URLs into the form sqlx understands.
+/// Quebec adopts SQLAlchemy semantics because the Python ecosystem overwhelmingly
+/// uses that convention:
+///   - `sqlite:///:memory:[?...]`    → `sqlite::memory:[?...]`
+///   - `sqlite:////abs/path[?...]`   → `sqlite:///abs/path[?...]`   (4-slash = absolute)
+///   - `sqlite:///relative.db[?...]` → `sqlite://relative.db[?...]` (3-slash = relative)
+///   - `sqlite://path[?...]` is already sqlx's native relative form and is left alone.
+///
+/// Windows absolute paths (e.g. `sqlite:///C:/data/app.db`, which SQLAlchemy
+/// documents with drive-letter prefix) also fall into the 3-slash branch and
+/// get rewritten to `sqlite://C:/data/app.db`. sqlx-sqlite derives the path
+/// with `trim_start_matches("sqlite://")`, so it sees `C:/data/app.db` —
+/// the correct drive-absolute path. The URL parser used downstream treats
+/// `C` as a host, but Quebec never reads `host`/`path` off sqlite DSNs;
+/// sqlx consumes the raw string.
 fn normalize_sqlite(url: &str) -> String {
     let Some(rest) = url.strip_prefix("sqlite://") else {
         return url.to_string();
     };
-    if rest == "/:memory:" {
-        return "sqlite::memory:".to_string();
+    if let Some(tail) = rest.strip_prefix("/:memory:") {
+        return format!("sqlite::memory:{}", tail);
     }
     if let Some(abs) = rest.strip_prefix("//") {
         return format!("sqlite:///{}", abs);
+    }
+    if let Some(rel) = rest.strip_prefix('/') {
+        return format!("sqlite://{}", rel);
     }
     url.to_string()
 }
@@ -229,8 +251,10 @@ mod tests {
                 .as_connect_str(),
             "mysql://u@h/db"
         );
+        // Use the 4-slash absolute form to isolate driver-suffix stripping
+        // from the 3-slash relative rewrite covered in a dedicated test.
         assert_eq!(
-            DatabaseUrl::parse("sqlite+aiosqlite:///tmp/x.db")
+            DatabaseUrl::parse("sqlite+aiosqlite:////tmp/x.db")
                 .unwrap()
                 .as_connect_str(),
             "sqlite:///tmp/x.db"
@@ -248,12 +272,78 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_sqlite_memory_with_query() {
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///:memory:?cache=shared")
+                .unwrap()
+                .as_connect_str(),
+            "sqlite::memory:?cache=shared"
+        );
+    }
+
+    #[test]
     fn normalizes_sqlite_four_slash_abs() {
         assert_eq!(
             DatabaseUrl::parse("sqlite:////var/lib/q.db")
                 .unwrap()
                 .as_connect_str(),
             "sqlite:///var/lib/q.db"
+        );
+    }
+
+    #[test]
+    fn normalizes_sqlite_three_slash_relative() {
+        // SQLAlchemy convention: `sqlite:///x.db` is a relative path. sqlx
+        // reads the 3-slash form as absolute, so rewrite to the 2-slash
+        // relative form before handing it off.
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///demo.db?mode=rwc")
+                .unwrap()
+                .as_connect_str(),
+            "sqlite://demo.db?mode=rwc"
+        );
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///var/x.db")
+                .unwrap()
+                .as_connect_str(),
+            "sqlite://var/x.db"
+        );
+    }
+
+    #[test]
+    fn masked_preserves_sqlite_drive_letter() {
+        // `url::Url::to_string` rewrites `sqlite://C:/data` to
+        // `sqlite://C/data`. `masked()` must not round-trip through that.
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///C:/data/app.db")
+                .unwrap()
+                .masked(),
+            "sqlite://C:/data/app.db"
+        );
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///demo.db?mode=rwc")
+                .unwrap()
+                .masked(),
+            "sqlite://demo.db"
+        );
+    }
+
+    #[test]
+    fn normalizes_sqlite_windows_drive_letter() {
+        // SQLAlchemy Windows absolute form: `sqlite:///C:/...`.
+        // Rewrite strips the leading slash so sqlx's `trim_start_matches`
+        // yields the literal drive-absolute path.
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///C:/data/app.db")
+                .unwrap()
+                .as_connect_str(),
+            "sqlite://C:/data/app.db"
+        );
+        assert_eq!(
+            DatabaseUrl::parse("sqlite:///D:\\logs\\q.db")
+                .unwrap()
+                .as_connect_str(),
+            "sqlite://D:\\logs\\q.db"
         );
     }
 
@@ -265,11 +355,12 @@ mod tests {
                 .as_connect_str(),
             "postgres://u:p@h/db"
         );
+        // Already in sqlx's native 2-slash relative form.
         assert_eq!(
-            DatabaseUrl::parse("sqlite:///var/x.db")
+            DatabaseUrl::parse("sqlite://demo.db")
                 .unwrap()
                 .as_connect_str(),
-            "sqlite:///var/x.db"
+            "sqlite://demo.db"
         );
     }
 
