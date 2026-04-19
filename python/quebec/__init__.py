@@ -191,17 +191,20 @@ class JobBuilder:
         """Create a JobDescriptor with configured options (for bulk enqueue)."""
         return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
 
-    def perform_later(self, qc=None, *args, **kwargs) -> "ActiveJob":
+    def perform_later(self, *args, **kwargs) -> "ActiveJob":
         """Enqueue the job with configured options.
 
-        ``qc`` may be passed explicitly (legacy) or omitted when the job
-        class has been registered with a Quebec instance (all three
-        registration paths bind ``cls.quebec``). If the first positional
-        argument is not a ``Quebec`` instance it is treated as job data.
+        The Quebec instance may be passed explicitly as the first
+        positional argument (legacy form) or omitted entirely when the
+        job class has been registered with a Quebec instance. A leading
+        argument is only consumed as the Quebec instance when it is
+        actually a ``Quebec`` object; any other value (including
+        ``None``) is treated as job payload data.
         """
-        if qc is not None and not isinstance(qc, Quebec):
-            args = (qc, *args)
-            qc = None
+        qc = None
+        if args and isinstance(args[0], Quebec):
+            qc = args[0]
+            args = args[1:]
 
         scheduled_at = self._calculate_scheduled_at()
 
@@ -216,7 +219,15 @@ class JobBuilder:
             kwargs["_priority"] = self.options["priority"]
 
         if qc is None:
-            return self.job_class.perform_later(*args, **kwargs)
+            qc = getattr(self.job_class, "quebec", None)
+            if qc is None:
+                name = self.job_class.__qualname__
+                raise TypeError(
+                    f"{name} is not registered with a Quebec instance. Use "
+                    f"@qc.register_job, qc.register_job_class({name}), or "
+                    f"qc.discover_jobs(...) — or pass the Quebec instance as "
+                    f"the first argument to perform_later."
+                )
         return self.job_class.perform_later(qc, *args, **kwargs)
 
 

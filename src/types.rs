@@ -2081,34 +2081,43 @@ impl ActiveJob {
     /// via ``@qc.register_job``, ``qc.register_job_class`` or
     /// ``qc.discover_jobs`` — all three paths bind the instance onto
     /// ``cls.quebec``, so ``MyJob.perform_later(arg1, arg2)`` works.
+    ///
+    /// A leading argument is only consumed as the Quebec instance when it
+    /// is actually a ``Quebec`` object; any other value (including
+    /// ``None``) is treated as job payload data.
     #[classmethod]
-    #[pyo3(signature = (quebec=None, *args, **kwargs))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn perform_later<'py>(
         cls: &Bound<'py, PyType>,
         py: Python<'py>,
-        quebec: Option<Bound<'py, PyAny>>,
         args: &Bound<'py, PyTuple>,
         kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<ActiveJob> {
-        match quebec {
-            Some(first) if first.is_instance_of::<PyQuebec>() => {
+        if let Ok(first) = args.get_item(0) {
+            if first.is_instance_of::<PyQuebec>() {
                 let qc = first.extract::<PyQuebec>()?;
-                qc.perform_later(py, cls, args, kwargs)
-            }
-            Some(first) => {
-                let mut items: Vec<Bound<'py, PyAny>> = Vec::with_capacity(args.len() + 1);
-                items.push(first);
-                for item in args.iter() {
-                    items.push(item);
-                }
-                let combined = PyTuple::new(py, items)?;
-                let qc = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-                qc.perform_later(py, cls, &combined, kwargs)
-            }
-            None => {
-                let qc = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-                qc.perform_later(py, cls, args, kwargs)
+                let rest = args.get_slice(1, args.len());
+                return qc.perform_later(py, cls, &rest, kwargs);
             }
         }
+        let qc = resolve_quebec_from_cls(cls)?;
+        qc.perform_later(py, cls, args, kwargs)
     }
+}
+
+fn resolve_quebec_from_cls(cls: &Bound<'_, PyType>) -> PyResult<PyQuebec> {
+    let name_err = || {
+        let name = cls
+            .qualname()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "job class".to_string());
+        PyTypeError::new_err(format!(
+            "{name} is not registered with a Quebec instance. Use \
+             @qc.register_job, qc.register_job_class({name}), or \
+             qc.discover_jobs(...) — or pass the Quebec instance as the \
+             first argument to perform_later."
+        ))
+    };
+    let attr = cls.getattr("quebec").map_err(|_| name_err())?;
+    attr.extract::<PyQuebec>().map_err(|_| name_err())
 }
