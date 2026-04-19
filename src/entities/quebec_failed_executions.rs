@@ -15,11 +15,14 @@ pub trait Retryable {
         table_config: &TableConfig,
     ) -> Result<(), DbErr>;
 
-    /// Retry all failed jobs by moving them from failed_executions to ready_executions
+    /// Retry all failed jobs by moving them from failed_executions to ready_executions.
+    /// When `class_name` or `queue_name` is provided, only matching jobs are retried.
     async fn retry_all(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr>;
 }
 
@@ -32,11 +35,14 @@ pub trait Discardable {
         table_config: &TableConfig,
     ) -> Result<(), DbErr>;
 
-    /// Discard all failed jobs by removing them from failed_executions and optionally marking the jobs as finished
+    /// Discard all failed jobs by removing them from failed_executions and marking the jobs as finished.
+    /// When `class_name` or `queue_name` is provided, only matching jobs are discarded.
     async fn discard_all(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr>;
 }
 
@@ -111,10 +117,13 @@ impl Retryable for Model {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
         let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config).await?;
+            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
+                .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -181,10 +190,13 @@ impl Discardable for Model {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
         let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config).await?;
+            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
+                .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -226,10 +238,13 @@ impl Retryable for Entity {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
         let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config).await?;
+            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
+                .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -281,10 +296,13 @@ impl Discardable for Entity {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
         let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config).await?;
+            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
+                .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);

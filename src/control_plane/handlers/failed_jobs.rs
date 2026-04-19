@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, Response},
+    response::{Html, IntoResponse, Response},
 };
 use sea_orm::{DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ impl ControlPlane {
     pub async fn failed_jobs(
         State(state): State<Arc<ControlPlane>>,
         Query(pagination): Query<Pagination>,
-    ) -> Result<Html<String>, (StatusCode, String)> {
+    ) -> Result<Response, (StatusCode, String)> {
         let start = Instant::now();
         let db = state
             .ctx
@@ -103,8 +103,19 @@ impl ControlPlane {
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);
 
-        if total_pages > 0 && pagination.page > total_pages {
-            return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
+        // Clamp out-of-range page to the last valid page (preserving filters) so
+        // actions taken on the final row don't bounce users onto a dead page.
+        if pagination.page > total_pages {
+            let mut ser = url::form_urlencoded::Serializer::new(String::new());
+            ser.append_pair("page", &total_pages.to_string());
+            if let Some(cn) = pagination.class_name.as_deref() {
+                ser.append_pair("class_name", cn);
+            }
+            if let Some(qn) = pagination.queue_name.as_deref() {
+                ser.append_pair("queue_name", qn);
+            }
+            let target = format!("{}/failed-jobs?{}", state.base_path, ser.finish());
+            return Ok(Self::redirect_back(&target));
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
@@ -115,6 +126,8 @@ impl ControlPlane {
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "failed-jobs");
+        context.insert("filter_class_name", &pagination.class_name);
+        context.insert("filter_queue_name", &pagination.queue_name);
 
         // Use helper method to render template
         let html = state
@@ -123,7 +136,7 @@ impl ControlPlane {
 
         debug!("Template rendering completed in {:?}", start.elapsed());
 
-        Ok(Html(html))
+        Ok(Html(html).into_response())
     }
 
     #[instrument(skip(state), fields(path = "/failed-jobs/:id/retry"))]
@@ -165,6 +178,10 @@ impl ControlPlane {
             Ok(_) => {
                 info!("Retried failed job {}", id);
                 Self::redirect_back(&redirect)
+            }
+            Err(e) if e.to_string().contains("not found") => {
+                info!("Failed job {} already gone: {}", id, e);
+                Self::not_found_response()
             }
             Err(e) => {
                 error!("Failed to retry job {}: {}", id, e);
@@ -213,6 +230,10 @@ impl ControlPlane {
                 info!("Deleted failed job {}", id);
                 Self::redirect_back(&redirect)
             }
+            Err(e) if e.to_string().contains("not found") => {
+                info!("Failed job {} already gone: {}", id, e);
+                Self::not_found_response()
+            }
             Err(e) => {
                 error!("Failed to delete job {}: {}", id, e);
                 Self::error_response()
@@ -223,6 +244,7 @@ impl ControlPlane {
     #[instrument(skip(state), fields(path = "/failed-jobs/all/retry"))]
     pub async fn retry_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
         headers: HeaderMap,
     ) -> Response {
         let db = match state.ctx.get_db().await {
@@ -231,12 +253,21 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
-        let redirect = Self::referer_or(&headers, "/failed-jobs");
+        let redirect = Self::referer_without_page_or(&headers, "/failed-jobs");
+        let class_name = pagination.class_name.clone();
+        let queue_name = pagination.queue_name.clone();
 
         match db
             .transaction::<_, u64, DbErr>(|txn| {
                 Box::pin(async move {
-                    let count = FailedExecutionEntity.retry_all(txn, &table_config).await?;
+                    let count = FailedExecutionEntity
+                        .retry_all(
+                            txn,
+                            &table_config,
+                            class_name.as_deref(),
+                            queue_name.as_deref(),
+                        )
+                        .await?;
                     Ok(count)
                 })
             })
@@ -256,6 +287,7 @@ impl ControlPlane {
     #[instrument(skip(state), fields(path = "/failed-jobs/all/delete"))]
     pub async fn discard_all_failed_jobs(
         State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
         headers: HeaderMap,
     ) -> Response {
         let db = match state.ctx.get_db().await {
@@ -264,13 +296,20 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
-        let redirect = Self::referer_or(&headers, "/failed-jobs");
+        let redirect = Self::referer_without_page_or(&headers, "/failed-jobs");
+        let class_name = pagination.class_name.clone();
+        let queue_name = pagination.queue_name.clone();
 
         match db
             .transaction::<_, u64, DbErr>(|txn| {
                 Box::pin(async move {
                     let count = FailedExecutionEntity
-                        .discard_all(txn, &table_config)
+                        .discard_all(
+                            txn,
+                            &table_config,
+                            class_name.as_deref(),
+                            queue_name.as_deref(),
+                        )
                         .await?;
                     Ok(count)
                 })

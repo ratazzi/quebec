@@ -21,7 +21,7 @@ pub struct WorkerInfo {
 
 #[derive(Debug, Deserialize)]
 pub struct Pagination {
-    #[serde(default = "default_page")]
+    #[serde(default = "default_page", deserialize_with = "deserialize_page")]
     pub page: u64,
     pub class_name: Option<String>,
     pub queue_name: Option<String>,
@@ -30,6 +30,16 @@ pub struct Pagination {
 
 fn default_page() -> u64 {
     1
+}
+
+// Clamp `?page=0` (or any explicit 0) up to 1 so handlers can safely compute
+// `(page - 1) * page_size` without underflowing u64.
+fn deserialize_page<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let n = u64::deserialize(deserializer)?;
+    Ok(n.max(1))
 }
 
 #[derive(Debug, Serialize)]

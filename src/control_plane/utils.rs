@@ -10,9 +10,7 @@ use url::Url;
 
 use crate::query_builder;
 
-#[cfg(debug_assertions)]
-use super::templates;
-use super::ControlPlane;
+use super::{templates, ControlPlane};
 
 /// Clean SQL string by removing extra whitespace and joining lines
 pub fn clean_sql(sql: &str) -> String {
@@ -109,7 +107,8 @@ impl ControlPlane {
 
         // Count blocked jobs
         let blocked_count =
-            query_builder::blocked_executions::count_all(db, table_config).await? as i64;
+            query_builder::blocked_executions::count_all(db, table_config, None, None).await?
+                as i64;
 
         // Count active workers
         let active_workers = query_builder::processes::count_all(db, table_config).await?;
@@ -148,6 +147,16 @@ impl ControlPlane {
 
     /// Extract path+query from Referer header, falling back to default_path
     pub fn referer_or(headers: &HeaderMap, default_path: &str) -> String {
+        Self::referer_or_inner(headers, default_path, false)
+    }
+
+    /// Like [`referer_or`] but strips any `page` query parameter, so bulk actions
+    /// that shrink the result set won't bounce the user onto an out-of-range page.
+    pub fn referer_without_page_or(headers: &HeaderMap, default_path: &str) -> String {
+        Self::referer_or_inner(headers, default_path, true)
+    }
+
+    fn referer_or_inner(headers: &HeaderMap, default_path: &str, drop_page: bool) -> String {
         headers
             .get(header::REFERER)
             .and_then(|v| v.to_str().ok())
@@ -159,7 +168,21 @@ impl ControlPlane {
                     return None;
                 }
                 let mut target = path.to_string();
-                if let Some(q) = u.query() {
+                if drop_page {
+                    let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                    let mut any = false;
+                    for (k, v) in u.query_pairs() {
+                        if k == "page" {
+                            continue;
+                        }
+                        ser.append_pair(&k, &v);
+                        any = true;
+                    }
+                    if any {
+                        target.push('?');
+                        target.push_str(&ser.finish());
+                    }
+                } else if let Some(q) = u.query() {
                     target.push('?');
                     target.push_str(q);
                 }
@@ -172,6 +195,14 @@ impl ControlPlane {
     pub fn error_response() -> Response {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    /// Return a 404 Not Found response (for stale/missing rows)
+    pub fn not_found_response() -> Response {
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::empty())
             .unwrap()
     }
@@ -284,26 +315,6 @@ impl ControlPlane {
         template_name: &str,
         context: &mut Context,
     ) -> Result<String, (StatusCode, String)> {
-        // In debug compilation mode, reload templates
-        #[cfg(debug_assertions)]
-        {
-            debug!("Debug mode detected, reloading templates");
-            match tera::Tera::new(&self.template_path) {
-                Ok(new_tera) => {
-                    // Successfully loaded new templates, replace existing Tera instance
-                    match self.tera.write() {
-                        Ok(mut tera) => {
-                            *tera = new_tera;
-                            tera.autoescape_on(vec!["html"]);
-                            debug!("Templates reloaded successfully");
-                        }
-                        Err(e) => error!("Failed to acquire write lock: {}", e),
-                    }
-                }
-                Err(e) => error!("Error reloading templates: {}", e),
-            }
-        }
-
         // Add database connection information
         let _db = self
             .ctx
@@ -311,30 +322,11 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        let dsn = self.ctx.dsn.to_string();
-        let (db_type, connection_info) = if let Ok(mut parsed) = Url::parse(&dsn) {
-            let db_type = match parsed.scheme() {
-                s if s.starts_with("postgres") => "PostgreSQL",
-                s if s.starts_with("mysql") => "MySQL",
-                s if s.starts_with("sqlite") => "SQLite",
-                _ => "Unknown",
-            };
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("***"));
-            }
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            let display = parsed.to_string();
-            (db_type, display)
-        } else {
-            ("Unknown", "<invalid url>".to_string())
-        };
-
         let db_info = serde_json::json!({
-            "database_type": db_type,
+            "database_type": self.ctx.dsn.kind().as_str(),
             "connection_type": "Pool",
             "status": "Connected",
-            "dsn": connection_info
+            "dsn": self.ctx.dsn.masked(),
         });
         context.insert("db_info", &db_info);
         context.insert("version", env!("CARGO_PKG_VERSION"));
@@ -418,15 +410,25 @@ impl ControlPlane {
                 error!("Detailed error: {}", error_detail);
 
                 // Output source template content
-                let template_path = format!("src/templates/{}", template_name);
-                match std::fs::read_to_string(&template_path) {
-                    Ok(content) => {
-                        info!(
-                            "Template content preview (first 100 chars): {}",
-                            content.chars().take(100).collect::<String>()
-                        );
+                if let Some(template_path) = templates::template_file_path(template_name) {
+                    match std::fs::read_to_string(&template_path) {
+                        Ok(content) => {
+                            info!(
+                                "Template content preview (first 100 chars): {}",
+                                content.chars().take(100).collect::<String>()
+                            );
+                        }
+                        Err(e) => error!(
+                            "Could not read template file {}: {}",
+                            template_path.display(),
+                            e
+                        ),
                     }
-                    Err(e) => error!("Could not read template file {}: {}", template_path, e),
+                } else {
+                    debug!(
+                        "No filesystem template path available for {}, skipping source preview",
+                        template_name
+                    );
                 }
 
                 Err((

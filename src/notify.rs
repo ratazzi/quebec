@@ -37,7 +37,7 @@ impl NotifyManager {
 
         let (tx, rx) = mpsc::channel::<String>(200);
         let channel = self.channel_name.clone();
-        let dsn = self.ctx.dsn.to_string();
+        let dsn = self.ctx.dsn.as_connect_str().to_string();
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
 
         // Spawn a background task to handle LISTEN using sqlx
@@ -200,10 +200,10 @@ impl NotifyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use url::Url;
+    use crate::database_url::DatabaseUrl;
 
     /// Helper to create AppContext for tests (handles cfg-gated signature)
-    fn make_ctx(dsn: Url) -> Arc<AppContext> {
+    fn make_ctx(dsn: DatabaseUrl) -> Arc<AppContext> {
         #[cfg(feature = "python")]
         {
             Arc::new(AppContext::new(
@@ -225,7 +225,8 @@ mod tests {
 
     #[test]
     fn test_channel_name_generation() {
-        let dsn = Url::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
+        let dsn =
+            DatabaseUrl::parse("postgres://user:pass@localhost/test").expect("Valid test URL");
         let ctx = make_ctx(dsn);
         let manager = NotifyManager::new(ctx);
         assert_eq!(manager.get_channel_name(), "quebec_jobs");
@@ -233,12 +234,12 @@ mod tests {
 
     #[test]
     fn test_is_postgres_detection() {
-        let postgres_dsn =
-            Url::parse("postgres://user:pass@localhost/test").expect("Valid postgres test URL");
+        let postgres_dsn = DatabaseUrl::parse("postgres://user:pass@localhost/test")
+            .expect("Valid postgres test URL");
         let postgres_ctx = make_ctx(postgres_dsn);
         assert!(postgres_ctx.is_postgres());
 
-        let sqlite_dsn = Url::parse("sqlite://test.db").expect("Valid sqlite test URL");
+        let sqlite_dsn = DatabaseUrl::parse("sqlite://test.db").expect("Valid sqlite test URL");
         let sqlite_ctx = make_ctx(sqlite_dsn);
         assert!(!sqlite_ctx.is_postgres());
     }

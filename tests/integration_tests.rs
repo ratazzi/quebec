@@ -34,7 +34,7 @@ mod schema {
             0
         );
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             0
@@ -156,7 +156,9 @@ mod jobs {
         assert!(job.finished_at.is_some());
 
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc).await.unwrap(),
+            query_builder::jobs::count_finished(&db, &tc, None, None)
+                .await
+                .unwrap(),
             1
         );
     }
@@ -180,7 +182,9 @@ mod jobs {
             .unwrap();
         assert_eq!(rows, 2);
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc).await.unwrap(),
+            query_builder::jobs::count_finished(&db, &tc, None, None)
+                .await
+                .unwrap(),
             2
         );
     }
@@ -394,9 +398,15 @@ mod claimed_executions {
             .await
             .unwrap();
 
-        let ce_id = query_builder::claimed_executions::insert(&db, &tc, job_id, Some(12345))
-            .await
-            .unwrap();
+        let ce_id = query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(12345),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         assert!(ce_id > 0);
 
         let found = query_builder::claimed_executions::find_by_job_id(&db, &tc, job_id)
@@ -439,14 +449,164 @@ mod claimed_executions {
             .await
             .unwrap();
 
-        query_builder::claimed_executions::insert(&db, &tc, j1, Some(100))
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            j1,
+            Some(100),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            j2,
+            Some(100),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
+
+        let deleted = query_builder::claimed_executions::delete_by_process_id(&db, &tc, 100)
             .await
             .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, j2, Some(100))
+        assert_eq!(deleted, 2);
+    }
+
+    #[tokio::test]
+    async fn test_insert_all_returning() {
+        let (db, tc) = setup_db().await;
+        let now = chrono::Utc::now().naive_utc();
+
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+        let j3 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
             .await
             .unwrap();
 
-        let deleted = query_builder::claimed_executions::delete_by_process_id(&db, &tc, 100)
+        let data = vec![
+            (j1, Some(200i64), now),
+            (j2, Some(200), now),
+            (j3, Some(200), now),
+        ];
+        let models = query_builder::claimed_executions::insert_all_returning(&db, &tc, &data)
+            .await
+            .unwrap();
+
+        assert_eq!(models.len(), 3);
+        let returned_job_ids: Vec<i64> = models.iter().map(|m| m.job_id).collect();
+        assert!(returned_job_ids.contains(&j1));
+        assert!(returned_job_ids.contains(&j2));
+        assert!(returned_job_ids.contains(&j3));
+        for m in &models {
+            assert!(m.id > 0);
+            assert_eq!(m.process_id, Some(200));
+        }
+
+        assert_eq!(
+            query_builder::claimed_executions::count_all(&db, &tc, None, None)
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_by_job_ids() {
+        let (db, tc) = setup_db().await;
+        let now = chrono::Utc::now().naive_utc();
+
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+
+        query_builder::claimed_executions::insert(&db, &tc, j1, Some(1), now)
+            .await
+            .unwrap();
+        query_builder::claimed_executions::insert(&db, &tc, j2, Some(1), now)
+            .await
+            .unwrap();
+
+        // Query in reverse order [j2, j1] — results must still be job_id ASC
+        let found = query_builder::claimed_executions::find_by_job_ids(&db, &tc, &[j2, j1])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].job_id, j1);
+        assert_eq!(found[1].job_id, j2);
+
+        // Empty input
+        let empty = query_builder::claimed_executions::find_by_job_ids(&db, &tc, &[])
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+}
+
+mod ready_executions_batch {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_delete_by_ids() {
+        let (db, tc) = setup_db().await;
+
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+
+        let r1 = query_builder::ready_executions::insert(&db, &tc, j1, "q", 0)
+            .await
+            .unwrap();
+        let r2 = query_builder::ready_executions::insert(&db, &tc, j2, "q", 0)
+            .await
+            .unwrap();
+
+        let deleted = query_builder::ready_executions::delete_by_ids(&db, &tc, &[r1, r2])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 2);
+
+        let remaining = query_builder::ready_executions::find_by_queue(&db, &tc, "q", 10)
+            .await
+            .unwrap();
+        assert!(remaining.is_empty());
+    }
+}
+
+mod scheduled_executions_batch {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_delete_by_job_ids() {
+        let (db, tc) = setup_db().await;
+        let future = chrono::Utc::now().naive_utc() + chrono::Duration::hours(1);
+
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+            .await
+            .unwrap();
+
+        query_builder::scheduled_executions::insert(&db, &tc, j1, "q", 0, future)
+            .await
+            .unwrap();
+        query_builder::scheduled_executions::insert(&db, &tc, j2, "q", 0, future)
+            .await
+            .unwrap();
+
+        let deleted = query_builder::scheduled_executions::delete_by_job_ids(&db, &tc, &[j1, j2])
             .await
             .unwrap();
         assert_eq!(deleted, 2);
@@ -546,7 +706,7 @@ mod blocked_executions {
         assert_eq!(found[0].job_id, job_id);
 
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             1
@@ -556,7 +716,7 @@ mod blocked_executions {
             .await
             .unwrap();
         assert_eq!(
-            query_builder::blocked_executions::count_all(&db, &tc)
+            query_builder::blocked_executions::count_all(&db, &tc, None, None)
                 .await
                 .unwrap(),
             0
@@ -889,9 +1049,15 @@ mod lifecycle {
         query_builder::ready_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, job_id, Some(9999))
-            .await
-            .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(9999),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             query_builder::claimed_executions::count_all(&db, &tc, None, None)
                 .await
@@ -924,9 +1090,15 @@ mod lifecycle {
         query_builder::ready_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();
-        query_builder::claimed_executions::insert(&db, &tc, job_id, Some(9999))
-            .await
-            .unwrap();
+        query_builder::claimed_executions::insert(
+            &db,
+            &tc,
+            job_id,
+            Some(9999),
+            chrono::Utc::now().naive_utc(),
+        )
+        .await
+        .unwrap();
         query_builder::claimed_executions::delete_by_job_id(&db, &tc, job_id)
             .await
             .unwrap();

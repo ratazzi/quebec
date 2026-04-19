@@ -12,13 +12,13 @@
     </div>
     <div class="flex gap-2">
       {% if queue_status == 'active' %}
-        <form action="{{ base_path }}/queues/{{ queue_name }}/pause" method="post">
-          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-9 px-4 py-2">
+        <form action="{{ base_path }}/queues/{{ queue_name }}/pause" method="post" data-turbo-frame="_top">
+          <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-9 px-4 py-2">
             Pause Queue
           </button>
         </form>
       {% else %}
-        <form action="{{ base_path }}/queues/{{ queue_name }}/resume" method="post">
+        <form action="{{ base_path }}/queues/{{ queue_name }}/resume" method="post" data-turbo-frame="_top">
           <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-9 px-4 py-2">
             Resume Queue
           </button>
@@ -86,12 +86,8 @@
               </td>
               <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                 {% if job.status == 'failed' %}
-                  <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline">
-                    <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-3 py-1">Retry</button>
-                  </form>
-                {% elif job.status == 'processing' %}
-                  <form action="{{ base_path }}/in-progress-jobs/{{ job.execution_id }}/cancel" method="post" class="inline">
-                    <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">Cancel</button>
+                  <form action="{{ base_path }}/failed-jobs/{{ job.id }}/retry" method="post" class="inline" data-turbo-frame="_top">
+                    <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">Retry</button>
                   </form>
                 {% endif %}
               </td>

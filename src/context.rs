@@ -11,7 +11,8 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use url::Url;
+
+use crate::database_url::DatabaseUrl;
 
 use tracing::{debug, error, trace, warn};
 
@@ -274,7 +275,7 @@ impl DiscardStrategy {
 #[derive(Debug)]
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
-    pub dsn: Url,
+    pub dsn: DatabaseUrl,
     pub db: Option<Arc<DatabaseConnection>>, // Use shared connection for SQLite
     pub connect_options: ConnectOptions,     // For creating new connections
     pub name: String, // Application name for NOTIFY channel (default: "quebec")
@@ -316,7 +317,7 @@ fn parse_bool_env(s: &str) -> Option<bool> {
 }
 
 /// Parse env var string as Duration (supports f64 for sub-second precision)
-fn parse_duration_f64_env(s: &str) -> Option<Duration> {
+pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
     s.parse::<f64>()
         .ok()
         .filter(|f| f.is_finite() && *f >= 0.0)
@@ -327,23 +328,24 @@ fn parse_duration_f64_env(s: &str) -> Option<Duration> {
 impl AppContext {
     #[cfg(feature = "python")]
     pub fn new(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
         options: Option<HashMap<String, Py<PyAny>>>,
     ) -> Self {
         let mut ctx = Self::new_inner(dsn, db, connect_options);
 
-        // Override default configuration if options are provided
-        if let Some(options) = options {
-            Python::attach(|py| {
-                // Helper closures that warn on type mismatch
-                // Priority: kwargs > env var (QUEBEC_<KEY_UPPER>) > default (None)
-                let env_var = |key: &str| -> Option<String> {
-                    std::env::var(format!("QUEBEC_{}", key.to_uppercase())).ok()
-                };
-                let get_bool = |key: &str| -> Option<bool> {
-                    options
+        // Apply configuration from kwargs and/or env vars
+        // unwrap_or_default: even without kwargs, env vars (QUEBEC_*) must still be processed
+        let options = options.unwrap_or_default();
+        Python::attach(|py| {
+            // Helper closures that warn on type mismatch
+            // Priority: kwargs > env var (QUEBEC_<KEY_UPPER>) > default (None)
+            let env_var = |key: &str| -> Option<String> {
+                std::env::var(format!("QUEBEC_{}", key.to_uppercase())).ok()
+            };
+            let get_bool = |key: &str| -> Option<bool> {
+                options
                         .get(key)
                         .and_then(|v| {
                             v.extract(py)
@@ -366,160 +368,155 @@ impl AppContext {
                                 None
                             })
                         })
-                };
-                let get_u64 = |key: &str| -> Option<u64> {
-                    options
-                        .get(key)
-                        .and_then(|v| {
-                            v.extract(py)
-                                .map_err(|_| {
-                                    warn!(
-                                        "Config '{}': expected u64, got {:?}",
-                                        key,
-                                        v.bind(py).get_type()
-                                    );
-                                })
-                                .ok()
-                        })
-                        .or_else(|| {
-                            let s = env_var(key)?;
-                            s.parse().ok().or_else(|| {
+            };
+            let get_u64 = |key: &str| -> Option<u64> {
+                options
+                    .get(key)
+                    .and_then(|v| {
+                        v.extract(py)
+                            .map_err(|_| {
                                 warn!(
-                                    "Env 'QUEBEC_{}': failed to parse '{}' as u64",
-                                    key.to_uppercase(),
-                                    s
+                                    "Config '{}': expected u64, got {:?}",
+                                    key,
+                                    v.bind(py).get_type()
                                 );
-                                None
                             })
+                            .ok()
+                    })
+                    .or_else(|| {
+                        let s = env_var(key)?;
+                        s.parse().ok().or_else(|| {
+                            warn!(
+                                "Env 'QUEBEC_{}': failed to parse '{}' as u64",
+                                key.to_uppercase(),
+                                s
+                            );
+                            None
                         })
-                };
-                let get_duration = |key: &str| -> Option<Duration> {
-                    options
-                        .get(key)
-                        .and_then(|v| {
-                            v.extract::<Duration>(py)
-                                .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
-                                .map_err(|_| {
-                                    warn!(
-                                        "Config '{}': expected Duration or u64, got {:?}",
-                                        key,
-                                        v.bind(py).get_type()
-                                    );
-                                })
-                                .ok()
-                        })
-                        .or_else(|| {
-                            let s = env_var(key)?;
-                            parse_duration_f64_env(&s).or_else(|| {
+                    })
+            };
+            let get_duration = |key: &str| -> Option<Duration> {
+                options
+                    .get(key)
+                    .and_then(|v| {
+                        v.extract::<Duration>(py)
+                            .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
+                            .map_err(|_| {
                                 warn!(
-                                    "Env 'QUEBEC_{}': failed to parse '{}' as duration",
-                                    key.to_uppercase(),
-                                    s
+                                    "Config '{}': expected Duration or u64, got {:?}",
+                                    key,
+                                    v.bind(py).get_type()
                                 );
-                                None
                             })
+                            .ok()
+                    })
+                    .or_else(|| {
+                        let s = env_var(key)?;
+                        parse_duration_f64_env(&s).or_else(|| {
+                            warn!(
+                                "Env 'QUEBEC_{}': failed to parse '{}' as duration",
+                                key.to_uppercase(),
+                                s
+                            );
+                            None
                         })
-                };
+                    })
+            };
 
-                if let Some(v) = get_bool("use_skip_locked") {
-                    ctx.use_skip_locked = v;
+            if let Some(v) = get_bool("use_skip_locked") {
+                ctx.use_skip_locked = v;
+            }
+            if let Some(v) = get_duration("process_heartbeat_interval") {
+                ctx.process_heartbeat_interval = v;
+            }
+            if let Some(v) = get_duration("process_alive_threshold") {
+                ctx.process_alive_threshold = v;
+            }
+            if let Some(v) = get_duration("shutdown_timeout") {
+                ctx.shutdown_timeout = v;
+            }
+            if let Some(v) = get_bool("silence_polling") {
+                ctx.silence_polling = v;
+            }
+            if let Some(v) = get_bool("preserve_finished_jobs") {
+                ctx.preserve_finished_jobs = v;
+            }
+            if let Some(v) = get_duration("clear_finished_jobs_after") {
+                ctx.clear_finished_jobs_after = v;
+            }
+            if let Some(v) = get_u64("cleanup_batch_size") {
+                ctx.cleanup_batch_size = v;
+            }
+            if let Some(v) = get_duration("cleanup_interval") {
+                ctx.cleanup_interval = v;
+            }
+            if let Some(v) = get_duration("default_concurrency_control_period") {
+                ctx.default_concurrency_control_period = v;
+            }
+            if let Some(v) = get_duration("dispatcher_polling_interval") {
+                ctx.dispatcher_polling_interval = v;
+            }
+            if let Some(v) = get_u64("dispatcher_batch_size") {
+                ctx.dispatcher_batch_size = v;
+            }
+            if let Some(v) = get_duration("dispatcher_concurrency_maintenance_interval") {
+                ctx.dispatcher_concurrency_maintenance_interval = v;
+            }
+            if let Some(v) = get_duration("control_plane_sse_interval") {
+                ctx.control_plane_sse_interval = v;
+            }
+            // worker_polling_interval: also accepts f64 for sub-second precision
+            if let Some(val) = options.get("worker_polling_interval") {
+                let result = val
+                    .extract::<Duration>(py)
+                    .or_else(|_| val.extract::<u64>(py).map(Duration::from_secs))
+                    .or_else(|_| {
+                        val.extract::<f64>(py).and_then(|f| {
+                            if f.is_finite() && f >= 0.0 {
+                                Ok(Duration::from_secs_f64(f))
+                            } else {
+                                warn!("Config 'worker_polling_interval': invalid f64 value {}", f);
+                                Err(pyo3::PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                                    "invalid",
+                                ))
+                            }
+                        })
+                    });
+                match result {
+                    Ok(v) => ctx.worker_polling_interval = v,
+                    Err(_) => warn!(
+                        "Config 'worker_polling_interval': expected Duration, u64 or f64, got {:?}",
+                        val.bind(py).get_type()
+                    ),
                 }
-                if let Some(v) = get_duration("process_heartbeat_interval") {
-                    ctx.process_heartbeat_interval = v;
+            } else if let Some(s) = env_var("worker_polling_interval") {
+                match parse_duration_f64_env(&s) {
+                    Some(v) => ctx.worker_polling_interval = v,
+                    None => warn!(
+                        "Env 'QUEBEC_WORKER_POLLING_INTERVAL': failed to parse '{}' as duration",
+                        s
+                    ),
                 }
-                if let Some(v) = get_duration("process_alive_threshold") {
-                    ctx.process_alive_threshold = v;
-                }
-                if let Some(v) = get_duration("shutdown_timeout") {
-                    ctx.shutdown_timeout = v;
-                }
-                if let Some(v) = get_bool("silence_polling") {
-                    ctx.silence_polling = v;
-                }
-                if let Some(v) = get_bool("preserve_finished_jobs") {
-                    ctx.preserve_finished_jobs = v;
-                }
-                if let Some(v) = get_duration("clear_finished_jobs_after") {
-                    ctx.clear_finished_jobs_after = v;
-                }
-                if let Some(v) = get_u64("cleanup_batch_size") {
-                    ctx.cleanup_batch_size = v;
-                }
-                if let Some(v) = get_duration("cleanup_interval") {
-                    ctx.cleanup_interval = v;
-                }
-                if let Some(v) = get_duration("default_concurrency_control_period") {
-                    ctx.default_concurrency_control_period = v;
-                }
-                if let Some(v) = get_duration("dispatcher_polling_interval") {
-                    ctx.dispatcher_polling_interval = v;
-                }
-                if let Some(v) = get_u64("dispatcher_batch_size") {
-                    ctx.dispatcher_batch_size = v;
-                }
-                if let Some(v) = get_duration("dispatcher_concurrency_maintenance_interval") {
-                    ctx.dispatcher_concurrency_maintenance_interval = v;
-                }
-                if let Some(v) = get_duration("control_plane_sse_interval") {
-                    ctx.control_plane_sse_interval = v;
-                }
-                // worker_polling_interval: also accepts f64 for sub-second precision
-                if let Some(val) = options.get("worker_polling_interval") {
-                    let result = val
-                        .extract::<Duration>(py)
-                        .or_else(|_| val.extract::<u64>(py).map(Duration::from_secs))
-                        .or_else(|_| {
-                            val.extract::<f64>(py).and_then(|f| {
-                                if f.is_finite() && f >= 0.0 {
-                                    Ok(Duration::from_secs_f64(f))
-                                } else {
-                                    warn!(
-                                        "Config 'worker_polling_interval': invalid f64 value {}",
-                                        f
-                                    );
-                                    Err(pyo3::PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                        "invalid",
-                                    ))
-                                }
-                            })
-                        });
-                    match result {
-                        Ok(v) => ctx.worker_polling_interval = v,
-                        Err(_) => warn!(
-                            "Config 'worker_polling_interval': expected Duration, u64 or f64, got {:?}",
-                            val.bind(py).get_type()
-                        ),
+            }
+            if let Some(v) = get_u64("worker_threads") {
+                ctx.worker_threads = v;
+            }
+            // table_name_prefix: only apply if non-empty
+            if let Some(val) = options.get("table_name_prefix") {
+                match val.extract::<String>(py) {
+                    Ok(prefix) if !prefix.is_empty() => {
+                        ctx.table_config = TableConfig::with_prefix(&prefix);
                     }
-                } else if let Some(s) = env_var("worker_polling_interval") {
-                    match parse_duration_f64_env(&s) {
-                        Some(v) => ctx.worker_polling_interval = v,
-                        None => warn!(
-                            "Env 'QUEBEC_WORKER_POLLING_INTERVAL': failed to parse '{}' as duration",
-                            s
-                        ),
-                    }
+                    Ok(_) => {} // empty string, ignore
+                    Err(_) => warn!(
+                        "Config 'table_name_prefix': expected String, got {:?}",
+                        val.bind(py).get_type()
+                    ),
                 }
-                if let Some(v) = get_u64("worker_threads") {
-                    ctx.worker_threads = v;
-                }
-                // table_name_prefix: only apply if non-empty
-                if let Some(val) = options.get("table_name_prefix") {
-                    match val.extract::<String>(py) {
-                        Ok(prefix) if !prefix.is_empty() => {
-                            ctx.table_config = TableConfig::with_prefix(&prefix);
-                        }
-                        Ok(_) => {} // empty string, ignore
-                        Err(_) => warn!(
-                            "Config 'table_name_prefix': expected String, got {:?}",
-                            val.bind(py).get_type()
-                        ),
-                    }
-                } else if let Some(prefix) = env_var("table_name_prefix").filter(|s| !s.is_empty())
-                {
-                    ctx.table_config = TableConfig::with_prefix(&prefix);
-                }
-            });
-        }
+            } else if let Some(prefix) = env_var("table_name_prefix").filter(|s| !s.is_empty()) {
+                ctx.table_config = TableConfig::with_prefix(&prefix);
+            }
+        });
 
         crate::set_silence_polling(ctx.silence_polling);
         ctx
@@ -527,7 +524,7 @@ impl AppContext {
 
     #[cfg(not(feature = "python"))]
     pub fn new(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
@@ -537,7 +534,7 @@ impl AppContext {
     }
 
     fn new_inner(
-        dsn: Url,
+        dsn: DatabaseUrl,
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
@@ -618,7 +615,7 @@ impl AppContext {
 
     /// Check if the database is PostgreSQL
     pub fn is_postgres(&self) -> bool {
-        self.dsn.scheme().starts_with("postgres")
+        self.dsn.is_postgres()
     }
 
     /// Get a runnable by class name

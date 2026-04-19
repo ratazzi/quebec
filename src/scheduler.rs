@@ -194,9 +194,12 @@ where
         None => serde_json::Value::Array(vec![]),
     };
 
+    let active_job_id = crate::utils::generate_job_id();
+
     let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": entry.class,
         "job_id": entry.key,
+        "provider_job_id": active_job_id,
         "queue_name": queue_name,
         "priority": priority,
         "arguments": args,
@@ -307,7 +310,6 @@ where
 
     // Run the actual DB enqueue; on any error, close the around_enqueue generator
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
-    let active_job_id = crate::utils::generate_job_id();
     let db_result: Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = async {
         let job_id = query_builder::jobs::insert(
             db,
@@ -545,19 +547,20 @@ impl Scheduler {
                     anyhow::anyhow!("Failed to parse schedule file: {}", e)
                 })?;
 
-        // Use shared environment config parser
-        let tasks = crate::utils::parse_env_config_cloneable(env_config)?;
+        // Use strict environment parser — refuse to fall back to wrong environment,
+        // because stale-row deletion would wipe the correct environment's tasks.
+        let tasks = crate::utils::parse_env_config_strict(env_config, None)?;
         info!("Loaded {} scheduled tasks", tasks.len());
         Ok(vec![tasks])
     }
 
-    /// Load schedule from file path, returns empty vec if no path provided
+    /// Load schedule from file path, returns None if no path provided
     fn load_schedule(
         path: Option<String>,
-    ) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+    ) -> Result<Option<Vec<HashMap<String, ScheduledEntry>>>, anyhow::Error> {
         let Some(path) = path else {
             info!("No schedule file found, running without scheduled tasks");
-            return Ok(Vec::new());
+            return Ok(None);
         };
 
         info!("Loading schedule from: {}", path);
@@ -566,7 +569,7 @@ impl Scheduler {
             anyhow::anyhow!("Failed to read schedule file: {}", e)
         })?;
 
-        Self::parse_schedule_file(&contents)
+        Self::parse_schedule_file(&contents).map(Some)
     }
 
     /// Sync scheduled tasks to database (upsert recurring_tasks table)
@@ -597,35 +600,59 @@ impl Scheduler {
         // Delete tasks that exist in DB but no longer in the config
         let synced_keys: Vec<String> = scheduled.iter().filter_map(|e| e.key.clone()).collect();
 
-        if !synced_keys.is_empty() {
+        {
             let backend = db.get_database_backend();
             let table = &table_config.recurring_tasks;
 
-            let placeholders: String = match backend {
-                sea_orm::DbBackend::Postgres => synced_keys
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("${}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                _ => synced_keys
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(", "),
+            let (sql, values): (String, Vec<Value>) = if synced_keys.is_empty() {
+                // All tasks removed from config — delete all static rows
+                let sql = match backend {
+                    sea_orm::DbBackend::Postgres => {
+                        format!(r#"DELETE FROM "{}" WHERE "static" = TRUE"#, table)
+                    }
+                    sea_orm::DbBackend::MySql => {
+                        format!(r#"DELETE FROM `{}` WHERE `static` = 1"#, table)
+                    }
+                    sea_orm::DbBackend::Sqlite => {
+                        format!(r#"DELETE FROM "{}" WHERE "static" = 1"#, table)
+                    }
+                };
+                (sql, vec![])
+            } else {
+                let placeholders: String = match backend {
+                    sea_orm::DbBackend::Postgres => synced_keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("${}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => synced_keys
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                };
+
+                let sql = match backend {
+                    sea_orm::DbBackend::Postgres => format!(
+                        r#"DELETE FROM "{}" WHERE "static" = TRUE AND "key" NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                    sea_orm::DbBackend::MySql => format!(
+                        r#"DELETE FROM `{}` WHERE `static` = 1 AND `key` NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                    sea_orm::DbBackend::Sqlite => format!(
+                        r#"DELETE FROM "{}" WHERE "static" = 1 AND "key" NOT IN ({})"#,
+                        table, placeholders,
+                    ),
+                };
+
+                let values: Vec<Value> =
+                    synced_keys.iter().map(|k| Value::from(k.clone())).collect();
+                (sql, values)
             };
 
-            let sql = format!(
-                r#"DELETE FROM "{}" WHERE "static" = {} AND "key" NOT IN ({})"#,
-                table,
-                match backend {
-                    sea_orm::DbBackend::Postgres => "TRUE",
-                    _ => "1",
-                },
-                placeholders,
-            );
-
-            let values: Vec<Value> = synced_keys.iter().map(|k| Value::from(k.clone())).collect();
             let stmt = sea_orm::Statement::from_sql_and_values(backend, &sql, values);
 
             let deleted = db.execute(stmt).await?;
@@ -843,10 +870,20 @@ impl Scheduler {
         let schedule = Self::load_schedule(Self::find_schedule_path())?;
         trace!("Schedule: {:?}", schedule);
 
+        // Match Solid Queue: when recurring_tasks is empty, don't start Scheduler.
+        let has_tasks = schedule
+            .as_ref()
+            .is_some_and(|s| s.iter().any(|m| !m.is_empty()));
+        if !has_tasks {
+            info!("No recurring tasks found, skipping scheduler");
+            return Ok(());
+        }
+
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
 
-        let scheduled = Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?;
+        let scheduled =
+            Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule.unwrap()).await?;
 
         let mut task_handles = Vec::new();
 

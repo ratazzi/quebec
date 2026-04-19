@@ -5,46 +5,37 @@ Usage:
     python -m quebec app.jobs
     python -m quebec app.jobs app.other_jobs
 
+Each positional argument is a dotted package path; the runner recursively
+scans it via ``Quebec.discover_jobs`` and registers every ``BaseClass``
+subclass whose ``__module__`` falls under that package.
+
 All configuration via environment variables:
 
     QUEBEC_DATABASE_URL or DATABASE_URL  — database connection string (required)
-    QUEBEC_THREADS          — Python worker threads (default: 1)
+    QUEBEC_WORKER_THREADS   — worker threads (default from queue.yml or 3)
     QUEBEC_CREATE_TABLES    — create tables on startup (default: true, set false/0/no to disable)
     QUEBEC_CONTROL_PLANE    — control plane address, e.g. "127.0.0.1:5006"
     QUEBEC_SPAWN            — comma-separated components: worker,dispatcher,scheduler
     QUEBEC_LOG_LEVEL        — log level (default: INFO)
     QUEBEC_LOG_FORMAT       — structlog format: console, json, logfmt (default: console)
+    QUEBEC_DISCOVER_ON_ERROR — how discover_jobs handles submodule ImportError:
+                              "raise" (default) or "warn"
 
     Other QUEBEC_* env vars (pool, polling, etc.) are handled by the Rust core.
 """
 
-import importlib
-import inspect
 import logging
 import os
 import sys
 
-from quebec import BaseClass, Quebec
+from quebec import Quebec
 from quebec.logger import setup_structlog, get_structlog
-
-
-def discover_job_classes(module):
-    """Find all BaseClass subclasses defined in a module."""
-    return [
-        obj
-        for _name, obj in inspect.getmembers(module, inspect.isclass)
-        if issubclass(obj, BaseClass) and obj is not BaseClass
-    ]
-
-
-def parse_bool(value):
-    return value.lower() in ("true", "1", "yes")
 
 
 def main():
     modules = sys.argv[1:]
     if not modules:
-        print(__doc__.strip(), file=sys.stderr)
+        print((__doc__ or "").strip(), file=sys.stderr)
         sys.exit(1)
 
     # Logging
@@ -66,33 +57,26 @@ def main():
     # Create Quebec instance (QUEBEC_* env vars are read by Rust core)
     qc = Quebec(database_url)
 
-    # Discover and register job classes
-    total = 0
-    for module_path in modules:
-        try:
-            mod = importlib.import_module(module_path)
-        except ImportError as e:
-            logger.error(f"Cannot import module '{module_path}': {e}")
-            sys.exit(1)
+    on_error = os.environ.get("QUEBEC_DISCOVER_ON_ERROR", "raise")
+    try:
+        registered = qc.discover_jobs(*modules, on_error=on_error)
+    except ImportError as e:
+        logger.error(f"Cannot import module: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
 
-        classes = discover_job_classes(mod)
-        if not classes:
-            logger.warning(f"No BaseClass subclasses found in '{module_path}'")
-            continue
-
-        for cls in classes:
-            qc.register_job(cls)
-            logger.info(f"Registered {cls.__name__} from {module_path}")
-            total += 1
-
-    if total == 0:
+    if not registered:
         logger.error("No job classes found in any of the specified modules")
         sys.exit(1)
 
-    logger.info(f"Discovered {total} job class(es), starting Quebec")
+    for cls in registered:
+        logger.info(f"Registered {cls.__qualname__} from {cls.__module__}")
+
+    logger.info(f"Discovered {len(registered)} job class(es), starting Quebec")
 
     # Run options
-    threads = int(os.environ.get("QUEBEC_THREADS", "1"))
     create_tables_env = os.environ.get("QUEBEC_CREATE_TABLES")
     create_tables = (
         create_tables_env.lower() not in ("false", "0", "no")
@@ -109,7 +93,6 @@ def main():
         create_tables=create_tables,
         control_plane=control_plane,
         spawn=spawn,
-        threads=threads,
     )
 
 

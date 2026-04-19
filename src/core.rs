@@ -131,6 +131,8 @@ async fn enqueue_job(
 
     let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": job.class_name,
+        "job_id": job.active_job_id,
+        "provider_job_id": job.active_job_id,
         "queue_name": job.queue_name,
         "priority": job.priority,
         "arguments": args,

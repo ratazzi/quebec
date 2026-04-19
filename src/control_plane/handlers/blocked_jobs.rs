@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Response},
 };
 use sea_orm::{DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ impl ControlPlane {
     pub async fn blocked_jobs(
         State(state): State<Arc<ControlPlane>>,
         Query(pagination): Query<Pagination>,
-    ) -> Result<Html<String>, (StatusCode, String)> {
+    ) -> Result<Response, (StatusCode, String)> {
         let start = Instant::now();
         let db = state
             .ctx
@@ -35,11 +35,17 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get blocked jobs using query_builder
-        let blocked_executions =
-            query_builder::blocked_executions::find_paginated(db, table_config, offset, page_size)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        // Get blocked jobs using query_builder (filters applied at SQL level)
+        let blocked_executions = query_builder::blocked_executions::find_paginated(
+            db,
+            table_config,
+            offset,
+            page_size,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Create a vector to store blocked job information
         let mut blocked_jobs: Vec<BlockedJobInfo> = Vec::with_capacity(blocked_executions.len());
@@ -52,18 +58,6 @@ impl ControlPlane {
             if let Ok(Some(job)) =
                 query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
             {
-                // Apply filters
-                if let Some(ref filter_class) = pagination.class_name {
-                    if &job.class_name != filter_class {
-                        continue;
-                    }
-                }
-                if let Some(ref filter_queue) = pagination.queue_name {
-                    if &execution.queue_name != filter_queue {
-                        continue;
-                    }
-                }
-
                 // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
@@ -114,17 +108,33 @@ impl ControlPlane {
         // Get total number of blocked jobs for pagination
         let start = Instant::now();
 
-        let total_count: u64 = query_builder::blocked_executions::count_all(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_count: u64 = query_builder::blocked_executions::count_all(
+            db,
+            table_config,
+            pagination.class_name.as_deref(),
+            pagination.queue_name.as_deref(),
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         info!("Total blocked jobs count: {}", total_count);
 
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);
 
-        if total_pages > 0 && pagination.page > total_pages {
-            return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
+        // Clamp out-of-range page to the last valid page (preserving filters) so
+        // actions taken on the final row don't bounce users onto a dead page.
+        if pagination.page > total_pages {
+            let mut ser = url::form_urlencoded::Serializer::new(String::new());
+            ser.append_pair("page", &total_pages.to_string());
+            if let Some(cn) = pagination.class_name.as_deref() {
+                ser.append_pair("class_name", cn);
+            }
+            if let Some(qn) = pagination.queue_name.as_deref() {
+                ser.append_pair("queue_name", qn);
+            }
+            let target = format!("{}/blocked-jobs?{}", state.base_path, ser.finish());
+            return Ok(Self::redirect_back(&target));
         }
         debug!("Fetched count in {:?}", start.elapsed());
 
@@ -135,162 +145,162 @@ impl ControlPlane {
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "blocked-jobs");
+        context.insert("filter_class_name", &pagination.class_name);
+        context.insert("filter_queue_name", &pagination.queue_name);
 
         let html = state
             .render_template("blocked-jobs.html", &mut context)
             .await?;
         debug!("Template rendering completed in {:?}", start.elapsed());
 
-        Ok(Html(html))
+        Ok(Html(html).into_response())
     }
 
-    // Implement method to unblock a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/unblock"))]
     pub async fn unblock_job(
         State(state): State<Arc<ControlPlane>>,
+        headers: HeaderMap,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
             Err(e) => {
                 error!("Failed to get db connection: {}", e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/blocked-jobs".to_string(),
-                ));
+                return Self::error_response();
             }
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/blocked-jobs");
 
-        // Use transaction to operate
-        db.transaction::<_, (), DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // Find blocked execution using query_builder
-                let _blocked_execution =
-                    query_builder::blocked_executions::find_by_id(txn, &table_config, id)
-                        .await?
-                        .ok_or_else(|| {
-                            DbErr::Custom(format!("Blocked execution with ID {} not found", id))
-                        })?;
+        match db
+            .transaction::<_, (), DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let _blocked_execution =
+                        query_builder::blocked_executions::find_by_id(txn, &table_config, id)
+                            .await?
+                            .ok_or_else(|| {
+                                DbErr::Custom(format!("Blocked execution with ID {} not found", id))
+                            })?;
 
-                // Delete blocked execution using query_builder
-                query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
-
-                info!("Unblocked job ID: {}", id);
-                Ok(())
+                    query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map(|_| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
-        .map_err(|e| {
-            error!("Failed to unblock job {}: {}", id, e);
-            match e.to_string() {
-                s if s.contains("not found") => {
-                    (StatusCode::NOT_FOUND, "/blocked-jobs".to_string())
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/blocked-jobs".to_string(),
-                ),
+            .await
+        {
+            Ok(_) => {
+                info!("Unblocked job ID: {}", id);
+                Self::redirect_back(&redirect)
             }
-        })
+            Err(e) if e.to_string().contains("not found") => {
+                info!("Blocked job {} already gone: {}", id, e);
+                Self::not_found_response()
+            }
+            Err(e) => {
+                error!("Failed to unblock job {}: {}", id, e);
+                Self::error_response()
+            }
+        }
     }
 
-    // Implement method to cancel a single blocked job
     #[instrument(skip(state), fields(path = "/blocked-jobs/:id/cancel"))]
     pub async fn cancel_blocked_job(
         State(state): State<Arc<ControlPlane>>,
+        headers: HeaderMap,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
             Err(e) => {
                 error!("Failed to get db connection: {}", e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/blocked-jobs".to_string(),
-                ));
+                return Self::error_response();
             }
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_or(&headers, "/blocked-jobs");
 
-        // Use transaction to operate
-        db.transaction::<_, (), DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // Find blocked execution using query_builder
-                let blocked_execution =
-                    query_builder::blocked_executions::find_by_id(txn, &table_config, id)
-                        .await?
-                        .ok_or_else(|| {
-                            DbErr::Custom(format!("Blocked execution with ID {} not found", id))
-                        })?;
+        match db
+            .transaction::<_, i64, DbErr>(|txn| {
+                let table_config = table_config.clone();
+                Box::pin(async move {
+                    let blocked_execution =
+                        query_builder::blocked_executions::find_by_id(txn, &table_config, id)
+                            .await?
+                            .ok_or_else(|| {
+                                DbErr::Custom(format!("Blocked execution with ID {} not found", id))
+                            })?;
 
-                let job_id = blocked_execution.job_id;
-
-                // Delete blocked execution using query_builder
-                query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
-
-                // Delete related job using query_builder
-                query_builder::jobs::delete_by_id(txn, &table_config, job_id).await?;
-
-                info!("Cancelled blocked job ID: {}, job ID: {}", id, job_id);
-                Ok(())
+                    let job_id = blocked_execution.job_id;
+                    query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
+                    query_builder::jobs::delete_by_id(txn, &table_config, job_id).await?;
+                    Ok(job_id)
+                })
             })
-        })
-        .await
-        .map(|_| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
-        .map_err(|e| {
-            error!("Failed to cancel blocked job {}: {}", id, e);
-            match e.to_string() {
-                s if s.contains("not found") => {
-                    (StatusCode::NOT_FOUND, "/blocked-jobs".to_string())
-                }
-                _ => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/blocked-jobs".to_string(),
-                ),
+            .await
+        {
+            Ok(job_id) => {
+                info!("Cancelled blocked job ID: {}, job ID: {}", id, job_id);
+                Self::redirect_back(&redirect)
             }
-        })
+            Err(e) if e.to_string().contains("not found") => {
+                info!("Blocked job {} already gone: {}", id, e);
+                Self::not_found_response()
+            }
+            Err(e) => {
+                error!("Failed to cancel blocked job {}: {}", id, e);
+                Self::error_response()
+            }
+        }
     }
 
-    pub async fn unblock_all_jobs(State(state): State<Arc<ControlPlane>>) -> impl IntoResponse {
+    #[instrument(skip(state), fields(path = "/blocked-jobs/all/unblock"))]
+    pub async fn unblock_all_jobs(
+        State(state): State<Arc<ControlPlane>>,
+        Query(pagination): Query<Pagination>,
+        headers: HeaderMap,
+    ) -> Response {
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
             Err(e) => {
                 error!("Failed to get db connection: {}", e);
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "/blocked-jobs".to_string(),
-                ));
+                return Self::error_response();
             }
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let redirect = Self::referer_without_page_or(&headers, "/blocked-jobs");
+        let class_name = pagination.class_name.clone();
+        let queue_name = pagination.queue_name.clone();
 
-        // Use transaction to operate
-        db.transaction::<_, u64, DbErr>(|txn| {
-            let table_config = table_config.clone();
-            Box::pin(async move {
-                // Delete all blocked executions using query_builder
-                let count =
-                    query_builder::blocked_executions::delete_all(txn, &table_config).await?;
-
-                info!("Unblocked all {} blocked jobs", count);
-                Ok(count)
+        match db
+            .transaction::<_, u64, DbErr>(|txn| {
+                let table_config = table_config.clone();
+                let class_name = class_name.clone();
+                let queue_name = queue_name.clone();
+                Box::pin(async move {
+                    let count = query_builder::blocked_executions::delete_all(
+                        txn,
+                        &table_config,
+                        class_name.as_deref(),
+                        queue_name.as_deref(),
+                    )
+                    .await?;
+                    Ok(count)
+                })
             })
-        })
-        .await
-        .map(|_count| (StatusCode::SEE_OTHER, "/blocked-jobs".to_string()))
-        .map_err(|e| {
-            error!("Failed to unblock all jobs: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "/blocked-jobs".to_string(),
-            )
-        })
+            .await
+        {
+            Ok(count) => {
+                info!("Unblocked all {} blocked jobs", count);
+                Self::redirect_back(&redirect)
+            }
+            Err(e) => {
+                error!("Failed to unblock all jobs: {}", e);
+                Self::error_response()
+            }
+        }
     }
 }

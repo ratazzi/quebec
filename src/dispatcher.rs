@@ -86,59 +86,64 @@ impl Dispatcher {
                               info!("Found {} expired concurrency keys to unblock", expired_keys_result.len());
                           }
 
-                          for row in expired_keys_result {
-                              let concurrency_key = row.try_get::<String>("", "concurrency_key")
-                                  .map_err(|e| DbErr::Custom(format!("Failed to get concurrency_key: {}", e)))?;
+                          // Collect expired concurrency keys
+                          let expired_keys: Vec<String> = expired_keys_result
+                              .iter()
+                              .filter_map(|row| row.try_get::<String>("", "concurrency_key").ok())
+                              .collect();
 
+                          // Pre-filter: batch check semaphores (like Solid Queue's releasable)
+                          // Keys without semaphore OR with value > 0 are releasable
+                          let semaphore_map = query_builder::semaphores::find_values_by_keys(
+                              txn, &ctx.table_config, &expired_keys,
+                          ).await?;
+                          let releasable_keys: Vec<&String> = expired_keys.iter().filter(|k| {
+                              semaphore_map.get(*k).map_or(true, |&v| v > 0)
+                          }).collect();
+
+                          for concurrency_key in releasable_keys {
                               let blocked_execution = query_builder::blocked_executions::find_one_by_key_for_update(
                                   txn,
                                   &ctx.table_config,
-                                  &concurrency_key,
+                                  concurrency_key,
                               ).await?;
 
                               let Some(execution) = blocked_execution else { continue };
 
-                              // Get the job to access concurrency information (like original Solid Queue)
-                              let Some(job) = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
-                                  .await? else {
-                                  warn!("Job {} not found for blocked execution", execution.job_id);
-                                  continue;
-                              };
-
-                              // Get concurrency_limit from registered runnable
+                              // Get concurrency_limit from registered runnable via job's class_name
                               let concurrency_limit = {
                                   #[cfg(feature = "python")]
                                   {
-                                      let Ok(runnables) = ctx.runnables.read()
-                                          .inspect_err(|e| warn!("Failed to acquire read lock: {}", e)) else {
-                                          continue;
-                                      };
-                                      runnables
-                                          .get(&job.class_name)
-                                          .and_then(|runnable| runnable.concurrency_limit)
-                                          .unwrap_or(1)
+                                      let limit = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
+                                          .await?
+                                          .and_then(|job| {
+                                              ctx.runnables.read().ok().and_then(|runnables| {
+                                                  runnables.get(&job.class_name)
+                                                      .and_then(|r| r.concurrency_limit)
+                                              })
+                                          })
+                                          .unwrap_or(1);
+                                      limit
                                   }
                                   #[cfg(not(feature = "python"))]
                                   { 1 }
                               };
 
-                              // Try to acquire semaphore exactly like original Solid Queue's BlockedExecution.release
+                              // Try to acquire semaphore (like Solid Queue's BlockedExecution.release)
                               match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
                                   Ok(true) => {
                                       info!("Semaphore acquired for key: {}", concurrency_key);
 
-                                      // Move blocked execution to ready execution
-                                      // Use job's queue_name and priority (inherit from job like Solid Queue)
+                                      // Use queue_name and priority from blocked_execution (already stored)
                                       query_builder::ready_executions::insert(
                                           txn,
                                           &ctx.table_config,
                                           execution.job_id,
-                                          &job.queue_name,
-                                          job.priority,
+                                          &execution.queue_name,
+                                          execution.priority,
                                       )
                                       .await?;
 
-                                      // Remove from blocked executions
                                       query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
                                           .await?;
 
@@ -173,36 +178,25 @@ impl Dispatcher {
                           // Collect queue names for NOTIFY
                           let mut notified_queues = std::collections::HashSet::new();
 
-                          for scheduled_execution in scheduled_executions {
-                              // Get job details to retrieve queue_name and priority
-                              let job = query_builder::jobs::find_by_id(txn, &ctx.table_config, scheduled_execution.job_id)
-                                  .await?;
+                          // Batch fetch all jobs at once (eliminates N+1)
+                          let job_ids: Vec<i64> = scheduled_executions.iter().map(|se| se.job_id).collect();
+                          let jobs = query_builder::jobs::find_by_ids(txn, &ctx.table_config, job_ids.clone()).await?;
+                          let job_map: std::collections::HashMap<i64, _> = jobs.into_iter().map(|j| (j.id, j)).collect();
 
-                              let Some(job) = job else {
-                                  warn!("Job {} not found for scheduled execution {}", scheduled_execution.job_id, scheduled_execution.id);
+                          // Prepare batch data for ready_executions insert
+                          let mut ready_data: Vec<(i64, &str, i32)> = Vec::with_capacity(scheduled_executions.len());
+                          for se in &scheduled_executions {
+                              let Some(job) = job_map.get(&se.job_id) else {
+                                  warn!("Job {} not found for scheduled execution {}", se.job_id, se.id);
                                   continue;
                               };
-
-                              let queue_name = job.queue_name.clone();
-
-                              query_builder::ready_executions::insert(
-                                  txn,
-                                  &ctx.table_config,
-                                  scheduled_execution.job_id,
-                                  &job.queue_name,
-                                  job.priority,
-                              )
-                              .await?;
-
-                              query_builder::scheduled_executions::delete_by_job_id(
-                                  txn,
-                                  &ctx.table_config,
-                                  scheduled_execution.job_id,
-                              )
-                              .await?;
-
-                              notified_queues.insert(queue_name);
+                              ready_data.push((se.job_id, &job.queue_name, job.priority));
+                              notified_queues.insert(job.queue_name.clone());
                           }
+
+                          // Batch insert ready_executions + batch delete scheduled_executions
+                          query_builder::ready_executions::insert_all(txn, &ctx.table_config, &ready_data).await?;
+                          query_builder::scheduled_executions::delete_by_job_ids(txn, &ctx.table_config, &job_ids).await?;
 
                           if size > 0 {
                               info!("Dispatch scheduled jobs size: {}", size);

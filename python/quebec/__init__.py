@@ -154,8 +154,14 @@ class JobBuilder:
     """Builder for configuring job options before enqueueing.
 
     This allows chaining configuration like:
-        MyJob.set(wait=3600).perform_later(qc, arg1, arg2)
-        MyJob.set(queue='high', priority=10).perform_later(qc, arg1)
+        MyJob.set(wait=3600).perform_later(arg1, arg2)
+        MyJob.set(queue='high', priority=10).perform_later(arg1)
+
+    The Quebec instance is inferred from the class binding set by
+    ``@qc.register_job`` / ``qc.register_job_class`` / ``qc.discover_jobs``.
+    If the same job class is registered to more than one Quebec instance,
+    the most recent registration wins; pass the target instance explicitly
+    as the first positional argument to ``perform_later`` to disambiguate.
     """
 
     def __init__(self, job_class: Type, **options):
@@ -191,8 +197,21 @@ class JobBuilder:
         """Create a JobDescriptor with configured options (for bulk enqueue)."""
         return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
 
-    def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
-        """Enqueue the job with configured options."""
+    def perform_later(self, *args, **kwargs) -> "ActiveJob":
+        """Enqueue the job with configured options.
+
+        The Quebec instance may be passed explicitly as the first
+        positional argument (legacy form) or omitted entirely when the
+        job class has been registered with a Quebec instance. A leading
+        argument is only consumed as the Quebec instance when it is
+        actually a ``Quebec`` object; any other value (including
+        ``None``) is treated as job payload data.
+        """
+        qc = None
+        if args and isinstance(args[0], Quebec):
+            qc = args[0]
+            args = args[1:]
+
         scheduled_at = self._calculate_scheduled_at()
 
         # Pass internal options via kwargs (will be filtered out before serialization)
@@ -205,7 +224,16 @@ class JobBuilder:
         if "priority" in self.options:
             kwargs["_priority"] = self.options["priority"]
 
-        # Call the original perform_later
+        if qc is None:
+            qc = getattr(self.job_class, "quebec", None)
+            if qc is None:
+                name = self.job_class.__qualname__
+                raise TypeError(
+                    f"{name} is not registered with a Quebec instance. Use "
+                    f"@qc.register_job, qc.register_job_class({name}), or "
+                    f"qc.discover_jobs(...) — or pass the Quebec instance as "
+                    f"the first argument to perform_later."
+                )
         return self.job_class.perform_later(qc, *args, **kwargs)
 
 
@@ -249,9 +277,9 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
             JobBuilder instance for chaining with perform_later
 
         Example:
-            MyJob.set(wait=3600).perform_later(qc, arg1)  # Run in 1 hour
-            MyJob.set(wait_until=tomorrow).perform_later(qc, arg1)
-            MyJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+            MyJob.set(wait=3600).perform_later(arg1)  # Run in 1 hour
+            MyJob.set(wait_until=tomorrow).perform_later(arg1)
+            MyJob.set(queue='critical', priority=1).perform_later(arg1)
         """
         options = {}
         if wait is not None:
@@ -330,9 +358,13 @@ def _quebec_start(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
-    threads: int = 1,
 ):
     """Non-blocking start. Returns immediately after all components are started.
+
+    Worker thread count is normally configured via queue.yml
+    (workers.threads). The worker_threads constructor parameter can be used
+    as an explicit override. There is a single source of truth on the Rust
+    side; Python reads it via self.worker_threads.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -340,7 +372,6 @@ def _quebec_start(
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
                None means spawn all components.
-        threads: Number of worker threads to run jobs (default 1).
 
     Example:
         qc.start()
@@ -354,6 +385,9 @@ def _quebec_start(
 
     if control_plane:
         self.start_control_plane(control_plane)
+
+    # Thread count comes from Rust (typically queue.yml, optionally constructor override)
+    threads = self.worker_threads
 
     # Spawn components based on spawn parameter
     if spawn is None:
@@ -372,11 +406,6 @@ def _quebec_start(
     # Set up threading infrastructure
     shutdown_event = threading.Event()
     job_queue = queue.Queue()
-
-    # Register internal shutdown handler to signal the event
-    @self.on_shutdown
-    def _internal_shutdown_handler():
-        shutdown_event.set()
 
     if threads > 0:
         self.bind_queue(job_queue)
@@ -435,11 +464,13 @@ def _quebec_run(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
-    threads: int = 1,
 ):
     """Blocking run. Starts all components and waits until shutdown.
 
     This is equivalent to calling start() followed by wait().
+    Worker thread count is normally configured via queue.yml
+    (workers.threads). The worker_threads constructor parameter can be used
+    as an explicit override.
 
     Args:
         create_tables: Whether to create database tables (default False).
@@ -447,20 +478,17 @@ def _quebec_run(
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
                None means spawn all components.
-        threads: Number of worker threads to run jobs (default 1).
 
     Example:
         qc.run()  # Start all components and block
         qc.run(create_tables=True)  # Create tables and start all
         qc.run(spawn=['worker'])  # Only start worker
         qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
-        qc.run(threads=4)  # Run with 4 worker threads
     """
     self.start(
         create_tables=create_tables,
         control_plane=control_plane,
         spawn=spawn,
-        threads=threads,
     )
     self.wait()
 
@@ -554,8 +582,134 @@ def _quebec_asgi_app(self):
     return ControlPlaneASGI(self)
 
 
+def _quebec_discover_jobs(
+    self,
+    *packages: str,
+    recursive: bool = True,
+    on_error: str = "raise",
+) -> List[Type]:
+    """Import the given packages and register every ``BaseClass`` subclass found.
+
+    This is a thin wrapper around ``importlib`` + ``pkgutil`` that replaces the
+    hand-rolled job-discovery loops most projects end up writing (scan a
+    ``jobs`` package, ``issubclass(..., BaseClass)``, call ``register_job``).
+
+    A class is only registered once, even if it is re-exported from multiple
+    modules. Classes whose ``__module__`` does not fall under one of the given
+    packages are ignored, so ``from some.lib import JobMixin`` will not leak
+    unrelated classes into the worker registry.
+
+    The worker registry is currently keyed by each class's ``__qualname__``, so
+    two jobs sharing a qualified name (e.g. ``foo.jobs.CleanupJob`` and
+    ``bar.jobs.CleanupJob``) would silently clobber each other. ``discover_jobs``
+    raises ``ValueError`` on such collisions rather than letting them through.
+
+    Args:
+        *packages: Dotted package paths to scan (e.g. ``"app.services.jobs"``).
+        recursive: When ``True`` (default), walk nested subpackages as well.
+        on_error: How to handle import failures in submodules. ``"raise"``
+            (default) re-raises the first ``ImportError``; ``"warn"`` emits a
+            ``RuntimeWarning`` and continues with the remaining modules. The
+            top-level package is always imported strictly — if the root fails
+            to import, there is nothing to discover.
+
+    Returns:
+        The list of ``BaseClass`` subclasses that were registered, in discovery
+        order.
+
+    Raises:
+        ValueError: If no packages are given, if ``on_error`` is not one of the
+            supported values, or if two discovered classes collide on
+            ``__qualname__``.
+        ImportError: Propagated from submodule imports when ``on_error="raise"``.
+
+    Example:
+        qc = quebec.Quebec(dsn)
+        qc.discover_jobs("app.services.jobs")
+        qc.run()
+    """
+    import importlib
+    import pkgutil
+    import warnings
+
+    if not packages:
+        raise ValueError("discover_jobs() requires at least one package name")
+    if on_error not in ("raise", "warn"):
+        raise ValueError(
+            f"discover_jobs() on_error must be 'raise' or 'warn', got {on_error!r}"
+        )
+
+    registered: List[Type] = []
+    seen: set = set()
+    by_qualname: dict = {}
+
+    def _scan_module(module) -> None:
+        for obj in module.__dict__.values():
+            if not isinstance(obj, type):
+                continue
+            if not issubclass(obj, BaseClass) or obj is BaseClass:
+                continue
+            if obj in seen:
+                continue
+            if not any(
+                obj.__module__ == pkg or obj.__module__.startswith(pkg + ".")
+                for pkg in packages
+            ):
+                continue
+            existing = by_qualname.get(obj.__qualname__)
+            if existing is not None and existing is not obj:
+                raise ValueError(
+                    f"discover_jobs() found two classes sharing qualname "
+                    f"{obj.__qualname__!r}: {existing.__module__}.{existing.__qualname__} "
+                    f"and {obj.__module__}.{obj.__qualname__}. Quebec's worker "
+                    "registry is keyed by qualname, so the later registration "
+                    "would silently replace the earlier one. Rename one of the "
+                    "classes or skip this package."
+                )
+            seen.add(obj)
+            by_qualname[obj.__qualname__] = obj
+            self.register_job(obj)
+            registered.append(obj)
+
+    def _safe_import(module_name: str):
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as exc:
+            if on_error == "raise":
+                raise
+            warnings.warn(
+                f"discover_jobs: skipping {module_name!r} (import failed: {exc})",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return None
+
+    for pkg_name in packages:
+        # Top-level package must import cleanly — we cannot walk a missing package.
+        package = importlib.import_module(pkg_name)
+        _scan_module(package)
+
+        pkg_path = getattr(package, "__path__", None)
+        if pkg_path is None:
+            # Plain module, not a package — nothing else to walk.
+            continue
+
+        walker = pkgutil.walk_packages if recursive else pkgutil.iter_modules
+        for info in walker(pkg_path, prefix=f"{pkg_name}."):
+            module_name = info.name
+            if any(part.startswith("_") for part in module_name.split(".")):
+                continue
+            submodule = _safe_import(module_name)
+            if submodule is None:
+                continue
+            _scan_module(submodule)
+
+    return registered
+
+
 # Attach methods to Quebec class
 Quebec.start = _quebec_start
 Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
 Quebec.asgi_app = _quebec_asgi_app
+Quebec.discover_jobs = _quebec_discover_jobs

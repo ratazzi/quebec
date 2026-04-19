@@ -16,8 +16,6 @@ use std::time::Instant;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
-use url::Url;
-
 /// Extract a value from kwargs, falling back to an environment variable, then to a default.
 /// Priority: kwargs > env var > default
 fn extract_kwarg_or_env<T>(
@@ -51,6 +49,32 @@ where
     }
     // 3. Default
     default
+}
+
+/// Like `extract_kwarg_or_env` but returns `None` when neither kwargs nor env
+/// supplies a value. Use for optional config where an absent value must be
+/// distinguished from a typed default.
+fn extract_kwarg_or_env_opt<T>(
+    kwargs: Option<&Bound<'_, PyDict>>,
+    key: &str,
+    env_key: &str,
+) -> Option<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py> + FromStr,
+{
+    if let Some(py_val) = kwargs.and_then(|kw| kw.get_item(key).ok().flatten()) {
+        match py_val.extract::<T>() {
+            Ok(val) => return Some(val),
+            Err(_) => warn!("Config '{}': type mismatch, falling back to env", key),
+        }
+    }
+    if let Ok(raw) = std::env::var(env_key) {
+        match raw.parse::<T>() {
+            Ok(parsed) => return Some(parsed),
+            Err(_) => warn!("Env '{}': failed to parse '{}', ignoring", env_key, raw),
+        }
+    }
+    None
 }
 
 use crate::control_plane::{ControlPlane, ControlPlaneExt};
@@ -265,16 +289,60 @@ impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        let redacted = Url::parse(&url)
-            .ok()
-            .map(|mut u| {
-                if u.password().is_some() {
-                    let _ = u.set_password(Some("***"));
-                }
-                u.to_string()
-            })
-            .unwrap_or_else(|| "<invalid url>".to_string());
-        info!("PyQuebec<{}>", redacted);
+        let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
+        })?;
+
+        let sslmode: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslmode", "QUEBEC_SSLMODE");
+        let sslrootcert: Option<String> =
+            extract_kwarg_or_env_opt(kwargs, "sslrootcert", "QUEBEC_SSLROOTCERT");
+        let sslcert: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslcert", "QUEBEC_SSLCERT");
+        let sslkey: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslkey", "QUEBEC_SSLKEY");
+        let dsn = if sslmode.is_some()
+            || sslrootcert.is_some()
+            || sslcert.is_some()
+            || sslkey.is_some()
+        {
+            if !dsn.is_postgres() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "SSL parameters (sslmode/sslrootcert/sslcert/sslkey) require a postgres:// URL",
+                ));
+            }
+            dsn.with_ssl_params(
+                sslmode.as_deref(),
+                sslrootcert.as_deref(),
+                sslcert.as_deref(),
+                sslkey.as_deref(),
+            )
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to apply SSL params: {}",
+                    e
+                ))
+            })?
+        } else {
+            dsn
+        };
+
+        // sqlx-postgres 0.8 treats `sslmode=allow` identically to `disable`
+        // (plaintext, marked FIXME upstream). Reject it from any source
+        // (kwargs, env, or DSN query string) so callers don't silently get
+        // cleartext while expecting opportunistic TLS. sqlx also accepts
+        // `ssl-mode` as an alias of `sslmode`, so both spellings are scanned.
+        if dsn.is_postgres() {
+            let aliases = crate::database_url::ssl_param_aliases("sslmode");
+            let offender = dsn
+                .url()
+                .query_pairs()
+                .find(|(k, v)| aliases.contains(&k.as_ref()) && v.eq_ignore_ascii_case("allow"));
+            if offender.is_some() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "sslmode=allow is not supported: sqlx-postgres treats it as disable (plaintext). Use 'prefer' for opportunistic TLS or 'require'/'verify-*' to enforce it.",
+                ));
+            }
+        }
+
+        info!("PyQuebec<{}>", dsn);
 
         let rt = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
@@ -289,11 +357,8 @@ impl PyQuebec {
                 })?,
         );
 
-        let dsn = Url::parse(&url).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
-        })?;
-        let mut opt: ConnectOptions = ConnectOptions::new(url.to_string());
-        let is_sqlite = url.contains("sqlite");
+        let mut opt: ConnectOptions = ConnectOptions::new(dsn.as_connect_str().to_string());
+        let is_sqlite = dsn.is_sqlite();
         let min_conns: u32 = extract_kwarg_or_env(
             kwargs,
             "db_min_connections",
@@ -474,7 +539,39 @@ impl PyQuebec {
             })
             .ok();
 
+        // Check if worker config was explicitly set via code/env before options is moved
+        // Verify the value is actually extractable, not just present
+        let has_explicit_threads = kwargs
+            .and_then(|k| k.get_item("worker_threads").ok().flatten())
+            .and_then(|v| v.extract::<u64>().ok())
+            .is_some()
+            || std::env::var("QUEBEC_WORKER_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some();
+        let has_explicit_polling = kwargs
+            .and_then(|k| k.get_item("worker_polling_interval").ok().flatten())
+            .filter(|v| {
+                v.extract::<Duration>().is_ok()
+                    || v.extract::<u64>().is_ok()
+                    || v.extract::<f64>()
+                        .map(|f| f.is_finite() && f >= 0.0)
+                        .unwrap_or(false)
+            })
+            .is_some()
+            || std::env::var("QUEBEC_WORKER_POLLING_INTERVAL")
+                .ok()
+                .and_then(|s| parse_duration_f64_env(&s))
+                .is_some();
+
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
+
+        if _ctx.worker_threads == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker_threads must be >= 1",
+            ));
+        }
+
         // Bind the runtime handle so other parts can reuse the single runtime
         _ctx.set_runtime_handle(rt.handle().clone());
 
@@ -502,16 +599,24 @@ impl PyQuebec {
                 }
 
                 if let Some(worker) = workers.first() {
-                    // Only apply if still at default value
+                    // Code/env parameters take precedence over config file
                     if let Some(threads) = worker.threads {
-                        if _ctx.worker_threads == 3 {
-                            // default value
+                        if !has_explicit_threads {
+                            if threads == 0 {
+                                return Err(pyo3::exceptions::PyValueError::new_err(
+                                    "worker_threads must be >= 1 (set via queue.yml workers.threads)",
+                                ));
+                            }
                             _ctx.worker_threads = threads as u64;
                         }
                     }
                     if let Some(polling_interval) = worker.polling_interval {
-                        if _ctx.worker_polling_interval == Duration::from_millis(100) {
-                            // default value
+                        if !has_explicit_polling {
+                            if !polling_interval.is_finite() || polling_interval < 0.0 {
+                                return Err(pyo3::exceptions::PyValueError::new_err(
+                                    format!("worker_polling_interval must be finite and >= 0 (set via queue.yml workers.polling_interval, got {})", polling_interval),
+                                ));
+                            }
                             _ctx.worker_polling_interval =
                                 Duration::from_secs_f64(polling_interval);
                         }
@@ -576,8 +681,6 @@ impl PyQuebec {
         let shutdown_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let start_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
         let stop_handlers = Arc::new(RwLock::new(Vec::<Py<PyAny>>::new()));
-
-        ctx.set_proc_title("worker", Some(&ctx.worker_threads.to_string()));
 
         Ok(PyQuebec {
             ctx,
@@ -799,6 +902,11 @@ impl PyQuebec {
         Ok(())
     }
 
+    #[getter]
+    fn worker_threads(&self) -> u64 {
+        self.ctx.worker_threads
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {
@@ -935,7 +1043,20 @@ impl PyQuebec {
     }
 
     fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
-        // Register with worker (this will store in AppContext.runnables)
+        if !job_class.bind(py).is_instance_of::<PyType>() {
+            return Err(PyTypeError::new_err(
+                "Expected a class, but got an instance",
+            ));
+        }
+
+        let instance = job_class.bind(py).call0()?;
+        if !instance.is_instance_of::<ActiveJob>() {
+            return Err(PyTypeError::new_err(
+                "Job class must be a subclass of ActiveJob",
+            ));
+        }
+
+        job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?)?;
         self.worker.register_job_class(py, job_class)?;
         Ok(())
     }
@@ -1438,26 +1559,8 @@ impl PyQuebec {
 
     // implment a decorator to register job class
     fn register_job(&self, py: Python, job_class: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        // Check if the passed object is a class
-        if !job_class.bind(py).is_instance_of::<PyType>() {
-            return Err(PyTypeError::new_err(
-                "Expected a class, but got an instance",
-            ));
-        }
-
-        let binding = job_class.clone();
-        let bound = binding.bind(py);
-
-        let instance = bound.call0()?;
-        if !instance.is_instance_of::<ActiveJob>() {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Job class must be a subclass of ActiveJob",
-            ));
-        }
-
-        let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
-        let _ = self.worker.register_job_class(py, job_class);
+        self.register_job_class(py, job_class)?;
         Ok(dup)
     }
 
@@ -1476,20 +1579,18 @@ impl PyQuebec {
             .getattr("partial")?
             .call((handler_func,), Some(&kwargs))?;
 
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGINT")?, wrapped_handler.clone()),
-        )?;
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGTERM")?, wrapped_handler.clone()),
-        )?;
-        signal.call_method1(
-            "signal",
-            (signal.getattr("SIGQUIT")?, wrapped_handler.clone()),
-        )?;
+        let mut registered: Vec<&str> = Vec::with_capacity(3);
+        for name in ["SIGINT", "SIGTERM", "SIGQUIT"] {
+            if !signal.hasattr(name)? {
+                // SIGQUIT (and in theory others) is missing on Windows; skip
+                // rather than aborting startup.
+                continue;
+            }
+            signal.call_method1("signal", (signal.getattr(name)?, wrapped_handler.clone()))?;
+            registered.push(name);
+        }
 
-        info!("Signal handlers registered for SIGINT and SIGTERM and SIGQUIT");
+        info!("Signal handlers registered: {}", registered.join(", "));
         Ok(wrapped_handler.into_pyobject(py)?.into())
     }
 
@@ -1533,6 +1634,10 @@ impl PyQuebec {
                 return Err(e);
             }
         }
+
+        // Set process title on the main thread where it takes effect
+        self.ctx
+            .set_proc_title("worker", Some(&self.ctx.worker_threads.to_string()));
 
         // Spawn all components
         self.spawn_dispatcher()?;
@@ -2047,27 +2152,50 @@ impl ActiveJob {
         Ok(self.logger.clone())
     }
 
-    #[classmethod]
-    #[pyo3(signature = ( quebec, *args, **kwargs))]
-    fn perform_later(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        quebec: &PyQuebec,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<ActiveJob> {
-        quebec.perform_later(py, cls, args, kwargs)
-    }
-
+    /// Enqueue the job.
+    ///
+    /// The Quebec instance may be passed explicitly as the first argument
+    /// (legacy style) or omitted entirely when the class has been registered
+    /// via ``@qc.register_job``, ``qc.register_job_class`` or
+    /// ``qc.discover_jobs`` — all three paths bind the instance onto
+    /// ``cls.quebec``, so ``MyJob.perform_later(arg1, arg2)`` works.
+    ///
+    /// A leading argument is only consumed as the Quebec instance when it
+    /// is actually a ``Quebec`` object; any other value (including
+    /// ``None``) is treated as job payload data.
     #[classmethod]
     #[pyo3(signature = (*args, **kwargs))]
-    fn perform_later1(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
+    fn perform_later<'py>(
+        cls: &Bound<'py, PyType>,
+        py: Python<'py>,
+        args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<ActiveJob> {
-        let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-        quebec.perform_later(py, cls, args, kwargs)
+        if let Ok(first) = args.get_item(0) {
+            if first.is_instance_of::<PyQuebec>() {
+                let qc = first.extract::<PyQuebec>()?;
+                let rest = args.get_slice(1, args.len());
+                return qc.perform_later(py, cls, &rest, kwargs);
+            }
+        }
+        let qc = resolve_quebec_from_cls(cls)?;
+        qc.perform_later(py, cls, args, kwargs)
     }
+}
+
+fn resolve_quebec_from_cls(cls: &Bound<'_, PyType>) -> PyResult<PyQuebec> {
+    let name_err = || {
+        let name = cls
+            .qualname()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "job class".to_string());
+        PyTypeError::new_err(format!(
+            "{name} is not registered with a Quebec instance. Use \
+             @qc.register_job, qc.register_job_class({name}), or \
+             qc.discover_jobs(...) — or pass the Quebec instance as the \
+             first argument to perform_later."
+        ))
+    };
+    let attr = cls.getattr("quebec").map_err(|_| name_err())?;
+    attr.extract::<PyQuebec>().map_err(|_| name_err())
 }

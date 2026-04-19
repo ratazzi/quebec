@@ -226,14 +226,23 @@ pub mod jobs {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .and_where(Expr::col(col("id")).is_in(ids))
-            .to_owned();
 
-        execute_select(db, query).await
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut results = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.jobs);
+            let query = Query::select()
+                .column(Asterisk)
+                .from(table)
+                .and_where(Expr::col(col("id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            results.extend(execute_select::<quebec_jobs::Model, _>(db, query).await?);
+        }
+        Ok(results)
     }
 
     /// Insert a new job and return its ID
@@ -501,16 +510,28 @@ pub mod jobs {
     }
 
     /// Count finished jobs
-    pub async fn count_finished<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    pub async fn count_finished<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
+        let mut query = Query::select()
             .expr(Expr::col(Asterisk).count())
             .from(table)
             .and_where(Expr::col(col("finished_at")).is_not_null())
             .to_owned();
+
+        if let Some(cn) = class_name {
+            query.and_where(Expr::col(col("class_name")).eq(cn));
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col(col("queue_name")).eq(qn));
+        }
 
         execute_count(db, query).await
     }
@@ -521,12 +542,14 @@ pub mod jobs {
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_jobs::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.jobs);
-        let query = Query::select()
+        let mut query = Query::select()
             .column(Asterisk)
             .from(table)
             .and_where(Expr::col(col("finished_at")).is_not_null())
@@ -534,6 +557,13 @@ pub mod jobs {
             .offset(offset)
             .limit(limit)
             .to_owned();
+
+        if let Some(cn) = class_name {
+            query.and_where(Expr::col(col("class_name")).eq(cn));
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col(col("queue_name")).eq(qn));
+        }
 
         execute_select(db, query).await
     }
@@ -1009,6 +1039,36 @@ pub mod ready_executions {
         execute_delete(db, query).await
     }
 
+    /// Batch delete ready executions by IDs
+    pub async fn delete_by_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        ids: &[i64],
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut total = 0u64;
+        for chunk in ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.ready_executions);
+            let query = Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(col("id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            total += execute_delete(db, query).await?;
+        }
+        Ok(total)
+    }
+
     /// Find one ready execution with FOR UPDATE SKIP LOCKED (for job claiming)
     /// Returns None if no execution found or all are locked
     pub async fn find_one_for_update<C>(
@@ -1222,6 +1282,49 @@ pub mod ready_executions {
             .map(|row| row.try_get("", "queue_name"))
             .collect()
     }
+
+    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .to_owned();
+
+        execute_count(db, query).await
+    }
+
+    /// Get the oldest ready execution's created_at for pending latency calculation
+    pub async fn oldest_created_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Option<chrono::NaiveDateTime>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .expr(Expr::col(col("created_at")).min())
+            .from(table)
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        let row = db.query_one(stmt).await?;
+        Ok(row
+            .and_then(|r| {
+                r.try_get("", "MIN(\"created_at\")")
+                    .ok()
+                    .or_else(|| r.try_get_by_index(0).ok())
+            })
+            .flatten())
+    }
 }
 
 // =============================================================================
@@ -1238,17 +1341,17 @@ pub mod claimed_executions {
         table_config: &TableConfig,
         job_id: i64,
         process_id: Option<i64>,
+        created_at: chrono::NaiveDateTime,
     ) -> Result<i64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.claimed_executions);
-        let now = chrono::Utc::now().naive_utc();
 
         let mut query = Query::insert()
             .into_table(table)
             .columns([col("job_id"), col("process_id"), col("created_at")])
-            .values_panic([job_id.into(), process_id.into(), now.into()])
+            .values_panic([job_id.into(), process_id.into(), created_at.into()])
             .to_owned();
 
         if db.get_database_backend() == DbBackend::Postgres {
@@ -1256,6 +1359,101 @@ pub mod claimed_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Batch insert claimed execution records and return inserted models.
+    /// PostgreSQL/SQLite: uses RETURNING *.
+    /// MySQL: fallback to INSERT then SELECT.
+    /// SQLite: auto-chunks at 333 rows (3 cols * 333 = 999).
+    pub async fn insert_all_returning<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, Option<i64>, chrono::NaiveDateTime)],
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let backend = db.get_database_backend();
+        let cols_per_row: usize = 3;
+        let max_params = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+        let chunk_size = max_params / cols_per_row;
+
+        let mut all_models: Vec<quebec_claimed_executions::Model> = Vec::with_capacity(data.len());
+
+        for chunk in data.chunks(chunk_size) {
+            let table = Alias::new(&table_config.claimed_executions);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([col("job_id"), col("process_id"), col("created_at")])
+                .to_owned();
+
+            for &(job_id, process_id, created_at) in chunk {
+                query.values_panic([job_id.into(), process_id.into(), created_at.into()]);
+            }
+
+            match backend {
+                DbBackend::Postgres | DbBackend::Sqlite => {
+                    query.returning(Returning::new().all());
+                    let (sql, values) = build_insert_sql(backend, &query);
+                    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                    let models: Vec<quebec_claimed_executions::Model> =
+                        quebec_claimed_executions::Model::find_by_statement(stmt)
+                            .all(db)
+                            .await?;
+                    all_models.extend(models);
+                }
+                DbBackend::MySql => {
+                    let (sql, values) = build_insert_sql(backend, &query);
+                    let stmt = Statement::from_sql_and_values(backend, &sql, values);
+                    db.execute(stmt).await?;
+                    // Fallback: fetch by job_ids
+                    let job_ids: Vec<i64> = chunk.iter().map(|&(jid, _, _)| jid).collect();
+                    let fetched = find_by_job_ids(db, table_config, &job_ids).await?;
+                    all_models.extend(fetched);
+                }
+            }
+        }
+
+        Ok(all_models)
+    }
+
+    /// Batch fetch claimed executions by job_ids
+    pub async fn find_by_job_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_ids: &[i64],
+    ) -> Result<Vec<quebec_claimed_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if job_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut results = Vec::with_capacity(job_ids.len());
+        for chunk in job_ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.claimed_executions);
+            let query = Query::select()
+                .column(Asterisk)
+                .from(table)
+                .and_where(Expr::col(col("job_id")).is_in(chunk.iter().copied()))
+                .order_by(col("job_id"), Order::Asc)
+                .to_owned();
+            results.extend(execute_select::<quebec_claimed_executions::Model, _>(db, query).await?);
+        }
+        Ok(results)
     }
 
     /// Find a claimed execution by job_id
@@ -1529,6 +1727,36 @@ pub mod claimed_executions {
 
         execute_delete(db, query).await
     }
+
+    /// Get the oldest claimed execution's created_at for processing latency calculation
+    pub async fn oldest_created_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Option<chrono::NaiveDateTime>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.claimed_executions);
+        let query = Query::select()
+            .expr(Expr::col(col("created_at")).min())
+            .from(table)
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        let row = db.query_one(stmt).await?;
+        Ok(row
+            .and_then(|r| {
+                r.try_get("", "MIN(\"created_at\")")
+                    .ok()
+                    .or_else(|| r.try_get_by_index(0).ok())
+            })
+            .flatten())
+    }
 }
 
 // =============================================================================
@@ -1673,15 +1901,36 @@ pub mod blocked_executions {
     }
 
     /// Count all blocked executions
-    pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    pub async fn count_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::select()
+        let jobs = Alias::new(&table_config.jobs);
+        let mut query = Query::select()
             .expr(Expr::col(Asterisk).count())
-            .from(table)
+            .from(table.clone())
             .to_owned();
+
+        if class_name.is_some() {
+            query.inner_join(
+                jobs,
+                Expr::col((table.clone(), col("job_id")))
+                    .equals((Alias::new(&table_config.jobs), col("id"))),
+            );
+            query.and_where(
+                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
+                    .eq(class_name.unwrap()),
+            );
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col((table, col("queue_name"))).eq(qn));
+        }
 
         execute_count(db, query).await
     }
@@ -1706,18 +1955,36 @@ pub mod blocked_executions {
         table_config: &TableConfig,
         offset: u64,
         limit: u64,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_blocked_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::select()
-            .column(Asterisk)
-            .from(table)
-            .order_by(col("created_at"), Order::Desc)
+        let jobs = Alias::new(&table_config.jobs);
+        let mut query = Query::select()
+            .column((table.clone(), Asterisk))
+            .from(table.clone())
+            .order_by((table.clone(), col("created_at")), Order::Desc)
             .offset(offset)
             .limit(limit)
             .to_owned();
+
+        if class_name.is_some() {
+            query.inner_join(
+                jobs,
+                Expr::col((table.clone(), col("job_id")))
+                    .equals((Alias::new(&table_config.jobs), col("id"))),
+            );
+            query.and_where(
+                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
+                    .eq(class_name.unwrap()),
+            );
+        }
+        if let Some(qn) = queue_name {
+            query.and_where(Expr::col((table, col("queue_name"))).eq(qn));
+        }
 
         execute_select(db, query).await
     }
@@ -1741,14 +2008,52 @@ pub mod blocked_executions {
         execute_select_one(db, query).await
     }
 
-    /// Delete all blocked executions
-    pub async fn delete_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
+    /// Delete all blocked executions, optionally filtered by class_name/queue_name
+    pub async fn delete_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
     {
         let table = Alias::new(&table_config.blocked_executions);
-        let query = Query::delete().from_table(table).to_owned();
 
+        // No filters: simple bulk delete
+        if class_name.is_none() && queue_name.is_none() {
+            let query = Query::delete().from_table(table).to_owned();
+            return execute_delete(db, query).await;
+        }
+
+        // With filters: collect matching ids, then delete by id
+        let jobs_table = Alias::new(&table_config.jobs);
+        let mut select = Query::select();
+        select.column((table.clone(), Asterisk));
+        select.from(table.clone());
+        if class_name.is_some() {
+            select.inner_join(
+                jobs_table.clone(),
+                Expr::col((table.clone(), col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                select.and_where(Expr::col((jobs_table, col("class_name"))).eq(cn));
+            }
+        }
+        if let Some(qn) = queue_name {
+            select.and_where(Expr::col((table.clone(), col("queue_name"))).eq(qn));
+        }
+
+        let rows = execute_select::<quebec_blocked_executions::Model, C>(db, select).await?;
+        let ids: Vec<i64> = rows.into_iter().map(|m| m.id).collect();
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let query = Query::delete()
+            .from_table(table)
+            .and_where(Expr::col(col("id")).is_in(ids))
+            .to_owned();
         execute_delete(db, query).await
     }
 }
@@ -1834,18 +2139,43 @@ pub mod failed_executions {
         }
     }
 
-    /// Find all failed executions
+    /// Find all failed executions, optionally filtered by class_name/queue_name
     pub async fn find_all<C>(
         db: &C,
         table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
     ) -> Result<Vec<quebec_failed_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.failed_executions);
-        let query = Query::select().column(Asterisk).from(table).to_owned();
+        let fe_table = Alias::new(&table_config.failed_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let need_join = class_name.is_some() || queue_name.is_some();
 
-        execute_select(db, query).await
+        let mut query = Query::select();
+        query.columns([
+            (fe_table.clone(), col("id")),
+            (fe_table.clone(), col("job_id")),
+            (fe_table.clone(), col("error")),
+            (fe_table.clone(), col("created_at")),
+        ]);
+        query.from(fe_table.clone());
+
+        if need_join {
+            query.inner_join(
+                jobs_table.clone(),
+                Expr::col((fe_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
+            }
+            if let Some(qn) = queue_name {
+                query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
+            }
+        }
+
+        execute_select(db, query.to_owned()).await
     }
 
     /// Find a failed execution by job_id
@@ -2190,6 +2520,36 @@ pub mod scheduled_executions {
             .to_owned();
 
         execute_delete(db, query).await
+    }
+
+    /// Delete scheduled executions by job_ids (batch)
+    pub async fn delete_by_job_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_ids: &[i64],
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if job_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let chunk_size = match db.get_database_backend() {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut total = 0u64;
+        for chunk in job_ids.chunks(chunk_size) {
+            let table = Alias::new(&table_config.scheduled_executions);
+            let query = Query::delete()
+                .from_table(table)
+                .and_where(Expr::col(col("job_id")).is_in(chunk.iter().copied()))
+                .to_owned();
+            total += execute_delete(db, query).await?;
+        }
+        Ok(total)
     }
 
     /// Find a scheduled execution by ID
@@ -2629,6 +2989,47 @@ pub mod semaphores {
         execute_select(db, query).await
     }
 
+    /// Batch fetch semaphore (key, value) pairs by keys
+    /// Used for pre-filtering releasable concurrency keys (like Solid Queue's releasable)
+    pub async fn find_values_by_keys<C>(
+        db: &C,
+        table_config: &TableConfig,
+        keys: &[String],
+    ) -> Result<std::collections::HashMap<String, i32>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let backend = db.get_database_backend();
+        let chunk_size = match backend {
+            DbBackend::Sqlite => 999,
+            _ => 65535,
+        };
+
+        let mut map = std::collections::HashMap::with_capacity(keys.len());
+        for chunk in keys.chunks(chunk_size) {
+            let table = Alias::new(&table_config.semaphores);
+            let query = Query::select()
+                .columns([col("key"), col("value")])
+                .from(table)
+                .and_where(Expr::col(col("key")).is_in(chunk.iter().map(|s| s.as_str())))
+                .to_owned();
+
+            let (sql, values) = build_select_sql(backend, &query);
+            let stmt = Statement::from_sql_and_values(backend, &sql, values);
+            let rows = db.query_all(stmt).await?;
+            for row in rows {
+                let key: String = row.try_get("", "key")?;
+                let value: i32 = row.try_get("", "value")?;
+                map.insert(key, value);
+            }
+        }
+        Ok(map)
+    }
+
     /// Delete expired semaphores
     pub async fn delete_expired<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>
     where
@@ -2694,7 +3095,7 @@ pub mod pauses {
         execute_select(db, query).await
     }
 
-    /// Insert a pause record
+    /// Insert a pause record (idempotent - uses ON CONFLICT DO NOTHING / INSERT OR IGNORE)
     pub async fn insert<C>(
         db: &C,
         table_config: &TableConfig,
@@ -2704,19 +3105,68 @@ pub mod pauses {
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.pauses);
+        let backend = db.get_database_backend();
+        let table = &table_config.pauses;
 
-        let mut query = Query::insert()
-            .into_table(table)
-            .columns([col("queue_name"), col("created_at")])
-            .values_panic([queue_name.into(), created_at.into()])
-            .to_owned();
-
-        if db.get_database_backend() == DbBackend::Postgres {
-            query.returning_col(col("id"));
+        match backend {
+            DbBackend::Postgres => {
+                let sql = format!(
+                    r#"INSERT INTO "{}" ("queue_name", "created_at")
+                       VALUES ($1, $2)
+                       ON CONFLICT ("queue_name") DO NOTHING
+                       RETURNING "id""#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                match db.query_one(stmt).await? {
+                    Some(row) => {
+                        let id: i64 = row.try_get("", "id")?;
+                        Ok(id)
+                    }
+                    None => Ok(0), // already paused
+                }
+            }
+            DbBackend::Sqlite => {
+                let sql = format!(
+                    r#"INSERT OR IGNORE INTO "{}" ("queue_name", "created_at")
+                       VALUES (?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                let result = db.execute(stmt).await?;
+                if result.rows_affected() == 0 {
+                    Ok(0) // already paused
+                } else {
+                    Ok(result.last_insert_id() as i64)
+                }
+            }
+            DbBackend::MySql => {
+                let sql = format!(
+                    r#"INSERT IGNORE INTO `{}` (`queue_name`, `created_at`)
+                       VALUES (?, ?)"#,
+                    table
+                );
+                let stmt = Statement::from_sql_and_values(
+                    backend,
+                    sql,
+                    [queue_name.into(), created_at.into()],
+                );
+                let result = db.execute(stmt).await?;
+                if result.rows_affected() == 0 {
+                    Ok(0) // already paused
+                } else {
+                    Ok(result.last_insert_id() as i64)
+                }
+            }
         }
-
-        execute_insert(db, query).await
     }
 
     /// Delete a pause by queue name

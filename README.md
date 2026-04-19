@@ -91,8 +91,8 @@ class FakeJob(quebec.BaseClass):
 
 
 if __name__ == "__main__":
-    # Enqueue a job
-    FakeJob.perform_later(qc, 123, foo='bar')
+    # Enqueue a job (qc is inferred from @qc.register_job)
+    FakeJob.perform_later(123, foo='bar')
 
     # Start Quebec (handles signal, spawns workers, runs main loop)
     qc.run(
@@ -108,6 +108,54 @@ curl -O https://raw.githubusercontent.com/ratazzi/quebec/refs/heads/master/quick
 uv run quickstart.py
 ```
 
+### Auto-Discovering Jobs
+
+If your jobs are organized in a package (e.g. `app.jobs.*`), call
+`Quebec.discover_jobs()` instead of decorating each class with
+`@qc.register_job` or calling `qc.register_job_class(...)` one by one:
+
+```python
+# app/jobs/cleanup.py
+class CleanupJob(quebec.BaseClass):
+    def perform(self, *args, **kwargs): ...
+
+# main.py
+qc = quebec.Quebec(dsn)
+qc.discover_jobs("app.jobs", "worker.tasks")   # recursively scans each
+qc.run()
+```
+
+`discover_jobs` takes one or more dotted package paths as positional
+arguments (varargs) — no need to wrap a single package in a list.
+
+`discover_jobs(*packages, recursive=True, on_error="raise")`:
+
+- Registers every `BaseClass` subclass whose `__module__` falls under one of
+  the given packages. Classes imported from elsewhere (e.g. `from
+  some.lib import JobMixin`) are ignored.
+- Raises `ValueError` if two discovered classes share the same
+  `__qualname__`, since Quebec's worker registry is keyed by qualname and
+  the later registration would otherwise silently replace the earlier one.
+- `on_error="raise"` (default) propagates submodule `ImportError`. Pass
+  `on_error="warn"` to emit a `RuntimeWarning` and keep scanning —
+  useful when a package contains optional-integration modules that may
+  fail to import in some environments. The top-level package is always
+  imported strictly.
+
+### Multiple Quebec Instances
+
+Quebec is designed for one instance per process. Registering a job class
+(via `@qc.register_job`, `qc.register_job_class`, or `qc.discover_jobs`)
+binds it to that Quebec instance, so `MyJob.perform_later(...)` shorthand
+routes to the binding. If a process holds more than one Quebec instance
+and registers the same job class to each, the most recent registration
+wins — pass the target instance explicitly to disambiguate:
+
+```python
+MyJob.perform_later(qc2, arg1)                  # route to qc2
+MyJob.set(queue='critical').perform_later(qc2, arg1)
+```
+
 ### `qc.run()` Options
 
 | Parameter | Type | Default | Description |
@@ -115,7 +163,9 @@ uv run quickstart.py
 | `create_tables` | `bool` | `False` | Create database tables (requires DDL permissions) |
 | `control_plane` | `str` | `None` | Web dashboard address, e.g. `'127.0.0.1:5006'` |
 | `spawn` | `list[str]` | `None` | Components to spawn: `['worker', 'dispatcher', 'scheduler']`. `None` = all |
-| `threads` | `int` | `1` | Number of worker threads to run jobs |
+
+Recommended: configure worker thread count in `queue.yml` via `workers.threads`.
+If you need a one-off override, `Quebec(..., worker_threads=3)` is also supported.
 
 ### Delayed Jobs
 
@@ -123,13 +173,13 @@ uv run quickstart.py
 from datetime import timedelta
 
 # Run after 1 hour
-FakeJob.set(wait=3600).perform_later(qc, arg1)
+FakeJob.set(wait=3600).perform_later(arg1)
 
 # Run at specific time
-FakeJob.set(wait_until=tomorrow_9am).perform_later(qc, arg1)
+FakeJob.set(wait_until=tomorrow_9am).perform_later(arg1)
 
 # Override queue and priority
-FakeJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+FakeJob.set(queue='critical', priority=1).perform_later(arg1)
 ```
 
 ### Automatic Retries
@@ -175,6 +225,47 @@ class ReportJob(quebec.BaseClass):
 ```
 
 The actual concurrency key is `"ClassName/key"` (e.g. `"ReportJob/123"`), so different job classes never conflict. When the limit is reached, new jobs are blocked until a slot becomes available. The `concurrency_duration` acts as a safety TTL — the semaphore is released automatically if a worker crashes.
+
+### TLS Configuration (PostgreSQL)
+
+Quebec links `sqlx` against `rustls` + `webpki-roots`. Public CAs (AWS RDS,
+Neon, Google Cloud SQL, Supabase, etc.) are trusted out of the box — no OS
+trust store is consulted.
+
+Pass libpq-style SSL options as `Quebec(...)` kwargs, as DSN query params, or
+via `QUEBEC_SSL*` environment variables:
+
+```python
+qc = quebec.Quebec(
+    "postgresql://user:pass@host:5432/db",
+    sslmode="verify-full",             # or QUEBEC_SSLMODE
+    sslrootcert="/etc/ssl/certs/ca.pem",  # internal CAs only
+)
+```
+
+Priority is **kwargs > env > DSN query**. Passing any `ssl*` kwarg/env against
+a non-postgres URL raises `ValueError`.
+
+| `sslmode`     | Transport              | Certificate verification | Hostname verification |
+|---------------|------------------------|--------------------------|-----------------------|
+| `disable`     | plaintext              | —                        | —                     |
+| `prefer`      | TLS if offered, else plaintext | —                | —                     |
+| `require`     | TLS (fails if unsupported) | — (accepts any cert)  | —                     |
+| `verify-ca`   | TLS                    | CA-signed                | —                     |
+| `verify-full` | TLS                    | CA-signed                | hostname matches CN/SAN |
+
+For public CAs, `verify-full` works zero-config. Use `sslrootcert` for
+internal/self-signed CAs. `sslcert` + `sslkey` enable client certificate
+(mTLS) auth.
+
+> `sslmode=allow` is **rejected** with a `ValueError`. Upstream `sqlx-postgres`
+> 0.8 treats `allow` identically to `disable` (plaintext, marked `FIXME` in
+> the driver); to avoid a silent downgrade, Quebec refuses it. Use `prefer`
+> for opportunistic TLS, or `require`/`verify-*` to enforce it.
+
+> Note: some managed Postgres services (e.g. Neon) terminate TLS at a proxy
+> layer. In those cases `pg_stat_ssl.ssl` may report `false` because the
+> backend sees plaintext from the proxy — not the client.
 
 ## Lifecycle Hooks
 

@@ -412,46 +412,85 @@ where
             .col(col("finished_at"))
             .to_owned(),
         // Ready executions indexes
+        // Covering index for poll: WHERE queue_name = ? ORDER BY priority, job_id LIMIT N
         Index::create()
             .if_not_exists()
             .name(&format!(
-                "idx_{}_queue_priority",
+                "idx_{}_queue_priority_job",
                 table_config.ready_executions
             ))
             .table(tbl(&table_config.ready_executions))
             .col(col("queue_name"))
             .col(col("priority"))
+            .col(col("job_id"))
             .to_owned(),
         // Blocked executions indexes
+        // Covering index for release: WHERE concurrency_key = ? ORDER BY priority, job_id LIMIT 1
         Index::create()
             .if_not_exists()
             .name(&format!(
-                "idx_{}_concurrency_key",
+                "idx_{}_key_priority_job",
                 table_config.blocked_executions
             ))
             .table(tbl(&table_config.blocked_executions))
             .col(col("concurrency_key"))
+            .col(col("priority"))
+            .col(col("job_id"))
             .to_owned(),
+        // Maintenance index: WHERE expires_at < ? DISTINCT concurrency_key
         Index::create()
             .if_not_exists()
             .name(&format!(
-                "idx_{}_expires_at",
+                "idx_{}_expires_at_key",
                 table_config.blocked_executions
             ))
             .table(tbl(&table_config.blocked_executions))
             .col(col("expires_at"))
+            .col(col("concurrency_key"))
             .to_owned(),
         // Scheduled executions indexes
+        // Covering index for dispatch: WHERE scheduled_at <= ? ORDER BY scheduled_at, priority, job_id
         Index::create()
             .if_not_exists()
             .name(&format!(
-                "idx_{}_scheduled_at",
+                "idx_{}_dispatch",
                 table_config.scheduled_executions
             ))
             .table(tbl(&table_config.scheduled_executions))
             .col(col("scheduled_at"))
+            .col(col("priority"))
+            .col(col("job_id"))
+            .to_owned(),
+        // Poll-all index: ORDER BY priority, job_id (no queue filter)
+        Index::create()
+            .if_not_exists()
+            .name(&format!(
+                "idx_{}_priority_job",
+                table_config.ready_executions
+            ))
+            .table(tbl(&table_config.ready_executions))
+            .col(col("priority"))
+            .col(col("job_id"))
+            .to_owned(),
+        // Claimed executions: process cleanup index
+        Index::create()
+            .if_not_exists()
+            .name(&format!(
+                "idx_{}_process_job",
+                table_config.claimed_executions
+            ))
+            .table(tbl(&table_config.claimed_executions))
+            .col(col("process_id"))
+            .col(col("job_id"))
             .to_owned(),
         // Semaphores indexes
+        Index::create()
+            .if_not_exists()
+            .name(&format!("idx_{}_key_value", table_config.semaphores))
+            .table(tbl(&table_config.semaphores))
+            .col(col("key"))
+            .col(col("value"))
+            .to_owned(),
         Index::create()
             .if_not_exists()
             .name(&format!("idx_{}_expires_at", table_config.semaphores))

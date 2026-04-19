@@ -29,7 +29,7 @@ class FakeJob(quebec.BaseClass):
 
 
 if __name__ == "__main__":
-    FakeJob.perform_later(qc, 3466, foo='bar')
+    FakeJob.perform_later(3466, foo='bar')
 
     qc.run(
         create_tables=not db_path.exists(),

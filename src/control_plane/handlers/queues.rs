@@ -145,7 +145,7 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
 
-        // Create a new pause record using query_builder
+        // Insert is idempotent (ON CONFLICT DO NOTHING / INSERT OR IGNORE)
         if let Err(e) = query_builder::pauses::insert(
             db,
             table_config,

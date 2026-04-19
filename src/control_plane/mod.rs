@@ -26,8 +26,6 @@ pub use ext::ControlPlaneExt;
 pub struct ControlPlane {
     pub(crate) ctx: Arc<AppContext>,
     pub(crate) tera: RwLock<Tera>,
-    #[cfg(debug_assertions)]
-    pub(crate) template_path: String,
     pub(crate) page_size: u64,
     pub(crate) base_path: String,
     pub(crate) sse_interval: Duration,
@@ -61,8 +59,6 @@ impl ControlPlane {
         Self {
             ctx,
             tera: RwLock::new(tera),
-            #[cfg(debug_assertions)]
-            template_path: "src/templates/**/*".to_string(),
             page_size: 10,
             base_path: String::new(),
             sse_interval,
@@ -98,10 +94,25 @@ impl ControlPlane {
         let data = {
             #[cfg(debug_assertions)]
             {
-                let path = format!("src/control_plane/static/{}", filename);
-                tokio::fs::read(&path)
-                    .await
-                    .map_err(|_| StatusCode::NOT_FOUND)?
+                if let Some(path) = templates::static_asset_path(&filename) {
+                    match tokio::fs::read(&path).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            debug!(
+                                "Failed to read static asset {} from disk ({}), falling back to embedded asset",
+                                filename,
+                                e
+                            );
+                            templates::StaticAssets::get(&filename)
+                                .map(|asset| asset.data.to_vec())
+                                .ok_or(StatusCode::NOT_FOUND)?
+                        }
+                    }
+                } else {
+                    templates::StaticAssets::get(&filename)
+                        .map(|asset| asset.data.to_vec())
+                        .ok_or(StatusCode::NOT_FOUND)?
+                }
             }
 
             #[cfg(not(debug_assertions))]
@@ -143,14 +154,6 @@ impl ControlPlane {
                 post(Self::discard_all_failed_jobs),
             )
             .route("/in-progress-jobs", get(Self::in_progress_jobs))
-            .route(
-                "/in-progress-jobs/:id/cancel",
-                post(Self::cancel_in_progress_job),
-            )
-            .route(
-                "/in-progress-jobs/all/cancel",
-                post(Self::cancel_all_in_progress_jobs),
-            )
             .route("/blocked-jobs", get(Self::blocked_jobs))
             .route("/blocked-jobs/:id/unblock", post(Self::unblock_job))
             .route("/blocked-jobs/:id/cancel", post(Self::cancel_blocked_job))
