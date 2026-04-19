@@ -965,7 +965,20 @@ impl PyQuebec {
     }
 
     fn register_job_class(&self, py: Python, job_class: Py<PyAny>) -> PyResult<()> {
-        // Register with worker (this will store in AppContext.runnables)
+        if !job_class.bind(py).is_instance_of::<PyType>() {
+            return Err(PyTypeError::new_err(
+                "Expected a class, but got an instance",
+            ));
+        }
+
+        let instance = job_class.bind(py).call0()?;
+        if !instance.is_instance_of::<ActiveJob>() {
+            return Err(PyTypeError::new_err(
+                "Job class must be a subclass of ActiveJob",
+            ));
+        }
+
+        job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?)?;
         self.worker.register_job_class(py, job_class)?;
         Ok(())
     }
@@ -1468,26 +1481,8 @@ impl PyQuebec {
 
     // implment a decorator to register job class
     fn register_job(&self, py: Python, job_class: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        // Check if the passed object is a class
-        if !job_class.bind(py).is_instance_of::<PyType>() {
-            return Err(PyTypeError::new_err(
-                "Expected a class, but got an instance",
-            ));
-        }
-
-        let binding = job_class.clone();
-        let bound = binding.bind(py);
-
-        let instance = bound.call0()?;
-        if !instance.is_instance_of::<ActiveJob>() {
-            return Err(pyo3::exceptions::PyTypeError::new_err(
-                "Job class must be a subclass of ActiveJob",
-            ));
-        }
-
-        let _ = job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?);
         let dup = job_class.clone();
-        let _ = self.worker.register_job_class(py, job_class);
+        self.register_job_class(py, job_class)?;
         Ok(dup)
     }
 
@@ -2079,27 +2074,50 @@ impl ActiveJob {
         Ok(self.logger.clone())
     }
 
-    #[classmethod]
-    #[pyo3(signature = ( quebec, *args, **kwargs))]
-    fn perform_later(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        quebec: &PyQuebec,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<ActiveJob> {
-        quebec.perform_later(py, cls, args, kwargs)
-    }
-
+    /// Enqueue the job.
+    ///
+    /// The Quebec instance may be passed explicitly as the first argument
+    /// (legacy style) or omitted entirely when the class has been registered
+    /// via ``@qc.register_job``, ``qc.register_job_class`` or
+    /// ``qc.discover_jobs`` — all three paths bind the instance onto
+    /// ``cls.quebec``, so ``MyJob.perform_later(arg1, arg2)`` works.
+    ///
+    /// A leading argument is only consumed as the Quebec instance when it
+    /// is actually a ``Quebec`` object; any other value (including
+    /// ``None``) is treated as job payload data.
     #[classmethod]
     #[pyo3(signature = (*args, **kwargs))]
-    fn perform_later1(
-        cls: &Bound<'_, PyType>,
-        py: Python<'_>,
-        args: &Bound<'_, PyTuple>,
-        kwargs: Option<&Bound<'_, PyDict>>,
+    fn perform_later<'py>(
+        cls: &Bound<'py, PyType>,
+        py: Python<'py>,
+        args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<ActiveJob> {
-        let quebec = cls.getattr("quebec")?.extract::<PyQuebec>()?;
-        quebec.perform_later(py, cls, args, kwargs)
+        if let Ok(first) = args.get_item(0) {
+            if first.is_instance_of::<PyQuebec>() {
+                let qc = first.extract::<PyQuebec>()?;
+                let rest = args.get_slice(1, args.len());
+                return qc.perform_later(py, cls, &rest, kwargs);
+            }
+        }
+        let qc = resolve_quebec_from_cls(cls)?;
+        qc.perform_later(py, cls, args, kwargs)
     }
+}
+
+fn resolve_quebec_from_cls(cls: &Bound<'_, PyType>) -> PyResult<PyQuebec> {
+    let name_err = || {
+        let name = cls
+            .qualname()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| "job class".to_string());
+        PyTypeError::new_err(format!(
+            "{name} is not registered with a Quebec instance. Use \
+             @qc.register_job, qc.register_job_class({name}), or \
+             qc.discover_jobs(...) — or pass the Quebec instance as the \
+             first argument to perform_later."
+        ))
+    };
+    let attr = cls.getattr("quebec").map_err(|_| name_err())?;
+    attr.extract::<PyQuebec>().map_err(|_| name_err())
 }

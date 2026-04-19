@@ -91,8 +91,8 @@ class FakeJob(quebec.BaseClass):
 
 
 if __name__ == "__main__":
-    # Enqueue a job
-    FakeJob.perform_later(qc, 123, foo='bar')
+    # Enqueue a job (qc is inferred from @qc.register_job)
+    FakeJob.perform_later(123, foo='bar')
 
     # Start Quebec (handles signal, spawns workers, runs main loop)
     qc.run(
@@ -142,6 +142,20 @@ arguments (varargs) — no need to wrap a single package in a list.
   fail to import in some environments. The top-level package is always
   imported strictly.
 
+### Multiple Quebec Instances
+
+Quebec is designed for one instance per process. Registering a job class
+(via `@qc.register_job`, `qc.register_job_class`, or `qc.discover_jobs`)
+binds it to that Quebec instance, so `MyJob.perform_later(...)` shorthand
+routes to the binding. If a process holds more than one Quebec instance
+and registers the same job class to each, the most recent registration
+wins — pass the target instance explicitly to disambiguate:
+
+```python
+MyJob.perform_later(qc2, arg1)                  # route to qc2
+MyJob.set(queue='critical').perform_later(qc2, arg1)
+```
+
 ### `qc.run()` Options
 
 | Parameter | Type | Default | Description |
@@ -159,13 +173,13 @@ If you need a one-off override, `Quebec(..., worker_threads=3)` is also supporte
 from datetime import timedelta
 
 # Run after 1 hour
-FakeJob.set(wait=3600).perform_later(qc, arg1)
+FakeJob.set(wait=3600).perform_later(arg1)
 
 # Run at specific time
-FakeJob.set(wait_until=tomorrow_9am).perform_later(qc, arg1)
+FakeJob.set(wait_until=tomorrow_9am).perform_later(arg1)
 
 # Override queue and priority
-FakeJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+FakeJob.set(queue='critical', priority=1).perform_later(arg1)
 ```
 
 ### Automatic Retries

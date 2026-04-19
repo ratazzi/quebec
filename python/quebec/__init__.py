@@ -154,8 +154,14 @@ class JobBuilder:
     """Builder for configuring job options before enqueueing.
 
     This allows chaining configuration like:
-        MyJob.set(wait=3600).perform_later(qc, arg1, arg2)
-        MyJob.set(queue='high', priority=10).perform_later(qc, arg1)
+        MyJob.set(wait=3600).perform_later(arg1, arg2)
+        MyJob.set(queue='high', priority=10).perform_later(arg1)
+
+    The Quebec instance is inferred from the class binding set by
+    ``@qc.register_job`` / ``qc.register_job_class`` / ``qc.discover_jobs``.
+    If the same job class is registered to more than one Quebec instance,
+    the most recent registration wins; pass the target instance explicitly
+    as the first positional argument to ``perform_later`` to disambiguate.
     """
 
     def __init__(self, job_class: Type, **options):
@@ -191,8 +197,21 @@ class JobBuilder:
         """Create a JobDescriptor with configured options (for bulk enqueue)."""
         return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
 
-    def perform_later(self, qc: "Quebec", *args, **kwargs) -> "ActiveJob":
-        """Enqueue the job with configured options."""
+    def perform_later(self, *args, **kwargs) -> "ActiveJob":
+        """Enqueue the job with configured options.
+
+        The Quebec instance may be passed explicitly as the first
+        positional argument (legacy form) or omitted entirely when the
+        job class has been registered with a Quebec instance. A leading
+        argument is only consumed as the Quebec instance when it is
+        actually a ``Quebec`` object; any other value (including
+        ``None``) is treated as job payload data.
+        """
+        qc = None
+        if args and isinstance(args[0], Quebec):
+            qc = args[0]
+            args = args[1:]
+
         scheduled_at = self._calculate_scheduled_at()
 
         # Pass internal options via kwargs (will be filtered out before serialization)
@@ -205,7 +224,16 @@ class JobBuilder:
         if "priority" in self.options:
             kwargs["_priority"] = self.options["priority"]
 
-        # Call the original perform_later
+        if qc is None:
+            qc = getattr(self.job_class, "quebec", None)
+            if qc is None:
+                name = self.job_class.__qualname__
+                raise TypeError(
+                    f"{name} is not registered with a Quebec instance. Use "
+                    f"@qc.register_job, qc.register_job_class({name}), or "
+                    f"qc.discover_jobs(...) — or pass the Quebec instance as "
+                    f"the first argument to perform_later."
+                )
         return self.job_class.perform_later(qc, *args, **kwargs)
 
 
@@ -249,9 +277,9 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
             JobBuilder instance for chaining with perform_later
 
         Example:
-            MyJob.set(wait=3600).perform_later(qc, arg1)  # Run in 1 hour
-            MyJob.set(wait_until=tomorrow).perform_later(qc, arg1)
-            MyJob.set(queue='critical', priority=1).perform_later(qc, arg1)
+            MyJob.set(wait=3600).perform_later(arg1)  # Run in 1 hour
+            MyJob.set(wait_until=tomorrow).perform_later(arg1)
+            MyJob.set(queue='critical', priority=1).perform_later(arg1)
         """
         options = {}
         if wait is not None:
