@@ -1735,7 +1735,11 @@ impl Worker {
 
             let mut queue_name = "default".to_string();
             if bound.hasattr("queue_as")? {
-                queue_name = bound.getattr("queue_as")?.extract::<String>()?;
+                let attr = bound.getattr("queue_as")?;
+                if !attr.is_callable() {
+                    queue_name = attr.extract::<String>()?;
+                }
+                // Callable queue_as is re-evaluated per-enqueue in PyQuebec::perform_later.
             }
 
             let mut concurrency_limit: Option<i32> = None;
