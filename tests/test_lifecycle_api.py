@@ -14,7 +14,7 @@ def test_register_job_allows_convenience_perform_later_without_explicit_qc(
 
     qc.register_job(RegisteredJob)
 
-    enqueued = RegisteredJob.perform_later1(5)
+    enqueued = RegisteredJob.perform_later(5)
 
     assert enqueued.id is not None
     assert db_assert.count_jobs() == 1
