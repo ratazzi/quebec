@@ -15,6 +15,7 @@ exclude = [
     "*.db",
     "*.sqlite",
     "test_*.py",
+    "tests/",
     "demo.db",
     ".runtime/",
     "__pycache__/",

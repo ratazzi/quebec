@@ -747,6 +747,49 @@ impl PyQuebec {
         })
     }
 
+    /// Claim one ready job directly from the database and return an Execution.
+    /// Unlike pick_job(), this does not require a running dispatcher.
+    /// Intended for testing: enqueue a job, then immediately claim and execute it.
+    fn drain_one(&self, py: Python<'_>) -> PyResult<Execution> {
+        let worker = self.worker.clone();
+        let ctx = self.ctx.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let claimed = worker.claim_job().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "No ready job to claim: {}",
+                        e
+                    ))
+                })?;
+
+                let db = ctx.get_db().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                let job = crate::query_builder::jobs::find_by_id(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    claimed.job_id,
+                )
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Job record not found")
+                })?;
+
+                let runnable =
+                    Python::attach(|_py| ctx.get_runnable(&job.class_name)).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "Job handler not found: {}",
+                            e
+                        ))
+                    })?;
+
+                Ok(Execution::new(ctx, claimed, job, runnable))
+            })
+        })
+    }
+
     async fn post_job(&self) -> Result<(), anyhow::Error> {
         let _ = self.rt.spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -878,6 +921,41 @@ impl PyQuebec {
                 .inspect_err(|e| error!("Ping failed: {:?}", e))
                 .is_ok())
         })
+    }
+
+    /// Release all resources (DB connections, spawned tasks, tokio runtime)
+    /// without calling process::exit. Use in tests and short-lived scripts.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        self.ctx.graceful_shutdown.cancel();
+        let rt = self.rt.clone();
+        let handles = self.handles.clone();
+        let db = self.ctx.db.clone();
+        py.detach(|| {
+            rt.block_on(async move {
+                // Drain spawned tasks with timeout
+                let tasks = {
+                    let mut h = handles.lock().expect("Failed to lock handles");
+                    h.drain(..).collect::<Vec<_>>()
+                };
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    futures::future::join_all(tasks),
+                )
+                .await;
+                // Drop DB connection pool (releases all connections)
+                if let Some(conn) = db {
+                    match Arc::try_unwrap(conn) {
+                        Ok(owned) => {
+                            owned.close().await.ok();
+                        }
+                        Err(_) => warn!(
+                            "DB connection pool has other references, skipping explicit close"
+                        ),
+                    }
+                }
+            });
+        });
+        Ok(())
     }
 
     fn create_tables(&self) -> PyResult<bool> {
