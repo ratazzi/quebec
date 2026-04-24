@@ -1689,6 +1689,10 @@ impl Worker {
         }
     }
 
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
+    }
+
     fn register_handler(
         &self,
         py: Python,
@@ -2538,7 +2542,7 @@ impl Worker {
     }
 
     /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
-    async fn fail_claimed_execution<C>(
+    pub(crate) async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
         db: &C,
         table_config: &TableConfig,
@@ -2556,7 +2560,7 @@ impl Worker {
 
     /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.
     /// Used during recovery (orphan/prune) to prevent blocked jobs from getting permanently stuck.
-    async fn unblock_next_job<C>(
+    pub(crate) async fn unblock_next_job<C>(
         ctx: &Arc<AppContext>,
         db: &C,
         table_config: &TableConfig,

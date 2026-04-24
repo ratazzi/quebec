@@ -2694,6 +2694,27 @@ pub mod processes {
         execute_select_one(db, query).await
     }
 
+    /// Find a process by OS pid + hostname (hostname required to avoid cross-host pid collisions)
+    pub async fn find_by_pid<C>(
+        db: &C,
+        table_config: &TableConfig,
+        pid: i32,
+        hostname: &str,
+    ) -> Result<Option<quebec_processes::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.processes);
+        let query = Query::select()
+            .column(Asterisk)
+            .from(table)
+            .and_where(Expr::col(col("pid")).eq(pid))
+            .and_where(Expr::col(col("hostname")).eq(hostname))
+            .to_owned();
+
+        execute_select_one(db, query).await
+    }
+
     /// Delete a process by ID
     pub async fn delete_by_id<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
     where

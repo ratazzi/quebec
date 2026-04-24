@@ -16,11 +16,20 @@ use tracing::{info, trace, warn};
 #[derive(Debug)]
 pub struct Dispatcher {
     pub ctx: Arc<AppContext>,
+    /// Process ID for this dispatcher (set after on_start)
+    process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Dispatcher {
     pub fn new(ctx: Arc<AppContext>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            process_id: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {
@@ -31,6 +40,7 @@ impl Dispatcher {
         let init_db = self.ctx.get_db().await?;
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
+        *self.process_id.lock().await = Some(process.id);
 
         let quit = self.ctx.graceful_shutdown.clone();
 

@@ -464,6 +464,7 @@ def _quebec_run(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
+    processes: Optional[dict] = None,
 ):
     """Blocking run. Starts all components and waits until shutdown.
 
@@ -477,14 +478,34 @@ def _quebec_run(
                        Set to True only if the current user has DDL permissions.
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
-               None means spawn all components.
+               None means spawn all components. Ignored when ``processes`` is set.
+        processes: If set (or if the loaded queue.yml declares multiple
+                   worker/dispatcher processes), run in fork-based supervisor
+                   mode. Accepts a dict like ``{"worker": 2, "dispatcher": 1,
+                   "scheduler": 1}``.
 
     Example:
         qc.run()  # Start all components and block
         qc.run(create_tables=True)  # Create tables and start all
         qc.run(spawn=['worker'])  # Only start worker
-        qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
+        qc.run(processes={"worker": 4, "dispatcher": 1})  # Supervisor mode
     """
+    plan = processes
+    if plan is None:
+        try:
+            plan = self.supervisor_plan_from_config()
+        except Exception:
+            plan = None
+
+    if plan:
+        from .supervisor import Supervisor
+
+        if create_tables:
+            self.create_tables()
+        sup = Supervisor(self, plan, control_plane=control_plane)
+        sup.start()
+        return
+
     self.start(
         create_tables=create_tables,
         control_plane=control_plane,

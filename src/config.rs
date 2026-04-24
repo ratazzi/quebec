@@ -223,6 +223,9 @@ pub struct DispatcherConfig {
 
     /// Whether to perform concurrency maintenance
     pub concurrency_maintenance: Option<bool>,
+
+    /// Number of processes to fork (supervisor mode)
+    pub processes: Option<u32>,
 }
 
 #[cfg(feature = "python")]
@@ -246,6 +249,11 @@ impl DispatcherConfig {
     #[getter]
     fn concurrency_maintenance(&self) -> Option<bool> {
         self.concurrency_maintenance
+    }
+
+    #[getter]
+    fn processes(&self) -> Option<u32> {
+        self.processes
     }
 
     fn __repr__(&self) -> String {

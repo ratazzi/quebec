@@ -88,6 +88,84 @@ use crate::worker::{Execution, Worker};
 
 use tracing::{debug, error, info, trace, warn};
 
+/// Map a supervisor slot index (0..total_processes) to the config entry that
+/// should drive that slot's configuration. Entries with `processes == 0` are
+/// skipped entirely to match the counting done in `supervisor_plan_from_config`.
+fn slot_to_entry<T>(slot: usize, entries: &[T], processes: impl Fn(&T) -> u32) -> Option<&T> {
+    let mut acc = 0usize;
+    for entry in entries {
+        let n = processes(entry) as usize;
+        if n == 0 {
+            continue;
+        }
+        if slot < acc + n {
+            return Some(entry);
+        }
+        acc += n;
+    }
+    None
+}
+
+/// Apply a `WorkerConfig` to a freshly owned `AppContext`. Callers are
+/// responsible for re-wrapping the context in `Arc` once mutation is done.
+fn apply_worker_cfg_to(
+    ctx: &mut AppContext,
+    worker_cfg: &crate::config::WorkerConfig,
+) -> PyResult<()> {
+    if let Some(threads) = worker_cfg.threads {
+        if threads == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker threads must be >= 1",
+            ));
+        }
+        ctx.worker_threads = threads as u64;
+    }
+    if let Some(polling_interval) = worker_cfg.polling_interval {
+        if !polling_interval.is_finite() || polling_interval < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "worker polling_interval must be finite and >= 0, got {}",
+                polling_interval
+            )));
+        }
+        ctx.worker_polling_interval = Duration::from_secs_f64(polling_interval);
+    }
+    if worker_cfg.queues.is_some() {
+        ctx.worker_queues = worker_cfg.queues.clone();
+    }
+    Ok(())
+}
+
+/// Apply a `DispatcherConfig` to a freshly owned `AppContext`. Validates the
+/// floating-point intervals to avoid `Duration::from_secs_f64` panics on NaN
+/// or negative values coming from queue.yml.
+fn apply_dispatcher_cfg_to(
+    ctx: &mut AppContext,
+    dispatcher_cfg: &crate::config::DispatcherConfig,
+) -> PyResult<()> {
+    if let Some(polling_interval) = dispatcher_cfg.polling_interval {
+        if !polling_interval.is_finite() || polling_interval < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dispatcher polling_interval must be finite and >= 0, got {}",
+                polling_interval
+            )));
+        }
+        ctx.dispatcher_polling_interval = Duration::from_secs_f64(polling_interval);
+    }
+    if let Some(batch_size) = dispatcher_cfg.batch_size {
+        ctx.dispatcher_batch_size = batch_size;
+    }
+    if let Some(interval) = dispatcher_cfg.concurrency_maintenance_interval {
+        if !interval.is_finite() || interval < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "dispatcher concurrency_maintenance_interval must be finite and >= 0, got {}",
+                interval
+            )));
+        }
+        ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
+    }
+    Ok(())
+}
+
 #[pyfunction]
 fn signal_handler(
     py: Python<'_>,
@@ -281,6 +359,44 @@ impl PyQuebec {
                 self.rt.block_on(future)
             }
         }
+    }
+
+    /// Swap the current `AppContext` for the provided one and rebuild the four
+    /// role wrappers (`quebec`, `worker`, `dispatcher`, `scheduler`) so they
+    /// all reference it. Preserves any worker start/stop handlers registered
+    /// on the old `Worker`. Control-plane router and pyqueue mode are left
+    /// alone — callers that want them reset should clear them explicitly.
+    fn rebuild_wrappers_with_ctx(&mut self, py: Python<'_>, new_ctx: Arc<AppContext>) {
+        let preserved_start_handlers: Vec<Py<PyAny>> = self
+            .worker
+            .start_handlers
+            .read()
+            .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
+            .unwrap_or_default();
+        let preserved_stop_handlers: Vec<Py<PyAny>> = self
+            .worker
+            .stop_handlers
+            .read()
+            .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
+            .unwrap_or_default();
+
+        let new_quebec = Arc::new(Quebec::new(new_ctx.clone()));
+        let new_worker = Arc::new(Worker::new(new_ctx.clone()));
+        let new_dispatcher = Arc::new(Dispatcher::new(new_ctx.clone()));
+        let new_scheduler = Arc::new(Scheduler::new(new_ctx.clone()));
+
+        if let Ok(mut guard) = new_worker.start_handlers.write() {
+            *guard = preserved_start_handlers;
+        }
+        if let Ok(mut guard) = new_worker.stop_handlers.write() {
+            *guard = preserved_stop_handlers;
+        }
+
+        self.ctx = new_ctx;
+        self.quebec = new_quebec;
+        self.worker = new_worker;
+        self.dispatcher = new_dispatcher;
+        self.scheduler = new_scheduler;
     }
 }
 
@@ -586,18 +702,10 @@ impl PyQuebec {
                 }
             }
 
-            // Apply worker configuration
+            // Apply worker configuration. In supervisor mode multiple workers
+            // are valid; the first entry is used to seed the default ctx and
+            // child processes call apply_worker_config(index) to override.
             if let Some(workers) = config.workers {
-                // Warn if multiple workers are configured (not supported yet)
-                if workers.len() > 1 {
-                    warn!(
-                        "Multiple worker configurations detected ({} workers). Quebec currently only supports a single worker configuration. Only the first worker configuration will be used. \
-                        To run multiple workers, use separate config files or environments and start independent processes. \
-                        Example: QUEBEC_ENV=realtime python worker1.py & QUEBEC_ENV=background python worker2.py",
-                        workers.len()
-                    );
-                }
-
                 if let Some(worker) = workers.first() {
                     // Code/env parameters take precedence over config file
                     if let Some(threads) = worker.threads {
@@ -633,18 +741,10 @@ impl PyQuebec {
                 }
             }
 
-            // Apply dispatcher configuration
+            // Apply dispatcher configuration. Supervisor mode handles
+            // multiple dispatchers; first entry seeds ctx and children override
+            // via apply_dispatcher_config(index).
             if let Some(dispatchers) = config.dispatchers {
-                // Warn if multiple dispatchers are configured (not supported yet)
-                if dispatchers.len() > 1 {
-                    warn!(
-                        "Multiple dispatcher configurations detected ({} dispatchers). Quebec currently only supports a single dispatcher configuration. Only the first dispatcher configuration will be used. \
-                        To run multiple dispatchers, use separate config files or environments and start independent processes. \
-                        Example: QUEBEC_CONFIG=config/queue_dispatcher1.yml python dispatcher1.py & QUEBEC_CONFIG=config/queue_dispatcher2.yml python dispatcher2.py",
-                        dispatchers.len()
-                    );
-                }
-
                 if let Some(dispatcher) = dispatchers.first() {
                     if let Some(polling_interval) = dispatcher.polling_interval {
                         if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {
@@ -955,6 +1055,298 @@ impl PyQuebec {
                 }
             });
         });
+        Ok(())
+    }
+
+    /// Reset internal state after `os.fork()` in a child process.
+    ///
+    /// Idempotent. Must be the first thing a forked child calls on its PyQuebec
+    /// instance. Rebuilds the tokio runtime and database pool (both broken by
+    /// fork because of inherited background threads / fd state), creates fresh
+    /// cancellation tokens, and clears child-specific state.
+    ///
+    /// Preserved across fork: config, runnables (job class registry),
+    /// concurrency_enabled, table_config, and any worker start/stop handlers
+    /// the user registered pre-fork.
+    fn reset_after_fork(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Cancel the old tokens so any inherited tasks stop trying to run.
+        self.ctx.graceful_shutdown.cancel();
+        self.ctx.force_quit.cancel();
+
+        // Drop any inherited JoinHandles without awaiting (they belong to the
+        // parent's runtime, which we are about to discard).
+        {
+            let mut guard = self
+                .handles
+                .lock()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("handles lock poisoned"))?;
+            guard.clear();
+        }
+
+        // Remove ourselves from the process-global instance map, if present.
+        // Subsequent `get_instance(url)` in this child will build a fresh one
+        // rather than hand back this stale-by-fork handle.
+        if let Some(map) = INSTANCE_MAP.get(py) {
+            if let Ok(mut guard) = map.write() {
+                guard.remove(&self.url);
+            }
+        }
+
+        // Build a brand-new tokio runtime. The parent's worker threads did not
+        // survive fork; sqlx pool + reaper would deadlock on the old rt.
+        let new_rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(16)
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to build runtime in forked child: {}",
+                        e
+                    ))
+                })?,
+        );
+
+        // Reconnect the database pool using the preserved connect options.
+        let opt = self.ctx.connect_options.clone();
+        let new_db = py.detach(|| -> PyResult<Arc<DatabaseConnection>> {
+            new_rt
+                .block_on(async { Database::connect(opt).await })
+                .map(Arc::new)
+                .map_err(|e| {
+                    pyo3::exceptions::PyConnectionError::new_err(format!(
+                        "Database reconnect after fork failed: {}",
+                        e
+                    ))
+                })
+        })?;
+
+        // Build a new AppContext that preserves config/registries but uses the
+        // new db pool, runtime handle, and fresh cancellation tokens.
+        let new_ctx = Arc::new(
+            self.ctx
+                .fork_clone(Some(new_db.clone()), new_rt.handle().clone()),
+        );
+
+        self.rt = new_rt;
+        self.rebuild_wrappers_with_ctx(py, new_ctx);
+
+        // Child processes do not run the control plane; reset the slot.
+        let cp = self.control_plane_router.clone();
+        if let Ok(mut guard) = cp.try_lock() {
+            *guard = None;
+        }
+        self.pyqueue_mode.store(false, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// Supervisor: register this process as kind="Supervisor" in the `processes`
+    /// table. Returns the new row id.
+    fn register_supervisor(&self, py: Python<'_>) -> PyResult<i64> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.register().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "register_supervisor failed: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Update heartbeat for an arbitrary process row (typically the supervisor's).
+    fn heartbeat_process(&self, py: Python<'_>, process_id: i64) -> PyResult<()> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.heartbeat_process(process_id).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "heartbeat_process failed: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Delete a process row (typically the supervisor's on shutdown).
+    fn deregister_process(&self, py: Python<'_>, process_id: i64) -> PyResult<()> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.deregister_process(process_id).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "deregister_process failed: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Supervisor: mark all claimed executions belonging to a crashed child's
+    /// process row as failed, then prune the row. Returns count of failed executions.
+    fn supervisor_fail_claimed_by_process_id(
+        &self,
+        py: Python<'_>,
+        process_id: i64,
+    ) -> PyResult<u64> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.fail_claimed_by_process_id(process_id)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "fail_claimed_by_process_id failed: {}",
+                            e
+                        ))
+                    })
+            })
+        })
+    }
+
+    /// Supervisor: same as above but looks up by (pid, hostname). Returns 0 if
+    /// no such row exists.
+    fn supervisor_fail_claimed_by_pid(
+        &self,
+        py: Python<'_>,
+        pid: i32,
+        hostname: String,
+    ) -> PyResult<u64> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.fail_claimed_by_pid(pid, &hostname).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "fail_claimed_by_pid failed: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Return the process row id this child's Worker registered after on_start,
+    /// or None if the worker has not started yet.
+    fn current_worker_process_id(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let handle = self.worker.process_id_handle();
+        py.detach(|| Ok(self.rt.block_on(async move { *handle.lock().await })))
+    }
+
+    fn current_dispatcher_process_id(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let handle = self.dispatcher.process_id_handle();
+        py.detach(|| Ok(self.rt.block_on(async move { *handle.lock().await })))
+    }
+
+    fn current_scheduler_process_id(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let handle = self.scheduler.process_id_handle();
+        py.detach(|| Ok(self.rt.block_on(async move { *handle.lock().await })))
+    }
+
+    /// Read `workers`/`dispatchers` from the loaded queue.yml and return a plan
+    /// dict suitable for `Supervisor(plan=...)`, or `None` if the config file
+    /// is absent or specifies fewer than 2 total child processes.
+    fn supervisor_plan_from_config(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let env = std::env::var("QUEBEC_ENV").ok();
+        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
+            return Ok(None);
+        };
+        let total_workers: u32 = config
+            .workers
+            .as_ref()
+            .map(|ws| ws.iter().map(|w| w.processes.unwrap_or(1)).sum())
+            .unwrap_or(0);
+        let total_dispatchers: u32 = config
+            .dispatchers
+            .as_ref()
+            .map(|ds| ds.iter().map(|d| d.processes.unwrap_or(1)).sum())
+            .unwrap_or(0);
+        // Only auto-enter supervisor mode when more than one of something is
+        // requested. A bare "1 worker + 1 dispatcher" config stays in the
+        // existing single-process threaded mode for backward compatibility.
+        if total_workers <= 1 && total_dispatchers <= 1 {
+            return Ok(None);
+        }
+        let dict = PyDict::new(py);
+        if total_workers > 0 {
+            dict.set_item("worker", total_workers)?;
+        }
+        if total_dispatchers > 0 {
+            dict.set_item("dispatcher", total_dispatchers)?;
+        }
+        Ok(Some(dict.into()))
+    }
+
+    /// Apply the Nth worker configuration from the loaded queue.yml, overriding
+    /// the ctx values set at __new__ time. Call after reset_after_fork in the
+    /// child process assigned to role=worker, slot_index=i (0..total_processes).
+    ///
+    /// The slot index maps across worker entries weighted by each entry's
+    /// `processes` field: for `[{processes: 2}, {processes: 3}]`, slots 0..=1
+    /// use entry 0 and slots 2..=4 use entry 1.
+    ///
+    /// No-op if no config file is loaded or the `workers` section is missing.
+    fn apply_worker_config(&mut self, py: Python<'_>, slot_index: usize) -> PyResult<()> {
+        let env = std::env::var("QUEBEC_ENV").ok();
+        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
+            return Ok(());
+        };
+        let Some(workers) = config.workers else {
+            return Ok(());
+        };
+        let Some(worker_cfg) = slot_to_entry(slot_index, &workers, |w| w.processes.unwrap_or(1))
+        else {
+            let total: u32 = workers.iter().map(|w| w.processes.unwrap_or(1)).sum();
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "apply_worker_config: slot {} out of range (have {} total worker processes across {} entries)",
+                slot_index, total, workers.len()
+            )));
+        };
+
+        let mut new_inner = self
+            .ctx
+            .fork_clone(self.ctx.db.clone(), self.rt.handle().clone());
+        apply_worker_cfg_to(&mut new_inner, worker_cfg)?;
+        let new_ctx = Arc::new(new_inner);
+        self.rebuild_wrappers_with_ctx(py, new_ctx);
+        Ok(())
+    }
+
+    /// Apply the Nth dispatcher configuration. Same slot semantics as
+    /// apply_worker_config.
+    fn apply_dispatcher_config(&mut self, py: Python<'_>, slot_index: usize) -> PyResult<()> {
+        let env = std::env::var("QUEBEC_ENV").ok();
+        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
+            return Ok(());
+        };
+        let Some(dispatchers) = config.dispatchers else {
+            return Ok(());
+        };
+        let Some(dispatcher_cfg) =
+            slot_to_entry(slot_index, &dispatchers, |d| d.processes.unwrap_or(1))
+        else {
+            let total: u32 = dispatchers.iter().map(|d| d.processes.unwrap_or(1)).sum();
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "apply_dispatcher_config: slot {} out of range (have {} total dispatcher processes across {} entries)",
+                slot_index, total, dispatchers.len()
+            )));
+        };
+
+        let mut new_inner = self
+            .ctx
+            .fork_clone(self.ctx.db.clone(), self.rt.handle().clone());
+        apply_dispatcher_cfg_to(&mut new_inner, dispatcher_cfg)?;
+        let new_ctx = Arc::new(new_inner);
+        self.rebuild_wrappers_with_ctx(py, new_ctx);
         Ok(())
     }
 

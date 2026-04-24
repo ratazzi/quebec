@@ -505,6 +505,8 @@ where
 pub struct Scheduler {
     pub ctx: Arc<AppContext>,
     pub schedule: Vec<HashMap<String, ScheduledEntry>>,
+    /// Process ID for this scheduler (set after on_start)
+    process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Scheduler {
@@ -512,7 +514,12 @@ impl Scheduler {
         Self {
             ctx,
             schedule: Vec::new(),
+            process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
     }
 
     /// Find schedule file with priority:
@@ -881,6 +888,7 @@ impl Scheduler {
 
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
+        *self.process_id.lock().await = Some(process.id);
 
         let scheduled =
             Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule.unwrap()).await?;

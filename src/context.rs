@@ -580,6 +580,51 @@ impl AppContext {
         self.runtime_handle.clone()
     }
 
+    /// Produce a new `AppContext` suitable for a freshly forked child process.
+    ///
+    /// - Replaces the database connection and runtime handle with the caller-provided values.
+    /// - Creates fresh `CancellationToken`s (the parent's tokens may already be cancelled
+    ///   or associated with dropped tokio tasks).
+    /// - Clears the `idle_notify` slot (the old `Notify` is tied to the parent runtime).
+    /// - Preserves all configuration values and the shared registries
+    ///   (`runnables`, `concurrency_enabled`) so Python-side job class registrations
+    ///   keep working without re-registering in the child.
+    pub fn fork_clone(&self, db: Option<Arc<DatabaseConnection>>, runtime_handle: Handle) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            dsn: self.dsn.clone(),
+            db,
+            connect_options: self.connect_options.clone(),
+            name: self.name.clone(),
+            use_skip_locked: self.use_skip_locked,
+            process_heartbeat_interval: self.process_heartbeat_interval,
+            process_alive_threshold: self.process_alive_threshold,
+            shutdown_timeout: self.shutdown_timeout,
+            silence_polling: self.silence_polling,
+            preserve_finished_jobs: self.preserve_finished_jobs,
+            clear_finished_jobs_after: self.clear_finished_jobs_after,
+            cleanup_batch_size: self.cleanup_batch_size,
+            cleanup_interval: self.cleanup_interval,
+            default_concurrency_control_period: self.default_concurrency_control_period,
+            dispatcher_polling_interval: self.dispatcher_polling_interval,
+            dispatcher_batch_size: self.dispatcher_batch_size,
+            dispatcher_concurrency_maintenance_interval: self
+                .dispatcher_concurrency_maintenance_interval,
+            worker_polling_interval: self.worker_polling_interval,
+            worker_threads: self.worker_threads,
+            control_plane_sse_interval: self.control_plane_sse_interval,
+            worker_queues: self.worker_queues.clone(),
+            graceful_shutdown: CancellationToken::new(),
+            force_quit: CancellationToken::new(),
+            #[cfg(feature = "python")]
+            runnables: self.runnables.clone(),
+            concurrency_enabled: self.concurrency_enabled.clone(),
+            runtime_handle: Some(runtime_handle),
+            table_config: self.table_config.clone(),
+            idle_notify: Arc::new(RwLock::new(None)),
+        }
+    }
+
     async fn get_db_inner(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
         if let Some(db) = &self.db {
             return Ok(Arc::clone(db));
