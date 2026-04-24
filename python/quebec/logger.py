@@ -1,20 +1,11 @@
 import logging
-import contextvars
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+from .context import JobContext, job_context_var
+from .structlog import add_quebec_context
 
-@dataclass(frozen=True)
-class JobContext:
-    jid: str | None = None
-    queue: str | None = None
-    target: str | None = None
-
-
-job_context_var: contextvars.ContextVar[JobContext] = contextvars.ContextVar(
-    "job_context", default=JobContext()
-)
+__all__ = ["JobContext", "job_context_var"]
 
 
 class ContextFilter(logging.Filter):
@@ -54,16 +45,6 @@ def setup_logging(level: int = logging.INFO, *, replace_root: bool = True) -> No
     handler.setFormatter(QuebecFormatter())
     handler.addFilter(ContextFilter())
     root.addHandler(handler)
-
-
-def _add_job_context(logger, method_name, event_dict):
-    """Processor to add job context (jid, target) from contextvars."""
-    ctx = job_context_var.get()
-    if ctx.jid:
-        event_dict["jid"] = ctx.jid
-    if "target" not in event_dict and ctx.target:
-        event_dict["target"] = ctx.target
-    return event_dict
 
 
 def _rename_event_to_message(logger, method_name, event_dict):
@@ -188,7 +169,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
 
     shared_processors = [
         structlog.contextvars.merge_contextvars,
-        _add_job_context,
+        add_quebec_context,
         structlog.processors.add_log_level,
         structlog.processors.CallsiteParameterAdder(
             [
