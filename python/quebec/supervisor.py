@@ -115,16 +115,19 @@ class Supervisor:
         )
         self._install_signal_handlers()
 
-        if self.control_plane:
-            try:
-                self.qc.start_control_plane(self.control_plane)
-            except Exception:
-                logger.exception("Failed to start control plane")
-
         try:
             for role, count in self.plan.items():
                 for index in range(count):
                     self._fork_child(role, index)
+
+            # Start the control plane only after all children are forked so
+            # the listening socket/runtime task stays parent-only. Children
+            # would otherwise inherit the TcpListener fd.
+            if self.control_plane:
+                try:
+                    self.qc.start_control_plane(self.control_plane)
+                except Exception:
+                    logger.exception("Failed to start control plane")
 
             self._start_heartbeat()
             self._supervise()
