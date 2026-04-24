@@ -141,7 +141,7 @@ async fn fail_claimed_by_process_id_inner(
         .await?;
 
     warn!(
-        "Supervisor pruned crashed process {} (pid={}, host={:?}), failed {} claimed job(s)",
+        "Supervisor reaped process {} (pid={}, host={:?}), failed {} claimed job(s)",
         process_id, process_pid, process_hostname, deleted_count
     );
 
