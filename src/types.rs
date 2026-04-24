@@ -1170,15 +1170,15 @@ impl PyQuebec {
         // The freshly built wrappers above do not yet carry the preserved
         // start/stop handler lists — rebuild_wrappers_with_ctx below would,
         // but it also drops its old Arcs. We want both: transfer handlers +
-        // avoid dropping old state. So we do the transfer manually.
-        let preserved_start: Vec<Py<PyAny>> = self
-            .worker
+        // avoid dropping old state. Pull handlers off `old_worker` (the Arc
+        // we just swapped out) rather than `self.worker` (now the empty
+        // replacement).
+        let preserved_start: Vec<Py<PyAny>> = old_worker
             .start_handlers
             .read()
             .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
             .unwrap_or_default();
-        let preserved_stop: Vec<Py<PyAny>> = self
-            .worker
+        let preserved_stop: Vec<Py<PyAny>> = old_worker
             .stop_handlers
             .read()
             .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
