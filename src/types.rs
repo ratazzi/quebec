@@ -1069,19 +1069,26 @@ impl PyQuebec {
     /// concurrency_enabled, table_config, and any worker start/stop handlers
     /// the user registered pre-fork.
     fn reset_after_fork(&mut self, py: Python<'_>) -> PyResult<()> {
-        // Cancel the old tokens so any inherited tasks stop trying to run.
-        self.ctx.graceful_shutdown.cancel();
-        self.ctx.force_quit.cancel();
+        // Do NOT call `cancel()` on the inherited tokens. In a forked child
+        // the parent's tokio I/O driver is dead (kqueue fds are per-process on
+        // Darwin/Linux) and any waker fired by a CancellationToken wake path
+        // will try to notify that driver and panic with
+        // `failed to wake I/O driver: Bad file descriptor`.
 
-        // Drop any inherited JoinHandles without awaiting (they belong to the
-        // parent's runtime, which we are about to discard).
-        {
+        // Drain inherited JoinHandles without awaiting. `JoinHandle::drop`
+        // detaches without waking the runtime, so this is safe.
+        let inherited_handles = {
             let mut guard = self
                 .handles
                 .lock()
                 .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("handles lock poisoned"))?;
-            guard.clear();
-        }
+            std::mem::take(&mut *guard)
+        };
+        // But do NOT drop the Vec contents here — leak them. The JoinHandles
+        // themselves reference the dead parent runtime; leaving them to be
+        // dropped at the end of this function would destructure through the
+        // runtime's task table and touch the dead driver.
+        std::mem::forget(inherited_handles);
 
         // Remove ourselves from the process-global instance map, if present.
         // Subsequent `get_instance(url)` in this child will build a fresh one
@@ -1128,8 +1135,56 @@ impl PyQuebec {
                 .fork_clone(Some(new_db.clone()), new_rt.handle().clone()),
         );
 
-        self.rt = new_rt;
-        self.rebuild_wrappers_with_ctx(py, new_ctx);
+        // Swap in the new runtime + ctx + wrappers, then LEAK the old ones.
+        // Dropping the old `Arc<Runtime>` would run tokio's shutdown path
+        // (wake worker threads that no longer exist, touch the dead I/O
+        // driver) and panic. Dropping the old `Arc<AppContext>` would
+        // eventually drop the inherited sqlx pool and Notify/CancellationToken
+        // fields, which can also wake on the dead runtime. Leaking a few
+        // Arcs once per child at fork time is cheap and the only safe option.
+        let old_rt = std::mem::replace(&mut self.rt, new_rt);
+        let old_ctx = std::mem::replace(&mut self.ctx, new_ctx.clone());
+        let old_quebec =
+            std::mem::replace(&mut self.quebec, Arc::new(Quebec::new(new_ctx.clone())));
+        let old_worker =
+            std::mem::replace(&mut self.worker, Arc::new(Worker::new(new_ctx.clone())));
+        let old_dispatcher = std::mem::replace(
+            &mut self.dispatcher,
+            Arc::new(Dispatcher::new(new_ctx.clone())),
+        );
+        let old_scheduler = std::mem::replace(
+            &mut self.scheduler,
+            Arc::new(Scheduler::new(new_ctx.clone())),
+        );
+        // The freshly built wrappers above do not yet carry the preserved
+        // start/stop handler lists — rebuild_wrappers_with_ctx below would,
+        // but it also drops its old Arcs. We want both: transfer handlers +
+        // avoid dropping old state. So we do the transfer manually.
+        let preserved_start: Vec<Py<PyAny>> = self
+            .worker
+            .start_handlers
+            .read()
+            .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
+            .unwrap_or_default();
+        let preserved_stop: Vec<Py<PyAny>> = self
+            .worker
+            .stop_handlers
+            .read()
+            .map(|g| g.iter().map(|h| h.clone_ref(py)).collect())
+            .unwrap_or_default();
+        if let Ok(mut guard) = self.worker.start_handlers.write() {
+            *guard = preserved_start;
+        }
+        if let Ok(mut guard) = self.worker.stop_handlers.write() {
+            *guard = preserved_stop;
+        }
+
+        std::mem::forget(old_rt);
+        std::mem::forget(old_ctx);
+        std::mem::forget(old_quebec);
+        std::mem::forget(old_worker);
+        std::mem::forget(old_dispatcher);
+        std::mem::forget(old_scheduler);
 
         // Child processes do not run the control plane; reset the slot.
         let cp = self.control_plane_router.clone();
