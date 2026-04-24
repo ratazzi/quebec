@@ -527,7 +527,7 @@ impl Scheduler {
     /// 2. QUEBEC_RECURRING_SCHEDULE env var
     /// 3. recurring.yml (current directory)
     /// 4. config/recurring.yml (Solid Queue compatible)
-    fn find_schedule_path() -> Option<String> {
+    pub(crate) fn find_schedule_path() -> Option<String> {
         std::env::var("SOLID_QUEUE_RECURRING_SCHEDULE")
             .or_else(|_| std::env::var("QUEBEC_RECURRING_SCHEDULE"))
             .ok()
@@ -540,6 +540,13 @@ impl Scheduler {
                     None
                 }
             })
+    }
+
+    /// Whether a recurring schedule is configured (env var or YAML file).
+    /// Used by the supervisor plan builder to decide whether to fork a
+    /// dedicated scheduler child.
+    pub(crate) fn has_recurring_schedule() -> bool {
+        Self::find_schedule_path().is_some()
     }
 
     fn parse_schedule_file(

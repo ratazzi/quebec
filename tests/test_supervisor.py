@@ -210,8 +210,93 @@ class TestSupervisorPlanFromConfig:
         assert plan is None or isinstance(plan, dict)
         if plan is not None:
             for key, val in plan.items():
-                assert key in {"worker", "dispatcher"}
+                assert key in {"worker", "dispatcher", "scheduler"}
                 assert isinstance(val, int) and val > 0
+
+    def test_scheduler_included_when_recurring_schedule_exists(
+        self, qc, tmp_path, monkeypatch
+    ):
+        """Supervisor plan should fork a scheduler child when recurring.yml
+        is configured, so the scheduler's cron loop runs in its own process
+        instead of piggybacking on the worker child's tokio runtime."""
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  workers:
+    - queues: "*"
+      threads: 1
+      processes: 2
+"""
+        )
+        recurring_yml = tmp_path / "recurring.yml"
+        recurring_yml.write_text(
+            """
+development:
+  hourly_cleanup:
+    class: CleanupJob
+    schedule: "every hour"
+"""
+        )
+
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.setenv("QUEBEC_RECURRING_SCHEDULE", str(recurring_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+        monkeypatch.delenv("SOLID_QUEUE_RECURRING_SCHEDULE", raising=False)
+
+        plan = qc.supervisor_plan_from_config()
+        assert plan is not None, "supervisor plan should trigger with processes=2"
+        assert plan.get("worker") == 2
+        assert plan.get("scheduler") == 1
+
+    def test_scheduler_omitted_when_no_recurring_schedule(
+        self, qc, tmp_path, monkeypatch
+    ):
+        """Without a recurring.yml, scheduler should NOT be forked — there's
+        nothing for it to do, and forking it would just trip the crash-loop
+        guard when Scheduler.run() exits immediately."""
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  workers:
+    - queues: "*"
+      threads: 1
+      processes: 2
+"""
+        )
+
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+        monkeypatch.delenv("QUEBEC_RECURRING_SCHEDULE", raising=False)
+        monkeypatch.delenv("SOLID_QUEUE_RECURRING_SCHEDULE", raising=False)
+        monkeypatch.chdir(tmp_path)  # Ensure no recurring.yml in cwd picks up
+
+        plan = qc.supervisor_plan_from_config()
+        assert plan is not None
+        assert "scheduler" not in plan
+
+    def test_single_process_config_returns_none(self, qc, tmp_path, monkeypatch):
+        """Bare 1-worker + 1-dispatcher config must stay in the single-process
+        threaded path for backward compatibility — the supervisor shouldn't
+        take over just because a config file exists."""
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  workers:
+    - queues: "*"
+      threads: 3
+  dispatchers:
+    - polling_interval: 1
+"""
+        )
+
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+        monkeypatch.chdir(tmp_path)
+
+        assert qc.supervisor_plan_from_config() is None
 
 
 class TestResetAfterFork:

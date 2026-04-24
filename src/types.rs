@@ -1283,6 +1283,13 @@ impl PyQuebec {
         if total_dispatchers > 0 {
             dict.set_item("dispatcher", total_dispatchers)?;
         }
+        // Once supervisor mode is active, move the scheduler into its own
+        // process too when a recurring schedule is configured. In the
+        // single-process fallback, spawn_all already covers the scheduler via
+        // a tokio task, so we skip it there to stay backward-compatible.
+        if crate::scheduler::Scheduler::has_recurring_schedule() {
+            dict.set_item("scheduler", 1u32)?;
+        }
         Ok(Some(dict.into()))
     }
 
