@@ -35,6 +35,8 @@ impl Dispatcher {
     pub async fn run(&self) -> Result<(), anyhow::Error> {
         let mut polling_interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let batch_size = self.ctx.dispatcher_batch_size;
 
         let init_db = self.ctx.get_db().await?;
@@ -51,6 +53,13 @@ impl Dispatcher {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
                     self.heartbeat(&heartbeat_db, &process).await?;
+                }
+                // Detect supervisor death: if our ppid changed we were reparented.
+                _ = parent_check_interval.tick() => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
+                    }
                 }
                 _ = quit.cancelled() => {
                     info!("Stopped");

@@ -201,6 +201,8 @@ class Supervisor:
                 os.close(self._wakeup_w)
 
                 self.qc.reset_after_fork()
+                # Record ppid so role loops self-terminate if supervisor dies.
+                self.qc.watch_parent_pid()
 
                 if role == ROLE_WORKER:
                     try:

@@ -392,6 +392,17 @@ impl PyQuebec {
             *guard = preserved_stop_handlers;
         }
 
+        let preserved_supervisor_pid = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if preserved_supervisor_pid != 0 {
+            new_ctx.supervisor_pid.store(
+                preserved_supervisor_pid,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
         self.ctx = new_ctx;
         self.quebec = new_quebec;
         self.worker = new_worker;
@@ -1194,6 +1205,22 @@ impl PyQuebec {
         self.pyqueue_mode.store(false, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Record the current parent PID so role loops exit gracefully if the
+    /// supervisor dies. Called by the Python supervisor in each child right
+    /// after `reset_after_fork`. Mirrors Solid Queue's `supervised_by`.
+    fn watch_parent_pid(&self) -> PyResult<()> {
+        self.ctx.watch_parent_pid();
+        Ok(())
+    }
+
+    /// Whether the parent PID recorded by `watch_parent_pid` no longer matches
+    /// our current ppid — i.e. the supervisor died and we got reparented.
+    /// Returns `false` when `watch_parent_pid` was never called (the usual
+    /// single-process library case).
+    fn is_orphaned(&self) -> PyResult<bool> {
+        Ok(self.ctx.is_orphaned())
     }
 
     /// Supervisor: register this process as kind="Supervisor" in the `processes`

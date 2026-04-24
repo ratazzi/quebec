@@ -840,12 +840,21 @@ impl Scheduler {
         task_handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<(), anyhow::Error> {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
                     self.heartbeat(db, process).await?;
                     trace!("Scheduler heartbeat");
+                }
+                // Detect supervisor death: if our ppid changed we were reparented.
+                _ = parent_check_interval.tick() => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
+                    }
                 }
                 _ = graceful_shutdown.cancelled() => {
                     info!("Scheduler stopping - waiting for {} tasks to complete", task_handles.len());

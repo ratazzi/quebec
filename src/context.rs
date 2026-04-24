@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "python")]
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -305,6 +306,11 @@ pub struct AppContext {
     pub table_config: TableConfig, // Dynamic table name configuration
     /// Optional notifier for idle worker threads - when set, signals main loop to poll for new jobs
     pub idle_notify: Arc<RwLock<Option<Arc<Notify>>>>,
+    /// Supervisor PID recorded right after fork. When non-zero, the role loops
+    /// periodically compare `getppid()` against it and trigger graceful shutdown
+    /// if it no longer matches (i.e. the supervisor died and we got reparented
+    /// to init/launchd). Zero means "not supervised, do not check".
+    pub supervisor_pid: AtomicI32,
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -569,7 +575,29 @@ impl AppContext {
             runtime_handle: None,
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
+            supervisor_pid: AtomicI32::new(0),
         }
+    }
+
+    /// Record the current parent PID so role loops can detect supervisor death.
+    /// Intended to be called from a forked child right after `reset_after_fork`
+    /// (mirrors Solid Queue's `Supervised#supervised_by`). A zero PID disables
+    /// the check (e.g. a standalone library user has no supervisor to watch).
+    pub fn watch_parent_pid(&self) {
+        let ppid = unsafe { libc::getppid() };
+        self.supervisor_pid.store(ppid, Ordering::Relaxed);
+    }
+
+    /// Whether we were reparented since `watch_parent_pid` was called.
+    /// Returns false when `watch_parent_pid` has not been invoked (the common
+    /// single-process library case).
+    pub fn is_orphaned(&self) -> bool {
+        let stored = self.supervisor_pid.load(Ordering::Relaxed);
+        if stored == 0 {
+            return false;
+        }
+        let current = unsafe { libc::getppid() };
+        current != stored
     }
 
     pub fn set_runtime_handle(&mut self, handle: Handle) {
@@ -622,6 +650,8 @@ impl AppContext {
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
             idle_notify: Arc::new(RwLock::new(None)),
+            // Fresh state; child must call `watch_parent_pid` after fork.
+            supervisor_pid: AtomicI32::new(0),
         }
     }
 

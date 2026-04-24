@@ -447,6 +447,17 @@ def _quebec_wait(self):
 
     try:
         while not state["shutdown_event"].is_set():
+            # Detect supervisor death in fork-based mode: if Rust flagged us
+            # orphaned, unblock this wait loop so run() returns and the child
+            # can exit. `is_orphaned()` stays False unless `watch_parent_pid`
+            # was called, so the non-supervisor case is unaffected.
+            if self.is_orphaned():
+                logger.warning(
+                    "Supervisor went away (ppid changed), shutting down child"
+                )
+                state["shutdown_event"].set()
+                self.graceful_shutdown()
+                break
             time.sleep(0.5)
     except KeyboardInterrupt:
         logger.debug("KeyboardInterrupt, shutting down...")

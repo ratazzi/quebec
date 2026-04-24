@@ -2734,6 +2734,8 @@ impl Worker {
             std::time::Duration::from_secs(3600) // dummy interval when disabled
         };
         let mut cleanup_interval = tokio::time::interval(cleanup_duration);
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
         let ctx = self.ctx.clone();
@@ -2798,6 +2800,14 @@ impl Worker {
                 _ = cleanup_interval.tick(), if cleanup_enabled => {
                     if let Err(e) = self.clear_finished_jobs().await {
                         warn!("Failed to clear finished jobs: {}", e);
+                    }
+                }
+                // Detect supervisor death: if our ppid changed we were reparented
+                // (usually to init/launchd), so shut down gracefully.
+                _ = parent_check_interval.tick() => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
                     }
                 }
                 _ = quit.cancelled() => {
