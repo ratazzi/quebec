@@ -126,9 +126,9 @@ impl ControlPlane {
         context.insert("blocked_jobs_count", &blocked_count);
         context.insert("scheduled_jobs_count", &scheduled_count);
 
-        // Calculate finished jobs count (total jobs minus active executions)
+        // Count finished jobs by finished_at to match the /finished-jobs page
         let finished_count =
-            total_jobs as i64 - scheduled_count - in_progress_count - failed_count - blocked_count;
+            query_builder::jobs::count_finished(db, table_config, None, None).await? as i64;
         context.insert("finished_jobs_count", &finished_count);
 
         Ok(())
