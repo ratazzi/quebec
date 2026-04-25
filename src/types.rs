@@ -1006,6 +1006,11 @@ impl PyQuebec {
     }
 
     fn spawn_job_claim_poller(&self) -> PyResult<()> {
+        // Set the process title on the main thread (where it actually takes
+        // effect) before handing the loop off to the tokio runtime.
+        self.ctx
+            .set_proc_title("worker", Some(&self.ctx.worker_threads.to_string()));
+
         let worker = self.worker.clone();
         let _ = self.rt.spawn(async move {
             let _ = worker.run_main_loop().await;
@@ -1015,6 +1020,8 @@ impl PyQuebec {
     }
 
     fn spawn_dispatcher(&self) -> PyResult<()> {
+        self.ctx.set_proc_title("dispatcher", None);
+
         let dispatcher = self.dispatcher.clone();
         let _ = self.rt.spawn(async move {
             let _ = dispatcher.run().await;
@@ -1024,6 +1031,8 @@ impl PyQuebec {
     }
 
     fn spawn_scheduler(&self) -> PyResult<()> {
+        self.ctx.set_proc_title("scheduler", None);
+
         let scheduler = self.scheduler.clone();
         let _ = self.rt.spawn(async move {
             let _ = scheduler.run().await;
@@ -1245,6 +1254,11 @@ impl PyQuebec {
     /// Supervisor: register this process as kind="Supervisor" in the `processes`
     /// table. Returns the new row id.
     fn register_supervisor(&self, py: Python<'_>) -> PyResult<i64> {
+        // Set the supervisor's process title on the main thread before
+        // releasing the GIL — this is the supervisor parent's only entry
+        // into Rust prior to forking its children.
+        self.ctx.set_proc_title("supervisor", None);
+
         let ctx = self.ctx.clone();
         py.detach(|| {
             self.rt.block_on(async move {
@@ -2159,11 +2173,9 @@ impl PyQuebec {
             }
         }
 
-        // Set process title on the main thread where it takes effect
-        self.ctx
-            .set_proc_title("worker", Some(&self.ctx.worker_threads.to_string()));
-
-        // Spawn all components
+        // Spawn all components. Each spawn_* sets the process title on the
+        // main thread; spawn_job_claim_poller runs last so the final title
+        // is "worker:<threads>" in single-process mode.
         self.spawn_dispatcher()?;
         self.spawn_scheduler()?;
         self.spawn_job_claim_poller()?;
