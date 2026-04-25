@@ -98,6 +98,7 @@ class Supervisor:
         self._children: Dict[int, _ChildInfo] = {}
         self._slots: Dict[Tuple[str, int], _SlotState] = {}
         self._stopping = False
+        self._immediate = False
         self._hostname = socket.gethostname()
         self._wakeup_r, self._wakeup_w = os.pipe()
         os.set_blocking(self._wakeup_r, False)
@@ -160,13 +161,25 @@ class Supervisor:
     # -- internals --------------------------------------------------------
 
     def _install_signal_handlers(self) -> None:
-        def handler(signum, _frame):
+        def graceful(signum, _frame):
             logger.info("Supervisor received signal %d", signum)
             self._stopping = True
             self._wake()
 
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT):
-            signal.signal(sig, handler)
+        # SIGQUIT skips the graceful-wait window and SIGKILLs children at once.
+        # Mirrors Solid Queue's terminate_immediately path for the QUIT signal.
+        def immediate(signum, _frame):
+            logger.warning(
+                "Supervisor received signal %d, terminating children immediately",
+                signum,
+            )
+            self._stopping = True
+            self._immediate = True
+            self._wake()
+
+        signal.signal(signal.SIGTERM, graceful)
+        signal.signal(signal.SIGINT, graceful)
+        signal.signal(signal.SIGQUIT, immediate)
 
     def _wake(self) -> None:
         try:
@@ -372,14 +385,21 @@ class Supervisor:
         if not pids:
             return
 
-        logger.info("Supervisor sending SIGTERM to %d child(ren)", len(pids))
+        if self._immediate:
+            # SIGQUIT path: skip the SIGTERM wait entirely.
+            sig_first, sig_name = signal.SIGKILL, "SIGKILL"
+            deadline = time.monotonic()
+        else:
+            sig_first, sig_name = signal.SIGTERM, "SIGTERM"
+            deadline = time.monotonic() + self.shutdown_timeout
+
+        logger.info("Supervisor sending %s to %d child(ren)", sig_name, len(pids))
         for pid in pids:
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, sig_first)
             except ProcessLookupError:
                 self._children.pop(pid, None)
 
-        deadline = time.monotonic() + self.shutdown_timeout
         while self._children and time.monotonic() < deadline:
             pid = self._reap_one(block=False)
             if pid == 0:

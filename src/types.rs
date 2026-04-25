@@ -173,7 +173,26 @@ fn signal_handler(
     _frame: Py<PyAny>,
     quebec: Py<PyAny>,
 ) -> PyResult<()> {
-    info!("Received signal {}, initiating graceful shutdown", signum);
+    // SIGQUIT is the "exit now" signal in the Solid Queue convention. Only
+    // supervisor-managed children skip cleanup — standalone Quebec processes
+    // (no supervisor watching) drain gracefully so they release claims and
+    // delete their process row instead of leaking them.
+    const SIGQUIT: i32 = 3;
+    if signum == SIGQUIT {
+        let supervised = quebec
+            .bind(py)
+            .cast::<PyQuebec>()
+            .ok()
+            .map(|q| q.borrow().ctx.supervisor_pid.load(Ordering::Relaxed) != 0)
+            .unwrap_or(false);
+        if supervised {
+            warn!("Received SIGQUIT, exiting immediately");
+            std::process::exit(0);
+        }
+        info!("Received SIGQUIT (standalone process), draining gracefully");
+    } else {
+        info!("Received signal {}, initiating graceful shutdown", signum);
+    }
 
     if let Err(e) = quebec.bind(py).call_method0("graceful_shutdown") {
         error!("Error calling graceful_shutdown: {:?}", e);
