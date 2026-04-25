@@ -205,22 +205,30 @@ class Supervisor:
         )
         self._heartbeat_thread.start()
 
+    def _run_maintenance_once(self) -> None:
+        try:
+            pruned, orphaned = self.qc.supervisor_run_maintenance(self._process_id)
+            if pruned or orphaned:
+                logger.info(
+                    "Supervisor maintenance: pruned %d process(es), "
+                    "failed %d orphaned claim(s)",
+                    pruned,
+                    orphaned,
+                )
+        except Exception as e:
+            logger.warning("Supervisor maintenance failed: %s", e)
+
     def _start_maintenance(self) -> None:
+        # Solid Queue runs `fail_orphaned_executions` once at boot and starts
+        # the prune timer with `run_now: true`. Mirror that by sweeping
+        # immediately before the periodic loop so a fresh supervisor cleans up
+        # stale state from the previous instance instead of waiting one full
+        # interval.
+        self._run_maintenance_once()
+
         def loop():
             while not self._maintenance_stop.wait(self.maintenance_interval):
-                try:
-                    pruned, orphaned = self.qc.supervisor_run_maintenance(
-                        self._process_id
-                    )
-                    if pruned or orphaned:
-                        logger.info(
-                            "Supervisor maintenance: pruned %d process(es), "
-                            "failed %d orphaned claim(s)",
-                            pruned,
-                            orphaned,
-                        )
-                except Exception as e:
-                    logger.warning("Supervisor maintenance failed: %s", e)
+                self._run_maintenance_once()
 
         self._maintenance_thread = threading.Thread(
             target=loop, name="quebec-supervisor-maintenance", daemon=True
