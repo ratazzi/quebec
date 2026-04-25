@@ -476,7 +476,6 @@ def _quebec_run(
     create_tables: bool = False,
     control_plane: Optional[str] = None,
     spawn: Optional[List[str]] = None,
-    processes: Optional[dict] = None,
 ):
     """Blocking run. Starts all components and waits until shutdown.
 
@@ -485,30 +484,36 @@ def _quebec_run(
     (workers.threads). The worker_threads constructor parameter can be used
     as an explicit override.
 
+    Fork-based supervisor mode is enabled by setting ``QUEBEC_SUPERVISOR=1``
+    in the environment. The plan is then derived from ``queue.yml`` —
+    ``workers[].processes`` and ``dispatchers[].processes`` decide how many
+    children to fork, and each child picks its config from the yml entry
+    matching its slot index. This matches Solid Queue's model.
+
+    For low-level use (tests, embedded services without a yml), construct
+    ``quebec.supervisor.Supervisor`` directly instead.
+
     Args:
         create_tables: Whether to create database tables (default False).
                        Set to True only if the current user has DDL permissions.
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
-               None means spawn all components. Ignored when ``processes`` is set.
-        processes: If set, run in fork-based supervisor mode. Accepts a dict
-                   like ``{"worker": 2, "dispatcher": 1, "scheduler": 1}``.
-                   When unset, the call stays in single-process threaded mode
-                   for backward compatibility, even if ``queue.yml`` declares
-                   ``processes: >1``. Set ``QUEBEC_SUPERVISOR=1`` to opt in to
-                   auto-deriving the plan from ``queue.yml``.
+               None means spawn all components. Ignored in supervisor mode.
 
     Example:
-        qc.run()  # Start all components and block (single-process mode)
-        qc.run(create_tables=True)  # Create tables and start all
-        qc.run(spawn=['worker'])  # Only start worker
-        qc.run(processes={"worker": 4, "dispatcher": 1})  # Supervisor mode
+        qc.run()  # Single-process mode (default)
+        qc.run(create_tables=True)
+        qc.run(spawn=['worker'])
+
+        # Fork-based supervisor:
+        #   queue.yml: workers.processes / dispatchers.processes
+        #   shell:    QUEBEC_SUPERVISOR=1 python -m quebec your.jobs
     """
-    plan = processes
-    # Auto-deriving the plan from queue.yml is opt-in (QUEBEC_SUPERVISOR=1) so
-    # that an existing deployment with `processes: >1` does not silently switch
-    # from the single-process threaded runtime to fork-based supervision.
-    if plan is None and os.environ.get("QUEBEC_SUPERVISOR") == "1":
+    plan = None
+    # Fork-based supervision is opt-in via QUEBEC_SUPERVISOR=1, so that an
+    # existing deployment with `processes: >1` in queue.yml does not silently
+    # switch from the single-process threaded runtime to fork mode on upgrade.
+    if os.environ.get("QUEBEC_SUPERVISOR") == "1":
         try:
             plan = self.supervisor_plan_from_config()
         except Exception:
