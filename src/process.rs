@@ -10,9 +10,9 @@ use std::sync::Arc;
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-use tracing::info;
 #[cfg(feature = "python")]
 use tracing::trace;
+use tracing::{info, warn};
 
 #[cfg(feature = "python")]
 pub fn is_running_in_pyo3() -> bool {
@@ -157,7 +157,33 @@ pub trait ProcessTrait: Send + Sync {
         process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let ctx = self.ctx();
-        query_builder::processes::update_heartbeat(db, &ctx.table_config, process.id).await?;
+        let rows =
+            query_builder::processes::update_heartbeat(db, &ctx.table_config, process.id).await?;
+        // Row gone means the supervisor pruned us (stale heartbeat) or another
+        // operator deregistered us. Mirrors Solid Queue's Registrable#heartbeat
+        // rescue of RecordNotFound: stop polling and exit gracefully so we do
+        // not hold claimed jobs with no process row backing them.
+        // Only enabled for supervisor-managed children (supervisor_pid != 0)
+        // so standalone single-process Quebec keeps its old behavior of just
+        // logging when the row disappears.
+        if rows == 0 {
+            let supervised = ctx
+                .supervisor_pid
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0;
+            if supervised {
+                warn!(
+                    "Process row {} (pid={}) no longer exists; initiating graceful shutdown",
+                    process.id, process.pid
+                );
+                ctx.graceful_shutdown.cancel();
+            } else {
+                warn!(
+                    "Process row {} (pid={}) no longer exists; continuing (standalone mode)",
+                    process.id, process.pid
+                );
+            }
+        }
         Ok(())
     }
 
