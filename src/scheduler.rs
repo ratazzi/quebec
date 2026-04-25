@@ -841,6 +841,12 @@ impl Scheduler {
     ) -> Result<(), anyhow::Error> {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only armed when running as a supervisor-managed child.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
@@ -850,7 +856,7 @@ impl Scheduler {
                     trace!("Scheduler heartbeat");
                 }
                 // Detect supervisor death: if our ppid changed we were reparented.
-                _ = parent_check_interval.tick() => {
+                _ = parent_check_interval.tick(), if supervised => {
                     if self.ctx.is_orphaned() {
                         warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
                         self.ctx.graceful_shutdown.cancel();

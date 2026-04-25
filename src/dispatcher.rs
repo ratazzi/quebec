@@ -36,6 +36,12 @@ impl Dispatcher {
         let mut polling_interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only armed when running as a supervisor-managed child.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let batch_size = self.ctx.dispatcher_batch_size;
 
@@ -55,7 +61,7 @@ impl Dispatcher {
                     self.heartbeat(&heartbeat_db, &process).await?;
                 }
                 // Detect supervisor death: if our ppid changed we were reparented.
-                _ = parent_check_interval.tick() => {
+                _ = parent_check_interval.tick(), if supervised => {
                     if self.ctx.is_orphaned() {
                         warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
                         self.ctx.graceful_shutdown.cancel();

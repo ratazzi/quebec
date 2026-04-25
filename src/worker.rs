@@ -2735,6 +2735,13 @@ impl Worker {
         };
         let mut cleanup_interval = tokio::time::interval(cleanup_duration);
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only enabled when running as a supervisor-managed child so the old
+        // single-process threaded mode is unaffected.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
@@ -2803,8 +2810,9 @@ impl Worker {
                     }
                 }
                 // Detect supervisor death: if our ppid changed we were reparented
-                // (usually to init/launchd), so shut down gracefully.
-                _ = parent_check_interval.tick() => {
+                // (usually to init/launchd), so shut down gracefully. Only armed
+                // for supervisor-managed children.
+                _ = parent_check_interval.tick(), if supervised => {
                     if self.ctx.is_orphaned() {
                         warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
                         self.ctx.graceful_shutdown.cancel();
