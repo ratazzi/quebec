@@ -66,7 +66,7 @@ class Supervisor:
         plan: Plan,
         *,
         control_plane: Optional[str] = None,
-        shutdown_timeout: float = 30.0,
+        shutdown_timeout: Optional[float] = None,
         crash_loop_window: float = 10.0,
         crash_loop_max: int = 3,
         heartbeat_interval: float = 60.0,
@@ -88,7 +88,10 @@ class Supervisor:
         self.qc = qc
         self.plan = normalized
         self.control_plane = control_plane
-        self.shutdown_timeout = shutdown_timeout
+        # Match Solid Queue's default (`SolidQueue.shutdown_timeout = 5`).
+        self.shutdown_timeout = (
+            shutdown_timeout if shutdown_timeout is not None else 5.0
+        )
         self.crash_loop_window = crash_loop_window
         self.crash_loop_max = crash_loop_max
         self.heartbeat_interval = heartbeat_interval
