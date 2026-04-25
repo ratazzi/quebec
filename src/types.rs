@@ -1256,6 +1256,30 @@ impl PyQuebec {
         })
     }
 
+    /// Supervisor maintenance: prune processes whose heartbeat has gone stale
+    /// and sweep any orphaned claimed executions. Mirrors Solid Queue's
+    /// `Supervisor#launch_maintenance_task`. `exclude_process_id` is the
+    /// supervisor's own row so it is not pruned. Returns
+    /// (pruned_processes, orphaned_claims_failed).
+    fn supervisor_run_maintenance(
+        &self,
+        py: Python<'_>,
+        exclude_process_id: Option<i64>,
+    ) -> PyResult<(usize, usize)> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let sup = crate::supervisor::Supervisor::new(ctx);
+                sup.run_maintenance(exclude_process_id).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "supervisor_run_maintenance failed: {}",
+                        e
+                    ))
+                })
+            })
+        })
+    }
+
     /// Delete a process row (typically the supervisor's on shutdown).
     fn deregister_process(&self, py: Python<'_>, process_id: i64) -> PyResult<()> {
         let ctx = self.ctx.clone();

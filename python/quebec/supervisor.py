@@ -70,6 +70,7 @@ class Supervisor:
         crash_loop_window: float = 10.0,
         crash_loop_max: int = 3,
         heartbeat_interval: float = 60.0,
+        maintenance_interval: float = 300.0,
     ):
         normalized: Dict[str, int] = {}
         for role, spec in plan.items():
@@ -91,6 +92,7 @@ class Supervisor:
         self.crash_loop_window = crash_loop_window
         self.crash_loop_max = crash_loop_max
         self.heartbeat_interval = heartbeat_interval
+        self.maintenance_interval = maintenance_interval
 
         self._process_id: Optional[int] = None
         self._children: Dict[int, _ChildInfo] = {}
@@ -102,6 +104,8 @@ class Supervisor:
         os.set_blocking(self._wakeup_w, False)
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
+        self._maintenance_thread: Optional[threading.Thread] = None
+        self._maintenance_stop = threading.Event()
 
     # -- public -----------------------------------------------------------
 
@@ -130,14 +134,18 @@ class Supervisor:
                     logger.exception("Failed to start control plane")
 
             self._start_heartbeat()
+            self._start_maintenance()
             self._supervise()
         finally:
             try:
                 self._terminate_gracefully()
             finally:
                 self._heartbeat_stop.set()
+                self._maintenance_stop.set()
                 if self._heartbeat_thread is not None:
                     self._heartbeat_thread.join(timeout=2.0)
+                if self._maintenance_thread is not None:
+                    self._maintenance_thread.join(timeout=2.0)
                 if self._process_id is not None:
                     try:
                         self.qc.deregister_process(self._process_id)
@@ -180,6 +188,28 @@ class Supervisor:
             target=loop, name="quebec-supervisor-heartbeat", daemon=True
         )
         self._heartbeat_thread.start()
+
+    def _start_maintenance(self) -> None:
+        def loop():
+            while not self._maintenance_stop.wait(self.maintenance_interval):
+                try:
+                    pruned, orphaned = self.qc.supervisor_run_maintenance(
+                        self._process_id
+                    )
+                    if pruned or orphaned:
+                        logger.info(
+                            "Supervisor maintenance: pruned %d process(es), "
+                            "failed %d orphaned claim(s)",
+                            pruned,
+                            orphaned,
+                        )
+                except Exception as e:
+                    logger.warning("Supervisor maintenance failed: %s", e)
+
+        self._maintenance_thread = threading.Thread(
+            target=loop, name="quebec-supervisor-maintenance", daemon=True
+        )
+        self._maintenance_thread.start()
 
     def _fork_child(self, role: str, index: int) -> None:
         slot = self._slots.setdefault((role, index), _SlotState())

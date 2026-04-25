@@ -84,6 +84,79 @@ impl Supervisor {
         };
         self.fail_claimed_by_process_id(process_id).await
     }
+
+    /// Periodic maintenance run by the supervisor itself. Mirrors Solid Queue's
+    /// `Supervisor#launch_maintenance_task`: prune processes whose heartbeat has
+    /// gone stale (failing their claimed executions) and then sweep any leftover
+    /// orphaned claims whose process row is already gone.
+    ///
+    /// `exclude_process_id` is the supervisor's own row id, so it is not pruned.
+    /// Returns (pruned_processes, orphaned_claims_failed).
+    pub async fn run_maintenance(&self, exclude_process_id: Option<i64>) -> Result<(usize, usize)> {
+        let db = self.ctx.get_db().await?;
+        let table_config = self.ctx.table_config.clone();
+
+        let threshold = chrono::Utc::now().naive_utc()
+            - chrono::Duration::from_std(self.ctx.process_alive_threshold)?;
+        let stale = query_builder::processes::find_prunable(
+            db.as_ref(),
+            &table_config,
+            threshold,
+            exclude_process_id,
+        )
+        .await?;
+
+        let pruned = stale.len();
+        if pruned > 0 {
+            info!(
+                "Supervisor maintenance: pruning {} stale process(es) (no heartbeat since {})",
+                pruned, threshold
+            );
+        }
+        for p in stale {
+            if let Err(e) = fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), p.id).await {
+                warn!(
+                    "Supervisor maintenance: failed to prune process {}: {}",
+                    p.id, e
+                );
+            }
+        }
+
+        // Any claimed row whose process is already gone is orphaned; fail it so
+        // the job can be retried. Safety net for cases where process cleanup
+        // raced or skipped releasing claims.
+        let orphaned =
+            query_builder::claimed_executions::find_orphaned(db.as_ref(), &table_config).await?;
+        let orphaned_count = orphaned.len();
+        if orphaned_count > 0 {
+            info!(
+                "Supervisor maintenance: failing {} orphaned claimed execution(s)",
+                orphaned_count
+            );
+        }
+        for execution in orphaned {
+            let ctx = self.ctx.clone();
+            let tc = table_config.clone();
+            let job_id = execution.job_id;
+            let exec_id = execution.id;
+            db.transaction::<_, (), DbErr>(|txn| {
+                Box::pin(async move {
+                    Worker::fail_claimed_execution(
+                        &ctx,
+                        txn,
+                        &tc,
+                        job_id,
+                        exec_id,
+                        "Process crashed or was killed before job completion",
+                    )
+                    .await
+                })
+            })
+            .await?;
+        }
+
+        Ok((pruned, orphaned_count))
+    }
 }
 
 async fn fail_claimed_by_process_id_inner(
