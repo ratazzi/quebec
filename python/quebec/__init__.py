@@ -5,6 +5,7 @@ from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
 from .quebec import Continuable as _RustContinuable
 from .quebec import StepContext, StepContextManager
 import logging
+import os
 import time
 import queue
 import threading
@@ -490,19 +491,24 @@ def _quebec_run(
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
                None means spawn all components. Ignored when ``processes`` is set.
-        processes: If set (or if the loaded queue.yml declares multiple
-                   worker/dispatcher processes), run in fork-based supervisor
-                   mode. Accepts a dict like ``{"worker": 2, "dispatcher": 1,
-                   "scheduler": 1}``.
+        processes: If set, run in fork-based supervisor mode. Accepts a dict
+                   like ``{"worker": 2, "dispatcher": 1, "scheduler": 1}``.
+                   When unset, the call stays in single-process threaded mode
+                   for backward compatibility, even if ``queue.yml`` declares
+                   ``processes: >1``. Set ``QUEBEC_SUPERVISOR=1`` to opt in to
+                   auto-deriving the plan from ``queue.yml``.
 
     Example:
-        qc.run()  # Start all components and block
+        qc.run()  # Start all components and block (single-process mode)
         qc.run(create_tables=True)  # Create tables and start all
         qc.run(spawn=['worker'])  # Only start worker
         qc.run(processes={"worker": 4, "dispatcher": 1})  # Supervisor mode
     """
     plan = processes
-    if plan is None:
+    # Auto-deriving the plan from queue.yml is opt-in (QUEBEC_SUPERVISOR=1) so
+    # that an existing deployment with `processes: >1` does not silently switch
+    # from the single-process threaded runtime to fork-based supervision.
+    if plan is None and os.environ.get("QUEBEC_SUPERVISOR") == "1":
         try:
             plan = self.supervisor_plan_from_config()
         except Exception:
