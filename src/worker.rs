@@ -1064,12 +1064,23 @@ impl Execution {
         self.timer = Instant::now();
         let mut job = self.job.clone();
         let jid = job.active_job_id.clone().unwrap_or_default();
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
             jid = jid,
-            tid = self.tid.clone()
+            tid = tracing::field::Empty,
+            pid = tracing::field::Empty,
         );
+        if supervised {
+            span.record("pid", std::process::id());
+        } else {
+            span.record("tid", self.tid.clone());
+        }
         // Get cancellation token from context for continuation support
         let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
@@ -1542,12 +1553,23 @@ impl Execution {
             crate::utils::increment_executions(job.arguments.as_deref(), Some(&exception_key));
 
         let jid = job.active_job_id.clone().unwrap_or_default();
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
             jid = jid,
-            tid = self.tid.clone()
+            tid = tracing::field::Empty,
+            pid = tracing::field::Empty,
         );
+        if supervised {
+            span.record("pid", std::process::id());
+        } else {
+            span.record("tid", self.tid.clone());
+        }
         let _enter = span.enter();
 
         let exception_count =
@@ -3100,8 +3122,23 @@ impl Worker {
             }
         });
 
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        let runner_span = info_span!(
+            "runner",
+            tid = tracing::field::Empty,
+            pid = tracing::field::Empty,
+        );
+        if supervised {
+            runner_span.record("pid", std::process::id());
+        } else {
+            runner_span.record("tid", tid.clone());
+        }
         let ret = runner(self.ctx.clone(), tid.clone(), state, rx)
-            .instrument(info_span!("runner", tid = tid.clone()))
+            .instrument(runner_span)
             .await;
 
         // Call worker stop handlers
