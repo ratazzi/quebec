@@ -2838,18 +2838,58 @@ pub mod processes {
         execute_select(db, query).await
     }
 
-    /// Find prunable (stale) processes with heartbeat before threshold
-    /// These are processes that have stopped sending heartbeats
+    /// Find prunable (stale) processes with heartbeat before threshold.
+    /// These are processes that have stopped sending heartbeats. When
+    /// `use_skip_locked` is set the rows are taken with `FOR UPDATE SKIP
+    /// LOCKED` so concurrent supervisors (multi-host deployments) do not
+    /// double-prune the same row. Mirrors Solid Queue's
+    /// `Process.prunable.non_blocking_lock`.
     pub async fn find_prunable<C>(
         db: &C,
         table_config: &TableConfig,
         heartbeat_threshold: chrono::NaiveDateTime,
         exclude_id: Option<i64>,
+        use_skip_locked: bool,
     ) -> Result<Vec<quebec_processes::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
-        let table = Alias::new(&table_config.processes);
+        let backend = db.get_database_backend();
+        let table_name = &table_config.processes;
+
+        if use_skip_locked && backend != DbBackend::Sqlite {
+            let (where_extra, params): (&str, Vec<sea_orm::Value>) = match exclude_id {
+                Some(id) => match backend {
+                    DbBackend::Postgres => (
+                        " AND \"id\" <> $2",
+                        vec![heartbeat_threshold.into(), id.into()],
+                    ),
+                    _ => (
+                        " AND `id` <> ?",
+                        vec![heartbeat_threshold.into(), id.into()],
+                    ),
+                },
+                None => ("", vec![heartbeat_threshold.into()]),
+            };
+
+            let sql = match backend {
+                DbBackend::Postgres => format!(
+                    r#"SELECT * FROM "{}" WHERE "last_heartbeat_at" < $1{} FOR UPDATE SKIP LOCKED"#,
+                    table_name, where_extra
+                ),
+                DbBackend::MySql => format!(
+                    r#"SELECT * FROM `{}` WHERE `last_heartbeat_at` < ?{} FOR UPDATE SKIP LOCKED"#,
+                    table_name, where_extra
+                ),
+                DbBackend::Sqlite => unreachable!(),
+            };
+            let stmt = Statement::from_sql_and_values(backend, sql, params);
+            return quebec_processes::Model::find_by_statement(stmt)
+                .all(db)
+                .await;
+        }
+
+        let table = Alias::new(table_name);
         let mut query = Query::select()
             .column(Asterisk)
             .from(table)

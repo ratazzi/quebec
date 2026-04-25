@@ -2219,6 +2219,7 @@ impl Worker {
             &table_config,
             threshold,
             exclude_process_id,
+            self.ctx.use_skip_locked,
         )
         .await?;
 
