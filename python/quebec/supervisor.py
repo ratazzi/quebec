@@ -388,28 +388,25 @@ class Supervisor:
         if not pids:
             return
 
+        # Solid Queue mirror:
+        #   * SIGTERM phase (graceful) -> wait shutdown_timeout
+        #   * SIGQUIT phase (terminate_immediately) -> children call exit(0)
+        #     via the supervised SIGQUIT handler in src/types.rs
+        #   * SIGKILL is a final safety net for processes wedged in C code that
+        #     never reach the SIGQUIT handler (Solid Queue stops at SIGQUIT and
+        #     leaves wedged children to init).
         if self._immediate:
-            # SIGQUIT path: skip the SIGTERM wait entirely.
-            sig_first, sig_name = signal.SIGKILL, "SIGKILL"
-            deadline = time.monotonic()
+            self._kill_children(pids, signal.SIGQUIT, "SIGQUIT")
         else:
-            sig_first, sig_name = signal.SIGTERM, "SIGTERM"
-            deadline = time.monotonic() + self.shutdown_timeout
+            self._kill_children(pids, signal.SIGTERM, "SIGTERM")
+            self._reap_until(deadline=time.monotonic() + self.shutdown_timeout)
+            if self._children:
+                self._kill_children(
+                    list(self._children.keys()), signal.SIGQUIT, "SIGQUIT"
+                )
 
-        logger.info("Supervisor sending %s to %d child(ren)", sig_name, len(pids))
-        for pid in pids:
-            try:
-                os.kill(pid, sig_first)
-            except ProcessLookupError:
-                self._children.pop(pid, None)
-
-        while self._children and time.monotonic() < deadline:
-            pid = self._reap_one(block=False)
-            if pid == 0:
-                time.sleep(0.1)
-                continue
-            info = self._children.pop(pid, None)
-            self._fail_claimed_for_pid(pid, info)
+        # Short window for SIGQUIT handlers to run before final SIGKILL.
+        self._reap_until(deadline=time.monotonic() + 1.0)
 
         remaining = list(self._children.keys())
         for pid in remaining:
@@ -423,5 +420,22 @@ class Supervisor:
             pid = self._reap_one(block=True)
             if pid == 0:
                 break
+            info = self._children.pop(pid, None)
+            self._fail_claimed_for_pid(pid, info)
+
+    def _kill_children(self, pids: List[int], sig: int, sig_name: str) -> None:
+        logger.info("Supervisor sending %s to %d child(ren)", sig_name, len(pids))
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                self._children.pop(pid, None)
+
+    def _reap_until(self, *, deadline: float) -> None:
+        while self._children and time.monotonic() < deadline:
+            pid = self._reap_one(block=False)
+            if pid == 0:
+                time.sleep(0.1)
+                continue
             info = self._children.pop(pid, None)
             self._fail_claimed_for_pid(pid, info)
