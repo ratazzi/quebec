@@ -281,6 +281,10 @@ pub struct AppContext {
     pub connect_options: ConnectOptions,     // For creating new connections
     pub name: String, // Application name for NOTIFY channel (default: "quebec")
     pub use_skip_locked: bool,
+    /// Enable PostgreSQL LISTEN/NOTIFY for low-latency job pickup.
+    /// Disable when running through transaction-pooling proxies (RDS Proxy,
+    /// PgBouncer transaction mode) that don't keep session state across queries.
+    pub use_listen_notify: bool,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
@@ -432,6 +436,9 @@ impl AppContext {
             if let Some(v) = get_bool("use_skip_locked") {
                 ctx.use_skip_locked = v;
             }
+            if let Some(v) = get_bool("use_listen_notify") {
+                ctx.use_listen_notify = v;
+            }
             if let Some(v) = get_duration("process_heartbeat_interval") {
                 ctx.process_heartbeat_interval = v;
             }
@@ -551,6 +558,7 @@ impl AppContext {
             connect_options,
             name: std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string()),
             use_skip_locked: true,
+            use_listen_notify: true,
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
@@ -652,6 +660,7 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
+            use_listen_notify: self.use_listen_notify,
         }
     }
 

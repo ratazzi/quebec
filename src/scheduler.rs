@@ -311,7 +311,7 @@ where
     // Run the actual DB enqueue; on any error, close the around_enqueue generator
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
     let db_result: Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = async {
-        let job_id = query_builder::jobs::insert(
+        let job = query_builder::jobs::insert_returning(
             db,
             &ctx.table_config,
             queue_name,
@@ -323,10 +323,6 @@ where
             concurrency_key_str,
         )
         .await?;
-
-        let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id)
-            .await?
-            .ok_or_else(|| DbErr::Custom("Failed to find inserted job".to_string()))?;
 
         let claimed = query_builder::recurring_executions::try_insert(
             db,

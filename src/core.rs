@@ -57,7 +57,7 @@ impl Quebec {
 
     pub async fn perform_all_later(
         &self,
-        jobs: Vec<PreparedJob>,
+        jobs: Arc<Vec<PreparedJob>>,
     ) -> Result<Vec<quebec_jobs::Model>> {
         if jobs.is_empty() {
             return Ok(vec![]);
@@ -71,6 +71,7 @@ impl Quebec {
                 let table_config = ctx.table_config.clone();
                 let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                let jobs = Arc::clone(&jobs);
                 Box::pin(async move { enqueue_all_jobs(txn, &table_config, &jobs, duration).await })
             })
             .await
