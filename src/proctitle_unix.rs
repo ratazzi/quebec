@@ -7,7 +7,7 @@ use std::os::raw::c_char;
 use std::sync::Once;
 
 #[cfg(target_os = "linux")]
-use std::{cmp::min, ffi::CStr, ptr, sync::Mutex};
+use std::{cmp::min, ptr, sync::Mutex};
 
 static INIT: Once = Once::new();
 #[cfg(target_os = "linux")]
@@ -68,7 +68,7 @@ unsafe fn init_state() -> Option<ProcTitleState> {
         argv_len = min(argv_len, env_start.saturating_sub(arg_start));
     }
 
-    if argv_len < 64 || argv_len > 1024 * 1024 {
+    if argv_len == 0 || argv_len > 1024 * 1024 {
         return None;
     }
 

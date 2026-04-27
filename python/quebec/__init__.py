@@ -5,6 +5,7 @@ from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
 from .quebec import Continuable as _RustContinuable
 from .quebec import StepContext, StepContextManager
 import logging
+import os
 import time
 import queue
 import threading
@@ -447,6 +448,17 @@ def _quebec_wait(self):
 
     try:
         while not state["shutdown_event"].is_set():
+            # Detect supervisor death in fork-based mode: if Rust flagged us
+            # orphaned, unblock this wait loop so run() returns and the child
+            # can exit. `is_orphaned()` stays False unless `watch_parent_pid`
+            # was called, so the non-supervisor case is unaffected.
+            if self.is_orphaned():
+                logger.warning(
+                    "Supervisor went away (ppid changed), shutting down child"
+                )
+                state["shutdown_event"].set()
+                self.graceful_shutdown()
+                break
             time.sleep(0.5)
     except KeyboardInterrupt:
         logger.debug("KeyboardInterrupt, shutting down...")
@@ -472,19 +484,50 @@ def _quebec_run(
     (workers.threads). The worker_threads constructor parameter can be used
     as an explicit override.
 
+    Fork-based supervisor mode is enabled by setting ``QUEBEC_SUPERVISOR=1``
+    in the environment. The plan is then derived from ``queue.yml`` —
+    ``workers[].processes`` and ``dispatchers[].processes`` decide how many
+    children to fork, and each child picks its config from the yml entry
+    matching its slot index. This matches Solid Queue's model.
+
+    For low-level use (tests, embedded services without a yml), construct
+    ``quebec.supervisor.Supervisor`` directly instead.
+
     Args:
         create_tables: Whether to create database tables (default False).
                        Set to True only if the current user has DDL permissions.
         control_plane: Control plane listen address, e.g. '127.0.0.1:5006'.
         spawn: List of components to spawn. Options: 'worker', 'dispatcher', 'scheduler'.
-               None means spawn all components.
+               None means spawn all components. Ignored in supervisor mode.
 
     Example:
-        qc.run()  # Start all components and block
-        qc.run(create_tables=True)  # Create tables and start all
-        qc.run(spawn=['worker'])  # Only start worker
-        qc.run(spawn=['worker', 'dispatcher'], control_plane='127.0.0.1:5006')
+        qc.run()  # Single-process mode (default)
+        qc.run(create_tables=True)
+        qc.run(spawn=['worker'])
+
+        # Fork-based supervisor:
+        #   queue.yml: workers.processes / dispatchers.processes
+        #   shell:    QUEBEC_SUPERVISOR=1 python -m quebec your.jobs
     """
+    plan = None
+    # Fork-based supervision is opt-in via QUEBEC_SUPERVISOR=1, so that an
+    # existing deployment with `processes: >1` in queue.yml does not silently
+    # switch from the single-process threaded runtime to fork mode on upgrade.
+    if os.environ.get("QUEBEC_SUPERVISOR") == "1":
+        try:
+            plan = self.supervisor_plan_from_config()
+        except Exception:
+            plan = None
+
+    if plan:
+        from .supervisor import Supervisor
+
+        if create_tables:
+            self.create_tables()
+        sup = Supervisor(self, plan, control_plane=control_plane)
+        sup.start()
+        return
+
     self.start(
         create_tables=create_tables,
         control_plane=control_plane,

@@ -996,12 +996,23 @@ impl Execution {
         let delay_ms = (now - target).num_milliseconds().max(0);
         let mut job = self.job.clone();
         let jid = job.active_job_id.clone().unwrap_or_default();
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
             jid = jid,
-            tid = self.tid.clone()
+            tid = tracing::field::Empty,
+            pid = tracing::field::Empty,
         );
+        if supervised {
+            span.record("pid", std::process::id());
+        } else {
+            span.record("tid", self.tid.clone());
+        }
         // Get cancellation token from context for continuation support
         let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
@@ -1483,12 +1494,23 @@ impl Execution {
             crate::utils::increment_executions(job.arguments.as_deref(), Some(&exception_key));
 
         let jid = job.active_job_id.clone().unwrap_or_default();
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
             jid = jid,
-            tid = self.tid.clone()
+            tid = tracing::field::Empty,
+            pid = tracing::field::Empty,
         );
+        if supervised {
+            span.record("pid", std::process::id());
+        } else {
+            span.record("tid", self.tid.clone());
+        }
         let _enter = span.enter();
 
         let exception_count =
@@ -1628,6 +1650,10 @@ impl Worker {
             idle_notify,
             process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
     }
 
     fn register_handler(
@@ -2156,6 +2182,7 @@ impl Worker {
             &table_config,
             threshold,
             exclude_process_id,
+            self.ctx.use_skip_locked,
         )
         .await?;
 
@@ -2479,7 +2506,7 @@ impl Worker {
     }
 
     /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
-    async fn fail_claimed_execution<C>(
+    pub(crate) async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
         db: &C,
         table_config: &TableConfig,
@@ -2497,7 +2524,7 @@ impl Worker {
 
     /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.
     /// Used during recovery (orphan/prune) to prevent blocked jobs from getting permanently stuck.
-    async fn unblock_next_job<C>(
+    pub(crate) async fn unblock_next_job<C>(
         ctx: &Arc<AppContext>,
         db: &C,
         table_config: &TableConfig,
@@ -2675,6 +2702,15 @@ impl Worker {
             std::time::Duration::from_secs(3600) // dummy interval when disabled
         };
         let mut cleanup_interval = tokio::time::interval(cleanup_duration);
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only enabled when running as a supervisor-managed child so the old
+        // single-process threaded mode is unaffected.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let worker_threads = self.ctx.worker_threads;
         let tx = self.dispatch_sender.clone();
         let ctx = self.ctx.clone();
@@ -2739,6 +2775,15 @@ impl Worker {
                 _ = cleanup_interval.tick(), if cleanup_enabled => {
                     if let Err(e) = self.clear_finished_jobs().await {
                         warn!("Failed to clear finished jobs: {}", e);
+                    }
+                }
+                // Detect supervisor death: if our ppid changed we were reparented
+                // (usually to init/launchd), so shut down gracefully. Only armed
+                // for supervisor-managed children.
+                _ = parent_check_interval.tick(), if supervised => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
                     }
                 }
                 _ = quit.cancelled() => {

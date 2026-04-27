@@ -16,21 +16,39 @@ use tracing::{info, trace, warn};
 #[derive(Debug)]
 pub struct Dispatcher {
     pub ctx: Arc<AppContext>,
+    /// Process ID for this dispatcher (set after on_start)
+    process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Dispatcher {
     pub fn new(ctx: Arc<AppContext>) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            process_id: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
     }
 
     pub async fn run(&self) -> Result<(), anyhow::Error> {
         let mut polling_interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only armed when running as a supervisor-managed child.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let batch_size = self.ctx.dispatcher_batch_size;
 
         let init_db = self.ctx.get_db().await?;
         let process = self.on_start(&init_db).await?;
         info!(">> Process started: {:?}", process);
+        *self.process_id.lock().await = Some(process.id);
 
         let quit = self.ctx.graceful_shutdown.clone();
 
@@ -41,6 +59,13 @@ impl Dispatcher {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
                     self.heartbeat(&heartbeat_db, &process).await?;
+                }
+                // Detect supervisor death: if our ppid changed we were reparented.
+                _ = parent_check_interval.tick(), if supervised => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
+                    }
                 }
                 _ = quit.cancelled() => {
                     info!("Stopped");

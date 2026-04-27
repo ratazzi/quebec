@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "python")]
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -309,6 +310,11 @@ pub struct AppContext {
     pub table_config: TableConfig, // Dynamic table name configuration
     /// Optional notifier for idle worker threads - when set, signals main loop to poll for new jobs
     pub idle_notify: Arc<RwLock<Option<Arc<Notify>>>>,
+    /// Supervisor PID recorded right after fork. When non-zero, the role loops
+    /// periodically compare `getppid()` against it and trigger graceful shutdown
+    /// if it no longer matches (i.e. the supervisor died and we got reparented
+    /// to init/launchd). Zero means "not supervised, do not check".
+    pub supervisor_pid: AtomicI32,
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -577,7 +583,29 @@ impl AppContext {
             runtime_handle: None,
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
+            supervisor_pid: AtomicI32::new(0),
         }
+    }
+
+    /// Record the current parent PID so role loops can detect supervisor death.
+    /// Intended to be called from a forked child right after `reset_after_fork`
+    /// (mirrors Solid Queue's `Supervised#supervised_by`). A zero PID disables
+    /// the check (e.g. a standalone library user has no supervisor to watch).
+    pub fn watch_parent_pid(&self) {
+        let ppid = unsafe { libc::getppid() };
+        self.supervisor_pid.store(ppid, Ordering::Relaxed);
+    }
+
+    /// Whether we were reparented since `watch_parent_pid` was called.
+    /// Returns false when `watch_parent_pid` has not been invoked (the common
+    /// single-process library case).
+    pub fn is_orphaned(&self) -> bool {
+        let stored = self.supervisor_pid.load(Ordering::Relaxed);
+        if stored == 0 {
+            return false;
+        }
+        let current = unsafe { libc::getppid() };
+        current != stored
     }
 
     pub fn set_runtime_handle(&mut self, handle: Handle) {
@@ -586,6 +614,54 @@ impl AppContext {
 
     pub fn get_runtime_handle(&self) -> Option<Handle> {
         self.runtime_handle.clone()
+    }
+
+    /// Produce a new `AppContext` suitable for a freshly forked child process.
+    ///
+    /// - Replaces the database connection and runtime handle with the caller-provided values.
+    /// - Creates fresh `CancellationToken`s (the parent's tokens may already be cancelled
+    ///   or associated with dropped tokio tasks).
+    /// - Clears the `idle_notify` slot (the old `Notify` is tied to the parent runtime).
+    /// - Preserves all configuration values and the shared registries
+    ///   (`runnables`, `concurrency_enabled`) so Python-side job class registrations
+    ///   keep working without re-registering in the child.
+    pub fn fork_clone(&self, db: Option<Arc<DatabaseConnection>>, runtime_handle: Handle) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            dsn: self.dsn.clone(),
+            db,
+            connect_options: self.connect_options.clone(),
+            name: self.name.clone(),
+            use_skip_locked: self.use_skip_locked,
+            process_heartbeat_interval: self.process_heartbeat_interval,
+            process_alive_threshold: self.process_alive_threshold,
+            shutdown_timeout: self.shutdown_timeout,
+            silence_polling: self.silence_polling,
+            preserve_finished_jobs: self.preserve_finished_jobs,
+            clear_finished_jobs_after: self.clear_finished_jobs_after,
+            cleanup_batch_size: self.cleanup_batch_size,
+            cleanup_interval: self.cleanup_interval,
+            default_concurrency_control_period: self.default_concurrency_control_period,
+            dispatcher_polling_interval: self.dispatcher_polling_interval,
+            dispatcher_batch_size: self.dispatcher_batch_size,
+            dispatcher_concurrency_maintenance_interval: self
+                .dispatcher_concurrency_maintenance_interval,
+            worker_polling_interval: self.worker_polling_interval,
+            worker_threads: self.worker_threads,
+            control_plane_sse_interval: self.control_plane_sse_interval,
+            worker_queues: self.worker_queues.clone(),
+            graceful_shutdown: CancellationToken::new(),
+            force_quit: CancellationToken::new(),
+            #[cfg(feature = "python")]
+            runnables: self.runnables.clone(),
+            concurrency_enabled: self.concurrency_enabled.clone(),
+            runtime_handle: Some(runtime_handle),
+            table_config: self.table_config.clone(),
+            idle_notify: Arc::new(RwLock::new(None)),
+            // Fresh state; child must call `watch_parent_pid` after fork.
+            supervisor_pid: AtomicI32::new(0),
+            use_listen_notify: self.use_listen_notify,
+        }
     }
 
     async fn get_db_inner(&self) -> Result<Arc<DatabaseConnection>, DbErr> {

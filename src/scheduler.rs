@@ -501,6 +501,8 @@ where
 pub struct Scheduler {
     pub ctx: Arc<AppContext>,
     pub schedule: Vec<HashMap<String, ScheduledEntry>>,
+    /// Process ID for this scheduler (set after on_start)
+    process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
 }
 
 impl Scheduler {
@@ -508,7 +510,12 @@ impl Scheduler {
         Self {
             ctx,
             schedule: Vec::new(),
+            process_id: Arc::new(tokio::sync::Mutex::new(None)),
         }
+    }
+
+    pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
+        self.process_id.clone()
     }
 
     /// Find schedule file with priority:
@@ -516,7 +523,7 @@ impl Scheduler {
     /// 2. QUEBEC_RECURRING_SCHEDULE env var
     /// 3. recurring.yml (current directory)
     /// 4. config/recurring.yml (Solid Queue compatible)
-    fn find_schedule_path() -> Option<String> {
+    pub(crate) fn find_schedule_path() -> Option<String> {
         std::env::var("SOLID_QUEUE_RECURRING_SCHEDULE")
             .or_else(|_| std::env::var("QUEBEC_RECURRING_SCHEDULE"))
             .ok()
@@ -529,6 +536,13 @@ impl Scheduler {
                     None
                 }
             })
+    }
+
+    /// Whether a recurring schedule is configured (env var or YAML file).
+    /// Used by the supervisor plan builder to decide whether to fork a
+    /// dedicated scheduler child.
+    pub(crate) fn has_recurring_schedule() -> bool {
+        Self::find_schedule_path().is_some()
     }
 
     fn parse_schedule_file(
@@ -822,12 +836,27 @@ impl Scheduler {
         task_handles: Vec<tokio::task::JoinHandle<()>>,
     ) -> Result<(), anyhow::Error> {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
+        // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
+        // Only armed when running as a supervisor-managed child.
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
                     self.heartbeat(db, process).await?;
                     trace!("Scheduler heartbeat");
+                }
+                // Detect supervisor death: if our ppid changed we were reparented.
+                _ = parent_check_interval.tick(), if supervised => {
+                    if self.ctx.is_orphaned() {
+                        warn!("Supervisor went away (ppid changed), initiating graceful shutdown");
+                        self.ctx.graceful_shutdown.cancel();
+                    }
                 }
                 _ = graceful_shutdown.cancelled() => {
                     info!("Scheduler stopping - waiting for {} tasks to complete", task_handles.len());
@@ -877,6 +906,7 @@ impl Scheduler {
 
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
+        *self.process_id.lock().await = Some(process.id);
 
         let scheduled =
             Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule.unwrap()).await?;
