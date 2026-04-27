@@ -149,22 +149,6 @@ where
     }
 }
 
-/// Helper macro for quickly creating errors
-#[macro_export]
-macro_rules! quebec_error {
-    ($variant:ident, $($arg:tt)*) => {
-        $crate::error::QuebecError::$variant(format!($($arg)*))
-    };
-}
-
-/// Helper macro for quickly returning errors
-#[macro_export]
-macro_rules! bail {
-    ($($arg:tt)*) => {
-        return Err($crate::error::QuebecError::Runtime(format!($($arg)*)))
-    };
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

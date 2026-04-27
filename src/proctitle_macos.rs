@@ -7,6 +7,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Mutex;
+use tracing::error;
 
 static PROCTITLE_STATE: Mutex<Option<ProcTitleState>> = Mutex::new(None);
 
@@ -127,7 +128,7 @@ pub fn set_title(title: &str) {
                 state.write_title(title);
             }
         } else {
-            eprintln!("Failed to initialize proctitle system");
+            error!("Failed to initialize proctitle system");
         }
     }
 

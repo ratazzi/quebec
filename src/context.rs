@@ -673,28 +673,29 @@ impl AppContext {
     }
 
     pub async fn get_db(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
-        for retry in 0..3 {
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
             match self.get_db_inner().await {
                 Ok(db) => return Ok(db),
                 Err(e) => {
-                    if retry < 2 {
-                        warn!(
-                            "Failed to get database connection, retrying ({}/3): {}",
-                            retry + 1,
-                            e
+                    attempt += 1;
+                    if attempt >= MAX_RETRIES {
+                        error!(
+                            "Failed to get database connection after {} retries: {}",
+                            MAX_RETRIES, e
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(
-                            100 * (retry + 1) as u64,
-                        ))
-                        .await;
-                    } else {
-                        error!("Failed to get database connection after 3 retries: {}", e);
                         return Err(e);
                     }
+                    warn!(
+                        "Failed to get database connection, retrying ({}/{}): {}",
+                        attempt, MAX_RETRIES, e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
                 }
             }
         }
-        unreachable!()
     }
 
     /// Check if the database is PostgreSQL
