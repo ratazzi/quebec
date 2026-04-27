@@ -127,7 +127,7 @@ fn init_logging() {
     let use_ansi = match std::env::var("QUEBEC_COLOR").as_deref() {
         Ok("always") => true,
         Ok("never") => false,
-        _ => atty::is(atty::Stream::Stdout),
+        _ => std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
 
     let result = match format.as_str() {
