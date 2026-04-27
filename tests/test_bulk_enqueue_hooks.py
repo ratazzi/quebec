@@ -31,7 +31,8 @@ def test_perform_all_later_does_not_trigger_enqueue_hooks(
     jobs = [TrackedBulkJob.build(i) for i in range(5)]
     inserted = qc.perform_all_later(jobs)
 
-    assert inserted == 5
+    assert len(inserted) == 5
+    assert all(job.id is not None for job in inserted)
     assert TrackedBulkJob.before_calls == 0
     assert TrackedBulkJob.after_calls == 0
     assert db_assert.count_jobs() == 5

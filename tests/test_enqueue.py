@@ -201,7 +201,14 @@ def test_perform_all_later_enqueues_multiple_descriptors(
         )
     ).fetchall()
 
-    assert inserted == 3
+    assert len(inserted) == 3
+    assert all(job.id is not None for job in inserted)
+    assert [job.id for job in inserted] == [
+        row.id
+        for row in session.execute(
+            text(f"SELECT id FROM {prefix}_jobs ORDER BY id")
+        ).fetchall()
+    ]
     assert len(rows) == 3
     assert rows[0].queue_name == "bulk-default"
     assert rows[0].priority == 0
@@ -216,3 +223,63 @@ def test_perform_all_later_enqueues_multiple_descriptors(
     assert db_assert.count_jobs() == 3
     assert db_assert.count_ready_executions() == 2
     assert db_assert.count_scheduled_executions() == 1
+
+
+def test_perform_all_later_returns_active_jobs_in_input_order(
+    qc_with_sqlalchemy,
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(BulkJob)
+
+    descriptors = [BulkJob.build(i) for i in range(5)]
+    inserted = qc.perform_all_later(descriptors)
+
+    assert len(inserted) == 5
+    assert all(isinstance(job, quebec.ActiveJob) for job in inserted)
+
+    ids = [job.id for job in inserted]
+    assert ids == sorted(ids)
+    assert len(set(ids)) == 5
+
+    for job in inserted:
+        assert job.queue_name == "bulk-default"
+        assert job.priority == 0
+        assert job.active_job_id
+
+    active_job_ids = [job.active_job_id for job in inserted]
+    assert len(set(active_job_ids)) == 5
+
+
+def test_perform_all_later_populates_overrides_on_returned_jobs(
+    qc_with_sqlalchemy,
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(BulkJob)
+
+    inserted = qc.perform_all_later(
+        [
+            BulkJob.build(1),
+            BulkJob.set(queue="critical", priority=9).build(2),
+            BulkJob.set(wait=timedelta(minutes=5)).build(3),
+        ]
+    )
+
+    assert inserted[0].queue_name == "bulk-default"
+    assert inserted[0].priority == 0
+
+    assert inserted[1].queue_name == "critical"
+    assert inserted[1].priority == 9
+
+    assert inserted[2].queue_name == "bulk-default"
+    # scheduled_at should reflect the wait offset (~5 minutes from now)
+    delta = inserted[2].scheduled_at - inserted[0].scheduled_at
+    assert delta >= timedelta(minutes=4, seconds=30)
+
+
+def test_perform_all_later_returns_empty_list_for_empty_input(
+    qc_with_sqlalchemy,
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(BulkJob)
+
+    assert qc.perform_all_later([]) == []

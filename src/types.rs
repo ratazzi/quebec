@@ -1379,8 +1379,13 @@ impl PyQuebec {
     /// Each descriptor has: job_class, args, kwargs, options.
     /// All class attribute extraction, JSON serialization and concurrency
     /// resolution happens here (GIL held), then DB operations run with
-    /// GIL released.  Returns the number of enqueued jobs.
-    fn perform_all_later(&self, py: Python<'_>, descriptors: &Bound<'_, PyList>) -> PyResult<u64> {
+    /// GIL released.  Returns the enqueued ActiveJob objects (with `id`
+    /// populated), in the same order as the input descriptors.
+    fn perform_all_later(
+        &self,
+        py: Python<'_>,
+        descriptors: &Bound<'_, PyList>,
+    ) -> PyResult<Vec<ActiveJob>> {
         let start_time = Instant::now();
 
         // Phase 1 (GIL held): extract everything from Python JobDescriptor objects
@@ -1541,16 +1546,47 @@ impl PyQuebec {
 
         // Phase 2 (GIL released): perform database operations
         let quebec = self.quebec.clone();
-        let count = py
-            .detach(|| self.block_on(async move { quebec.perform_all_later(prepared).await }))
-            .map(|models| models.len() as u64)
+        let prepared = Arc::new(prepared);
+        let prepared_for_db = Arc::clone(&prepared);
+        let models = py
+            .detach(|| {
+                self.block_on(async move { quebec.perform_all_later(prepared_for_db).await })
+            })
             .map_err(|e| {
                 error!("perform_all_later error: {:?}", e);
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
             })?;
 
-        debug!("Bulk enqueued {} jobs in {:?}", count, start_time.elapsed());
-        Ok(count)
+        let now = chrono::Utc::now().naive_utc();
+        let prepared = Arc::try_unwrap(prepared).unwrap_or_else(|arc| (*arc).clone());
+        let active_jobs: Vec<ActiveJob> = prepared
+            .into_iter()
+            .zip(models.iter())
+            .map(|(p, model)| ActiveJob {
+                logger: ActiveLogger::new(),
+                id: Some(model.id),
+                queue_name: p.queue_name,
+                class_name: p.class_name,
+                arguments: p.arguments,
+                priority: p.priority,
+                executions: 0,
+                active_job_id: p.active_job_id,
+                scheduled_at: p.scheduled_at.unwrap_or(now),
+                finished_at: None,
+                concurrency_key: p.concurrency_key,
+                concurrency_limit: p.concurrency_limit,
+                concurrency_on_conflict: p.concurrency_on_conflict,
+                created_at: Some(model.created_at),
+                updated_at: Some(model.updated_at),
+            })
+            .collect();
+
+        debug!(
+            "Bulk enqueued {} jobs in {:?}",
+            active_jobs.len(),
+            start_time.elapsed()
+        );
+        Ok(active_jobs)
     }
 
     fn __repr__(&self) -> PyResult<String> {
