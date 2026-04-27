@@ -190,9 +190,8 @@ impl StepContext {
                 } else if let Ok(s) = val.extract::<String>() {
                     // For strings, try to implement succ-like behavior
                     // This is a simplified version - just increment last char
-                    let char_count = s.chars().count();
-                    if char_count > 0 {
-                        let last_char = s.chars().last().unwrap();
+                    if let Some(last_char) = s.chars().last() {
+                        let char_count = s.chars().count();
                         let next_char = char::from_u32(last_char as u32 + 1).unwrap_or(last_char);
                         let new_str: String = s.chars().take(char_count - 1).collect::<String>()
                             + &next_char.to_string();
@@ -219,9 +218,8 @@ impl StepContext {
                     }
                     Some(serde_json::Value::String(s)) => {
                         // String succ - use char count, not byte length
-                        let char_count = s.chars().count();
-                        if char_count > 0 {
-                            let last_char = s.chars().last().unwrap();
+                        if let Some(last_char) = s.chars().last() {
+                            let char_count = s.chars().count();
                             let next_char =
                                 char::from_u32(last_char as u32 + 1).unwrap_or(last_char);
                             let new_str: String =

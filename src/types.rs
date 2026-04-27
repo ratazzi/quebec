@@ -2338,11 +2338,12 @@ impl PyQuebec {
             rt.block_on(async {
                 let mut router = {
                     let mut guard = router_lock.lock().await;
-                    if guard.is_none() {
-                        let cp = Arc::new(ControlPlane::new(ctx).with_base_path(base_path));
-                        *guard = Some(cp.build_router());
-                    }
-                    guard.as_ref().unwrap().clone()
+                    guard
+                        .get_or_insert_with(|| {
+                            let cp = Arc::new(ControlPlane::new(ctx).with_base_path(base_path));
+                            cp.build_router()
+                        })
+                        .clone()
                 };
                 ControlPlane::handle_request(&mut router, &method, &uri, headers, body).await
             })

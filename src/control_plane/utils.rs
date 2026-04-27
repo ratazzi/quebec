@@ -196,7 +196,7 @@ impl ControlPlane {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(axum::body::Body::empty())
-            .unwrap()
+            .expect("static response builder is infallible")
     }
 
     /// Return a 404 Not Found response (for stale/missing rows)
@@ -204,7 +204,7 @@ impl ControlPlane {
         Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(axum::body::Body::empty())
-            .unwrap()
+            .expect("static response builder is infallible")
     }
 
     /// Redirect back to the given URL with 303 See Other
@@ -213,7 +213,7 @@ impl ControlPlane {
             .status(StatusCode::SEE_OTHER)
             .header(header::LOCATION, url)
             .body(axum::body::Body::empty())
-            .unwrap()
+            .expect("static response builder is infallible")
     }
 
     /// Get pagination parameters
