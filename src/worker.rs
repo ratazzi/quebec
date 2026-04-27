@@ -980,6 +980,7 @@ pub struct Metric {
     id: i64,
     success: bool,
     duration: tokio::time::Duration,
+    delay: tokio::time::Duration,
 }
 
 #[pymethods]
@@ -989,10 +990,15 @@ impl Metric {
         self.duration
     }
 
+    #[getter]
+    fn get_delay(&self) -> tokio::time::Duration {
+        self.delay
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "Metric(id={}, success={}, duration={:?})",
-            self.id, self.success, self.duration
+            "Metric(id={}, success={}, duration={:?}, delay={:?})",
+            self.id, self.success, self.duration, self.delay
         )
     }
 }
@@ -1010,6 +1016,9 @@ pub struct Execution {
     retry_info: Option<RetryInfo>,
     /// Continuation info for interrupted jobs
     continuation_info: Option<ContinuationInfo>,
+    /// Wall-clock timestamp when the worker thread picked up this execution.
+    /// Used to compute queue delay (start - max(scheduled_at, created_at)).
+    pub(crate) started_at: Option<chrono::NaiveDateTime>,
     /// Direct reference to idle notifier - avoids RwLock access in async context
     idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
@@ -1043,6 +1052,7 @@ impl Execution {
             metric: None,
             retry_info: None,
             continuation_info: None,
+            started_at: None,
             idle_notify: None,
         }
     }
@@ -1062,6 +1072,10 @@ impl Execution {
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
         self.timer = Instant::now();
+        let now = chrono::Utc::now().naive_utc();
+        self.started_at = Some(now);
+        let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
+        let delay_ms = (now - target).num_milliseconds().max(0);
         let mut job = self.job.clone();
         let jid = job.active_job_id.clone().unwrap_or_default();
         let span = tracing::info_span!(
@@ -1073,6 +1087,7 @@ impl Execution {
         // Get cancellation token from context for continuation support
         let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
+            info!(delay_ms, "Job `{}' started", self.runnable.class_name);
             let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
@@ -1162,10 +1177,18 @@ impl Execution {
                 );
             }
 
+            let delay = self
+                .started_at
+                .map(|started| {
+                    let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
+                    (started - target).to_std().unwrap_or_default()
+                })
+                .unwrap_or_default();
             let metric = Metric {
                 id: job_id,
                 success: result.is_ok(),
                 duration: eplased,
+                delay,
             };
             self.metric = Some(metric);
         }
