@@ -16,14 +16,14 @@ use sea_orm::TransactionTrait;
 use sea_orm::*;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 
 use colored::*;
-use tracing::{info_span, Instrument};
+use tracing::Instrument;
 
 use pyo3::exceptions::PyTypeError;
-use pyo3::types::{PyBool, PyDict, PyList, PyModule, PyTuple, PyType};
+use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 
 use crate::notify::NotifyManager;
 
@@ -58,88 +58,6 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> 
         }
         serde_json::Value::Null => Ok(py.None()),
     }
-}
-
-fn python_thread_ident() -> Option<u64> {
-    Python::attach(|py| -> PyResult<u64> {
-        let threading = PyModule::import(py, "threading")?;
-        let get_ident = threading.getattr("get_ident")?;
-        let ident = get_ident.call0()?;
-        ident.extract::<u64>()
-    })
-    .ok()
-}
-
-async fn runner(
-    ctx: Arc<AppContext>,
-    _thread_id: String,
-    _state: Arc<Mutex<i32>>,
-    rx: Arc<Mutex<Receiver<Execution>>>,
-) -> Result<()> {
-    let tid = python_thread_ident()
-        .map(|thread_id| {
-            trace!("python thread_id: {:?}", thread_id);
-            thread_id.to_string()
-        })
-        .unwrap_or_else(|| format!("{:?}", std::thread::current().id()));
-    let graceful_shutdown = ctx.graceful_shutdown.clone();
-    let force_quit = ctx.force_quit.clone();
-
-    loop {
-        let mut receiver = rx.lock().await;
-        tokio::select! {
-          _ = graceful_shutdown.cancelled() => {
-              info!("Graceful shutdown");
-              break;
-          }
-          execution = receiver.recv() => {
-              drop(receiver);
-              let Some(mut execution) = execution else { continue };
-              execution.tid = tid.clone();
-
-              let class_name = execution.job.class_name.clone();
-              info!("Job `{}' started", class_name);
-
-              let timeout_duration = std::time::Duration::from_secs(10);
-
-              let result = tokio::select! {
-                  _ = graceful_shutdown.cancelled() => {
-                      info!("Graceful cancelling");
-                      Err(anyhow::anyhow!("Job `{}' cancelling", class_name))
-                  }
-                  _ = force_quit.cancelled() => {
-                      error!("Job `{}' cancelled", class_name);
-                      break;
-                  }
-                  _ = tokio::time::sleep(timeout_duration) => {
-                      error!("Job `{}' timeout", class_name);
-                      Err(anyhow::anyhow!("Job `{}' timeout", class_name))
-                  }
-                  result = tokio::task::spawn_blocking(move || {
-                      tokio::runtime::Handle::current().block_on(execution.invoke())
-                  }) => {
-                      match result {
-                          Ok(result) => result,
-                          Err(e) => Err(anyhow::anyhow!("Job `{}' failed: {:?}", class_name, e)),
-                      }
-                  }
-              };
-
-              match result {
-                  Ok(_) => info!("Job `{}' completed successfully", class_name),
-                  Err(e) => error!("Job `{}' failed: {:?}", class_name, e),
-              }
-
-              if graceful_shutdown.is_cancelled() {
-                  trace!("Current job executed, shutdown gracefully");
-                  break;
-              }
-          }
-        }
-    }
-
-    trace!("Worker thread stopped");
-    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3080,42 +2998,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    pub async fn run(&self) -> Result<(), anyhow::Error> {
-        let rx = self.dispatch_receiver.clone();
-        let state = self.token.clone();
-        let tid = Self::get_tid();
-
-        debug!("Worker started: {:?}", tid);
-
-        // Call worker start handlers
-        Python::attach(|py| {
-            let handlers = self.start_handlers.read().expect("Lock poisoned");
-            for handler in handlers.iter() {
-                match handler.bind(py).call0() {
-                    Ok(_) => debug!("Worker start handler executed successfully"),
-                    Err(e) => error!("Error calling worker start handler: {:?}", e),
-                }
-            }
-        });
-
-        let ret = runner(self.ctx.clone(), tid.clone(), state, rx)
-            .instrument(info_span!("runner", tid = tid.clone()))
-            .await;
-
-        // Call worker stop handlers
-        Python::attach(|py| {
-            let handlers = self.stop_handlers.read().expect("Lock poisoned");
-            for handler in handlers.iter() {
-                match handler.bind(py).call0() {
-                    Ok(_) => debug!("Worker stop handler executed successfully"),
-                    Err(e) => error!("Error calling worker stop handler: {:?}", e),
-                }
-            }
-        });
-
-        ret
     }
 
     pub async fn pick_job(&self) -> Result<Execution, anyhow::Error> {

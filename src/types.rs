@@ -716,23 +716,6 @@ impl PyQuebec {
         Ok(instance)
     }
 
-    fn runner(&self) -> PyResult<()> {
-        let worker = self.worker.clone();
-        let handle = self.rt.spawn(async move {
-            let _ = worker.run().await;
-        });
-
-        self.handles
-            .lock()
-            .map_err(|_| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    "Failed to acquire lock for handles",
-                )
-            })?
-            .push(handle);
-        Ok(())
-    }
-
     fn pick_job(&self, py: Python<'_>) -> PyResult<Execution> {
         let worker = self.worker.clone();
 
