@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{QuebecError, Result};
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
@@ -704,14 +704,17 @@ impl AppContext {
 
     /// Get a runnable by class name
     #[cfg(feature = "python")]
-    pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable, anyhow::Error> {
+    pub fn get_runnable(&self, class_name: &str) -> Result<crate::worker::Runnable> {
         let runnables = self
             .runnables
             .read()
-            .map_err(|e| anyhow::anyhow!("Failed to acquire read lock: {}", e))?;
-        let runnable = runnables
-            .get(class_name)
-            .ok_or_else(|| anyhow::anyhow!("Runnable not found for class: {}", class_name))?;
+            .map_err(|e| QuebecError::Runtime(format!("Failed to acquire read lock: {}", e)))?;
+        let runnable =
+            runnables
+                .get(class_name)
+                .ok_or_else(|| QuebecError::JobClassNotRegistered {
+                    class_name: class_name.to_string(),
+                })?;
 
         // Clone with GIL since Runnable contains Py<PyAny>
         Python::attach(|py| Ok(runnable.clone_with_gil(py)))
