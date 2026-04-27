@@ -4,14 +4,19 @@
 //! `proctitle` crate or kernel facilities.
 
 use std::os::raw::c_char;
-use std::sync::Once;
 
 #[cfg(target_os = "linux")]
-use std::{cmp::min, ptr, sync::Mutex};
+use std::{
+    cmp::min,
+    ptr,
+    sync::{Mutex, OnceLock},
+};
 
-static INIT: Once = Once::new();
+// `OnceLock` ensures the argv probe runs at most once; the inner `Mutex`
+// serializes the raw-pointer writes performed by `set_title` so concurrent
+// callers from different worker threads never race on the argv buffer.
 #[cfg(target_os = "linux")]
-static PROCTITLE_STATE: Mutex<Option<ProcTitleState>> = Mutex::new(None);
+static PROCTITLE_STATE: OnceLock<Mutex<ProcTitleState>> = OnceLock::new();
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct ProcTitleState {
@@ -26,19 +31,24 @@ unsafe impl Send for ProcTitleState {}
 /// range using /proc/self/stat. Other platforms keep the default behaviour.
 pub fn init() {
     #[cfg(target_os = "linux")]
-    INIT.call_once(|| unsafe {
-        if let Some(state) = init_state() {
-            *PROCTITLE_STATE.lock().unwrap() = Some(state);
-        }
-    });
-
-    #[cfg(not(target_os = "linux"))]
-    INIT.call_once(|| {});
+    {
+        PROCTITLE_STATE.get_or_init(|| Mutex::new(unsafe { init_state() }));
+    }
 }
 
 /// Linux-specific initialization using /proc/self/stat to get arg pointers.
+/// Returns a null state when the probe fails; `write_title` treats that as a
+/// no-op so callers fall back to `prctl(PR_SET_NAME)` only.
 #[cfg(target_os = "linux")]
-unsafe fn init_state() -> Option<ProcTitleState> {
+unsafe fn init_state() -> ProcTitleState {
+    try_init_state().unwrap_or(ProcTitleState {
+        argv_start: ptr::null_mut(),
+        argv_len: 0,
+    })
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn try_init_state() -> Option<ProcTitleState> {
     let stat_contents = std::fs::read_to_string("/proc/self/stat").ok()?;
 
     // Field 2 (comm) is wrapped in parentheses and may contain spaces.
@@ -80,21 +90,14 @@ unsafe fn init_state() -> Option<ProcTitleState> {
 
 /// Set the process title on Unix/Linux systems.
 pub fn set_title(title: &str) {
-    init();
-
     #[cfg(target_os = "linux")]
     {
-        let mut guard = PROCTITLE_STATE.lock().unwrap();
-        if let Some(state) = guard.as_mut() {
-            unsafe {
-                state.write_title(title);
-                set_title_via_prctl(title);
-            }
-            return;
-        }
-
-        // Fallback if we failed to initialize argv pointers.
+        let cell = PROCTITLE_STATE.get_or_init(|| Mutex::new(unsafe { init_state() }));
+        // If a previous holder panicked we still own the buffer; recover and
+        // continue, since cosmetic title writes shouldn't propagate poisoning.
+        let guard = cell.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
+            guard.write_title(title);
             set_title_via_prctl(title);
         }
     }
@@ -108,7 +111,7 @@ pub fn set_title(title: &str) {
 #[cfg(target_os = "linux")]
 impl ProcTitleState {
     /// Write the supplied title into the reserved argv buffer.
-    unsafe fn write_title(&mut self, title: &str) {
+    unsafe fn write_title(&self, title: &str) {
         if self.argv_start.is_null() || self.argv_len == 0 {
             return;
         }
