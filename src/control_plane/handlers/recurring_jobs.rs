@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::ScheduledEntry;
 use crate::control_plane::{models::RecurringTaskInfo, utils::clean_sql, ControlPlane};
+use crate::error::QuebecError;
 use crate::notify::NotifyManager;
 use crate::scheduler::enqueue_job;
 
@@ -96,7 +97,7 @@ impl ControlPlane {
         Redirect::to("/recurring-jobs")
     }
 
-    async fn do_run_recurring_job(state: &Arc<ControlPlane>, id: i64) -> Result<(), anyhow::Error> {
+    async fn do_run_recurring_job(state: &Arc<ControlPlane>, id: i64) -> crate::error::Result<()> {
         let db = state.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
@@ -114,7 +115,7 @@ impl ControlPlane {
                 [Value::from(id)],
             ))
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Recurring task {} not found", id))?;
+            .ok_or_else(|| QuebecError::runtime(format!("Recurring task {} not found", id)))?;
 
         let key: String = row.try_get("", "key").unwrap_or_default();
         let class_name: String = row.try_get("", "class_name").unwrap_or_default();
