@@ -2632,6 +2632,10 @@ impl Worker {
             info!("Non-PostgreSQL database detected, using polling only");
             return None;
         }
+        if !self.ctx.use_listen_notify {
+            info!("LISTEN/NOTIFY disabled by config, using polling only");
+            return None;
+        }
 
         info!("PostgreSQL detected, enabling LISTEN/NOTIFY for immediate job processing");
         let notify_manager = NotifyManager::new(self.ctx.clone());
