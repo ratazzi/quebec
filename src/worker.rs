@@ -383,8 +383,7 @@ impl Runnable {
         let error_name = error
             .get_type(py)
             .name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "unknown error".to_string());
+            .map_or_else(|_| "unknown error".to_string(), |s| s.to_string());
         info!("Job discarded due to {}", error_name);
 
         // Call after_discard hook on the job instance — only if overridden
@@ -415,8 +414,7 @@ impl Runnable {
         let exception_class = error
             .get_type(py)
             .name()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "UnknownError".to_string());
+            .map_or_else(|_| "UnknownError".to_string(), |s| s.to_string());
 
         let error_payload = serde_json::json!({
             "exception_class": exception_class,
@@ -704,15 +702,12 @@ impl Runnable {
             .and_then(|attr| attr.extract::<bool>().ok())
             .unwrap_or(true);
 
-        let (has_continuation_progress, current_resumptions) = self
-            .continuation_info
-            .as_ref()
-            .map(|info| {
+        let (has_continuation_progress, current_resumptions) =
+            self.continuation_info.as_ref().map_or((false, 0), |info| {
                 // Check if state has any completed steps or current step with cursor
                 let has_progress = !info.state.completed.is_empty() || info.state.current.is_some();
                 (has_progress, info.resumptions)
-            })
-            .unwrap_or((false, 0));
+            });
 
         if resume_errors_after_advancing && has_continuation_progress {
             if current_resumptions >= max_resumptions {
@@ -860,8 +855,7 @@ impl Runnable {
         let error_type = error
             .get_type(py)
             .qualname()
-            .map(|q| q.to_string())
-            .unwrap_or_else(|_| "Unknown".to_string());
+            .map_or_else(|_| "Unknown".to_string(), |q| q.to_string());
         let exception_key = format!("[{error_type}]");
         job.arguments = Some(crate::utils::increment_executions(
             job.arguments.as_deref(),
@@ -1447,8 +1441,7 @@ impl Execution {
             let exception_class = e
                 .get_type()
                 .str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| "Unknown".to_string());
+                .map_or_else(|_| "Unknown".to_string(), |s| s.to_string());
 
             error!("error: {:?}", e);
             error!("error_type: {}", exception_class);
@@ -1579,15 +1572,14 @@ impl Execution {
             }
             .instrument(span.clone());
 
-            let job = self
-                .ctx
-                .get_runtime_handle()
-                .map(|h| h.block_on(retry_future))
-                .unwrap_or_else(|| {
+            let job = self.ctx.get_runtime_handle().map_or_else(
+                || {
                     Err(sea_orm::TransactionError::Connection(DbErr::Custom(
                         "Runtime handle unavailable".into(),
                     )))
-                });
+                },
+                |h| h.block_on(retry_future),
+            );
 
             if job.is_err() {
                 error!("Job failed to schedule: {:?}", job.err());
@@ -1883,8 +1875,7 @@ impl Worker {
 
                     let queue_patterns = queue_selector
                         .as_ref()
-                        .map(|q| q.ordered_patterns())
-                        .unwrap_or_else(|| vec![(false, "*".to_string())]);
+                        .map_or_else(|| vec![(false, "*".to_string())], |q| q.ordered_patterns());
 
                     // Helper macro to avoid duplicating find + claim logic
                     macro_rules! try_claim_one {
@@ -1974,8 +1965,7 @@ impl Worker {
                     // This preserves Solid Queue's queue ordering semantics
                     let queue_patterns = queue_selector
                         .as_ref()
-                        .map(|q| q.ordered_patterns())
-                        .unwrap_or_else(|| vec![(false, "*".to_string())]); // Default to all
+                        .map_or_else(|| vec![(false, "*".to_string())], |q| q.ordered_patterns()); // Default to all
 
                     // Helper macro to claim jobs from a queue (batch insert + batch delete)
                     macro_rules! claim_from_queue {
@@ -2535,14 +2525,13 @@ impl Worker {
         let (limit, duration) = Python::attach(|_py| {
             ctx.get_runnable(&job.class_name)
                 .ok()
-                .map(|r| {
+                .map_or((1, None), |r| {
                     (
                         r.concurrency_limit.unwrap_or(1),
                         r.concurrency_duration
                             .map(|s| chrono::Duration::seconds(s as i64)),
                     )
                 })
-                .unwrap_or((1, None))
         });
 
         if release_semaphore(db, table_config, key.clone(), limit, duration)

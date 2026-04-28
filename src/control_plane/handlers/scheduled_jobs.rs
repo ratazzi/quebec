@@ -215,8 +215,7 @@ impl ControlPlane {
             ))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
-            .unwrap_or(0);
+            .map_or(0, |row| row.try_get::<i64>("", "count").unwrap_or(0));
 
         let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
         let total_pages = total_pages.max(1);

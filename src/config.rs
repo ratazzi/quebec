@@ -47,8 +47,7 @@ impl WorkerConfig {
             "WorkerConfig(queues={}, threads={:?}, polling_interval={:?})",
             self.queues
                 .as_ref()
-                .map(|q| q.to_string())
-                .unwrap_or_else(|| "None".to_string()),
+                .map_or_else(|| "None".to_string(), |q| q.to_string()),
             self.threads,
             self.polling_interval
         )
@@ -62,7 +61,7 @@ impl WorkerConfig {
 
     /// Check if processes all queues
     fn is_all_queues(&self) -> bool {
-        self.queues.as_ref().map(|q| q.is_all()).unwrap_or(false)
+        self.queues.as_ref().is_some_and(|q| q.is_all())
     }
 }
 
