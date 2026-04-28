@@ -1917,16 +1917,13 @@ pub mod blocked_executions {
             .from(table.clone())
             .to_owned();
 
-        if class_name.is_some() {
+        if let Some(cn) = class_name {
             query.inner_join(
                 jobs,
                 Expr::col((table.clone(), col("job_id")))
                     .equals((Alias::new(&table_config.jobs), col("id"))),
             );
-            query.and_where(
-                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
-                    .eq(class_name.unwrap()),
-            );
+            query.and_where(Expr::col((Alias::new(&table_config.jobs), col("class_name"))).eq(cn));
         }
         if let Some(qn) = queue_name {
             query.and_where(Expr::col((table, col("queue_name"))).eq(qn));
@@ -1971,16 +1968,13 @@ pub mod blocked_executions {
             .limit(limit)
             .to_owned();
 
-        if class_name.is_some() {
+        if let Some(cn) = class_name {
             query.inner_join(
                 jobs,
                 Expr::col((table.clone(), col("job_id")))
                     .equals((Alias::new(&table_config.jobs), col("id"))),
             );
-            query.and_where(
-                Expr::col((Alias::new(&table_config.jobs), col("class_name")))
-                    .eq(class_name.unwrap()),
-            );
+            query.and_where(Expr::col((Alias::new(&table_config.jobs), col("class_name"))).eq(cn));
         }
         if let Some(qn) = queue_name {
             query.and_where(Expr::col((table, col("queue_name"))).eq(qn));

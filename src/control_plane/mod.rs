@@ -233,7 +233,7 @@ impl ControlPlane {
             http::Response::builder()
                 .status(500)
                 .body(axum::body::Body::from("Internal Server Error"))
-                .unwrap()
+                .expect("static response builder is infallible")
         });
 
         let status = response.status().as_u16();

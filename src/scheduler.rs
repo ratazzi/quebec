@@ -896,20 +896,16 @@ impl Scheduler {
         trace!("Schedule: {:?}", schedule);
 
         // Match Solid Queue: when recurring_tasks is empty, don't start Scheduler.
-        let has_tasks = schedule
-            .as_ref()
-            .is_some_and(|s| s.iter().any(|m| !m.is_empty()));
-        if !has_tasks {
+        let Some(schedule) = schedule.filter(|s| s.iter().any(|m| !m.is_empty())) else {
             info!("No recurring tasks found, skipping scheduler");
             return Ok(());
-        }
+        };
 
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
         *self.process_id.lock().await = Some(process.id);
 
-        let scheduled =
-            Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule.unwrap()).await?;
+        let scheduled = Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?;
 
         let mut task_handles = Vec::new();
 
