@@ -743,8 +743,7 @@ impl AppContext {
     pub fn get_runnable_names(&self) -> Vec<String> {
         self.runnables
             .read()
-            .map(|r| r.keys().cloned().collect())
-            .unwrap_or_else(|_| Vec::new())
+            .map_or_else(|_| Vec::new(), |r| r.keys().cloned().collect())
     }
 
     /// Check if a job class has concurrency control enabled

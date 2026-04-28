@@ -74,19 +74,17 @@ impl ControlPlane {
         let pending_seconds = query_builder::ready_executions::oldest_created_at(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .map(|created_at| {
+            .map_or(0.0, |created_at| {
                 now.signed_duration_since(created_at).num_milliseconds() as f64 / 1000.0
-            })
-            .unwrap_or(0.0);
+            });
 
         let processing_seconds =
             query_builder::claimed_executions::oldest_created_at(db, table_config)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-                .map(|created_at| {
+                .map_or(0.0, |created_at| {
                     now.signed_duration_since(created_at).num_milliseconds() as f64 / 1000.0
-                })
-                .unwrap_or(0.0);
+                });
 
         // Job counts — propagate errors so the health endpoint surfaces DB failures
         let map_err = |e: sea_orm::DbErr| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());

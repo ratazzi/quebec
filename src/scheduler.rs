@@ -369,7 +369,7 @@ where
                             job.class_name,
                             constraint.key,
                             constraint.limit,
-                            constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
+                            constraint.duration.map_or(0, |d| d.num_seconds())
                         );
                         query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
                         return Ok((job, false)); // discarded

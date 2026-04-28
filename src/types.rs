@@ -198,8 +198,7 @@ fn signal_handler(
             .bind(py)
             .cast::<PyQuebec>()
             .ok()
-            .map(|q| q.borrow().ctx.supervisor_pid.load(Ordering::Relaxed) != 0)
-            .unwrap_or(false);
+            .is_some_and(|q| q.borrow().ctx.supervisor_pid.load(Ordering::Relaxed) != 0);
         if supervised {
             warn!("Received SIGQUIT, exiting immediately");
             std::process::exit(0);
@@ -1383,13 +1382,11 @@ impl PyQuebec {
         let total_workers: u32 = config
             .workers
             .as_ref()
-            .map(|ws| ws.iter().map(|w| w.processes.unwrap_or(1)).sum())
-            .unwrap_or(0);
+            .map_or(0, |ws| ws.iter().map(|w| w.processes.unwrap_or(1)).sum());
         let total_dispatchers: u32 = config
             .dispatchers
             .as_ref()
-            .map(|ds| ds.iter().map(|d| d.processes.unwrap_or(1)).sum())
-            .unwrap_or(0);
+            .map_or(0, |ds| ds.iter().map(|d| d.processes.unwrap_or(1)).sum());
         // Only auto-enter supervisor mode when more than one of something is
         // requested. A bare "1 worker + 1 dispatcher" config stays in the
         // existing single-process threaded mode for backward compatibility.
@@ -2755,8 +2752,7 @@ fn resolve_quebec_from_cls(cls: &Bound<'_, PyType>) -> PyResult<PyQuebec> {
     let name_err = || {
         let name = cls
             .qualname()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| "job class".to_string());
+            .map_or_else(|_| "job class".to_string(), |s| s.to_string());
         PyTypeError::new_err(format!(
             "{name} is not registered with a Quebec instance. Use \
              @qc.register_job, qc.register_job_class({name}), or \
