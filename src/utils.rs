@@ -340,7 +340,7 @@ pub fn increment_executions(arguments: Option<&str>, exception_key: Option<&str>
 /// available environment if the specified one isn't found.
 pub fn parse_env_config_cloneable<T>(
     env_config: std::collections::HashMap<String, T>,
-) -> anyhow::Result<T>
+) -> crate::Result<T>
 where
     T: Clone + std::fmt::Debug,
 {
@@ -365,7 +365,9 @@ where
     }
 
     warn!("No environments found in configuration");
-    Err(anyhow::anyhow!("No environments found in configuration"))
+    Err(crate::error::QuebecError::Config(
+        "No environments found in configuration".into(),
+    ))
 }
 
 /// Parse environment-specific configuration from a HashMap (strict mode)
@@ -375,7 +377,7 @@ where
 pub fn parse_env_config_strict<T>(
     env_config: std::collections::HashMap<String, T>,
     env: Option<&str>,
-) -> anyhow::Result<T>
+) -> crate::Result<T>
 where
     T: Clone + std::fmt::Debug,
 {
@@ -395,9 +397,8 @@ where
 
     // Environment not found, return error with available environments
     let available: Vec<String> = env_config.keys().cloned().collect();
-    anyhow::bail!(
+    Err(crate::error::QuebecError::Config(format!(
         "Environment '{}' not found in config. Available environments: {:?}",
-        environment,
-        available
-    )
+        environment, available
+    )))
 }
