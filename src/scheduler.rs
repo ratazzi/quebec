@@ -1,8 +1,8 @@
 use crate::context::{AppContext, ScheduledEntry};
+use crate::error::Result;
 use crate::notify::NotifyManager;
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
-use anyhow::Result;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, ExecResult, Statement, TransactionTrait, Value};
@@ -23,7 +23,7 @@ pub async fn upsert_task<C>(
     db: &C,
     table_config: &crate::context::TableConfig,
     entry: ScheduledEntry,
-) -> Result<ExecResult, DbErr>
+) -> std::result::Result<ExecResult, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -168,7 +168,7 @@ pub async fn enqueue_job<C>(
     db: &C,
     entry: ScheduledEntry,
     scheduled_at: NaiveDateTime,
-) -> Result<Option<String>, DbErr>
+) -> std::result::Result<Option<String>, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -240,67 +240,73 @@ where
     {
         let any_enqueue_hook = hooks.before_enqueue || hooks.around_enqueue || hooks.after_enqueue;
         if any_enqueue_hook {
-            let skip_reason = pyo3::Python::attach(|py| -> Result<Option<&str>, DbErr> {
-                let runnable = ctx
-                    .get_runnable(&entry.class)
-                    .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {}", e)))?;
-                let bound = runnable.handler.bind(py);
-                let instance = bound
-                    .call0()
-                    .map_err(|e| DbErr::Custom(format!("Failed to create instance: {}", e)))?;
-                if let Ok(cell) = instance.cast::<crate::types::ActiveJob>() {
-                    let mut inner = cell.borrow_mut();
-                    inner.queue_name = queue_name.to_string();
-                    inner.arguments = params.to_string();
-                    inner.active_job_id = task_key.clone();
-                    inner.priority = priority;
-                }
+            let skip_reason =
+                pyo3::Python::attach(|py| -> std::result::Result<Option<&str>, DbErr> {
+                    let runnable = ctx
+                        .get_runnable(&entry.class)
+                        .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {}", e)))?;
+                    let bound = runnable.handler.bind(py);
+                    let instance = bound
+                        .call0()
+                        .map_err(|e| DbErr::Custom(format!("Failed to create instance: {}", e)))?;
+                    if let Ok(cell) = instance.cast::<crate::types::ActiveJob>() {
+                        let mut inner = cell.borrow_mut();
+                        inner.queue_name = queue_name.to_string();
+                        inner.arguments = params.to_string();
+                        inner.active_job_id = task_key.clone();
+                        inner.priority = priority;
+                    }
 
-                // before_enqueue — raise AbortEnqueue to skip
-                if hooks.before_enqueue {
-                    match instance.call_method0("before_enqueue") {
-                        Ok(_) => {}
-                        Err(e) if e.is_instance_of::<crate::context::AbortEnqueue>(py) => {
-                            return Ok(Some("before_enqueue"));
-                        }
-                        Err(e) => {
-                            return Err(DbErr::Custom(format!("before_enqueue hook error: {}", e)));
+                    // before_enqueue — raise AbortEnqueue to skip
+                    if hooks.before_enqueue {
+                        match instance.call_method0("before_enqueue") {
+                            Ok(_) => {}
+                            Err(e) if e.is_instance_of::<crate::context::AbortEnqueue>(py) => {
+                                return Ok(Some("before_enqueue"));
+                            }
+                            Err(e) => {
+                                return Err(DbErr::Custom(format!(
+                                    "before_enqueue hook error: {}",
+                                    e
+                                )));
+                            }
                         }
                     }
-                }
 
-                // around_enqueue: advance generator to yield, unbind to keep alive
-                if hooks.around_enqueue {
-                    let gen = instance
-                        .call_method0("around_enqueue")
-                        .map_err(|e| DbErr::Custom(format!("around_enqueue hook error: {}", e)))?;
-                    let builtins = py
-                        .import("builtins")
-                        .map_err(|e| DbErr::Custom(format!("Failed to import builtins: {}", e)))?;
-                    let first_next = builtins
-                        .getattr("next")
-                        .and_then(|next_fn| next_fn.call1((&gen,)));
-                    match first_next {
-                        Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-                            // Generator returned without yielding — skip enqueue
-                            return Ok(Some("around_enqueue"));
+                    // around_enqueue: advance generator to yield, unbind to keep alive
+                    if hooks.around_enqueue {
+                        let gen = instance.call_method0("around_enqueue").map_err(|e| {
+                            DbErr::Custom(format!("around_enqueue hook error: {}", e))
+                        })?;
+                        let builtins = py.import("builtins").map_err(|e| {
+                            DbErr::Custom(format!("Failed to import builtins: {}", e))
+                        })?;
+                        let first_next = builtins
+                            .getattr("next")
+                            .and_then(|next_fn| next_fn.call1((&gen,)));
+                        match first_next {
+                            Err(ref e)
+                                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) =>
+                            {
+                                // Generator returned without yielding — skip enqueue
+                                return Ok(Some("around_enqueue"));
+                            }
+                            Err(e) => {
+                                return Err(DbErr::Custom(format!(
+                                    "around_enqueue before-yield error: {}",
+                                    e
+                                )));
+                            }
+                            Ok(_) => {}
                         }
-                        Err(e) => {
-                            return Err(DbErr::Custom(format!(
-                                "around_enqueue before-yield error: {}",
-                                e
-                            )));
-                        }
-                        Ok(_) => {}
+                        around_gen = Some(gen.unbind());
                     }
-                    around_gen = Some(gen.unbind());
-                }
 
-                // Keep instance alive for post-enqueue hooks (around resume + after)
-                hook_instance = Some(instance.unbind());
+                    // Keep instance alive for post-enqueue hooks (around resume + after)
+                    hook_instance = Some(instance.unbind());
 
-                Ok(None) // don't skip
-            })?;
+                    Ok(None) // don't skip
+                })?;
             if let Some(hook) = skip_reason {
                 tracing::info!("Job `{}' skipped by {} hook", task_key, hook);
                 return Ok(None);
@@ -310,102 +316,103 @@ where
 
     // Run the actual DB enqueue; on any error, close the around_enqueue generator
     let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
-    let db_result: Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = async {
-        let job = query_builder::jobs::insert_returning(
-            db,
-            &ctx.table_config,
-            queue_name,
-            &entry.class,
-            Some(params.to_string()).as_deref(),
-            priority,
-            Some(active_job_id.as_str()),
-            Some(scheduled_at),
-            concurrency_key_str,
-        )
-        .await?;
+    let db_result: std::result::Result<(crate::entities::quebec_jobs::Model, bool), DbErr> =
+        async {
+            let job = query_builder::jobs::insert_returning(
+                db,
+                &ctx.table_config,
+                queue_name,
+                &entry.class,
+                Some(params.to_string()).as_deref(),
+                priority,
+                Some(active_job_id.as_str()),
+                Some(scheduled_at),
+                concurrency_key_str,
+            )
+            .await?;
 
-        let claimed = query_builder::recurring_executions::try_insert(
-            db,
-            &ctx.table_config,
-            job.id,
-            &task_key,
-            scheduled_at,
-        )
-        .await?;
-
-        if !claimed {
-            query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
-            trace!(
-                "Skipping job {} at {} - already claimed by another scheduler",
-                task_key,
-                scheduled_at
-            );
-            return Ok((job, false)); // not claimed
-        }
-
-        let blocked_by = if let Some(constraint) = &concurrency_constraint {
-            use crate::semaphore::acquire_semaphore_with_constraint;
-            if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
-                info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
-                None
-            } else {
-                warn!(
-                    "Scheduler: Failed to acquire semaphore for key: {}",
-                    constraint.key
-                );
-                Some(constraint)
-            }
-        } else {
-            None
-        };
-
-        if let Some(constraint) = blocked_by {
-            match constraint.on_conflict {
-                crate::context::ConcurrencyConflict::Discard => {
-                    warn!(
-                        job_id = job.id,
-                        "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
-                        job.class_name,
-                        constraint.key,
-                        constraint.limit,
-                        constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
-                    );
-                    query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
-                    return Ok((job, false)); // discarded
-                }
-                crate::context::ConcurrencyConflict::Block => {
-                    let block_now = chrono::Utc::now().naive_utc();
-                    let duration = constraint.duration.unwrap_or_else(|| {
-                        chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                            .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                    });
-                    let expires_at = block_now + duration;
-                    query_builder::blocked_executions::insert(
-                        db,
-                        &ctx.table_config,
-                        job.id,
-                        &job.queue_name,
-                        job.priority,
-                        &constraint.key,
-                        expires_at,
-                    )
-                    .await?;
-                }
-            }
-        } else {
-            query_builder::ready_executions::insert(
+            let claimed = query_builder::recurring_executions::try_insert(
                 db,
                 &ctx.table_config,
                 job.id,
-                &job.queue_name,
-                job.priority,
+                &task_key,
+                scheduled_at,
             )
             .await?;
-        }
 
-        Ok((job, true)) // success
-    }
-    .await;
+            if !claimed {
+                query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
+                trace!(
+                    "Skipping job {} at {} - already claimed by another scheduler",
+                    task_key,
+                    scheduled_at
+                );
+                return Ok((job, false)); // not claimed
+            }
+
+            let blocked_by = if let Some(constraint) = &concurrency_constraint {
+                use crate::semaphore::acquire_semaphore_with_constraint;
+                if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
+                    info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
+                    None
+                } else {
+                    warn!(
+                        "Scheduler: Failed to acquire semaphore for key: {}",
+                        constraint.key
+                    );
+                    Some(constraint)
+                }
+            } else {
+                None
+            };
+
+            if let Some(constraint) = blocked_by {
+                match constraint.on_conflict {
+                    crate::context::ConcurrencyConflict::Discard => {
+                        warn!(
+                            job_id = job.id,
+                            "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
+                            job.class_name,
+                            constraint.key,
+                            constraint.limit,
+                            constraint.duration.map(|d| d.num_seconds()).unwrap_or(0)
+                        );
+                        query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
+                        return Ok((job, false)); // discarded
+                    }
+                    crate::context::ConcurrencyConflict::Block => {
+                        let block_now = chrono::Utc::now().naive_utc();
+                        let duration = constraint.duration.unwrap_or_else(|| {
+                            chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                        });
+                        let expires_at = block_now + duration;
+                        query_builder::blocked_executions::insert(
+                            db,
+                            &ctx.table_config,
+                            job.id,
+                            &job.queue_name,
+                            job.priority,
+                            &constraint.key,
+                            expires_at,
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                query_builder::ready_executions::insert(
+                    db,
+                    &ctx.table_config,
+                    job.id,
+                    &job.queue_name,
+                    job.priority,
+                )
+                .await?;
+            }
+
+            Ok((job, true)) // success
+        }
+        .await;
 
     // On any DB error or early exit, throw into generator before propagating
     let (job, enqueued) = match db_result {
@@ -545,17 +552,12 @@ impl Scheduler {
         Self::find_schedule_path().is_some()
     }
 
-    fn parse_schedule_file(
-        contents: &str,
-    ) -> Result<Vec<HashMap<String, ScheduledEntry>>, anyhow::Error> {
+    fn parse_schedule_file(contents: &str) -> Result<Vec<HashMap<String, ScheduledEntry>>> {
         // Parse as multi-environment config (Solid Queue format)
         // Format: { development: { task1: {...}, task2: {...} }, production: {...} }
         let env_config =
             serde_yaml::from_str::<HashMap<String, HashMap<String, ScheduledEntry>>>(contents)
-                .map_err(|e| {
-                    error!("Failed to parse schedule file: {}", e);
-                    anyhow::anyhow!("Failed to parse schedule file: {}", e)
-                })?;
+                .inspect_err(|e| error!("Failed to parse schedule file: {}", e))?;
 
         // Use strict environment parser — refuse to fall back to wrong environment,
         // because stale-row deletion would wipe the correct environment's tasks.
@@ -565,19 +567,15 @@ impl Scheduler {
     }
 
     /// Load schedule from file path, returns None if no path provided
-    fn load_schedule(
-        path: Option<String>,
-    ) -> Result<Option<Vec<HashMap<String, ScheduledEntry>>>, anyhow::Error> {
+    fn load_schedule(path: Option<String>) -> Result<Option<Vec<HashMap<String, ScheduledEntry>>>> {
         let Some(path) = path else {
             info!("No schedule file found, running without scheduled tasks");
             return Ok(None);
         };
 
         info!("Loading schedule from: {}", path);
-        let contents = std::fs::read_to_string(&path).map_err(|e| {
-            error!("Failed to read schedule file {}: {}", path, e);
-            anyhow::anyhow!("Failed to read schedule file: {}", e)
-        })?;
+        let contents = std::fs::read_to_string(&path)
+            .inspect_err(|e| error!("Failed to read schedule file {}: {}", path, e))?;
 
         Self::parse_schedule_file(&contents).map(Some)
     }
@@ -587,7 +585,7 @@ impl Scheduler {
         db: &C,
         table_config: &crate::context::TableConfig,
         schedule: Vec<HashMap<String, ScheduledEntry>>,
-    ) -> Result<Vec<ScheduledEntry>, anyhow::Error> {
+    ) -> Result<Vec<ScheduledEntry>> {
         let mut scheduled = Vec::new();
 
         for entry in schedule {
@@ -834,7 +832,7 @@ impl Scheduler {
         mut heartbeat_interval: tokio::time::Interval,
         mut interval: tokio::time::Interval,
         task_handles: Vec<tokio::task::JoinHandle<()>>,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         let graceful_shutdown = self.ctx.graceful_shutdown.clone();
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
         // Only armed when running as a supervisor-managed child.
@@ -879,7 +877,7 @@ impl Scheduler {
         }
     }
 
-    pub async fn run(&self) -> Result<(), anyhow::Error> {
+    pub async fn run(&self) -> Result<()> {
         let db = self.ctx.get_db().await?;
         let interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
