@@ -173,6 +173,24 @@ fn signal_handler(
     _frame: Py<PyAny>,
     quebec: Py<PyAny>,
 ) -> PyResult<()> {
+    // SIGTSTP (Sidekiq convention) and SIGUSR1 both enter "quiet" mode:
+    // stop fetching new jobs but keep running so in-flight jobs finish.
+    // Used for seamless restarts. SIGUSR1 is the always-on alternative
+    // when SIGTSTP isn't intercepted (interactive tty, where Ctrl-Z is
+    // left to shell job control).
+    if signum == libc::SIGTSTP || signum == libc::SIGUSR1 {
+        let sname = if signum == libc::SIGTSTP {
+            "SIGTSTP"
+        } else {
+            "SIGUSR1"
+        };
+        info!("Received {}, entering quiet mode (no new jobs)", sname);
+        if let Err(e) = quebec.bind(py).call_method0("quiet") {
+            error!("Error calling quiet: {:?}", e);
+        }
+        return Ok(());
+    }
+
     // SIGQUIT is the "exit now" signal in the Solid Queue convention. Only
     // supervisor-managed children skip cleanup — standalone Quebec processes
     // (no supervisor watching) drain gracefully so they release claims and
@@ -2136,15 +2154,31 @@ impl PyQuebec {
             .getattr("partial")?
             .call((handler_func,), Some(&kwargs))?;
 
-        let mut registered: Vec<&str> = Vec::with_capacity(3);
-        for name in ["SIGINT", "SIGTERM", "SIGQUIT"] {
-            if !signal.hasattr(name)? {
+        // SIGUSR1 is the always-on quiet signal: works in any environment.
+        // SIGTSTP is the Sidekiq-compatible quiet signal, but only registered
+        // when stdin is not a tty — in an interactive terminal we leave Ctrl-Z
+        // to shell job control. Under systemd / docker / nohup / supervisor
+        // (no controlling tty), SIGTSTP also enters quiet mode.
+        use std::io::IsTerminal;
+        let stdin_is_tty = std::io::stdin().is_terminal();
+        let signals: &[&str] = if stdin_is_tty {
+            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGUSR1"]
+        } else {
+            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGTSTP", "SIGUSR1"]
+        };
+
+        let mut registered: Vec<&str> = Vec::with_capacity(signals.len());
+        for name in signals {
+            if !signal.hasattr(*name)? {
                 // SIGQUIT (and in theory others) is missing on Windows; skip
                 // rather than aborting startup.
                 continue;
             }
-            signal.call_method1("signal", (signal.getattr(name)?, wrapped_handler.clone()))?;
+            signal.call_method1("signal", (signal.getattr(*name)?, wrapped_handler.clone()))?;
             registered.push(name);
+        }
+        if stdin_is_tty {
+            info!("stdin is a tty; SIGTSTP left to shell job control (use SIGUSR1 for quiet mode)");
         }
 
         info!("Signal handlers registered: {}", registered.join(", "));
@@ -2200,6 +2234,22 @@ impl PyQuebec {
         self.spawn_job_claim_poller()?;
 
         Ok(())
+    }
+
+    /// Enter Sidekiq-style quiet mode: stop claiming new jobs but keep
+    /// running so in-flight jobs finish. Used for seamless restarts.
+    /// Idempotent.
+    fn quiet(&self) -> PyResult<()> {
+        if !self.ctx.quiet.is_cancelled() {
+            info!("Quebec entering quiet mode (worker stops claiming new jobs)");
+            self.ctx.quiet.cancel();
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn is_quiet(&self) -> bool {
+        self.ctx.quiet.is_cancelled()
     }
 
     fn graceful_shutdown(&self, py: Python) -> PyResult<()> {

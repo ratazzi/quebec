@@ -151,14 +151,27 @@ pub trait ProcessTrait: Send + Sync {
         None
     }
 
+    /// Runtime metadata refreshed every heartbeat. Default returns `None`
+    /// (don't touch the metadata column). Override to surface dynamic state
+    /// — e.g. Worker returns `{"quiet":true}` while in quiet mode.
+    fn runtime_metadata(&self) -> Option<String> {
+        None
+    }
+
     async fn heartbeat(
         &self,
         db: &DatabaseConnection,
         process: &quebec_processes::Model,
     ) -> Result<(), Error> {
         let ctx = self.ctx();
-        let rows =
-            query_builder::processes::update_heartbeat(db, &ctx.table_config, process.id).await?;
+        let metadata = self.runtime_metadata();
+        let rows = query_builder::processes::update_heartbeat_with_metadata(
+            db,
+            &ctx.table_config,
+            process.id,
+            metadata.as_deref(),
+        )
+        .await?;
         // Row gone means the supervisor pruned us (stale heartbeat) or another
         // operator deregistered us. Mirrors Solid Queue's Registrable#heartbeat
         // rescue of RecordNotFound: stop polling and exit gracefully so we do

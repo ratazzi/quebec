@@ -2663,16 +2663,34 @@ pub mod processes {
     where
         C: ConnectionTrait,
     {
+        update_heartbeat_with_metadata(db, table_config, id, None).await
+    }
+
+    /// Update heartbeat and optionally update the metadata column.
+    /// When `metadata` is `Some`, the metadata column is overwritten (use
+    /// `Some("")` or `Some("{}")` to clear). When `None`, metadata is left
+    /// untouched.
+    pub async fn update_heartbeat_with_metadata<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+        metadata: Option<&str>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
         let table = Alias::new(&table_config.processes);
         let now = chrono::Utc::now().naive_utc();
 
-        let query = Query::update()
-            .table(table)
-            .value(col("last_heartbeat_at"), Expr::val(now))
-            .and_where(Expr::col(col("id")).eq(id))
-            .to_owned();
+        let mut stmt = Query::update();
+        stmt.table(table)
+            .value(col("last_heartbeat_at"), Expr::val(now));
+        if let Some(m) = metadata {
+            stmt.value(col("metadata"), Expr::val(m));
+        }
+        stmt.and_where(Expr::col(col("id")).eq(id));
 
-        execute_update(db, query).await
+        execute_update(db, stmt.to_owned()).await
     }
 
     /// Find a process by ID

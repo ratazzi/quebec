@@ -303,6 +303,11 @@ pub struct AppContext {
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
     pub force_quit: CancellationToken,
+    /// Sidekiq-style "quiet" mode: when cancelled, the worker stops claiming
+    /// new jobs but continues running so in-flight jobs can finish. Used for
+    /// seamless restarts (signal old instance quiet, start new instance,
+    /// later send SIGTERM once old instance has drained).
+    pub quiet: CancellationToken,
     #[cfg(feature = "python")]
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
@@ -577,6 +582,7 @@ impl AppContext {
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
+            quiet: CancellationToken::new(),
             #[cfg(feature = "python")]
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
@@ -652,6 +658,7 @@ impl AppContext {
             worker_queues: self.worker_queues.clone(),
             graceful_shutdown: CancellationToken::new(),
             force_quit: CancellationToken::new(),
+            quiet: CancellationToken::new(),
             #[cfg(feature = "python")]
             runnables: self.runnables.clone(),
             concurrency_enabled: self.concurrency_enabled.clone(),

@@ -2720,6 +2720,8 @@ impl Worker {
         let thread_id = Self::get_tid();
 
         let quit = self.ctx.graceful_shutdown.clone();
+        let quiet_token = self.ctx.quiet.clone();
+        let mut quiet_announced = false;
 
         // Initialize process record
         let init_db = self.ctx.get_db().await?;
@@ -2764,6 +2766,18 @@ impl Worker {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
                     self.heartbeat(&heartbeat_db, &process).await?;
+                }
+                // Quiet mode entered: immediately push a heartbeat so the
+                // metadata column reflects the new state without waiting
+                // for the next tick (which can be up to ~60s away).
+                _ = quiet_token.cancelled(), if !quiet_announced => {
+                    quiet_announced = true;
+                    info!("Quiet mode active, flushing heartbeat to surface state");
+                    if let Ok(db) = self.ctx.get_db().await {
+                        if let Err(e) = self.heartbeat(&db, &process).await {
+                            warn!("Failed to flush quiet heartbeat: {}", e);
+                        }
+                    }
                 }
                 // Periodic maintenance: prune dead processes and fail their claimed jobs
                 _ = maintenance_interval.tick() => {
@@ -2866,6 +2880,13 @@ impl Worker {
         thread_id: &str,
         source: &str,
     ) {
+        // Sidekiq-style quiet mode: keep running but stop claiming new work
+        // so in-flight jobs can drain. Used for seamless restarts.
+        if ctx.quiet.is_cancelled() {
+            trace!("[{}] quiet mode, skipping claim", source);
+            return;
+        }
+
         // Only claim as many jobs as the channel can accept to prevent
         // claimed execution leaks when the channel is full.
         let available = tx.lock().await.capacity();
@@ -3084,5 +3105,13 @@ impl ProcessTrait for Worker {
 
     fn process_info(&self) -> ProcessInfo {
         ProcessInfo::new("Worker", "worker")
+    }
+
+    fn runtime_metadata(&self) -> Option<String> {
+        if self.ctx.quiet.is_cancelled() {
+            Some(r#"{"quiet":true}"#.to_string())
+        } else {
+            None
+        }
     }
 }
