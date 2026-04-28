@@ -3,7 +3,7 @@ use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use crate::semaphore::acquire_semaphore;
 
-use anyhow::Result;
+use crate::error::Result;
 use async_trait::async_trait;
 use sea_orm::TransactionTrait;
 use sea_orm::*;
@@ -32,7 +32,7 @@ impl Dispatcher {
         self.process_id.clone()
     }
 
-    pub async fn run(&self) -> Result<(), anyhow::Error> {
+    pub async fn run(&self) -> Result<()> {
         let mut polling_interval = tokio::time::interval(self.ctx.dispatcher_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
