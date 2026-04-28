@@ -9,10 +9,10 @@
 #![allow(dead_code)]
 
 use crate::context::AppContext;
+use crate::error::Result;
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use crate::worker::Worker;
-use anyhow::Result;
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -97,7 +97,8 @@ impl Supervisor {
         let table_config = self.ctx.table_config.clone();
 
         let threshold = chrono::Utc::now().naive_utc()
-            - chrono::Duration::from_std(self.ctx.process_alive_threshold)?;
+            - chrono::Duration::from_std(self.ctx.process_alive_threshold)
+                .map_err(|e| crate::error::QuebecError::Other(e.into()))?;
         let stale = query_builder::processes::find_prunable(
             db.as_ref(),
             &table_config,
