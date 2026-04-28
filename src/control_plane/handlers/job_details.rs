@@ -364,10 +364,7 @@ impl ControlPlane {
 
             Ok(Html(html))
         } else {
-            Err((
-                StatusCode::NOT_FOUND,
-                format!("Job with ID {} not found", id),
-            ))
+            Err((StatusCode::NOT_FOUND, format!("Job with ID {id} not found")))
         }
     }
 }

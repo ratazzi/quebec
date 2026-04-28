@@ -167,8 +167,7 @@ fn init_logging() {
 
     if result.is_err() {
         eprintln!(
-            "quebec: tracing subscriber already initialized, QUEBEC_LOG_FORMAT={} ignored",
-            format
+            "quebec: tracing subscriber already initialized, QUEBEC_LOG_FORMAT={format} ignored"
         );
     }
 }

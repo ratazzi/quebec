@@ -147,7 +147,7 @@ impl ControlPlane {
                 format!("{:.1}m", secs / 60.0)
             }
             Some(secs) => {
-                format!("{:.1}s", secs)
+                format!("{secs:.1}s")
             }
             None => "N/A".to_string(),
         };
@@ -359,7 +359,7 @@ impl ControlPlane {
                     format!("{:.1}m", secs / 60.0)
                 }
                 Some(secs) => {
-                    format!("{:.1}s", secs)
+                    format!("{secs:.1}s")
                 }
                 None => "N/A".to_string(),
             };

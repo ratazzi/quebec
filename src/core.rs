@@ -128,7 +128,7 @@ async fn enqueue_job(
 
     // Validate arguments JSON without full parsing (zero-copy validation)
     let args: Box<serde_json::value::RawValue> = serde_json::from_str(&job.arguments)
-        .map_err(|e| DbErr::Custom(format!("Invalid JSON in arguments: {}", e)))?;
+        .map_err(|e| DbErr::Custom(format!("Invalid JSON in arguments: {e}")))?;
 
     let params = crate::utils::build_job_params(serde_json::json!({
         "job_class": job.class_name,

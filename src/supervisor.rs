@@ -180,8 +180,7 @@ async fn fail_claimed_by_process_id_inner(
     };
 
     let error_msg = format!(
-        "Child process {} (pid={}, host={:?}) crashed",
-        process_id, process_pid, process_hostname
+        "Child process {process_id} (pid={process_pid}, host={process_hostname:?}) crashed"
     );
 
     let ctx = ctx.clone();

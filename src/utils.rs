@@ -398,7 +398,6 @@ where
     // Environment not found, return error with available environments
     let available: Vec<String> = env_config.keys().cloned().collect();
     Err(crate::error::QuebecError::Config(format!(
-        "Environment '{}' not found in config. Available environments: {:?}",
-        environment, available
+        "Environment '{environment}' not found in config. Available environments: {available:?}"
     )))
 }

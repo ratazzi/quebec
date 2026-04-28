@@ -158,7 +158,7 @@ impl ControlPlane {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
-        Self::redirect_back(&format!("/queues/{}", queue_name))
+        Self::redirect_back(&format!("/queues/{queue_name}"))
     }
 
     pub async fn resume_queue(
@@ -180,7 +180,7 @@ impl ControlPlane {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
-        Self::redirect_back(&format!("/queues/{}", queue_name))
+        Self::redirect_back(&format!("/queues/{queue_name}"))
     }
 
     pub async fn pause_all_queues(State(state): State<Arc<ControlPlane>>) -> Response {
