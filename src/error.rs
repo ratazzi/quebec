@@ -81,8 +81,10 @@ pub enum QuebecError {
     Postgres(#[from] tokio_postgres::Error),
 }
 
-/// Type alias for simplified usage
-pub type Result<T> = std::result::Result<T, QuebecError>;
+/// Type alias for simplified usage. Mirrors `anyhow::Result`, allowing an
+/// explicit error type (`Result<T, E>`) when a function deliberately surfaces
+/// a non-`QuebecError` (e.g. a sea-orm transaction returning `DbErr`).
+pub type Result<T, E = QuebecError> = std::result::Result<T, E>;
 
 impl QuebecError {
     /// Create a configuration error
