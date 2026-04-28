@@ -903,7 +903,7 @@ impl PyQuebec {
         })
     }
 
-    async fn post_job(&self) -> Result<(), anyhow::Error> {
+    async fn post_job(&self) -> crate::error::Result<()> {
         let _ = self.rt.spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
