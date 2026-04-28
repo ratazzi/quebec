@@ -1,9 +1,9 @@
 use crate::context::*;
 use crate::entities::*;
+use crate::error::{QuebecError, Result};
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use crate::semaphore::release_semaphore;
-use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
@@ -233,7 +233,7 @@ impl Runnable {
                 on_conflict: self.concurrency_on_conflict,
             }))
         })
-        .map_err(|e: PyErr| anyhow::anyhow!("Python error in get_concurrency_constraint: {}", e))
+        .map_err(|e: PyErr| QuebecError::Python(format!("get_concurrency_constraint: {}", e)))
     }
 
     /// Check if should retry, return matching retry strategy and its exception key.
@@ -816,7 +816,7 @@ impl Runnable {
         let delay = strategy.wait;
         let scheduled_at = chrono::Utc::now().naive_utc()
             + chrono::Duration::from_std(delay)
-                .map_err(|e| anyhow::anyhow!("Invalid delay duration: {}", e))?;
+                .map_err(|e| QuebecError::validation(format!("Invalid delay duration: {}", e)))?;
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
@@ -868,7 +868,7 @@ impl Runnable {
             Some(&exception_key),
         ));
         let error_payload = self.create_error_payload(py, error);
-        Err(anyhow::anyhow!(error_payload))
+        Err(QuebecError::generic(error_payload))
     }
 }
 
@@ -1051,7 +1051,7 @@ impl Execution {
         scheduled_at: chrono::NaiveDateTime,
         arguments: &str,
         override_arguments: Option<&str>,
-    ) -> Result<(), DbErr> {
+    ) -> std::result::Result<(), DbErr> {
         let arguments = override_arguments.unwrap_or(arguments);
 
         let new_job_id = query_builder::jobs::insert(
@@ -1154,7 +1154,7 @@ impl Execution {
 
         let claimed_id = claimed.id;
         let max_retries = 3u32;
-        let mut transaction_result: Result<bool, TransactionError<DbErr>> = Err(
+        let mut transaction_result: std::result::Result<bool, TransactionError<DbErr>> = Err(
             TransactionError::Transaction(DbErr::Custom("not attempted".into())),
         );
 
@@ -1356,10 +1356,10 @@ impl Execution {
         // Only return error if the database transaction failed
         match transaction_result {
             Ok(_) => Ok(self.job.clone()),
-            Err(e) => Err(anyhow::anyhow!(
+            Err(e) => Err(QuebecError::Transaction(format!(
                 "Database error during job processing: {}",
                 e
-            )),
+            ))),
         }
     }
 }
@@ -1462,10 +1462,10 @@ impl Execution {
                 "backtrace": backtrace,
             });
 
-            Err(anyhow::anyhow!(serde_json::to_string(&error_payload)
-                .unwrap_or_else(
-                    |_| "Error serialization failed".to_string()
-                )))
+            Err(QuebecError::generic(
+                serde_json::to_string(&error_payload)
+                    .unwrap_or_else(|_| "Error serialization failed".to_string()),
+            ))
         };
 
         py.detach(|| {
@@ -1846,7 +1846,7 @@ impl Worker {
         table_config: &crate::context::TableConfig,
         execution: &quebec_ready_executions::Model,
         process_id: Option<i64>,
-    ) -> Result<Option<quebec_claimed_executions::Model>, DbErr> {
+    ) -> std::result::Result<Option<quebec_claimed_executions::Model>, DbErr> {
         let now = chrono::Utc::now().naive_utc();
         let id = query_builder::claimed_executions::insert(
             txn,
@@ -1865,7 +1865,7 @@ impl Worker {
         }))
     }
 
-    pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model, anyhow::Error> {
+    pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model> {
         let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
@@ -1949,7 +1949,7 @@ impl Worker {
     pub async fn claim_jobs(
         &self,
         batch_size: u64,
-    ) -> Result<Vec<quebec_claimed_executions::Model>, anyhow::Error> {
+    ) -> Result<Vec<quebec_claimed_executions::Model>> {
         let timer = Instant::now();
         let db = self.ctx.get_db().await?;
         let use_skip_locked = self.ctx.use_skip_locked;
@@ -2118,7 +2118,7 @@ impl Worker {
 
     /// Fail all orphaned claimed executions (jobs claimed by non-existent processes)
     /// Called at startup to clean up jobs left by crashed workers
-    async fn fail_orphaned_executions(&self) -> Result<usize, anyhow::Error> {
+    async fn fail_orphaned_executions(&self) -> Result<usize> {
         let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
@@ -2166,16 +2166,14 @@ impl Worker {
 
     /// Prune dead processes and fail their claimed executions
     /// Called periodically to clean up stale processes
-    async fn prune_dead_processes(
-        &self,
-        exclude_process_id: Option<i64>,
-    ) -> Result<usize, anyhow::Error> {
+    async fn prune_dead_processes(&self, exclude_process_id: Option<i64>) -> Result<usize> {
         let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
         // Processes with heartbeat older than this are considered dead
         let threshold = chrono::Utc::now().naive_utc()
-            - chrono::Duration::from_std(self.ctx.process_alive_threshold)?;
+            - chrono::Duration::from_std(self.ctx.process_alive_threshold)
+                .map_err(|e| QuebecError::Other(e.into()))?;
 
         let stale_processes = query_builder::processes::find_prunable(
             db.as_ref(),
@@ -2249,7 +2247,7 @@ impl Worker {
     /// Clear finished jobs older than the configured threshold.
     /// Called periodically to clean up completed jobs.
     /// Returns the total number of jobs deleted.
-    async fn clear_finished_jobs(&self) -> Result<u64, anyhow::Error> {
+    async fn clear_finished_jobs(&self) -> Result<u64> {
         // Skip if preserve_finished_jobs is false (jobs are deleted immediately after completion)
         if !self.ctx.preserve_finished_jobs {
             return Ok(0);
@@ -2264,7 +2262,10 @@ impl Worker {
         // Calculate the cutoff timestamp
         let finished_before = chrono::Utc::now().naive_utc()
             - chrono::Duration::from_std(clear_after).map_err(|e| {
-                anyhow::anyhow!("Invalid clear_finished_jobs_after duration: {}", e)
+                QuebecError::validation(format!(
+                    "Invalid clear_finished_jobs_after duration: {}",
+                    e
+                ))
             })?;
 
         let mut total_deleted: u64 = 0;
@@ -2314,10 +2315,7 @@ impl Worker {
     /// Called during graceful shutdown for jobs claimed but not yet started.
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
     /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
-    async fn release_all_claimed_executions(
-        &self,
-        process_id: i64,
-    ) -> Result<usize, anyhow::Error> {
+    async fn release_all_claimed_executions(&self, process_id: i64) -> Result<usize> {
         let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
 
@@ -2513,7 +2511,7 @@ impl Worker {
         job_id: i64,
         execution_id: i64,
         error_msg: &str,
-    ) -> Result<(), DbErr>
+    ) -> std::result::Result<(), DbErr>
     where
         C: ConnectionTrait,
     {
@@ -2529,7 +2527,7 @@ impl Worker {
         db: &C,
         table_config: &TableConfig,
         job_id: i64,
-    ) -> Result<(), DbErr>
+    ) -> std::result::Result<(), DbErr>
     where
         C: ConnectionTrait,
     {
@@ -2573,7 +2571,7 @@ impl Worker {
         db: &C,
         concurrency_key: &str,
         concurrency_limit: i32,
-    ) -> Result<bool, DbErr>
+    ) -> std::result::Result<bool, DbErr>
     where
         C: ConnectionTrait,
     {
@@ -2685,7 +2683,7 @@ impl Worker {
         }
     }
 
-    pub async fn run_main_loop(&self) -> Result<(), anyhow::Error> {
+    pub async fn run_main_loop(&self) -> Result<()> {
         // Don't acquire long-term connections here, get them when needed
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
         let mut heartbeat_interval = tokio::time::interval(self.ctx.process_heartbeat_interval);
@@ -3049,14 +3047,14 @@ impl Worker {
         }
     }
 
-    pub async fn pick_job(&self) -> Result<Execution, anyhow::Error> {
+    pub async fn pick_job(&self) -> Result<Execution> {
         let rx = self.dispatch_receiver.clone();
         let mut receiver = rx.lock().await;
         let execution = receiver.recv().await;
         if execution.is_none() {
-            return Err(anyhow::Error::msg("No job found"));
+            return Err(QuebecError::runtime("No job found"));
         }
-        let execution = execution.ok_or_else(|| anyhow::Error::msg("No job found"))?;
+        let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
         Ok(execution)
     }
 
