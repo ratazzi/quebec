@@ -52,6 +52,11 @@
                 Dead
               </span>
             {% endif %}
+            {% if worker.quiet %}
+              <span class="ml-1 px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="Worker is in quiet mode: no longer claiming new jobs, draining in-flight work">
+                Quiet
+              </span>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
