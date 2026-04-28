@@ -1,8 +1,7 @@
 use crate::context::AppContext;
 use crate::entities::quebec_processes;
+use crate::error::Result;
 use crate::query_builder;
-use anyhow::Error;
-use anyhow::Result;
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
 use std::sync::Arc;
@@ -62,7 +61,7 @@ pub trait ProcessTrait: Send + Sync {
     fn process_info(&self) -> ProcessInfo;
 
     /// Called when process starts - registers in database
-    async fn on_start(&self, db: &DatabaseConnection) -> Result<quebec_processes::Model, Error> {
+    async fn on_start(&self, db: &DatabaseConnection) -> Result<quebec_processes::Model> {
         let info = self.process_info();
         let ctx = self.ctx();
         let table_config = ctx.table_config.clone();
@@ -155,7 +154,7 @@ pub trait ProcessTrait: Send + Sync {
         &self,
         db: &DatabaseConnection,
         process: &quebec_processes::Model,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let ctx = self.ctx();
         let rows =
             query_builder::processes::update_heartbeat(db, &ctx.table_config, process.id).await?;
@@ -191,7 +190,7 @@ pub trait ProcessTrait: Send + Sync {
         &self,
         db: &DatabaseConnection,
         process: &quebec_processes::Model,
-    ) -> Result<(), Error> {
+    ) -> Result<()> {
         let process_name = process.name.clone();
         let process_pid = process.pid;
         let process_hostname = process.hostname.clone();
