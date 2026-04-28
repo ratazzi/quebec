@@ -47,6 +47,13 @@ impl ControlPlane {
                     "alive"
                 };
 
+                let quiet = worker
+                    .metadata
+                    .as_deref()
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| v.get("quiet").and_then(|q| q.as_bool()))
+                    .unwrap_or(false);
+
                 WorkerInfo {
                     id: worker.id,
                     name: worker.name,
@@ -56,6 +63,7 @@ impl ControlPlane {
                     last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
                     seconds_since_heartbeat,
                     status: status.to_string(),
+                    quiet,
                 }
             })
             .collect();

@@ -12,6 +12,7 @@ import os
 import select
 import signal
 import socket
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -180,9 +181,41 @@ class Supervisor:
             self._immediate = True
             self._wake()
 
+        # Sidekiq-style quiet: supervisor doesn't claim jobs itself, so we
+        # cascade the signal to every worker child. Dispatcher/scheduler are
+        # unaffected (they don't own in-flight job execution).
+        def quiet(signum, _frame):
+            logger.info(
+                "Supervisor received signal %d, forwarding quiet (SIGUSR1) "
+                "to worker children",
+                signum,
+            )
+            for pid, info in list(self._children.items()):
+                if info.role != ROLE_WORKER:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except ProcessLookupError:
+                    pass
+                except OSError as e:
+                    logger.warning(
+                        "Failed to forward quiet to worker pid=%d: %s", pid, e
+                    )
+
         signal.signal(signal.SIGTERM, graceful)
         signal.signal(signal.SIGINT, graceful)
         signal.signal(signal.SIGQUIT, immediate)
+        # SIGUSR1 is the always-on quiet trigger.
+        signal.signal(signal.SIGUSR1, quiet)
+        # In an interactive terminal Ctrl-Z must keep its shell-job-control
+        # meaning, so only intercept SIGTSTP when stdin isn't a tty (daemon /
+        # systemd / docker / nohup).
+        try:
+            stdin_is_tty = sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            stdin_is_tty = False
+        if not stdin_is_tty and hasattr(signal, "SIGTSTP"):
+            signal.signal(signal.SIGTSTP, quiet)
 
     def _wake(self) -> None:
         try:
