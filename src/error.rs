@@ -71,6 +71,14 @@ pub enum QuebecError {
     /// Unsupported operations
     #[error("Unsupported operation: {0}")]
     Unsupported(String),
+
+    /// Wrapped anyhow error preserving the underlying source chain
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+
+    /// PostgreSQL driver errors (preserves source chain)
+    #[error(transparent)]
+    Postgres(#[from] tokio_postgres::Error),
 }
 
 /// Type alias for simplified usage
@@ -98,13 +106,6 @@ impl QuebecError {
     }
 }
 
-/// Convert from anyhow::Error
-impl From<anyhow::Error> for QuebecError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Generic(err.to_string())
-    }
-}
-
 /// Convert from pyo3::PyErr
 #[cfg(feature = "python")]
 impl From<pyo3::PyErr> for QuebecError {
@@ -126,13 +127,6 @@ impl From<QuebecError> for pyo3::PyErr {
 impl From<croner::errors::CronError> for QuebecError {
     fn from(err: croner::errors::CronError) -> Self {
         Self::InvalidCron(err.to_string())
-    }
-}
-
-/// Convert from tokio_postgres errors
-impl From<tokio_postgres::Error> for QuebecError {
-    fn from(err: tokio_postgres::Error) -> Self {
-        Self::Database(DbErr::Custom(err.to_string()))
     }
 }
 
