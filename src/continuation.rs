@@ -464,16 +464,14 @@ impl Continuable {
             // Validation 1: Step can't be nested inside another step
             if let Some(ref running) = ctx.running_step {
                 return Err(InvalidStepError::new_err(format!(
-                    "Step '{}' is nested inside step '{}'",
-                    name, running
+                    "Step '{name}' is nested inside step '{running}'"
                 )));
             }
 
             // Validation 2: Step can't be repeated in same execution
             if ctx.encountered.contains(&name.to_string()) {
                 return Err(InvalidStepError::new_err(format!(
-                    "Step '{}' has already been encountered",
-                    name
+                    "Step '{name}' has already been encountered"
                 )));
             }
 
@@ -481,8 +479,7 @@ impl Continuable {
             if let Some((current_name, _)) = &ctx.state.current {
                 if current_name != name && !ctx.state.is_completed(name) {
                     return Err(InvalidStepError::new_err(format!(
-                        "Step '{}' found, expected to resume from '{}'",
-                        name, current_name
+                        "Step '{name}' found, expected to resume from '{current_name}'"
                     )));
                 }
             }
@@ -493,8 +490,7 @@ impl Continuable {
                 let expected = &ctx.state.completed[encountered_count];
                 if expected != name {
                     return Err(InvalidStepError::new_err(format!(
-                        "Step '{}' found, expected to see '{}'",
-                        name, expected
+                        "Step '{name}' found, expected to see '{expected}'"
                     )));
                 }
             }
@@ -511,8 +507,7 @@ impl Continuable {
                 // Drop lock before raising exception
                 drop(ctx);
                 return Err(JobInterrupted::new_err(format!(
-                    "Isolated step '{}' requires separate execution",
-                    name
+                    "Isolated step '{name}' requires separate execution"
                 )));
             }
 

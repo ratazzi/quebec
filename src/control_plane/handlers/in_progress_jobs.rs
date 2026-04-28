@@ -71,7 +71,7 @@ impl ControlPlane {
                             Some(p) => {
                                 format!("{}:{}", p.hostname.as_deref().unwrap_or("unknown"), p.pid)
                             }
-                            None => format!("pid:{}", pid),
+                            None => format!("pid:{pid}"),
                         }
                     }
                     None => "unknown".to_string(),

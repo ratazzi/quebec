@@ -55,7 +55,7 @@ impl ControlPlane {
         let seconds = duration.num_seconds();
 
         if seconds < 60 {
-            format!("{}s", seconds)
+            format!("{seconds}s")
         } else if seconds < 3600 {
             format!("{}m", seconds / 60)
         } else if seconds < 86400 {
@@ -270,7 +270,7 @@ impl ControlPlane {
 
             // Build readable error line
             if !exception_class.is_empty() {
-                job.error = Some(format!("{}: {}", exception_class, message));
+                job.error = Some(format!("{exception_class}: {message}"));
             } else if !message.is_empty() {
                 job.error = Some(message.to_string());
             }
@@ -301,7 +301,7 @@ impl ControlPlane {
                     .unwrap_or("");
                 let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("");
                 if !exception_class.is_empty() {
-                    item.error = Some(format!("{}: {}", exception_class, message));
+                    item.error = Some(format!("{exception_class}: {message}"));
                 } else if !message.is_empty() {
                     item.error = Some(message.to_string());
                 }
@@ -372,7 +372,7 @@ impl ControlPlane {
             error!("Failed to acquire read lock: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to acquire template lock: {}", e),
+                format!("Failed to acquire template lock: {e}"),
             ));
         }
 
@@ -382,7 +382,7 @@ impl ControlPlane {
                 error!("Failed to acquire read lock: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to acquire template lock: {}", e),
+                    format!("Failed to acquire template lock: {e}"),
                 ));
             }
         };
@@ -396,12 +396,12 @@ impl ControlPlane {
                 error!("Failed to render {}: {}", template_name, e);
 
                 // Output complete error chain
-                let mut error_detail = format!("Template error: {}", e);
+                let mut error_detail = format!("Template error: {e}");
                 let mut current_error = e.source();
                 let mut level = 1;
 
                 while let Some(source) = current_error {
-                    error_detail.push_str(&format!("\n  Caused by ({}): {}", level, source));
+                    error_detail.push_str(&format!("\n  Caused by ({level}): {source}"));
                     current_error = source.source();
                     level += 1;
                 }
@@ -433,7 +433,7 @@ impl ControlPlane {
 
                 Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Template error: {}", e),
+                    format!("Template error: {e}"),
                 ))
             }
         }

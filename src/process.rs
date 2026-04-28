@@ -131,7 +131,7 @@ pub trait ProcessTrait: Send + Sync {
                         .unwrap_or(0);
                 });
 
-                let py_tid = format!("{}", thread_id);
+                let py_tid = format!("{thread_id}");
                 trace!("python thread_id: {:?}", py_tid);
                 return py_tid;
             }

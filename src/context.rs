@@ -110,17 +110,17 @@ impl TableConfig {
         // Strip trailing underscore to avoid double underscores (e.g., "hive_" -> "hive__jobs")
         let prefix = prefix.trim_end_matches('_');
         Self {
-            jobs: format!("{}_jobs", prefix),
-            ready_executions: format!("{}_ready_executions", prefix),
-            claimed_executions: format!("{}_claimed_executions", prefix),
-            scheduled_executions: format!("{}_scheduled_executions", prefix),
-            failed_executions: format!("{}_failed_executions", prefix),
-            blocked_executions: format!("{}_blocked_executions", prefix),
-            recurring_executions: format!("{}_recurring_executions", prefix),
-            recurring_tasks: format!("{}_recurring_tasks", prefix),
-            pauses: format!("{}_pauses", prefix),
-            processes: format!("{}_processes", prefix),
-            semaphores: format!("{}_semaphores", prefix),
+            jobs: format!("{prefix}_jobs"),
+            ready_executions: format!("{prefix}_ready_executions"),
+            claimed_executions: format!("{prefix}_claimed_executions"),
+            scheduled_executions: format!("{prefix}_scheduled_executions"),
+            failed_executions: format!("{prefix}_failed_executions"),
+            blocked_executions: format!("{prefix}_blocked_executions"),
+            recurring_executions: format!("{prefix}_recurring_executions"),
+            recurring_tasks: format!("{prefix}_recurring_tasks"),
+            pauses: format!("{prefix}_pauses"),
+            processes: format!("{prefix}_processes"),
+            semaphores: format!("{prefix}_semaphores"),
         }
     }
 }
@@ -716,7 +716,7 @@ impl AppContext {
         let runnables = self
             .runnables
             .read()
-            .map_err(|e| QuebecError::Runtime(format!("Failed to acquire read lock: {}", e)))?;
+            .map_err(|e| QuebecError::Runtime(format!("Failed to acquire read lock: {e}")))?;
         let runnable =
             runnables
                 .get(class_name)

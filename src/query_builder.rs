@@ -673,9 +673,7 @@ pub mod jobs {
         };
 
         let sql = format!(
-            r#"SELECT DISTINCT {q}queue_name{q} FROM {q}{table}{q} ORDER BY {q}queue_name{q} ASC"#,
-            q = q,
-            table = table_name
+            r#"SELECT DISTINCT {q}queue_name{q} FROM {q}{table_name}{q} ORDER BY {q}queue_name{q} ASC"#
         );
 
         let stmt = Statement::from_string(backend, sql);
@@ -703,9 +701,7 @@ pub mod jobs {
         };
 
         let sql = format!(
-            r#"SELECT DISTINCT {q}class_name{q} FROM {q}{table}{q} ORDER BY {q}class_name{q} ASC"#,
-            q = q,
-            table = table_name
+            r#"SELECT DISTINCT {q}class_name{q} FROM {q}{table_name}{q} ORDER BY {q}class_name{q} ASC"#
         );
 
         let stmt = Statement::from_string(backend, sql);
@@ -841,16 +837,13 @@ pub mod jobs {
         // This pattern: DELETE FROM table WHERE id IN (SELECT id FROM table WHERE ... LIMIT ?)
         let sql = match backend {
             DbBackend::Postgres => format!(
-                r#"DELETE FROM "{table}" WHERE "id" IN (SELECT "id" FROM "{table}" WHERE "finished_at" IS NOT NULL AND "finished_at" < $1 LIMIT $2)"#,
-                table = table_name
+                r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "finished_at" < $1 LIMIT $2)"#
             ),
             DbBackend::MySql => format!(
-                r#"DELETE FROM `{table}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table}` WHERE `finished_at` IS NOT NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#,
-                table = table_name
+                r#"DELETE FROM `{table_name}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table_name}` WHERE `finished_at` IS NOT NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#
             ),
             DbBackend::Sqlite => format!(
-                r#"DELETE FROM "{table}" WHERE "id" IN (SELECT "id" FROM "{table}" WHERE "finished_at" IS NOT NULL AND "finished_at" < ? LIMIT ?)"#,
-                table = table_name
+                r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "finished_at" < ? LIMIT ?)"#
             ),
         };
 
@@ -1088,7 +1081,7 @@ pub mod ready_executions {
         // Helper to generate placeholder based on backend
         let placeholder = |idx: usize| -> String {
             match backend {
-                DbBackend::Postgres => format!("${}", idx),
+                DbBackend::Postgres => format!("${idx}"),
                 DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
             }
         };
@@ -1141,12 +1134,7 @@ pub mod ready_executions {
         };
 
         let sql = format!(
-            r#"SELECT * FROM {tq}{table}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT 1 {lock}"#,
-            tq = tq,
-            table = table_name,
-            where_clause = where_clause,
-            q = q,
-            lock = lock_clause
+            r#"SELECT * FROM {tq}{table_name}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT 1 {lock_clause}"#
         );
 
         let stmt = Statement::from_sql_and_values(backend, sql, params);
@@ -1175,7 +1163,7 @@ pub mod ready_executions {
         // Helper to generate placeholder based on backend
         let placeholder = |idx: usize| -> String {
             match backend {
-                DbBackend::Postgres => format!("${}", idx),
+                DbBackend::Postgres => format!("${idx}"),
                 DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
             }
         };
@@ -1232,13 +1220,7 @@ pub mod ready_executions {
         let limit_placeholder = placeholder(params.len());
 
         let sql = format!(
-            r#"SELECT * FROM {tq}{table}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_ph} {lock}"#,
-            tq = tq,
-            table = table_name,
-            where_clause = where_clause,
-            q = q,
-            limit_ph = limit_placeholder,
-            lock = lock_clause
+            r#"SELECT * FROM {tq}{table_name}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_placeholder} {lock_clause}"#
         );
 
         let stmt = Statement::from_sql_and_values(backend, sql, params);
@@ -1257,20 +1239,17 @@ pub mod ready_executions {
         C: ConnectionTrait,
     {
         let table_name = &table_config.ready_executions;
-        let like_pattern = format!("{}%", pattern);
+        let like_pattern = format!("{pattern}%");
 
         let sql = match db.get_database_backend() {
             DbBackend::Postgres => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{}" WHERE "queue_name" LIKE $1 ORDER BY "queue_name" ASC"#,
-                table_name
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ORDER BY "queue_name" ASC"#
             ),
             DbBackend::MySql => format!(
-                r#"SELECT DISTINCT `queue_name` FROM `{}` WHERE `queue_name` LIKE ? ORDER BY `queue_name` ASC"#,
-                table_name
+                r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ORDER BY `queue_name` ASC"#
             ),
             DbBackend::Sqlite => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{}" WHERE "queue_name" LIKE ? ORDER BY "queue_name" ASC"#,
-                table_name
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ORDER BY "queue_name" ASC"#
             ),
         };
 
@@ -1877,17 +1856,14 @@ pub mod blocked_executions {
         let table_name = &table_config.blocked_executions;
         let sql = match db.get_database_backend() {
             DbBackend::Postgres => format!(
-                r#"SELECT * FROM "{}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#,
-                table_name
+                r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
             ),
             DbBackend::MySql => format!(
-                r#"SELECT * FROM `{}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#,
-                table_name
+                r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
             ),
             DbBackend::Sqlite => format!(
                 // SQLite doesn't support SKIP LOCKED
-                r#"SELECT * FROM "{}" WHERE "concurrency_key" = ? ORDER BY "priority" ASC, "job_id" ASC LIMIT 1"#,
-                table_name
+                r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = ? ORDER BY "priority" ASC, "job_id" ASC LIMIT 1"#
             ),
         };
         let stmt = Statement::from_sql_and_values(
@@ -2082,11 +2058,10 @@ pub mod failed_executions {
                 // For PostgreSQL, use query_one to handle RETURNING properly
                 // When conflict occurs, no row is returned
                 let sql = format!(
-                    r#"INSERT INTO "{}" ("job_id", "error", "created_at")
+                    r#"INSERT INTO "{table}" ("job_id", "error", "created_at")
                        VALUES ($1, $2, $3)
                        ON CONFLICT ("job_id") DO NOTHING
-                       RETURNING "id""#,
-                    table
+                       RETURNING "id""#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,
@@ -2104,9 +2079,8 @@ pub mod failed_executions {
             }
             DbBackend::Sqlite => {
                 let sql = format!(
-                    r#"INSERT OR IGNORE INTO "{}" ("job_id", "error", "created_at")
-                       VALUES (?, ?, ?)"#,
-                    table
+                    r#"INSERT OR IGNORE INTO "{table}" ("job_id", "error", "created_at")
+                       VALUES (?, ?, ?)"#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,
@@ -2118,9 +2092,8 @@ pub mod failed_executions {
             }
             DbBackend::MySql => {
                 let sql = format!(
-                    r#"INSERT IGNORE INTO `{}` (`job_id`, `error`, `created_at`)
-                       VALUES (?, ?, ?)"#,
-                    table
+                    r#"INSERT IGNORE INTO `{table}` (`job_id`, `error`, `created_at`)
+                       VALUES (?, ?, ?)"#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,
@@ -2461,17 +2434,14 @@ pub mod scheduled_executions {
             // doesn't directly support lock behavior
             let sql = match db.get_database_backend() {
                 DbBackend::Postgres => format!(
-                    r#"SELECT * FROM "{}" WHERE "scheduled_at" <= $1 ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#,
-                    table_name
+                    r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= $1 ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#
                 ),
                 DbBackend::MySql => format!(
-                    r#"SELECT * FROM `{}` WHERE `scheduled_at` <= ? ORDER BY `scheduled_at` ASC, `priority` ASC, `job_id` ASC LIMIT ? FOR UPDATE SKIP LOCKED"#,
-                    table_name
+                    r#"SELECT * FROM `{table_name}` WHERE `scheduled_at` <= ? ORDER BY `scheduled_at` ASC, `priority` ASC, `job_id` ASC LIMIT ? FOR UPDATE SKIP LOCKED"#
                 ),
                 DbBackend::Sqlite => format!(
                     // SQLite doesn't support SKIP LOCKED, fallback to regular query
-                    r#"SELECT * FROM "{}" WHERE "scheduled_at" <= ? ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT ?"#,
-                    table_name
+                    r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= ? ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT ?"#
                 ),
             };
             let stmt = Statement::from_sql_and_values(
@@ -2886,12 +2856,10 @@ pub mod processes {
 
             let sql = match backend {
                 DbBackend::Postgres => format!(
-                    r#"SELECT * FROM "{}" WHERE "last_heartbeat_at" < $1{} FOR UPDATE SKIP LOCKED"#,
-                    table_name, where_extra
+                    r#"SELECT * FROM "{table_name}" WHERE "last_heartbeat_at" < $1{where_extra} FOR UPDATE SKIP LOCKED"#
                 ),
                 DbBackend::MySql => format!(
-                    r#"SELECT * FROM `{}` WHERE `last_heartbeat_at` < ?{} FOR UPDATE SKIP LOCKED"#,
-                    table_name, where_extra
+                    r#"SELECT * FROM `{table_name}` WHERE `last_heartbeat_at` < ?{where_extra} FOR UPDATE SKIP LOCKED"#
                 ),
                 DbBackend::Sqlite => unreachable!(),
             };
@@ -2984,24 +2952,21 @@ pub mod recurring_executions {
         let sql = match backend {
             DbBackend::Postgres => {
                 format!(
-                    r#"INSERT INTO "{}" ("job_id", "task_key", "run_at", "created_at")
+                    r#"INSERT INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
                        VALUES ($1, $2, $3, $4)
-                       ON CONFLICT ("task_key", "run_at") DO NOTHING"#,
-                    table
+                       ON CONFLICT ("task_key", "run_at") DO NOTHING"#
                 )
             }
             DbBackend::Sqlite => {
                 format!(
-                    r#"INSERT OR IGNORE INTO "{}" ("job_id", "task_key", "run_at", "created_at")
-                       VALUES (?, ?, ?, ?)"#,
-                    table
+                    r#"INSERT OR IGNORE INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
+                       VALUES (?, ?, ?, ?)"#
                 )
             }
             DbBackend::MySql => {
                 format!(
-                    r#"INSERT IGNORE INTO `{}` (`job_id`, `task_key`, `run_at`, `created_at`)
-                       VALUES (?, ?, ?, ?)"#,
-                    table
+                    r#"INSERT IGNORE INTO `{table}` (`job_id`, `task_key`, `run_at`, `created_at`)
+                       VALUES (?, ?, ?, ?)"#
                 )
             }
         };
@@ -3138,9 +3103,9 @@ pub mod pauses {
     {
         let table_name = &table_config.pauses;
         let sql = match db.get_database_backend() {
-            DbBackend::Postgres => format!(r#"SELECT "queue_name" FROM "{}""#, table_name),
-            DbBackend::MySql => format!(r#"SELECT `queue_name` FROM `{}`"#, table_name),
-            DbBackend::Sqlite => format!(r#"SELECT "queue_name" FROM "{}""#, table_name),
+            DbBackend::Postgres => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
+            DbBackend::MySql => format!(r#"SELECT `queue_name` FROM `{table_name}`"#),
+            DbBackend::Sqlite => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
         };
         let stmt = Statement::from_string(db.get_database_backend(), sql);
         let rows = db.query_all(stmt).await?;
@@ -3184,11 +3149,10 @@ pub mod pauses {
         match backend {
             DbBackend::Postgres => {
                 let sql = format!(
-                    r#"INSERT INTO "{}" ("queue_name", "created_at")
+                    r#"INSERT INTO "{table}" ("queue_name", "created_at")
                        VALUES ($1, $2)
                        ON CONFLICT ("queue_name") DO NOTHING
-                       RETURNING "id""#,
-                    table
+                       RETURNING "id""#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,
@@ -3205,9 +3169,8 @@ pub mod pauses {
             }
             DbBackend::Sqlite => {
                 let sql = format!(
-                    r#"INSERT OR IGNORE INTO "{}" ("queue_name", "created_at")
-                       VALUES (?, ?)"#,
-                    table
+                    r#"INSERT OR IGNORE INTO "{table}" ("queue_name", "created_at")
+                       VALUES (?, ?)"#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,
@@ -3223,9 +3186,8 @@ pub mod pauses {
             }
             DbBackend::MySql => {
                 let sql = format!(
-                    r#"INSERT IGNORE INTO `{}` (`queue_name`, `created_at`)
-                       VALUES (?, ?)"#,
-                    table
+                    r#"INSERT IGNORE INTO `{table}` (`queue_name`, `created_at`)
+                       VALUES (?, ?)"#
                 );
                 let stmt = Statement::from_sql_and_values(
                     backend,

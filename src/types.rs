@@ -123,8 +123,7 @@ fn apply_worker_cfg_to(
     if let Some(polling_interval) = worker_cfg.polling_interval {
         if !polling_interval.is_finite() || polling_interval < 0.0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "worker polling_interval must be finite and >= 0, got {}",
-                polling_interval
+                "worker polling_interval must be finite and >= 0, got {polling_interval}"
             )));
         }
         ctx.worker_polling_interval = Duration::from_secs_f64(polling_interval);
@@ -145,8 +144,7 @@ fn apply_dispatcher_cfg_to(
     if let Some(polling_interval) = dispatcher_cfg.polling_interval {
         if !polling_interval.is_finite() || polling_interval < 0.0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dispatcher polling_interval must be finite and >= 0, got {}",
-                polling_interval
+                "dispatcher polling_interval must be finite and >= 0, got {polling_interval}"
             )));
         }
         ctx.dispatcher_polling_interval = Duration::from_secs_f64(polling_interval);
@@ -157,8 +155,7 @@ fn apply_dispatcher_cfg_to(
     if let Some(interval) = dispatcher_cfg.concurrency_maintenance_interval {
         if !interval.is_finite() || interval < 0.0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dispatcher concurrency_maintenance_interval must be finite and >= 0, got {}",
-                interval
+                "dispatcher concurrency_maintenance_interval must be finite and >= 0, got {interval}"
             )));
         }
         ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
@@ -342,8 +339,7 @@ fn resolve_scheduled_at(
             .map(|dt| Some(dt.naive_utc()))
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
-                    "wait_until timestamp out of range: {}",
-                    ts
+                    "wait_until timestamp out of range: {ts}"
                 ))
             });
     }
@@ -454,7 +450,7 @@ impl PyQuebec {
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {}", e))
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {e}"))
         })?;
 
         let sslmode: Option<String> = extract_kwarg_or_env_opt(kwargs, "sslmode", "QUEBEC_SSLMODE");
@@ -480,8 +476,7 @@ impl PyQuebec {
             )
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to apply SSL params: {}",
-                    e
+                    "Failed to apply SSL params: {e}"
                 ))
             })?
         } else {
@@ -515,8 +510,7 @@ impl PyQuebec {
                 .build()
                 .map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "Failed to build runtime: {}",
-                        e
+                        "Failed to build runtime: {e}"
                     ))
                 })?,
         );
@@ -658,8 +652,7 @@ impl PyQuebec {
             })
             .map_err(|e| {
                 pyo3::exceptions::PyConnectionError::new_err(format!(
-                    "Database connection failed: {}",
-                    e
+                    "Database connection failed: {e}"
                 ))
             })?;
         let db_option = Some(Arc::new(db));
@@ -672,8 +665,7 @@ impl PyQuebec {
                     .map(|(k, v)| {
                         let key = k.extract::<String>().map_err(|_| {
                             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                                "Invalid option key: {:?}",
-                                k
+                                "Invalid option key: {k:?}"
                             ))
                         })?;
                         let obj: Py<PyAny> = v.into_pyobject(py)?.into();
@@ -770,7 +762,7 @@ impl PyQuebec {
                         if !has_explicit_polling {
                             if !polling_interval.is_finite() || polling_interval < 0.0 {
                                 return Err(pyo3::exceptions::PyValueError::new_err(
-                                    format!("worker_polling_interval must be finite and >= 0 (set via queue.yml workers.polling_interval, got {})", polling_interval),
+                                    format!("worker_polling_interval must be finite and >= 0 (set via queue.yml workers.polling_interval, got {polling_interval})"),
                                 ));
                             }
                             _ctx.worker_polling_interval =
@@ -871,8 +863,7 @@ impl PyQuebec {
             let ret = self.rt.block_on(async move { worker.pick_job().await });
             ret.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to pick job: {}",
-                    e
+                    "Failed to pick job: {e}"
                 ))
             })
         })
@@ -889,8 +880,7 @@ impl PyQuebec {
             self.rt.block_on(async move {
                 let claimed = worker.claim_job().await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "No ready job to claim: {}",
-                        e
+                        "No ready job to claim: {e}"
                     ))
                 })?;
 
@@ -911,8 +901,7 @@ impl PyQuebec {
                 let runnable =
                     Python::attach(|_py| ctx.get_runnable(&job.class_name)).map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                            "Job handler not found: {}",
-                            e
+                            "Job handler not found: {e}"
                         ))
                     })?;
 
@@ -1051,8 +1040,7 @@ impl PyQuebec {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {
                 pyo3::exceptions::PyConnectionError::new_err(format!(
-                    "Database connection failed: {}",
-                    e
+                    "Database connection failed: {e}"
                 ))
             })?;
             Ok(db
@@ -1148,8 +1136,7 @@ impl PyQuebec {
                 .build()
                 .map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "Failed to build runtime in forked child: {}",
-                        e
+                        "Failed to build runtime in forked child: {e}"
                     ))
                 })?,
         );
@@ -1162,8 +1149,7 @@ impl PyQuebec {
                 .map(Arc::new)
                 .map_err(|e| {
                     pyo3::exceptions::PyConnectionError::new_err(format!(
-                        "Database reconnect after fork failed: {}",
-                        e
+                        "Database reconnect after fork failed: {e}"
                     ))
                 })
         })?;
@@ -1266,8 +1252,7 @@ impl PyQuebec {
                 let sup = crate::supervisor::Supervisor::new(ctx);
                 sup.register().await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "register_supervisor failed: {}",
-                        e
+                        "register_supervisor failed: {e}"
                     ))
                 })
             })
@@ -1282,8 +1267,7 @@ impl PyQuebec {
                 let sup = crate::supervisor::Supervisor::new(ctx);
                 sup.heartbeat_process(process_id).await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "heartbeat_process failed: {}",
-                        e
+                        "heartbeat_process failed: {e}"
                     ))
                 })
             })
@@ -1306,8 +1290,7 @@ impl PyQuebec {
                 let sup = crate::supervisor::Supervisor::new(ctx);
                 sup.run_maintenance(exclude_process_id).await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "supervisor_run_maintenance failed: {}",
-                        e
+                        "supervisor_run_maintenance failed: {e}"
                     ))
                 })
             })
@@ -1322,8 +1305,7 @@ impl PyQuebec {
                 let sup = crate::supervisor::Supervisor::new(ctx);
                 sup.deregister_process(process_id).await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "deregister_process failed: {}",
-                        e
+                        "deregister_process failed: {e}"
                     ))
                 })
             })
@@ -1345,8 +1327,7 @@ impl PyQuebec {
                     .await
                     .map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                            "fail_claimed_by_process_id failed: {}",
-                            e
+                            "fail_claimed_by_process_id failed: {e}"
                         ))
                     })
             })
@@ -1367,8 +1348,7 @@ impl PyQuebec {
                 let sup = crate::supervisor::Supervisor::new(ctx);
                 sup.fail_claimed_by_pid(pid, &hostname).await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "fail_claimed_by_pid failed: {}",
-                        e
+                        "fail_claimed_by_pid failed: {e}"
                     ))
                 })
             })
@@ -1501,8 +1481,7 @@ impl PyQuebec {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {
                 pyo3::exceptions::PyConnectionError::new_err(format!(
-                    "Database connection failed: {}",
-                    e
+                    "Database connection failed: {e}"
                 ))
             })?;
 
@@ -1672,8 +1651,7 @@ impl PyQuebec {
                 .get_runnable(&class_name.to_string())
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get runnable: {:?}",
-                        e
+                        "Failed to get runnable: {e:?}"
                     ))
                 })?;
 
@@ -1681,8 +1659,7 @@ impl PyQuebec {
                 .get_concurrency_constraint(Some(args), kwargs)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get concurrency info: {:?}",
-                        e
+                        "Failed to get concurrency info: {e:?}"
                     ))
                 })?;
 
@@ -1751,8 +1728,7 @@ impl PyQuebec {
 
         let arguments = serde_json::to_string(&job_data).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "Failed to serialize job data: {}",
-                e
+                "Failed to serialize job data: {e}"
             ))
         })?;
 
@@ -1858,7 +1834,7 @@ impl PyQuebec {
             let obj_clone = obj.clone();
             let enqueue_result = py
                 .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e)));
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}")));
 
             let job_id_result;
             match enqueue_result {
@@ -1896,9 +1872,7 @@ impl PyQuebec {
             let obj_clone = obj.clone();
             let job = py
                 .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
-                })?;
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}")))?;
             obj.id.replace(job.id);
             debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
 
@@ -2033,8 +2007,7 @@ impl PyQuebec {
 
             let arguments = serde_json::to_string(&job_data).map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to serialize job data: {}",
-                    e
+                    "Failed to serialize job data: {e}"
                 ))
             })?;
 
@@ -2051,8 +2024,7 @@ impl PyQuebec {
                             .get_concurrency_constraint(Some(args_bound), kwargs_opt)
                             .map_err(|e| {
                                 pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "Failed to get concurrency info: {:?}",
-                                    e
+                                    "Failed to get concurrency info: {e:?}"
                                 ))
                             })?;
                         match constraint {
@@ -2093,7 +2065,7 @@ impl PyQuebec {
             })
             .map_err(|e| {
                 error!("perform_all_later error: {:?}", e);
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {:?}", e))
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}"))
             })?;
 
         let now = chrono::Utc::now().naive_utc();
@@ -2196,16 +2168,14 @@ impl PyQuebec {
         let check_result: PyResult<bool> = self.rt.block_on(async {
             let db = ctx.get_db().await.map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyConnectionError, _>(format!(
-                    "Database connection failed: {}",
-                    e
+                    "Database connection failed: {e}"
                 ))
             })?;
             crate::schema_builder::check_tables_exist(db.as_ref(), &ctx.table_config)
                 .await
                 .map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "Database error: {}",
-                        e
+                        "Database error: {e}"
                     ))
                 })
         });
@@ -2475,16 +2445,14 @@ impl PyQuebec {
                     .map(|dt| dt.naive_utc())
                     .ok_or_else(|| {
                         pyo3::exceptions::PyValueError::new_err(format!(
-                            "Invalid timestamp: {} is out of range",
-                            ts
+                            "Invalid timestamp: {ts} is out of range"
                         ))
                     })?
             }
             None => {
                 let duration = chrono::Duration::from_std(clear_after).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid clear_finished_jobs_after duration: {}",
-                        e
+                        "Invalid clear_finished_jobs_after duration: {e}"
                     ))
                 })?;
                 chrono::Utc::now().naive_utc() - duration
@@ -2495,8 +2463,7 @@ impl PyQuebec {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Database connection failed: {}",
-                        e
+                        "Database connection failed: {e}"
                     ))
                 })?;
                 let mut total_deleted: u64 = 0;
@@ -2511,8 +2478,7 @@ impl PyQuebec {
                     .await
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to delete finished jobs: {}",
-                            e
+                            "Failed to delete finished jobs: {e}"
                         ))
                     })?;
 
@@ -2564,16 +2530,14 @@ impl PyQuebec {
                     .map(|dt| dt.naive_utc())
                     .ok_or_else(|| {
                         pyo3::exceptions::PyValueError::new_err(format!(
-                            "Invalid timestamp: {} is out of range",
-                            ts
+                            "Invalid timestamp: {ts} is out of range"
                         ))
                     })?
             }
             None => {
                 let duration = chrono::Duration::from_std(clear_after).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid clear_finished_jobs_after duration: {}",
-                        e
+                        "Invalid clear_finished_jobs_after duration: {e}"
                     ))
                 })?;
                 chrono::Utc::now().naive_utc() - duration
@@ -2584,8 +2548,7 @@ impl PyQuebec {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Database connection failed: {}",
-                        e
+                        "Database connection failed: {e}"
                     ))
                 })?;
                 crate::query_builder::jobs::count_finished_before(
@@ -2596,8 +2559,7 @@ impl PyQuebec {
                 .await
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to count clearable jobs: {}",
-                        e
+                        "Failed to count clearable jobs: {e}"
                     ))
                 })
             })

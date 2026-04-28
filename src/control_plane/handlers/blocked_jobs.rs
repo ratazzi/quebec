@@ -181,7 +181,7 @@ impl ControlPlane {
                         query_builder::blocked_executions::find_by_id(txn, &table_config, id)
                             .await?
                             .ok_or_else(|| {
-                                DbErr::Custom(format!("Blocked execution with ID {} not found", id))
+                                DbErr::Custom(format!("Blocked execution with ID {id} not found"))
                             })?;
 
                     query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
@@ -230,7 +230,7 @@ impl ControlPlane {
                         query_builder::blocked_executions::find_by_id(txn, &table_config, id)
                             .await?
                             .ok_or_else(|| {
-                                DbErr::Custom(format!("Blocked execution with ID {} not found", id))
+                                DbErr::Custom(format!("Blocked execution with ID {id} not found"))
                             })?;
 
                     let job_id = blocked_execution.job_id;

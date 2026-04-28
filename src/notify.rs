@@ -153,7 +153,7 @@ impl NotifyManager {
         let message_json = serde_json::to_string(&message)?;
 
         // Use the same naming convention as LISTEN
-        let channel_name = format!("{}_jobs", app_name);
+        let channel_name = format!("{app_name}_jobs");
         Self::send_notify_with_db(db, &channel_name, &message_json).await
     }
 
@@ -164,7 +164,7 @@ impl NotifyManager {
     {
         // PostgreSQL NOTIFY doesn't support parameterized queries, so we need to escape and format directly
         let escaped_message = message.replace("'", "''"); // Escape single quotes
-        let sql = format!("NOTIFY {}, '{}'", channel_name, escaped_message);
+        let sql = format!("NOTIFY {channel_name}, '{escaped_message}'");
 
         match db
             .execute(Statement::from_sql_and_values(

@@ -115,7 +115,7 @@ impl ControlPlane {
                 [Value::from(id)],
             ))
             .await?
-            .ok_or_else(|| QuebecError::runtime(format!("Recurring task {} not found", id)))?;
+            .ok_or_else(|| QuebecError::runtime(format!("Recurring task {id} not found")))?;
 
         let key: String = row.try_get("", "key").unwrap_or_default();
         let class_name: String = row.try_get("", "class_name").unwrap_or_default();

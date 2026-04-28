@@ -49,22 +49,22 @@ where
         DbBackend::Postgres => {
             // PostgreSQL: ON CONFLICT DO UPDATE with IS NOT DISTINCT FROM for NULL-safe comparison
             format!(
-                r#"INSERT INTO "{t}" (
+                r#"INSERT INTO "{table}" (
                     "key", "schedule", "command", "class_name", "arguments",
                     "queue_name", "priority", "static", "description",
                     "created_at", "updated_at"
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT ("key") DO UPDATE SET
                     "updated_at" = CASE
-                        WHEN "{t}"."schedule" IS NOT DISTINCT FROM excluded."schedule"
-                            AND "{t}"."command" IS NOT DISTINCT FROM excluded."command"
-                            AND "{t}"."class_name" IS NOT DISTINCT FROM excluded."class_name"
-                            AND "{t}"."arguments" IS NOT DISTINCT FROM excluded."arguments"
-                            AND "{t}"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
-                            AND "{t}"."priority" IS NOT DISTINCT FROM excluded."priority"
-                            AND "{t}"."static" IS NOT DISTINCT FROM excluded."static"
-                            AND "{t}"."description" IS NOT DISTINCT FROM excluded."description"
-                        THEN "{t}"."updated_at"
+                        WHEN "{table}"."schedule" IS NOT DISTINCT FROM excluded."schedule"
+                            AND "{table}"."command" IS NOT DISTINCT FROM excluded."command"
+                            AND "{table}"."class_name" IS NOT DISTINCT FROM excluded."class_name"
+                            AND "{table}"."arguments" IS NOT DISTINCT FROM excluded."arguments"
+                            AND "{table}"."queue_name" IS NOT DISTINCT FROM excluded."queue_name"
+                            AND "{table}"."priority" IS NOT DISTINCT FROM excluded."priority"
+                            AND "{table}"."static" IS NOT DISTINCT FROM excluded."static"
+                            AND "{table}"."description" IS NOT DISTINCT FROM excluded."description"
+                        THEN "{table}"."updated_at"
                         ELSE CURRENT_TIMESTAMP
                     END,
                     "schedule" = excluded."schedule",
@@ -74,29 +74,28 @@ where
                     "queue_name" = excluded."queue_name",
                     "priority" = excluded."priority",
                     "static" = excluded."static",
-                    "description" = excluded."description""#,
-                t = table
+                    "description" = excluded."description""#
             )
         }
         DbBackend::Sqlite => {
             // SQLite: ON CONFLICT DO UPDATE with IS for NULL-safe comparison
             format!(
-                r#"INSERT INTO "{t}" (
+                r#"INSERT INTO "{table}" (
                     "key", "schedule", "command", "class_name", "arguments",
                     "queue_name", "priority", "static", "description",
                     "created_at", "updated_at"
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 ON CONFLICT ("key") DO UPDATE SET
                     "updated_at" = CASE
-                        WHEN "{t}"."schedule" IS excluded."schedule"
-                            AND "{t}"."command" IS excluded."command"
-                            AND "{t}"."class_name" IS excluded."class_name"
-                            AND "{t}"."arguments" IS excluded."arguments"
-                            AND "{t}"."queue_name" IS excluded."queue_name"
-                            AND "{t}"."priority" IS excluded."priority"
-                            AND "{t}"."static" IS excluded."static"
-                            AND "{t}"."description" IS excluded."description"
-                        THEN "{t}"."updated_at"
+                        WHEN "{table}"."schedule" IS excluded."schedule"
+                            AND "{table}"."command" IS excluded."command"
+                            AND "{table}"."class_name" IS excluded."class_name"
+                            AND "{table}"."arguments" IS excluded."arguments"
+                            AND "{table}"."queue_name" IS excluded."queue_name"
+                            AND "{table}"."priority" IS excluded."priority"
+                            AND "{table}"."static" IS excluded."static"
+                            AND "{table}"."description" IS excluded."description"
+                        THEN "{table}"."updated_at"
                         ELSE CURRENT_TIMESTAMP
                     END,
                     "schedule" = excluded."schedule",
@@ -106,15 +105,14 @@ where
                     "queue_name" = excluded."queue_name",
                     "priority" = excluded."priority",
                     "static" = excluded."static",
-                    "description" = excluded."description""#,
-                t = table
+                    "description" = excluded."description""#
             )
         }
         DbBackend::MySql => {
             // MySQL 8.0.20+: Use alias syntax instead of deprecated VALUES()
             // https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html
             format!(
-                r#"INSERT INTO `{t}` (
+                r#"INSERT INTO `{table}` (
                     `key`, `schedule`, `command`, `class_name`, `arguments`,
                     `queue_name`, `priority`, `static`, `description`,
                     `created_at`, `updated_at`
@@ -140,8 +138,7 @@ where
                     `queue_name` = new_vals.`queue_name`,
                     `priority` = new_vals.`priority`,
                     `static` = new_vals.`static`,
-                    `description` = new_vals.`description`"#,
-                t = table
+                    `description` = new_vals.`description`"#
             )
         }
     };
@@ -187,8 +184,7 @@ where
     let args = match &entry.args {
         Some(a) => serde_json::to_value(a).map_err(|e| {
             DbErr::Custom(format!(
-                "Failed to serialize args for task '{}': {}",
-                task_key, e
+                "Failed to serialize args for task '{task_key}': {e}"
             ))
         })?,
         None => serde_json::Value::Array(vec![]),
@@ -244,11 +240,11 @@ where
                 pyo3::Python::attach(|py| -> std::result::Result<Option<&str>, DbErr> {
                     let runnable = ctx
                         .get_runnable(&entry.class)
-                        .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {}", e)))?;
+                        .map_err(|e| DbErr::Custom(format!("Failed to get runnable: {e}")))?;
                     let bound = runnable.handler.bind(py);
                     let instance = bound
                         .call0()
-                        .map_err(|e| DbErr::Custom(format!("Failed to create instance: {}", e)))?;
+                        .map_err(|e| DbErr::Custom(format!("Failed to create instance: {e}")))?;
                     if let Ok(cell) = instance.cast::<crate::types::ActiveJob>() {
                         let mut inner = cell.borrow_mut();
                         inner.queue_name = queue_name.to_string();
@@ -266,8 +262,7 @@ where
                             }
                             Err(e) => {
                                 return Err(DbErr::Custom(format!(
-                                    "before_enqueue hook error: {}",
-                                    e
+                                    "before_enqueue hook error: {e}"
                                 )));
                             }
                         }
@@ -276,10 +271,10 @@ where
                     // around_enqueue: advance generator to yield, unbind to keep alive
                     if hooks.around_enqueue {
                         let gen = instance.call_method0("around_enqueue").map_err(|e| {
-                            DbErr::Custom(format!("around_enqueue hook error: {}", e))
+                            DbErr::Custom(format!("around_enqueue hook error: {e}"))
                         })?;
                         let builtins = py.import("builtins").map_err(|e| {
-                            DbErr::Custom(format!("Failed to import builtins: {}", e))
+                            DbErr::Custom(format!("Failed to import builtins: {e}"))
                         })?;
                         let first_next = builtins
                             .getattr("next")
@@ -293,8 +288,7 @@ where
                             }
                             Err(e) => {
                                 return Err(DbErr::Custom(format!(
-                                    "around_enqueue before-yield error: {}",
-                                    e
+                                    "around_enqueue before-yield error: {e}"
                                 )));
                             }
                             Ok(_) => {}
@@ -421,7 +415,7 @@ where
             #[cfg(feature = "python")]
             if let Some(gen) = around_gen.take() {
                 pyo3::Python::attach(|py| {
-                    let err_msg = format!("{}", e);
+                    let err_msg = format!("{e}");
                     let exc = pyo3::exceptions::PyRuntimeError::new_err(err_msg);
                     gen.bind(py)
                         .call_method1("throw", (exc.get_type(py), exc.value(py)))
@@ -616,13 +610,13 @@ impl Scheduler {
                 // All tasks removed from config — delete all static rows
                 let sql = match backend {
                     sea_orm::DbBackend::Postgres => {
-                        format!(r#"DELETE FROM "{}" WHERE "static" = TRUE"#, table)
+                        format!(r#"DELETE FROM "{table}" WHERE "static" = TRUE"#)
                     }
                     sea_orm::DbBackend::MySql => {
-                        format!(r#"DELETE FROM `{}` WHERE `static` = 1"#, table)
+                        format!(r#"DELETE FROM `{table}` WHERE `static` = 1"#)
                     }
                     sea_orm::DbBackend::Sqlite => {
-                        format!(r#"DELETE FROM "{}" WHERE "static" = 1"#, table)
+                        format!(r#"DELETE FROM "{table}" WHERE "static" = 1"#)
                     }
                 };
                 (sql, vec![])
@@ -643,16 +637,13 @@ impl Scheduler {
 
                 let sql = match backend {
                     sea_orm::DbBackend::Postgres => format!(
-                        r#"DELETE FROM "{}" WHERE "static" = TRUE AND "key" NOT IN ({})"#,
-                        table, placeholders,
+                        r#"DELETE FROM "{table}" WHERE "static" = TRUE AND "key" NOT IN ({placeholders})"#,
                     ),
                     sea_orm::DbBackend::MySql => format!(
-                        r#"DELETE FROM `{}` WHERE `static` = 1 AND `key` NOT IN ({})"#,
-                        table, placeholders,
+                        r#"DELETE FROM `{table}` WHERE `static` = 1 AND `key` NOT IN ({placeholders})"#,
                     ),
                     sea_orm::DbBackend::Sqlite => format!(
-                        r#"DELETE FROM "{}" WHERE "static" = 1 AND "key" NOT IN ({})"#,
-                        table, placeholders,
+                        r#"DELETE FROM "{table}" WHERE "static" = 1 AND "key" NOT IN ({placeholders})"#,
                     ),
                 };
 
@@ -911,7 +902,7 @@ impl Scheduler {
             let db = self.ctx.get_db().await?;
             let graceful_shutdown = self.ctx.graceful_shutdown.clone();
             let ctx = self.ctx.clone();
-            let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{}", i));
+            let task_key = entry.key.clone().unwrap_or_else(|| format!("task_{i}"));
 
             let handle = tokio::spawn(Self::run_task_loop(
                 ctx,

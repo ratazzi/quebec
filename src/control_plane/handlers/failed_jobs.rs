@@ -167,8 +167,7 @@ impl ControlPlane {
                             Ok(())
                         }
                         None => Err(DbErr::Custom(format!(
-                            "Failed execution for job {} not found",
-                            id
+                            "Failed execution for job {id} not found"
                         ))),
                     }
                 })
@@ -218,8 +217,7 @@ impl ControlPlane {
                             Ok(())
                         }
                         None => Err(DbErr::Custom(format!(
-                            "Failed execution for job {} not found",
-                            id
+                            "Failed execution for job {id} not found"
                         ))),
                     }
                 })

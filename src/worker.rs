@@ -216,7 +216,7 @@ impl Runnable {
             };
 
             // Build final concurrency_key as "group/key"
-            let key = format!("{}/{}", concurrency_group, raw_key);
+            let key = format!("{concurrency_group}/{raw_key}");
 
             // Return explicit limit or default to 1 (per Solid Queue spec)
             let limit = self.concurrency_limit.unwrap_or(1);
@@ -233,7 +233,7 @@ impl Runnable {
                 on_conflict: self.concurrency_on_conflict,
             }))
         })
-        .map_err(|e: PyErr| QuebecError::Python(format!("get_concurrency_constraint: {}", e)))
+        .map_err(|e: PyErr| QuebecError::Python(format!("get_concurrency_constraint: {e}")))
     }
 
     /// Check if should retry, return matching retry strategy and its exception key.
@@ -621,7 +621,7 @@ impl Runnable {
 
         let binding = json_to_py(py, &v)?;
         let args = binding.cast_bound::<pyo3::types::PyList>(py).map_err(|e| {
-            PyException::new_err(format!("Failed to convert arguments to PyList: {:?}", e))
+            PyException::new_err(format!("Failed to convert arguments to PyList: {e:?}"))
         })?;
 
         // Initialize kwargs
@@ -816,7 +816,7 @@ impl Runnable {
         let delay = strategy.wait;
         let scheduled_at = chrono::Utc::now().naive_utc()
             + chrono::Duration::from_std(delay)
-                .map_err(|e| QuebecError::validation(format!("Invalid delay duration: {}", e)))?;
+                .map_err(|e| QuebecError::validation(format!("Invalid delay duration: {e}")))?;
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
@@ -862,7 +862,7 @@ impl Runnable {
             .qualname()
             .map(|q| q.to_string())
             .unwrap_or_else(|_| "Unknown".to_string());
-        let exception_key = format!("[{}]", error_type);
+        let exception_key = format!("[{error_type}]");
         job.arguments = Some(crate::utils::increment_executions(
             job.arguments.as_deref(),
             Some(&exception_key),
@@ -952,7 +952,7 @@ impl Execution {
         let thread_id = std::thread::current().id();
 
         // Convert ThreadId to string
-        let thread_id_str = format!("{:?}", thread_id);
+        let thread_id_str = format!("{thread_id:?}");
 
         // Extract numeric part (fallback to 0 if parsing fails)
         let thread_id_num: u64 = thread_id_str
@@ -963,7 +963,7 @@ impl Execution {
         Self {
             ctx,
             timer: Instant::now(),
-            tid: format!("{}", thread_id_num),
+            tid: format!("{thread_id_num}"),
             claimed,
             job,
             runnable,
@@ -1097,7 +1097,7 @@ impl Execution {
                 info!(
                     "Job `{}' executed in: {}",
                     self.runnable.class_name,
-                    format!("{:?}", eplased).bright_purple(),
+                    format!("{eplased:?}").bright_purple(),
                 );
             } else {
                 error!(
@@ -1357,8 +1357,7 @@ impl Execution {
         match transaction_result {
             Ok(_) => Ok(self.job.clone()),
             Err(e) => Err(QuebecError::Transaction(format!(
-                "Database error during job processing: {}",
-                e
+                "Database error during job processing: {e}"
             ))),
         }
     }
@@ -1665,8 +1664,7 @@ impl Worker {
     ) -> PyResult<()> {
         if !handler.bind(py).is_callable() {
             return Err(PyTypeError::new_err(format!(
-                "Expected a callable object for worker {} handler",
-                handler_type
+                "Expected a callable object for worker {handler_type} handler"
             )));
         }
         if let Ok(mut h) = handlers.write() {
@@ -2200,8 +2198,7 @@ impl Worker {
             let process_pid = process.pid;
             let process_hostname = process.hostname.clone();
             let error_msg = format!(
-                "Worker process {} (pid={}, host={:?}) stopped responding",
-                process_id, process_pid, process_hostname
+                "Worker process {process_id} (pid={process_pid}, host={process_hostname:?}) stopped responding"
             );
 
             let ctx = self.ctx.clone();
@@ -2262,10 +2259,7 @@ impl Worker {
         // Calculate the cutoff timestamp
         let finished_before = chrono::Utc::now().naive_utc()
             - chrono::Duration::from_std(clear_after).map_err(|e| {
-                QuebecError::validation(format!(
-                    "Invalid clear_finished_jobs_after duration: {}",
-                    e
-                ))
+                QuebecError::validation(format!("Invalid clear_finished_jobs_after duration: {e}"))
             })?;
 
         let mut total_deleted: u64 = 0;

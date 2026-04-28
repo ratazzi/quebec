@@ -303,7 +303,7 @@ mod jobs {
                 &db,
                 &tc,
                 "q",
-                &format!("Job{}", i),
+                &format!("Job{i}"),
                 None,
                 0,
                 None,

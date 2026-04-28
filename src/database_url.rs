@@ -216,13 +216,13 @@ fn normalize_sqlite(url: &str) -> String {
         return url.to_string();
     };
     if let Some(tail) = rest.strip_prefix("/:memory:") {
-        return format!("sqlite::memory:{}", tail);
+        return format!("sqlite::memory:{tail}");
     }
     if let Some(abs) = rest.strip_prefix("//") {
-        return format!("sqlite:///{}", abs);
+        return format!("sqlite:///{abs}");
     }
     if let Some(rel) = rest.strip_prefix('/') {
-        return format!("sqlite://{}", rel);
+        return format!("sqlite://{rel}");
     }
     url.to_string()
 }

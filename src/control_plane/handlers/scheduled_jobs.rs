@@ -47,19 +47,19 @@ impl ControlPlane {
         if let Some(ref cn) = pagination.class_name {
             param_idx += 1;
             let placeholder = match backend {
-                sea_orm::DbBackend::Postgres => format!("${}", param_idx),
+                sea_orm::DbBackend::Postgres => format!("${param_idx}"),
                 _ => "?".to_string(),
             };
-            conditions.push(format!("j.class_name = {}", placeholder));
+            conditions.push(format!("j.class_name = {placeholder}"));
             values.push(Value::from(cn.clone()));
         }
         if let Some(ref qn) = pagination.queue_name {
             param_idx += 1;
             let placeholder = match backend {
-                sea_orm::DbBackend::Postgres => format!("${}", param_idx),
+                sea_orm::DbBackend::Postgres => format!("${param_idx}"),
                 _ => "?".to_string(),
             };
-            conditions.push(format!("j.queue_name = {}", placeholder));
+            conditions.push(format!("j.queue_name = {placeholder}"));
             values.push(Value::from(qn.clone()));
         }
 
@@ -181,19 +181,19 @@ impl ControlPlane {
         if let Some(ref cn) = pagination.class_name {
             count_idx += 1;
             let placeholder = match backend {
-                sea_orm::DbBackend::Postgres => format!("${}", count_idx),
+                sea_orm::DbBackend::Postgres => format!("${count_idx}"),
                 _ => "?".to_string(),
             };
-            count_conditions.push(format!("j.class_name = {}", placeholder));
+            count_conditions.push(format!("j.class_name = {placeholder}"));
             count_values.push(Value::from(cn.clone()));
         }
         if let Some(ref qn) = pagination.queue_name {
             count_idx += 1;
             let placeholder = match backend {
-                sea_orm::DbBackend::Postgres => format!("${}", count_idx),
+                sea_orm::DbBackend::Postgres => format!("${count_idx}"),
                 _ => "?".to_string(),
             };
-            count_conditions.push(format!("j.queue_name = {}", placeholder));
+            count_conditions.push(format!("j.queue_name = {placeholder}"));
             count_values.push(Value::from(qn.clone()));
         }
         let _ = count_idx;
@@ -277,8 +277,7 @@ impl ControlPlane {
                         info!("Cancelled scheduled job ID: {}", id);
                     } else {
                         return Err(DbErr::Custom(format!(
-                            "Scheduled job with ID {} not found",
-                            id
+                            "Scheduled job with ID {id} not found"
                         )));
                     }
 

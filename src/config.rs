@@ -387,8 +387,7 @@ impl QueueConfig {
                 return Ok(path.to_path_buf());
             } else {
                 return Err(QuebecError::Config(format!(
-                    "Config file specified in QUEBEC_CONFIG not found: {}",
-                    env_path
+                    "Config file specified in QUEBEC_CONFIG not found: {env_path}"
                 )));
             }
         }
