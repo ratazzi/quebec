@@ -1,4 +1,5 @@
 use crate::context::AppContext;
+use crate::error::{QuebecError, Result};
 use sea_orm::*;
 use sqlx::postgres::PgListener;
 use std::sync::Arc;
@@ -28,10 +29,10 @@ impl NotifyManager {
 
     /// Start listening for PostgreSQL NOTIFY messages
     /// Returns a receiver that will get notifications when new jobs are available
-    pub async fn start_listener(&self) -> Result<mpsc::Receiver<String>, anyhow::Error> {
+    pub async fn start_listener(&self) -> Result<mpsc::Receiver<String>> {
         if !self.ctx.is_postgres() {
-            return Err(anyhow::anyhow!(
-                "LISTEN/NOTIFY is only supported on PostgreSQL"
+            return Err(QuebecError::Unsupported(
+                "LISTEN/NOTIFY is only supported on PostgreSQL".into(),
             ));
         }
 
@@ -85,13 +86,18 @@ impl NotifyManager {
         channel: &str,
         tx: &mpsc::Sender<String>,
         graceful_shutdown: &tokio_util::sync::CancellationToken,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<()> {
         // Create a dedicated connection for LISTEN with optimized settings
         // Note: PgListener creates its own connection internally, so we use the DSN directly
-        let mut listener = PgListener::connect(dsn).await?;
+        let mut listener = PgListener::connect(dsn)
+            .await
+            .map_err(|e| QuebecError::Other(e.into()))?;
 
         // Start listening on the channel
-        listener.listen(channel).await?;
+        listener
+            .listen(channel)
+            .await
+            .map_err(|e| QuebecError::Other(e.into()))?;
         info!(
             "Started LISTEN on channel: {} (dedicated connection)",
             channel
@@ -104,7 +110,7 @@ impl NotifyManager {
                         Ok(n) => n,
                         Err(e) => {
                             error!("Error receiving NOTIFY on {}: {}", channel, e);
-                            return Err(anyhow::anyhow!("LISTEN receive error: {}", e));
+                            return Err(QuebecError::Other(e.into()));
                         }
                     };
 
@@ -136,12 +142,7 @@ impl NotifyManager {
     }
 
     /// Static method to send NOTIFY using existing database connection
-    pub async fn send_notify<C>(
-        app_name: &str,
-        db: &C,
-        queue_name: &str,
-        event: &str,
-    ) -> Result<(), anyhow::Error>
+    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str, event: &str) -> Result<()>
     where
         C: ConnectionTrait,
     {
@@ -149,8 +150,7 @@ impl NotifyManager {
             queue: queue_name.to_string(),
             event: event.to_string(),
         };
-        let message_json = serde_json::to_string(&message)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize notify message: {}", e))?;
+        let message_json = serde_json::to_string(&message)?;
 
         // Use the same naming convention as LISTEN
         let channel_name = format!("{}_jobs", app_name);
@@ -158,11 +158,7 @@ impl NotifyManager {
     }
 
     /// Internal helper to send NOTIFY with database connection and channel name
-    async fn send_notify_with_db<C>(
-        db: &C,
-        channel_name: &str,
-        message: &str,
-    ) -> Result<(), anyhow::Error>
+    async fn send_notify_with_db<C>(db: &C, channel_name: &str, message: &str) -> Result<()>
     where
         C: ConnectionTrait,
     {
@@ -170,22 +166,21 @@ impl NotifyManager {
         let escaped_message = message.replace("'", "''"); // Escape single quotes
         let sql = format!("NOTIFY {}, '{}'", channel_name, escaped_message);
 
-        let ret = db
+        match db
             .execute(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 sql,
                 vec![],
             ))
-            .await;
-
-        match ret {
+            .await
+        {
             Ok(_) => {
                 trace!("NOTIFY sent on channel {}: {}", channel_name, message);
                 Ok(())
             }
             Err(e) => {
                 warn!("Failed to send NOTIFY on channel {}: {}", channel_name, e);
-                Err(anyhow::anyhow!("NOTIFY failed: {}", e))
+                Err(e.into())
             }
         }
     }
