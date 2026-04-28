@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::error::{QuebecError, Result};
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,7 @@ impl QueueSelector {
 
 // Custom deserializer for QueueSelector to handle different YAML formats
 impl<'de> serde::Deserialize<'de> for QueueSelector {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
@@ -177,7 +177,7 @@ impl<'de> serde::Deserialize<'de> for QueueSelector {
             serde_yaml::Value::String(s) => Ok(QueueSelector::Single(s)),
             // [queue1, queue2] -> Multiple
             serde_yaml::Value::Sequence(seq) => {
-                let queues: Result<Vec<String>, _> = seq
+                let queues: std::result::Result<Vec<String>, _> = seq
                     .into_iter()
                     .map(|v| {
                         v.as_str()
@@ -195,7 +195,7 @@ impl<'de> serde::Deserialize<'de> for QueueSelector {
 }
 
 impl serde::Serialize for QueueSelector {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
@@ -312,9 +312,12 @@ impl QueueConfig {
     /// 3. ./config/queue.yml (Solid Queue compatible)
     pub fn find(env: Option<&str>) -> Result<Self> {
         let path = Self::find_config_file()?;
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Config path is not valid UTF-8: {}", path.display()))?;
+        let path_str = path.to_str().ok_or_else(|| {
+            QuebecError::Config(format!(
+                "Config path is not valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
         Self::load(path_str, env)
     }
 
@@ -323,7 +326,10 @@ impl QueueConfig {
         let path_obj = Path::new(path);
 
         if !path_obj.exists() {
-            anyhow::bail!("Config file not found: {}", path_obj.display());
+            return Err(QuebecError::Config(format!(
+                "Config file not found: {}",
+                path_obj.display()
+            )));
         }
 
         let content = std::fs::read_to_string(path_obj)?;
@@ -380,10 +386,10 @@ impl QueueConfig {
             if path.exists() {
                 return Ok(path.to_path_buf());
             } else {
-                anyhow::bail!(
+                return Err(QuebecError::Config(format!(
                     "Config file specified in QUEBEC_CONFIG not found: {}",
                     env_path
-                );
+                )));
             }
         }
 
@@ -395,10 +401,10 @@ impl QueueConfig {
             }
         }
 
-        anyhow::bail!(
+        Err(QuebecError::Config(format!(
             "Config file not found. Searched: QUEBEC_CONFIG env var, {}",
             DEFAULT_CONFIG_PATHS.join(", ")
-        )
+        )))
     }
 
     /// Expand environment variables in string
