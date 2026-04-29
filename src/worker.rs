@@ -1010,7 +1010,17 @@ impl Execution {
         // Get cancellation token from context for continuation support
         let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
-            info!(delay_ms, "Job `{}' started", self.runnable.class_name);
+            let class_name = &self.runnable.class_name;
+            if job.priority == 0 {
+                info!(id = job.id, delay_ms, "Job `{class_name}' started");
+            } else {
+                info!(
+                    id = job.id,
+                    priority = job.priority,
+                    delay_ms,
+                    "Job `{class_name}' started"
+                );
+            }
             let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
