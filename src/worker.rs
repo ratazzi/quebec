@@ -1701,19 +1701,14 @@ impl Worker {
             debug!("Registered job class: {:?}", class_name);
 
             let mut queue_name = "default".to_string();
-            if bound.hasattr("queue_as")? {
-                let attr = bound.getattr("queue_as")?;
+            if let Some((attr, attr_name)) = crate::utils::lookup_class_queue(bound, py)? {
                 if !attr.is_callable() {
-                    queue_name = attr.extract::<String>()?;
+                    queue_name = crate::utils::extract_queue_name_attr(bound, &attr, attr_name)?;
                 }
-                // Callable queue_as is re-evaluated per-enqueue in PyQuebec::perform_later.
+                // Callable queue is re-evaluated per-enqueue in PyQuebec::perform_later.
             }
 
-            let priority = match bound.getattr("queue_with_priority") {
-                Ok(attr) => i64::from(attr.extract::<i32>()?),
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
-                Err(e) => return Err(e),
-            };
+            let priority = i64::from(crate::utils::extract_class_priority(bound, py)?);
 
             let mut concurrency_limit: Option<i32> = None;
             let mut concurrency_duration: Option<i32> = None;

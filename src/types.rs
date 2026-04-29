@@ -1594,10 +1594,10 @@ impl PyQuebec {
         let bound = klass;
         let class_name = bound.cast::<PyType>()?.qualname()?;
 
-        let queue_name = match bound.getattr("queue_as") {
-            Ok(attr) if attr.is_callable() => {
+        let queue_name = match crate::utils::lookup_class_queue(bound, py)? {
+            Some((attr, _)) if attr.is_callable() => {
                 // Filter out internal _-prefixed kwargs (e.g. _queue, _priority, _scheduled_at)
-                // injected by JobBuilder.set() before passing to user's queue_as callable
+                // injected by JobBuilder.set() before passing to user's queue callable
                 let filtered = PyDict::new(py);
                 if let Some(k) = kwargs {
                     for (key, value) in k.iter() {
@@ -1621,18 +1621,13 @@ impl PyQuebec {
                     name
                 }
             }
-            Ok(attr) => attr.extract::<String>()?,
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
-                "default".to_string()
+            Some((attr, attr_name)) => {
+                crate::utils::extract_queue_name_attr(bound, &attr, attr_name)?
             }
-            Err(e) => return Err(e),
+            None => "default".to_string(),
         };
 
-        let priority = match bound.getattr("queue_with_priority") {
-            Ok(attr) => attr.extract::<i32>()?,
-            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
-            Err(e) => return Err(e),
-        };
+        let priority = crate::utils::extract_class_priority(bound, py)?;
 
         let instance = bound.call0()?;
 
@@ -1912,8 +1907,8 @@ impl PyQuebec {
             let args_bound = py_args.cast::<PyTuple>()?;
             let kwargs_bound = py_kwargs.cast::<PyDict>()?;
 
-            let queue_name = match job_class.getattr("queue_as") {
-                Ok(attr) if attr.is_callable() => {
+            let queue_name = match crate::utils::lookup_class_queue(&job_class, py)? {
+                Some((attr, _)) if attr.is_callable() => {
                     // Filter out internal _-prefixed kwargs for consistency with perform_later
                     let filtered = PyDict::new(py);
                     for (key, value) in kwargs_bound.iter() {
@@ -1936,18 +1931,13 @@ impl PyQuebec {
                         name
                     }
                 }
-                Ok(attr) => attr.extract::<String>()?,
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
-                    "default".to_string()
+                Some((attr, attr_name)) => {
+                    crate::utils::extract_queue_name_attr(&job_class, &attr, attr_name)?
                 }
-                Err(e) => return Err(e),
+                None => "default".to_string(),
             };
 
-            let priority = match job_class.getattr("queue_with_priority") {
-                Ok(attr) => attr.extract::<i32>()?,
-                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
-                Err(e) => return Err(e),
-            };
+            let priority = crate::utils::extract_class_priority(&job_class, py)?;
 
             // Apply option overrides
             let options = py_options.cast::<PyDict>()?;
