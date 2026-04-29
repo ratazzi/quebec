@@ -340,6 +340,14 @@ pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
         .or_else(|| s.parse::<u64>().ok().map(Duration::from_secs))
 }
 
+/// Class-level scheduling metadata captured at `register_job_class` time.
+/// Plain Rust types only — readable without the GIL.
+#[derive(Debug, Clone)]
+pub struct RunnableDefaults {
+    pub queue_as: String,
+    pub priority: i32,
+}
+
 impl AppContext {
     #[cfg(feature = "python")]
     pub fn new(
@@ -736,6 +744,26 @@ impl AppContext {
             .ok()
             .and_then(|r| r.get(class_name).map(|r| r.hooks.clone()))
             .unwrap_or_default()
+    }
+
+    /// Get the registered queue/priority defaults for a job class. Avoids the
+    /// GIL by skipping the `Py<PyAny>` clone that `get_runnable` performs, so
+    /// callers that only need scheduling metadata pay just a HashMap lookup.
+    #[cfg(feature = "python")]
+    pub fn get_runnable_defaults(&self, class_name: &str) -> Option<RunnableDefaults> {
+        self.runnables.read().ok().and_then(|r| {
+            r.get(class_name).map(|r| RunnableDefaults {
+                queue_as: r.queue_as.clone(),
+                priority: r.priority as i32,
+            })
+        })
+    }
+
+    /// No-op fallback when the `python` feature is disabled — there is no
+    /// runnable registry without Python job classes.
+    #[cfg(not(feature = "python"))]
+    pub fn get_runnable_defaults(&self, _class_name: &str) -> Option<RunnableDefaults> {
+        None
     }
 
     /// Get all registered runnable class names

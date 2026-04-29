@@ -175,13 +175,18 @@ where
         .ok_or_else(|| DbErr::Custom("Task key is missing".to_string()))?;
 
     // Step 1: Create the job first
-    let queue_name = entry.queue.as_deref().unwrap_or("default");
-    // Priority precedence: YAML entry > class `queue_with_priority` > 0
-    let priority = entry.priority.unwrap_or_else(|| {
-        ctx.get_runnable(&entry.class)
-            .map(|r| r.priority as i32)
-            .unwrap_or(0)
-    });
+    // Queue/priority precedence: YAML entry > class attribute > default.
+    let defaults = ctx.get_runnable_defaults(&entry.class);
+    let queue_name = entry
+        .queue
+        .clone()
+        .or_else(|| defaults.as_ref().map(|d| d.queue_as.clone()))
+        .unwrap_or_else(|| "default".to_string());
+    let queue_name = queue_name.as_str();
+    let priority = entry
+        .priority
+        .or_else(|| defaults.as_ref().map(|d| d.priority))
+        .unwrap_or(0);
 
     let now = chrono::Utc::now().naive_utc();
 
