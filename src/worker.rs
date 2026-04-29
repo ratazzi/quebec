@@ -1699,6 +1699,12 @@ impl Worker {
                 // Callable queue_as is re-evaluated per-enqueue in PyQuebec::perform_later.
             }
 
+            let priority = match bound.getattr("queue_with_priority") {
+                Ok(attr) => i64::from(attr.extract::<i32>()?),
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
+                Err(e) => return Err(e),
+            };
+
             let mut concurrency_limit: Option<i32> = None;
             let mut concurrency_duration: Option<i32> = None;
             let mut concurrency_on_conflict = ConcurrencyConflict::default();
@@ -1808,7 +1814,7 @@ impl Worker {
                 module_path,
                 handler: klass,
                 queue_as: queue_name,
-                priority: 0,
+                priority,
                 retry_info: None,
                 concurrency_limit,
                 concurrency_duration,
