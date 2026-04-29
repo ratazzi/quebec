@@ -17,6 +17,97 @@ pub fn generate_job_id() -> String {
     nanoid::nanoid!(12, &NANOID_ALPHABET)
 }
 
+/// Read a job class's queue priority, preferring the Pythonic `priority` attribute
+/// and falling back to `queue_with_priority` for Solid Queue compatibility.
+/// Returns 0 when neither attribute is defined.
+///
+/// `BaseClass` inherits from `ActiveJob`, which exposes a `priority` getset
+/// descriptor — when that descriptor is what's resolved (no user override) we
+/// fall through. A non-int override raises a TypeError naming the offending
+/// attribute and class so misconfiguration is easy to diagnose.
+#[cfg(feature = "python")]
+pub fn extract_class_priority(bound: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<i32> {
+    for attr_name in ["priority", "queue_with_priority"] {
+        match bound.getattr(attr_name) {
+            Ok(attr) if is_getset_descriptor(&attr) => continue,
+            Ok(attr) => {
+                return attr.extract::<i32>().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{}.{} must be int, got {}",
+                        class_qualname(bound),
+                        attr_name,
+                        type_qualname(&attr),
+                    ))
+                });
+            }
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(feature = "python")]
+fn is_getset_descriptor(attr: &Bound<'_, PyAny>) -> bool {
+    type_qualname(attr) == "getset_descriptor"
+}
+
+#[cfg(feature = "python")]
+fn type_qualname(obj: &Bound<'_, PyAny>) -> String {
+    obj.get_type()
+        .qualname()
+        .ok()
+        .and_then(|q| q.extract::<String>().ok())
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+#[cfg(feature = "python")]
+fn class_qualname(bound: &Bound<'_, PyAny>) -> String {
+    bound
+        .getattr("__qualname__")
+        .ok()
+        .and_then(|q| q.extract::<String>().ok())
+        .unwrap_or_else(|| "<class>".to_string())
+}
+
+/// Look up a job class's queue declaration, preferring the Pythonic `queue`
+/// attribute and falling back to `queue_as` for Solid Queue compatibility.
+/// Returns the resolved attribute together with the name it was found under,
+/// so callers can produce diagnostic errors. Returns `None` when neither
+/// attribute is defined.
+#[cfg(feature = "python")]
+pub fn lookup_class_queue<'py>(
+    bound: &Bound<'py, PyAny>,
+    py: Python<'py>,
+) -> PyResult<Option<(Bound<'py, PyAny>, &'static str)>> {
+    for attr_name in ["queue", "queue_as"] {
+        match bound.getattr(attr_name) {
+            Ok(attr) => return Ok(Some((attr, attr_name))),
+            Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// Extract a static queue name attribute as a string, raising a TypeError
+/// that names the offending class and attribute when it is not a string.
+#[cfg(feature = "python")]
+pub fn extract_queue_name_attr(
+    class: &Bound<'_, PyAny>,
+    attr: &Bound<'_, PyAny>,
+    attr_name: &str,
+) -> PyResult<String> {
+    attr.extract::<String>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "{}.{} must be str, got {}",
+            class_qualname(class),
+            attr_name,
+            type_qualname(attr),
+        ))
+    })
+}
+
 /// Convert YAML value to Python object
 #[cfg(feature = "python")]
 pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResult<Py<PyAny>> {

@@ -283,3 +283,90 @@ def test_perform_all_later_returns_empty_list_for_empty_input(
     qc.register_job(BulkJob)
 
     assert qc.perform_all_later([]) == []
+
+
+class PythonicAliasJob(quebec.BaseClass):
+    queue = "alias-q"
+    priority = 11
+
+    def perform(self, value: int) -> None:
+        return None
+
+
+class AliasOverridesSolidQueueJob(quebec.BaseClass):
+    # Pythonic names take precedence when both are present.
+    queue = "primary-q"
+    queue_as = "fallback-q"
+    priority = 21
+    queue_with_priority = 99
+
+    def perform(self, value: int) -> None:
+        return None
+
+
+def test_perform_later_reads_pythonic_queue_and_priority(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(PythonicAliasJob)
+
+    enqueued = PythonicAliasJob.perform_later(qc, 5)
+    persisted = get_job_by_active_job_id(session, prefix, enqueued.active_job_id)
+
+    assert persisted["queue_name"] == "alias-q"
+    assert persisted["priority"] == 11
+    assert db_assert.count_jobs() == 1
+
+
+def test_perform_later_prefers_pythonic_aliases_over_solid_queue_names(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(AliasOverridesSolidQueueJob)
+
+    enqueued = AliasOverridesSolidQueueJob.perform_later(qc, 7)
+    persisted = get_job_by_active_job_id(session, prefix, enqueued.active_job_id)
+
+    assert persisted["queue_name"] == "primary-q"
+    assert persisted["priority"] == 21
+    assert db_assert.count_jobs() == 1
+
+
+class StringPriorityJob(quebec.BaseClass):
+    priority = "10"  # type: ignore[assignment]
+
+    def perform(self, value: int) -> None:
+        return None
+
+
+def test_register_job_raises_for_non_int_priority(qc_with_sqlalchemy) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+
+    import pytest
+
+    with pytest.raises(
+        TypeError, match=r"StringPriorityJob\.priority must be int, got str"
+    ):
+        qc.register_job(StringPriorityJob)
+
+
+class NonStrQueueJob(quebec.BaseClass):
+    queue = 100  # type: ignore[assignment]
+
+    def perform(self, value: int) -> None:
+        return None
+
+
+def test_register_job_raises_for_non_str_queue(qc_with_sqlalchemy) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+
+    import pytest
+
+    with pytest.raises(TypeError, match=r"NonStrQueueJob\.queue must be str, got int"):
+        qc.register_job(NonStrQueueJob)
