@@ -1010,7 +1010,17 @@ impl Execution {
         // Get cancellation token from context for continuation support
         let cancellation_token = Some(self.ctx.graceful_shutdown.clone());
         let result = async {
-            info!(delay_ms, "Job `{}' started", self.runnable.class_name);
+            let class_name = &self.runnable.class_name;
+            if job.priority == 0 {
+                info!(id = job.id, delay_ms, "Job `{class_name}' started");
+            } else {
+                info!(
+                    id = job.id,
+                    priority = job.priority,
+                    delay_ms,
+                    "Job `{class_name}' started"
+                );
+            }
             let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
@@ -1699,6 +1709,12 @@ impl Worker {
                 // Callable queue_as is re-evaluated per-enqueue in PyQuebec::perform_later.
             }
 
+            let priority = match bound.getattr("queue_with_priority") {
+                Ok(attr) => i64::from(attr.extract::<i32>()?),
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => 0,
+                Err(e) => return Err(e),
+            };
+
             let mut concurrency_limit: Option<i32> = None;
             let mut concurrency_duration: Option<i32> = None;
             let mut concurrency_on_conflict = ConcurrencyConflict::default();
@@ -1808,7 +1824,7 @@ impl Worker {
                 module_path,
                 handler: klass,
                 queue_as: queue_name,
-                priority: 0,
+                priority,
                 retry_info: None,
                 concurrency_limit,
                 concurrency_duration,

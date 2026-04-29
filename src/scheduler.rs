@@ -176,7 +176,12 @@ where
 
     // Step 1: Create the job first
     let queue_name = entry.queue.as_deref().unwrap_or("default");
-    let priority = entry.priority.unwrap_or(0);
+    // Priority precedence: YAML entry > class `queue_with_priority` > 0
+    let priority = entry.priority.unwrap_or_else(|| {
+        ctx.get_runnable(&entry.class)
+            .map(|r| r.priority as i32)
+            .unwrap_or(0)
+    });
 
     let now = chrono::Utc::now().naive_utc();
 
