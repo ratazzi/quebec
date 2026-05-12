@@ -588,11 +588,19 @@ class ControlPlaneASGI:
         status, headers, response_body = self.qc.handle_control_plane_request(req)
 
         # Rewrite Location headers for redirects (303 etc.)
+        # Idempotent: skip if the Location already starts with the mount prefix
+        # (some Rust handlers derive the redirect from Referer / base_path and
+        # therefore emit a path that already includes root_path).
         if root_path:
             prefix = root_path.encode()
             rewritten = []
             for name, value in headers:
-                if name.lower() == b"location" and value.startswith(b"/"):
+                if (
+                    name.lower() == b"location"
+                    and value.startswith(b"/")
+                    and value != prefix
+                    and not value.startswith(prefix + b"/")
+                ):
                     value = prefix + value
                 rewritten.append((name, value))
             headers = rewritten
