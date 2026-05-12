@@ -152,6 +152,8 @@ impl ControlPlane {
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &total_pages);
         context.insert("active_page", "in-progress-jobs");
+        context.insert("filter_class_name", &pagination.class_name);
+        context.insert("filter_queue_name", &pagination.queue_name);
 
         let html = state
             .render_template("in-progress-jobs.html", &mut context)
