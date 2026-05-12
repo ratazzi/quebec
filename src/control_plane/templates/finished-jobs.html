@@ -41,6 +41,10 @@
   <div class="flex-grow"></div>
 </div>
 
+{% set filter_args = "" %}
+{% if filter_class_name %}{% set encoded_cn = filter_class_name | urlencode %}{% set filter_args = filter_args ~ "class_name=" ~ encoded_cn %}{% endif %}
+{% if filter_queue_name %}{% if filter_args %}{% set filter_args = filter_args ~ "&" %}{% endif %}{% set encoded_qn = filter_queue_name | urlencode %}{% set filter_args = filter_args ~ "queue_name=" ~ encoded_qn %}{% endif %}
+
 <!-- Table -->
 <div class="overflow-x-auto rounded-lg border border-gray-200">
   <table class="min-w-full divide-y divide-gray-200">
@@ -105,7 +109,7 @@
   </div>
   <div class="flex space-x-2">
     {% if current_page_num > 1 %}
-      <a href="{{ base_path }}/finished-jobs?page={{ current_page_num - 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      <a href="{{ base_path }}/finished-jobs?page={{ current_page_num - 1 }}{% if filter_args %}&{{ filter_args }}{% endif %}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
         Previous page
       </a>
     {% else %}
@@ -115,7 +119,7 @@
     {% endif %}
 
     {% if current_page_num < total_pages %}
-      <a href="{{ base_path }}/finished-jobs?page={{ current_page_num + 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
+      <a href="{{ base_path }}/finished-jobs?page={{ current_page_num + 1 }}{% if filter_args %}&{{ filter_args }}{% endif %}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
         Next page
       </a>
     {% else %}
