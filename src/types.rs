@@ -174,18 +174,21 @@ fn signal_handler(
     // stop fetching new jobs but keep running so in-flight jobs finish.
     // Used for seamless restarts. SIGUSR1 is the always-on alternative
     // when SIGTSTP isn't intercepted (interactive tty, where Ctrl-Z is
-    // left to shell job control).
-    if signum == libc::SIGTSTP || signum == libc::SIGUSR1 {
-        let sname = if signum == libc::SIGTSTP {
-            "SIGTSTP"
-        } else {
-            "SIGUSR1"
-        };
-        info!("Received {}, entering quiet mode (no new jobs)", sname);
-        if let Err(e) = quebec.bind(py).call_method0("quiet") {
-            error!("Error calling quiet: {:?}", e);
+    // left to shell job control). Unix-only; Windows has no equivalent.
+    #[cfg(unix)]
+    {
+        if signum == libc::SIGTSTP || signum == libc::SIGUSR1 {
+            let sname = if signum == libc::SIGTSTP {
+                "SIGTSTP"
+            } else {
+                "SIGUSR1"
+            };
+            info!("Received {}, entering quiet mode (no new jobs)", sname);
+            if let Err(e) = quebec.bind(py).call_method0("quiet") {
+                error!("Error calling quiet: {:?}", e);
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     // SIGQUIT is the "exit now" signal in the Solid Queue convention. Only

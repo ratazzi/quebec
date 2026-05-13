@@ -606,8 +606,13 @@ impl AppContext {
     /// (mirrors Solid Queue's `Supervised#supervised_by`). A zero PID disables
     /// the check (e.g. a standalone library user has no supervisor to watch).
     pub fn watch_parent_pid(&self) {
-        let ppid = unsafe { libc::getppid() };
-        self.supervisor_pid.store(ppid, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            let ppid = unsafe { libc::getppid() };
+            self.supervisor_pid.store(ppid, Ordering::Relaxed);
+        }
+        // Windows has no fork-based supervisor; leave supervisor_pid at 0
+        // so `is_orphaned` keeps reporting false.
     }
 
     /// Whether we were reparented since `watch_parent_pid` was called.
@@ -618,8 +623,15 @@ impl AppContext {
         if stored == 0 {
             return false;
         }
-        let current = unsafe { libc::getppid() };
-        current != stored
+        #[cfg(unix)]
+        {
+            let current = unsafe { libc::getppid() };
+            return current != stored;
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 
     pub fn set_runtime_handle(&mut self, handle: Handle) {
