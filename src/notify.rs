@@ -2,9 +2,48 @@ use crate::context::AppContext;
 use crate::error::{QuebecError, Result};
 use sea_orm::*;
 use sqlx::postgres::PgListener;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+
+/// Per-queue last-NOTIFY timestamps, shared across the process. Producers
+/// consult this table before emitting a NOTIFY to coalesce bursts (e.g.
+/// thousands of `perform_later` calls in a loop) into one wake-up per
+/// `notify_throttle_interval`. The window is per process — workers still
+/// catch up via polling / IDLE fallback if a NOTIFY is dropped.
+static LAST_NOTIFY: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Decide whether a NOTIFY for `queue` should be emitted now.
+///
+/// Returns `true` and records the emission time when the queue has not been
+/// notified within the last `throttle`. Returns `false` when an earlier
+/// NOTIFY is still inside the throttle window. `throttle == Duration::ZERO`
+/// disables throttling and always returns `true` (no state recorded).
+pub fn should_emit_notify(queue: &str, throttle: Duration) -> bool {
+    if throttle.is_zero() {
+        return true;
+    }
+    let now = Instant::now();
+    let mut map = LAST_NOTIFY.lock().expect("notify throttle map poisoned");
+    match map.get(queue) {
+        Some(last) if now.duration_since(*last) < throttle => false,
+        _ => {
+            map.insert(queue.to_string(), now);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_notify_throttle() {
+    LAST_NOTIFY
+        .lock()
+        .expect("notify throttle map poisoned")
+        .clear();
+}
 
 /// PostgreSQL LISTEN/NOTIFY manager for reducing queue latency
 pub struct NotifyManager {
@@ -237,5 +276,43 @@ mod tests {
         let sqlite_dsn = DatabaseUrl::parse("sqlite://test.db").expect("Valid sqlite test URL");
         let sqlite_ctx = make_ctx(sqlite_dsn);
         assert!(!sqlite_ctx.is_postgres());
+    }
+
+    #[test]
+    fn test_throttle_zero_disables() {
+        reset_notify_throttle();
+        for _ in 0..5 {
+            assert!(should_emit_notify("zero", Duration::ZERO));
+        }
+    }
+
+    #[test]
+    fn test_throttle_drops_within_window() {
+        reset_notify_throttle();
+        let throttle = Duration::from_secs(60);
+        assert!(should_emit_notify("within", throttle));
+        // Subsequent calls inside the window are dropped.
+        for _ in 0..10 {
+            assert!(!should_emit_notify("within", throttle));
+        }
+    }
+
+    #[test]
+    fn test_throttle_allows_after_window() {
+        reset_notify_throttle();
+        let throttle = Duration::from_millis(10);
+        assert!(should_emit_notify("after", throttle));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(should_emit_notify("after", throttle));
+    }
+
+    #[test]
+    fn test_throttle_is_per_queue() {
+        reset_notify_throttle();
+        let throttle = Duration::from_secs(60);
+        assert!(should_emit_notify("queue_a", throttle));
+        assert!(should_emit_notify("queue_b", throttle));
+        assert!(!should_emit_notify("queue_a", throttle));
+        assert!(!should_emit_notify("queue_b", throttle));
     }
 }
