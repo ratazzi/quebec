@@ -192,20 +192,20 @@ impl NotifyManager {
         Ok(())
     }
 
-    /// Static method to send NOTIFY using existing database connection
-    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str, event: &str) -> Result<()>
+    /// Static method to send NOTIFY using existing database connection.
+    ///
+    /// Payload is the queue name as a plain string. Workers parse the payload
+    /// directly; legacy `{"queue":"...","event":"..."}` JSON is still accepted
+    /// on the consumer side for mid-upgrade compatibility. Postgres collapses
+    /// duplicate (channel, payload) NOTIFYs emitted from the same transaction
+    /// for free, so a smaller payload helps both bandwidth and dedup.
+    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str) -> Result<()>
     where
         C: ConnectionTrait,
     {
-        let message = NotifyMessage {
-            queue: queue_name.to_string(),
-            event: event.to_string(),
-        };
-        let message_json = serde_json::to_string(&message)?;
-
         // Use the same naming convention as LISTEN
         let channel_name = format!("{app_name}_jobs");
-        Self::send_notify_with_db(db, &channel_name, &message_json).await
+        Self::send_notify_with_db(db, &channel_name, queue_name).await
     }
 
     /// Internal helper to send NOTIFY with database connection and channel name

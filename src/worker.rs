@@ -2072,17 +2072,26 @@ impl Worker {
         Ok(jobs)
     }
 
-    /// Check if this worker should handle the notify message for the given queue
+    /// Check if this worker should handle the notify message for the given queue.
+    ///
+    /// Current producers emit the queue name as a plain string. Older releases
+    /// (and any third-party publisher) emitted `{"queue":"...","event":"..."}`
+    /// JSON; we still accept that shape transparently so a mid-upgrade fleet
+    /// keeps working.
     fn should_handle_notify(&self, msg: &str) -> bool {
-        let notify_msg = match serde_json::from_str::<crate::notify::NotifyMessage>(msg) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to parse NOTIFY message '{}': {}", msg, e);
-                return true; // If we can't parse, process anyway to be safe
+        let queue_name = if msg.starts_with('{') {
+            match serde_json::from_str::<crate::notify::NotifyMessage>(msg) {
+                Ok(m) => m.queue,
+                Err(e) => {
+                    warn!("Failed to parse legacy JSON NOTIFY '{}': {}", msg, e);
+                    return true; // best-effort: process anyway
+                }
             }
+        } else {
+            msg.to_string()
         };
 
-        trace!("Received NOTIFY for queue: {}", notify_msg.queue);
+        trace!("Received NOTIFY for queue: {}", queue_name);
 
         let Some(ref queues) = self.ctx.worker_queues else {
             return true; // No queue config, process all queues
@@ -2095,10 +2104,10 @@ impl Worker {
         let exact = queues.exact_names();
         let wildcards = queues.wildcard_prefixes();
 
-        exact.contains(&notify_msg.queue)
+        exact.contains(&queue_name)
             || wildcards
                 .iter()
-                .any(|prefix| notify_msg.queue.starts_with(prefix))
+                .any(|prefix| queue_name.starts_with(prefix))
     }
 
     /// Drain pending notify messages from the channel, return count drained

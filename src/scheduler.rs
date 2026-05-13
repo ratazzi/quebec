@@ -813,7 +813,7 @@ impl Scheduler {
             // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
             if let Ok(Some(queue_name)) = result {
                 if crate::notify::should_send_notify(&ctx, &queue_name) {
-                    NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name, "new_job")
+                    NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name)
                         .await
                         .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                         .ok();

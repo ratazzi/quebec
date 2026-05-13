@@ -241,7 +241,7 @@ impl Dispatcher {
                         if !crate::notify::should_send_notify(&self.ctx, &queue_name) {
                             continue;
                         }
-                        crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name, "new_job")
+                        crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name)
                             .await
                             .inspect_err(|e| warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e))
                             .ok();

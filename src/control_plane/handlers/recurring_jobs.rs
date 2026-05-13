@@ -156,7 +156,7 @@ impl ControlPlane {
         // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
         if let Some(ref queue) = enqueued_queue {
             if crate::notify::should_send_notify(&state.ctx, queue) {
-                NotifyManager::send_notify(&state.ctx.name, db, queue, "new_job")
+                NotifyManager::send_notify(&state.ctx.name, db, queue)
                     .await
                     .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                     .ok();

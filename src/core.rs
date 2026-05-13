@@ -83,7 +83,7 @@ impl Quebec {
             if !crate::notify::should_send_notify(&self.ctx, queue_name) {
                 continue;
             }
-            NotifyManager::send_notify(&self.ctx.name, &*db, queue_name, "new_job")
+            NotifyManager::send_notify(&self.ctx.name, &*db, queue_name)
                 .await
                 .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                 .ok();
@@ -111,7 +111,7 @@ impl Quebec {
         if destination.should_notify()
             && crate::notify::should_send_notify(&self.ctx, &job_model.queue_name)
         {
-            NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job")
+            NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name)
                 .await
                 .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                 .ok();
