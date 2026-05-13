@@ -285,6 +285,12 @@ pub struct AppContext {
     /// Disable when running through transaction-pooling proxies (RDS Proxy,
     /// PgBouncer transaction mode) that don't keep session state across queries.
     pub use_listen_notify: bool,
+    /// Per-queue minimum interval between NOTIFYs emitted by this process.
+    /// Producers that fall inside the window are silently dropped; the worker
+    /// catches up via polling / IDLE fallback. Set to `Duration::ZERO` to
+    /// disable throttling. Mitigates NOTIFY storms on Aurora-style clusters
+    /// where every NOTIFY incurs cross-AZ replication cost.
+    pub notify_throttle_interval: Duration,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
@@ -452,6 +458,9 @@ impl AppContext {
             if let Some(v) = get_bool("use_listen_notify") {
                 ctx.use_listen_notify = v;
             }
+            if let Some(v) = get_duration("notify_throttle_interval") {
+                ctx.notify_throttle_interval = v;
+            }
             if let Some(v) = get_duration("process_heartbeat_interval") {
                 ctx.process_heartbeat_interval = v;
             }
@@ -572,6 +581,7 @@ impl AppContext {
             name: std::env::var("QUEBEC_NAME").unwrap_or_else(|_| "quebec".to_string()),
             use_skip_locked: true,
             use_listen_notify: true,
+            notify_throttle_interval: Duration::from_secs(1),
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
@@ -688,6 +698,7 @@ impl AppContext {
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
             use_listen_notify: self.use_listen_notify,
+            notify_throttle_interval: self.notify_throttle_interval,
         }
     }
 
