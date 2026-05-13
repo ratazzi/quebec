@@ -809,9 +809,10 @@ impl Scheduler {
                 .await
                 .inspect_err(|e| error!("Failed to enqueue scheduled job {}: {}", task_key, e));
 
-            // Send NOTIFY after transaction commits (only if job was actually created)
+            // Send NOTIFY after transaction commits (only if job was actually created).
+            // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
             if let Ok(Some(queue_name)) = result {
-                if ctx.is_postgres() {
+                if crate::notify::should_send_notify(&ctx, &queue_name) {
                     NotifyManager::send_notify(&ctx.name, db.as_ref(), &queue_name, "new_job")
                         .await
                         .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
