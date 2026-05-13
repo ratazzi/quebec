@@ -233,11 +233,14 @@ impl Dispatcher {
                     .instrument(tracing::info_span!("polling", component = "dispatcher"))
                     .await;
 
-                    // Send NOTIFY for each unique queue after transaction commits
+                    // Send NOTIFY for each unique queue after transaction commits.
+                    // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
                     let Ok(queues) = transaction_result else { continue };
-                    if !self.ctx.is_postgres() { continue; }
 
                     for queue_name in queues {
+                        if !crate::notify::should_send_notify(&self.ctx, &queue_name) {
+                            continue;
+                        }
                         crate::notify::NotifyManager::send_notify(&self.ctx.name, &*polling_db, &queue_name, "new_job")
                             .await
                             .inspect_err(|e| warn!("Failed to send NOTIFY for queue {}: {}", queue_name, e))

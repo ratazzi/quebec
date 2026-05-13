@@ -16,6 +16,18 @@ use tracing::{error, info, trace, warn};
 static LAST_NOTIFY: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Should the producer emit a NOTIFY for `queue` given the current context?
+///
+/// Combines three checks: the backend is PostgreSQL, the operator hasn't
+/// opted out via `use_listen_notify = false`, and the per-queue throttle
+/// window has elapsed. Centralized so every producer call site (perform_later,
+/// perform_all_later, dispatcher) honors the same policy.
+pub fn should_send_notify(ctx: &AppContext, queue: &str) -> bool {
+    ctx.is_postgres()
+        && ctx.use_listen_notify
+        && should_emit_notify(queue, ctx.notify_throttle_interval)
+}
+
 /// Decide whether a NOTIFY for `queue` should be emitted now.
 ///
 /// Returns `true` and records the emission time when the queue has not been
