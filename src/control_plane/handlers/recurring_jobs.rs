@@ -152,10 +152,11 @@ impl ControlPlane {
             })
             .await?;
 
-        // Send NOTIFY after transaction commits (only if job was created)
+        // Send NOTIFY after transaction commits (only if job was created).
+        // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
         if let Some(ref queue) = enqueued_queue {
-            if state.ctx.is_postgres() {
-                NotifyManager::send_notify(&state.ctx.name, db, queue, "new_job")
+            if crate::notify::should_send_notify(&state.ctx, queue) {
+                NotifyManager::send_notify(&state.ctx.name, db, queue)
                     .await
                     .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                     .ok();

@@ -77,14 +77,16 @@ impl Quebec {
             .await
             .map_err(crate::error::QuebecError::from)?;
 
-        // Send NOTIFY only for queues that have ready jobs (consistent with perform_later)
-        if self.ctx.is_postgres() {
-            for queue_name in &ready_queues {
-                NotifyManager::send_notify(&self.ctx.name, &*db, queue_name, "new_job")
-                    .await
-                    .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
-                    .ok();
+        // Send NOTIFY only for queues that have ready jobs (consistent with perform_later).
+        // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
+        for queue_name in &ready_queues {
+            if !crate::notify::should_send_notify(&self.ctx, queue_name) {
+                continue;
             }
+            NotifyManager::send_notify(&self.ctx.name, &*db, queue_name)
+                .await
+                .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
+                .ok();
         }
 
         Ok(job_models)
@@ -106,8 +108,10 @@ impl Quebec {
             .await
             .map_err(crate::error::QuebecError::from)?;
 
-        if destination.should_notify() && self.ctx.is_postgres() {
-            NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name, "new_job")
+        if destination.should_notify()
+            && crate::notify::should_send_notify(&self.ctx, &job_model.queue_name)
+        {
+            NotifyManager::send_notify(&self.ctx.name, &*db, &job_model.queue_name)
                 .await
                 .inspect_err(|e| warn!("Failed to send NOTIFY: {}", e))
                 .ok();

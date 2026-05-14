@@ -2,9 +2,52 @@ use crate::context::AppContext;
 use crate::error::{QuebecError, Result};
 use sea_orm::*;
 use sqlx::postgres::PgListener;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
+
+/// Per-queue last-NOTIFY timestamps, shared across the process. Producers
+/// consult this table before emitting a NOTIFY to coalesce bursts (e.g.
+/// thousands of `perform_later` calls in a loop) into one wake-up per
+/// `notify_throttle_interval`. The window is per process — workers still
+/// catch up via polling / IDLE fallback if a NOTIFY is dropped.
+static LAST_NOTIFY: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Should the producer emit a NOTIFY for `queue` given the current context?
+///
+/// Combines three checks: the backend is PostgreSQL, the operator hasn't
+/// opted out via `use_listen_notify = false`, and the per-queue throttle
+/// window has elapsed. Centralized so every producer call site (perform_later,
+/// perform_all_later, dispatcher) honors the same policy.
+pub fn should_send_notify(ctx: &AppContext, queue: &str) -> bool {
+    ctx.is_postgres()
+        && ctx.use_listen_notify
+        && should_emit_notify(queue, ctx.notify_throttle_interval)
+}
+
+/// Decide whether a NOTIFY for `queue` should be emitted now.
+///
+/// Returns `true` and records the emission time when the queue has not been
+/// notified within the last `throttle`. Returns `false` when an earlier
+/// NOTIFY is still inside the throttle window. `throttle == Duration::ZERO`
+/// disables throttling and always returns `true` (no state recorded).
+pub fn should_emit_notify(queue: &str, throttle: Duration) -> bool {
+    if throttle.is_zero() {
+        return true;
+    }
+    let now = Instant::now();
+    let mut map = LAST_NOTIFY.lock().expect("notify throttle map poisoned");
+    match map.get(queue) {
+        Some(last) if now.duration_since(*last) < throttle => false,
+        _ => {
+            map.insert(queue.to_string(), now);
+            true
+        }
+    }
+}
 
 /// PostgreSQL LISTEN/NOTIFY manager for reducing queue latency
 pub struct NotifyManager {
@@ -141,20 +184,20 @@ impl NotifyManager {
         Ok(())
     }
 
-    /// Static method to send NOTIFY using existing database connection
-    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str, event: &str) -> Result<()>
+    /// Static method to send NOTIFY using existing database connection.
+    ///
+    /// Payload is the queue name as a plain string. Workers parse the payload
+    /// directly; legacy `{"queue":"...","event":"..."}` JSON is still accepted
+    /// on the consumer side for mid-upgrade compatibility. Postgres collapses
+    /// duplicate (channel, payload) NOTIFYs emitted from the same transaction
+    /// for free, so a smaller payload helps both bandwidth and dedup.
+    pub async fn send_notify<C>(app_name: &str, db: &C, queue_name: &str) -> Result<()>
     where
         C: ConnectionTrait,
     {
-        let message = NotifyMessage {
-            queue: queue_name.to_string(),
-            event: event.to_string(),
-        };
-        let message_json = serde_json::to_string(&message)?;
-
         // Use the same naming convention as LISTEN
         let channel_name = format!("{app_name}_jobs");
-        Self::send_notify_with_db(db, &channel_name, &message_json).await
+        Self::send_notify_with_db(db, &channel_name, queue_name).await
     }
 
     /// Internal helper to send NOTIFY with database connection and channel name
@@ -237,5 +280,51 @@ mod tests {
         let sqlite_dsn = DatabaseUrl::parse("sqlite://test.db").expect("Valid sqlite test URL");
         let sqlite_ctx = make_ctx(sqlite_dsn);
         assert!(!sqlite_ctx.is_postgres());
+    }
+
+    // Throttle tests share the process-wide LAST_NOTIFY map and run in
+    // parallel under `cargo test`, so each test owns a unique queue-name
+    // prefix to stay independent without touching peers' state.
+
+    #[test]
+    fn test_throttle_zero_disables() {
+        // Duration::ZERO short-circuits before the map is touched.
+        for _ in 0..5 {
+            assert!(should_emit_notify(
+                "throttle_test::zero_disables",
+                Duration::ZERO
+            ));
+        }
+    }
+
+    #[test]
+    fn test_throttle_drops_within_window() {
+        let throttle = Duration::from_secs(60);
+        let queue = "throttle_test::drops_within_window";
+        assert!(should_emit_notify(queue, throttle));
+        // Subsequent calls inside the window are dropped.
+        for _ in 0..10 {
+            assert!(!should_emit_notify(queue, throttle));
+        }
+    }
+
+    #[test]
+    fn test_throttle_allows_after_window() {
+        let throttle = Duration::from_millis(10);
+        let queue = "throttle_test::allows_after_window";
+        assert!(should_emit_notify(queue, throttle));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(should_emit_notify(queue, throttle));
+    }
+
+    #[test]
+    fn test_throttle_is_per_queue() {
+        let throttle = Duration::from_secs(60);
+        let a = "throttle_test::per_queue_a";
+        let b = "throttle_test::per_queue_b";
+        assert!(should_emit_notify(a, throttle));
+        assert!(should_emit_notify(b, throttle));
+        assert!(!should_emit_notify(a, throttle));
+        assert!(!should_emit_notify(b, throttle));
     }
 }
