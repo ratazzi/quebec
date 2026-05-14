@@ -291,6 +291,15 @@ pub struct AppContext {
     /// disable throttling. Mitigates NOTIFY storms on Aurora-style clusters
     /// where every NOTIFY incurs cross-AZ replication cost.
     pub notify_throttle_interval: Duration,
+    /// When set, every enqueue path rewrites `queue_name` to this value,
+    /// ignoring whatever the class / call site / scheduler specified. Use
+    /// for multi-branch development against a shared database: each branch
+    /// runs with its own `QUEBEC_FORCE_OVERRIDE_QUEUE=branch_x` and only
+    /// consumes that queue, so jobs enqueued by one branch are never picked
+    /// up by another. Production deployments should leave this unset — the
+    /// silent rewrite is intentional for the dev use case but surprising
+    /// elsewhere.
+    pub force_override_queue: Option<String>,
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
@@ -536,6 +545,26 @@ impl AppContext {
             if let Some(v) = get_u64("worker_threads") {
                 ctx.worker_threads = v;
             }
+            // force_override_queue: kwargs win over the env var the Default
+            // already read. Empty / whitespace-only strings clear the override
+            // so callers can explicitly opt out from Python even when
+            // QUEBEC_FORCE_OVERRIDE_QUEUE is set in the environment.
+            if let Some(val) = options.get("force_override_queue") {
+                match val.extract::<String>(py) {
+                    Ok(q) => {
+                        let trimmed = q.trim();
+                        ctx.force_override_queue = if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        };
+                    }
+                    Err(_) => warn!(
+                        "Config 'force_override_queue': expected String, got {:?}",
+                        val.bind(py).get_type()
+                    ),
+                }
+            }
             // table_name_prefix: only apply if non-empty
             if let Some(val) = options.get("table_name_prefix") {
                 match val.extract::<String>(py) {
@@ -582,6 +611,9 @@ impl AppContext {
             use_skip_locked: true,
             use_listen_notify: true,
             notify_throttle_interval: Duration::from_secs(1),
+            force_override_queue: std::env::var("QUEBEC_FORCE_OVERRIDE_QUEUE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
@@ -699,6 +731,7 @@ impl AppContext {
             supervisor_pid: AtomicI32::new(0),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
+            force_override_queue: self.force_override_queue.clone(),
         }
     }
 
