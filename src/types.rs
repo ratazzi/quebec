@@ -1779,6 +1779,16 @@ impl PyQuebec {
             }
         }
 
+        // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class config and
+        // JobBuilder.set(queue=...). Applied after every other queue-resolution
+        // step so the Python-visible `ActiveJob.queue_name` stays consistent
+        // with the value persisted to the DB. The inner `arguments` JSON keeps
+        // the original queue_name as an audit trail.
+        if let Some(force_q) = self.worker.ctx.force_override_queue.as_deref() {
+            obj.queue_name = force_q.to_string();
+            debug!("Job queue forced to '{}' by override", obj.queue_name);
+        }
+
         // Get hook flags (lightweight read, no GIL/clone)
         let hooks = self.worker.ctx.get_hook_flags(&class_name.to_string());
         let any_enqueue_hook = hooks.before_enqueue || hooks.around_enqueue || hooks.after_enqueue;
@@ -2031,6 +2041,19 @@ impl PyQuebec {
             // Note: perform_all_later does NOT run enqueue callbacks, matching
             // ActiveJob's documented behavior: "Push many jobs onto the queue at
             // once without running enqueue callbacks."
+
+            // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class config
+            // and per-descriptor options. Applied here (after `arguments`
+            // serialization) so the persisted queue_name column and the
+            // ActiveJob returned to Python use the override, while the inner
+            // `arguments` JSON keeps the original queue_name as an audit
+            // trail — matching the single-enqueue path's behaviour.
+            let queue_name = self
+                .worker
+                .ctx
+                .force_override_queue
+                .clone()
+                .unwrap_or(queue_name);
 
             prepared.push(PreparedJob {
                 class_name,
