@@ -49,14 +49,6 @@ pub fn should_emit_notify(queue: &str, throttle: Duration) -> bool {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn reset_notify_throttle() {
-    LAST_NOTIFY
-        .lock()
-        .expect("notify throttle map poisoned")
-        .clear();
-}
-
 /// PostgreSQL LISTEN/NOTIFY manager for reducing queue latency
 pub struct NotifyManager {
     ctx: Arc<AppContext>,
@@ -290,41 +282,49 @@ mod tests {
         assert!(!sqlite_ctx.is_postgres());
     }
 
+    // Throttle tests share the process-wide LAST_NOTIFY map and run in
+    // parallel under `cargo test`, so each test owns a unique queue-name
+    // prefix to stay independent without touching peers' state.
+
     #[test]
     fn test_throttle_zero_disables() {
-        reset_notify_throttle();
+        // Duration::ZERO short-circuits before the map is touched.
         for _ in 0..5 {
-            assert!(should_emit_notify("zero", Duration::ZERO));
+            assert!(should_emit_notify(
+                "throttle_test::zero_disables",
+                Duration::ZERO
+            ));
         }
     }
 
     #[test]
     fn test_throttle_drops_within_window() {
-        reset_notify_throttle();
         let throttle = Duration::from_secs(60);
-        assert!(should_emit_notify("within", throttle));
+        let queue = "throttle_test::drops_within_window";
+        assert!(should_emit_notify(queue, throttle));
         // Subsequent calls inside the window are dropped.
         for _ in 0..10 {
-            assert!(!should_emit_notify("within", throttle));
+            assert!(!should_emit_notify(queue, throttle));
         }
     }
 
     #[test]
     fn test_throttle_allows_after_window() {
-        reset_notify_throttle();
         let throttle = Duration::from_millis(10);
-        assert!(should_emit_notify("after", throttle));
+        let queue = "throttle_test::allows_after_window";
+        assert!(should_emit_notify(queue, throttle));
         std::thread::sleep(Duration::from_millis(20));
-        assert!(should_emit_notify("after", throttle));
+        assert!(should_emit_notify(queue, throttle));
     }
 
     #[test]
     fn test_throttle_is_per_queue() {
-        reset_notify_throttle();
         let throttle = Duration::from_secs(60);
-        assert!(should_emit_notify("queue_a", throttle));
-        assert!(should_emit_notify("queue_b", throttle));
-        assert!(!should_emit_notify("queue_a", throttle));
-        assert!(!should_emit_notify("queue_b", throttle));
+        let a = "throttle_test::per_queue_a";
+        let b = "throttle_test::per_queue_b";
+        assert!(should_emit_notify(a, throttle));
+        assert!(should_emit_notify(b, throttle));
+        assert!(!should_emit_notify(a, throttle));
+        assert!(!should_emit_notify(b, throttle));
     }
 }
