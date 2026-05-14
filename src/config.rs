@@ -340,7 +340,11 @@ impl QueueConfig {
     /// Parse YAML string into configuration
     pub fn parse_yaml(yaml_str: &str, env: Option<&str>) -> Result<Self> {
         let yaml_str = Self::expand_env_vars(yaml_str);
-        let value: serde_yaml::Value = serde_yaml::from_str(&yaml_str)?;
+        let mut value: serde_yaml::Value = serde_yaml::from_str(&yaml_str)?;
+        // Expand YAML merge keys (`<<: *anchor`) so configs that factor a
+        // default block via anchors work. serde_yaml only honors merge keys
+        // when explicitly asked.
+        value.apply_merge()?;
 
         match &value {
             serde_yaml::Value::Mapping(map) => {
@@ -496,3 +500,30 @@ const DEFAULT_CONFIG_PATHS: &[&str] = &[
     "queue.yml",        // Current directory (Python projects)
     "config/queue.yml", // Solid Queue compatible (Rails projects)
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_yaml_merge_keys_in_queue_config() {
+        let yaml = r#"
+defaults: &defaults
+  workers:
+    - queues: "*"
+      threads: 3
+      polling_interval: 0.1
+
+development:
+  <<: *defaults
+
+production:
+  <<: *defaults
+"#;
+        let dev = QueueConfig::parse_yaml(yaml, Some("development"))
+            .expect("merge key in queue config must parse");
+        let workers = dev.workers.as_ref().expect("workers populated by merge");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].threads, Some(3));
+    }
+}

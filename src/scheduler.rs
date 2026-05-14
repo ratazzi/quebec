@@ -556,11 +556,24 @@ impl Scheduler {
         Self::find_schedule_path().is_some()
     }
 
-    fn parse_schedule_file(contents: &str) -> Result<Vec<HashMap<String, ScheduledEntry>>> {
+    pub(crate) fn parse_schedule_file(
+        contents: &str,
+    ) -> Result<Vec<HashMap<String, ScheduledEntry>>> {
         // Parse as multi-environment config (Solid Queue format)
         // Format: { development: { task1: {...}, task2: {...} }, production: {...} }
-        let env_config =
-            serde_yaml::from_str::<HashMap<String, HashMap<String, ScheduledEntry>>>(contents)
+        //
+        // Two-step parse via serde_yaml::Value so we can call apply_merge() and
+        // expand YAML merge keys (`<<: *anchor`). serde_yaml only honors merge
+        // keys when explicitly asked; a direct from_str into the strongly typed
+        // map would leave a literal `<<` task name behind and fail with
+        // "missing field `class`".
+        let mut value: serde_yaml::Value = serde_yaml::from_str(contents)
+            .inspect_err(|e| error!("Failed to parse schedule file: {}", e))?;
+        value
+            .apply_merge()
+            .inspect_err(|e| error!("Failed to apply YAML merge keys in schedule file: {}", e))?;
+        let env_config: HashMap<String, HashMap<String, ScheduledEntry>> =
+            serde_yaml::from_value(value)
                 .inspect_err(|e| error!("Failed to parse schedule file: {}", e))?;
 
         // Use strict environment parser — refuse to fall back to wrong environment,
@@ -940,5 +953,74 @@ impl ProcessTrait for Scheduler {
 
     fn process_info(&self) -> ProcessInfo {
         ProcessInfo::new("Scheduler", "scheduler")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_with_env<F: FnOnce() -> R, R>(value: &str, f: F) -> R {
+        // QUEBEC_ENV is read inside parse_env_config_strict; pin it for the
+        // duration of the test so tasks land under the expected environment.
+        let prev = std::env::var("QUEBEC_ENV").ok();
+        unsafe {
+            std::env::set_var("QUEBEC_ENV", value);
+        }
+        let result = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("QUEBEC_ENV", v),
+                None => std::env::remove_var("QUEBEC_ENV"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn parses_yaml_merge_keys_in_schedule_file() {
+        let yaml = r#"
+default: &default
+  a_periodic_job:
+    class: FakeJob
+    args: [911, 3466, {"foo":"bar"}]
+    schedule: "every 10 seconds"
+    queue: low
+  a_periodic_job2:
+    class: Fake1Job
+    args: [911, 3466, {"foo":"bar"}]
+    schedule: "every 10 seconds"
+    queue: low
+
+development:
+  <<: *default
+"#;
+        let result = run_with_env("development", || {
+            Scheduler::parse_schedule_file(yaml).expect("merge key expansion must succeed")
+        });
+        assert_eq!(result.len(), 1);
+        let tasks = &result[0];
+        assert!(tasks.contains_key("a_periodic_job"));
+        assert!(tasks.contains_key("a_periodic_job2"));
+        assert_eq!(tasks["a_periodic_job"].class, "FakeJob");
+        assert_eq!(tasks["a_periodic_job2"].class, "Fake1Job");
+        assert_eq!(tasks["a_periodic_job"].queue.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn rejects_schedule_without_merge_key_support_was_a_regression() {
+        // Sanity check: a flat schedule (no anchors) should still parse the
+        // same way after the merge-key plumbing was added.
+        let yaml = r#"
+development:
+  flat_job:
+    class: FakeJob
+    args: []
+    schedule: "every 1 minute"
+"#;
+        let result = run_with_env("development", || {
+            Scheduler::parse_schedule_file(yaml).expect("flat schedule must still parse")
+        });
+        assert!(result[0].contains_key("flat_job"));
     }
 }
