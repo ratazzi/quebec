@@ -613,7 +613,8 @@ impl AppContext {
             notify_throttle_interval: Duration::from_secs(1),
             force_override_queue: std::env::var("QUEBEC_FORCE_OVERRIDE_QUEUE")
                 .ok()
-                .filter(|s| !s.trim().is_empty()),
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
