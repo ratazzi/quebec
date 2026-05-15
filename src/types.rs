@@ -816,6 +816,15 @@ impl PyQuebec {
 
         // All parameters have been processed in AppContext.new
         let ctx = Arc::new(_ctx);
+        if let Some(override_q) = ctx.force_override_queue.as_deref() {
+            warn!(
+                "QUEBEC_FORCE_OVERRIDE_QUEUE is active: every enqueue will be \
+                 rewritten to queue '{}', ignoring class queue config and any \
+                 `.set(queue=...)` call. Intended for dev isolation; do not \
+                 leave this set in production.",
+                override_q
+            );
+        }
         let quebec = Arc::new(Quebec::new(ctx.clone()));
         let worker = Arc::new(Worker::new(ctx.clone()));
         let dispatcher = Arc::new(Dispatcher::new(ctx.clone()));
@@ -1779,11 +1788,11 @@ impl PyQuebec {
             }
         }
 
-        // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class config and
-        // JobBuilder.set(queue=...). Applied after every other queue-resolution
-        // step so the Python-visible `ActiveJob.queue_name` stays consistent
-        // with the value persisted to the DB. The inner `arguments` JSON keeps
-        // the original queue_name as an audit trail.
+        // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class queue
+        // config and any `.set(queue=...)` call. Applied after every other
+        // queue-resolution step so the Python-visible `ActiveJob.queue_name`
+        // stays consistent with the value persisted to the DB. The inner
+        // `arguments` JSON keeps the original queue_name as an audit trail.
         if let Some(force_q) = self.worker.ctx.force_override_queue.as_deref() {
             obj.queue_name = force_q.to_string();
             debug!("Job queue forced to '{}' by override", obj.queue_name);
