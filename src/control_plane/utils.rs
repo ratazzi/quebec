@@ -331,6 +331,10 @@ impl ControlPlane {
         context.insert("db_info", &db_info);
         context.insert("version", env!("CARGO_PKG_VERSION"));
         context.insert("base_path", &self.base_path);
+        // Surface the QUEBEC_FORCE_OVERRIDE_QUEUE setting so the layout can
+        // render a badge — operators on a shared dev DB need to see at a
+        // glance which queue this process is pinned to.
+        context.insert("force_override_queue", &self.ctx.force_override_queue);
 
         // Add navigation stats
         if let Err(e) = self.populate_nav_stats(context).await {

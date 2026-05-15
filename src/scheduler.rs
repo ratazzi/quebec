@@ -176,6 +176,10 @@ where
 
     // Step 1: Create the job first
     // Queue/priority precedence: YAML entry > class attribute > default.
+    // The original queue name is what we serialize into the `arguments`
+    // payload (audit trail); `routed_queue_name` below applies
+    // QUEBEC_FORCE_OVERRIDE_QUEUE for the persisted column and NOTIFY,
+    // matching the single/bulk enqueue paths.
     let defaults = ctx.get_runnable_defaults(&entry.class);
     let queue_name = entry
         .queue
@@ -232,6 +236,12 @@ where
     #[cfg(not(feature = "python"))]
     let concurrency_constraint: Option<crate::context::ConcurrencyConstraint> = None;
 
+    // QUEBEC_FORCE_OVERRIDE_QUEUE — applied after the `arguments` JSON was
+    // built so the payload keeps the original queue_name (audit trail) while
+    // the DB column / NOTIFY / enqueue hooks see the overridden value. Matches
+    // single/bulk; hooks must observe the value that will actually be routed.
+    let routed_queue_name = ctx.force_override_queue.as_deref().unwrap_or(queue_name);
+
     // Call enqueue hooks if overridden (before/around/after)
     #[cfg(feature = "python")]
     let hooks = ctx.get_hook_flags(&entry.class);
@@ -257,7 +267,7 @@ where
                         .map_err(|e| DbErr::Custom(format!("Failed to create instance: {e}")))?;
                     if let Ok(cell) = instance.cast::<crate::types::ActiveJob>() {
                         let mut inner = cell.borrow_mut();
-                        inner.queue_name = queue_name.to_string();
+                        inner.queue_name = routed_queue_name.to_string();
                         inner.arguments = params.to_string();
                         inner.active_job_id = task_key.clone();
                         inner.priority = priority;
@@ -325,7 +335,7 @@ where
             let job = query_builder::jobs::insert_returning(
                 db,
                 &ctx.table_config,
-                queue_name,
+                routed_queue_name,
                 &entry.class,
                 Some(params.to_string()).as_deref(),
                 priority,
