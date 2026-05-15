@@ -273,6 +273,25 @@ impl DiscardStrategy {
     }
 }
 
+/// Replace characters that would break downstream consumers if they ended up
+/// inside a queue name. Primary motivation is the control-plane router which
+/// uses queue_name as an `:name` path segment (anything with `/` would 404),
+/// but space / `?` / `#` / `%` / control chars are also URL-hostile and worth
+/// neutralising. Returns the cleaned string and a flag indicating whether any
+/// substitution happened so callers can warn the operator once.
+pub(crate) fn sanitize_queue_name(raw: &str) -> (String, bool) {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '?' | '#' | '%' => '-',
+            c if c.is_whitespace() || c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    let changed = cleaned != raw;
+    (cleaned, changed)
+}
+
 #[derive(Debug)]
 pub struct AppContext {
     pub cwd: std::path::PathBuf,
@@ -556,7 +575,15 @@ impl AppContext {
                         ctx.force_override_queue = if trimmed.is_empty() {
                             None
                         } else {
-                            Some(trimmed.to_string())
+                            let (cleaned, changed) = sanitize_queue_name(trimmed);
+                            if changed {
+                                warn!(
+                                    "force_override_queue='{}' sanitized to '{}' \
+                                     (URL-hostile characters replaced with '-')",
+                                    trimmed, cleaned
+                                );
+                            }
+                            Some(cleaned)
                         };
                     }
                     Err(_) => warn!(
@@ -614,7 +641,18 @@ impl AppContext {
             force_override_queue: std::env::var("QUEBEC_FORCE_OVERRIDE_QUEUE")
                 .ok()
                 .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+                .filter(|s| !s.is_empty())
+                .map(|raw| {
+                    let (cleaned, changed) = sanitize_queue_name(&raw);
+                    if changed {
+                        warn!(
+                            "QUEBEC_FORCE_OVERRIDE_QUEUE='{}' sanitized to '{}' \
+                             (URL-hostile characters replaced with '-')",
+                            raw, cleaned
+                        );
+                    }
+                    cleaned
+                }),
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
