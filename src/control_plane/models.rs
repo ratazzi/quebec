@@ -3,8 +3,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 pub struct QueueInfo {
     pub name: String,
+    /// HTML-id-safe version of `name` used as the anchor for turbo-stream
+    /// updates. Non `[A-Za-z0-9_-]` characters are replaced with `_`.
+    pub slug: String,
     pub jobs_count: i64,
     pub status: String,
+}
+
+/// Sanitize a queue name into an HTML-id-safe slug. Used to anchor
+/// per-queue turbo-stream targets (`queue-count-{slug}`, `queue-status-{slug}`).
+/// Collisions are theoretically possible if two queue names differ only in
+/// disallowed characters; current quebec callers use alphanumeric+underscore
+/// names so this is a non-issue in practice.
+pub fn queue_slug(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]

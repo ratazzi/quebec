@@ -1275,6 +1275,44 @@ pub mod ready_executions {
         execute_count(db, query).await
     }
 
+    /// Count ready executions grouped by queue name. Returns a map of
+    /// queue_name -> count for every queue that currently has at least one
+    /// ready execution. Queues with zero ready jobs are not present in the
+    /// result — callers that need a complete enumeration must merge against
+    /// their own list of known queue names.
+    pub async fn count_by_queue<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<std::collections::HashMap<String, i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .column(col("queue_name"))
+            .expr_as(Expr::col(col("queue_name")).count(), Alias::new("count"))
+            .from(table)
+            .group_by_col(col("queue_name"))
+            .to_owned();
+
+        let (sql, values) = match db.get_database_backend() {
+            DbBackend::Postgres => query.build(PostgresQueryBuilder),
+            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
+            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        };
+
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        let rows = db.query_all(stmt).await?;
+
+        let mut out = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "queue_name").unwrap_or_default();
+            let count: i64 = row.try_get("", "count").unwrap_or_default();
+            out.insert(name, count);
+        }
+        Ok(out)
+    }
+
     /// Get the oldest ready execution's created_at for pending latency calculation
     pub async fn oldest_created_at<C>(
         db: &C,
