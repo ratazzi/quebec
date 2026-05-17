@@ -102,8 +102,16 @@ impl ControlPlane {
                 as i64;
 
         // Count failed jobs
-        let failed_count =
-            query_builder::failed_executions::count_all(db, table_config, None, None).await? as i64;
+        let failed_count = query_builder::failed_executions::count_all(
+            db,
+            table_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await? as i64;
 
         // Count blocked jobs
         let blocked_count =

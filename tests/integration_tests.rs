@@ -40,7 +40,7 @@ mod schema {
             0
         );
         assert_eq!(
-            query_builder::failed_executions::count_all(&db, &tc, None, None)
+            query_builder::failed_executions::count_all(&db, &tc, None, None, None, None, None)
                 .await
                 .unwrap(),
             0
@@ -637,7 +637,7 @@ mod failed_executions {
         assert_eq!(found.error.as_deref(), Some("something broke"));
 
         assert_eq!(
-            query_builder::failed_executions::count_all(&db, &tc, None, None)
+            query_builder::failed_executions::count_all(&db, &tc, None, None, None, None, None)
                 .await
                 .unwrap(),
             1
@@ -647,7 +647,7 @@ mod failed_executions {
             .await
             .unwrap();
         assert_eq!(
-            query_builder::failed_executions::count_all(&db, &tc, None, None)
+            query_builder::failed_executions::count_all(&db, &tc, None, None, None, None, None)
                 .await
                 .unwrap(),
             0
@@ -1115,7 +1115,7 @@ mod lifecycle {
         // executions count is stored in arguments JSON
         assert_eq!(quebec::utils::get_executions(job.arguments.as_deref()), 1);
         assert_eq!(
-            query_builder::failed_executions::count_all(&db, &tc, None, None)
+            query_builder::failed_executions::count_all(&db, &tc, None, None, None, None, None)
                 .await
                 .unwrap(),
             0

@@ -2106,12 +2106,17 @@ pub mod failed_executions {
         }
     }
 
-    /// Find all failed executions, optionally filtered by class_name/queue_name
+    /// Find all failed executions, optionally filtered by class_name, queue_name,
+    /// creation time range (since/until), and error message pattern.
+    #[allow(clippy::too_many_arguments)]
     pub async fn find_all<C>(
         db: &C,
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<Vec<quebec_failed_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
@@ -2132,7 +2137,8 @@ pub mod failed_executions {
         if need_join {
             query.inner_join(
                 jobs_table.clone(),
-                Expr::col((fe_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+                Expr::col((fe_table.clone(), col("job_id")))
+                    .equals((jobs_table.clone(), col("id"))),
             );
             if let Some(cn) = class_name {
                 query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
@@ -2140,6 +2146,16 @@ pub mod failed_executions {
             if let Some(qn) = queue_name {
                 query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
             }
+        }
+
+        if let Some(ts) = since {
+            query.and_where(Expr::col((fe_table.clone(), col("created_at"))).gte(ts));
+        }
+        if let Some(ts) = until {
+            query.and_where(Expr::col((fe_table.clone(), col("created_at"))).lte(ts));
+        }
+        if let Some(pat) = error_like {
+            query.and_where(Expr::col((fe_table, col("error"))).like(pat));
         }
 
         execute_select(db, query.to_owned()).await
@@ -2203,12 +2219,17 @@ pub mod failed_executions {
         execute_delete(db, query).await
     }
 
-    /// Count failed executions, optionally filtered by class_name/queue_name
+    /// Count failed executions, optionally filtered by class_name, queue_name,
+    /// creation time range (since/until), and error message pattern.
+    #[allow(clippy::too_many_arguments)]
     pub async fn count_all<C>(
         db: &C,
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr>
     where
         C: ConnectionTrait,
@@ -2224,7 +2245,8 @@ pub mod failed_executions {
         if need_join {
             query.inner_join(
                 jobs_table.clone(),
-                Expr::col((fe_table, col("job_id"))).equals((jobs_table.clone(), col("id"))),
+                Expr::col((fe_table.clone(), col("job_id")))
+                    .equals((jobs_table.clone(), col("id"))),
             );
             if let Some(cn) = class_name {
                 query.and_where(Expr::col((jobs_table.clone(), col("class_name"))).eq(cn));
@@ -2232,6 +2254,16 @@ pub mod failed_executions {
             if let Some(qn) = queue_name {
                 query.and_where(Expr::col((jobs_table, col("queue_name"))).eq(qn));
             }
+        }
+
+        if let Some(ts) = since {
+            query.and_where(Expr::col((fe_table.clone(), col("created_at"))).gte(ts));
+        }
+        if let Some(ts) = until {
+            query.and_where(Expr::col((fe_table.clone(), col("created_at"))).lte(ts));
+        }
+        if let Some(pat) = error_like {
+            query.and_where(Expr::col((fe_table, col("error"))).like(pat));
         }
 
         let query = query.to_owned();

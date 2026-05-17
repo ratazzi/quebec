@@ -101,9 +101,17 @@ impl ControlPlane {
         let blocked = query_builder::blocked_executions::count_all(db, table_config, None, None)
             .await
             .map_err(map_err)?;
-        let failed = query_builder::failed_executions::count_all(db, table_config, None, None)
-            .await
-            .map_err(map_err)?;
+        let failed = query_builder::failed_executions::count_all(
+            db,
+            table_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(map_err)?;
 
         // Status determination
         // "unavailable" only when workers exist but all are dead, or no processes at all
