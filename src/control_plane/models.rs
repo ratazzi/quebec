@@ -10,21 +10,35 @@ pub struct QueueInfo {
     pub status: String,
 }
 
-/// Sanitize a queue name into an HTML-id-safe slug. Used to anchor
-/// per-queue turbo-stream targets (`queue-count-{slug}`, `queue-status-{slug}`).
-/// Collisions are theoretically possible if two queue names differ only in
-/// disallowed characters; current quebec callers use alphanumeric+underscore
-/// names so this is a non-issue in practice.
+/// Encode a queue name into an HTML-id-safe slug with **no collisions**.
+/// Used to anchor per-queue turbo-stream targets (`queue-count-{slug}`,
+/// `queue-status-{slug}`).
+///
+/// Standard URL percent-encoding semantics, byte-by-byte: `[A-Za-z0-9_-]`
+/// pass through unchanged, everything else becomes `%HH` (uppercase hex of
+/// the UTF-8 byte). Guarantees a one-to-one mapping — a naive "replace
+/// with `_`" strategy would collapse `a.b`, `a/b`, `a b` onto the same DOM
+/// element and silently freeze all but the first one's live counter.
+///
+/// `%` in an HTML `id` attribute is legal; turbo-stream `target=` looks the
+/// element up via `document.getElementById`, which doesn't need CSS-style
+/// escaping.
+///
+/// Examples:
+///   * `"auto"`           → `"auto"`
+///   * `"a.b"`            → `"a%2Eb"`
+///   * `"a/b"`            → `"a%2Fb"`
+///   * `"中"`             → `"%E4%B8%AD"`
 pub fn queue_slug(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize)]
