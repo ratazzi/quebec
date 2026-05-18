@@ -16,13 +16,18 @@ pub trait Retryable {
     ) -> Result<(), DbErr>;
 
     /// Retry all failed jobs by moving them from failed_executions to ready_executions.
-    /// When `class_name` or `queue_name` is provided, only matching jobs are retried.
+    /// Optional filters: `class_name`, `queue_name`, `since`/`until` (failed_executions.created_at
+    /// range), and `error_like` (SQL LIKE pattern against the stored error message).
+    #[allow(clippy::too_many_arguments)]
     async fn retry_all(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr>;
 }
 
@@ -36,13 +41,18 @@ pub trait Discardable {
     ) -> Result<(), DbErr>;
 
     /// Discard all failed jobs by removing them from failed_executions and marking the jobs as finished.
-    /// When `class_name` or `queue_name` is provided, only matching jobs are discarded.
+    /// Optional filters: `class_name`, `queue_name`, `since`/`until` (failed_executions.created_at
+    /// range), and `error_like` (SQL LIKE pattern against the stored error message).
+    #[allow(clippy::too_many_arguments)]
     async fn discard_all(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr>;
 }
 
@@ -119,11 +129,21 @@ impl Retryable for Model {
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
-        let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
-                .await?;
+        let failed_executions = query_builder::failed_executions::find_all(
+            txn,
+            table_config,
+            class_name,
+            queue_name,
+            since,
+            until,
+            error_like,
+        )
+        .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -192,11 +212,21 @@ impl Discardable for Model {
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
-        let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
-                .await?;
+        let failed_executions = query_builder::failed_executions::find_all(
+            txn,
+            table_config,
+            class_name,
+            queue_name,
+            since,
+            until,
+            error_like,
+        )
+        .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -240,11 +270,21 @@ impl Retryable for Entity {
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
-        let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
-                .await?;
+        let failed_executions = query_builder::failed_executions::find_all(
+            txn,
+            table_config,
+            class_name,
+            queue_name,
+            since,
+            until,
+            error_like,
+        )
+        .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);
@@ -298,11 +338,21 @@ impl Discardable for Entity {
         table_config: &TableConfig,
         class_name: Option<&str>,
         queue_name: Option<&str>,
+        since: Option<chrono::NaiveDateTime>,
+        until: Option<chrono::NaiveDateTime>,
+        error_like: Option<&str>,
     ) -> Result<u64, DbErr> {
         // 1. Get all failed job records
-        let failed_executions =
-            query_builder::failed_executions::find_all(txn, table_config, class_name, queue_name)
-                .await?;
+        let failed_executions = query_builder::failed_executions::find_all(
+            txn,
+            table_config,
+            class_name,
+            queue_name,
+            since,
+            until,
+            error_like,
+        )
+        .await?;
 
         if failed_executions.is_empty() {
             return Ok(0);

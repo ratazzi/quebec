@@ -88,12 +88,17 @@ impl ControlPlane {
         // Get total count of failed jobs for pagination calculation
         let start = Instant::now();
 
-        // Execute count query using query_builder (with same filters)
+        // Execute count query using query_builder (with same filters).
+        // The since/until/error_like filters are only used by the bulk
+        // retry/discard endpoints — the list view ignores them.
         let total_count: u64 = query_builder::failed_executions::count_all(
             db,
             table_config,
             pagination.class_name.as_deref(),
             pagination.queue_name.as_deref(),
+            None,
+            None,
+            None,
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -245,6 +250,11 @@ impl ControlPlane {
         Query(pagination): Query<Pagination>,
         headers: HeaderMap,
     ) -> Response {
+        let (since, until) = match parse_time_bounds(&pagination) {
+            Ok(v) => v,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        };
+
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
             Err(_) => return Self::error_response(),
@@ -254,6 +264,7 @@ impl ControlPlane {
         let redirect = Self::referer_without_page_or(&headers, "/failed-jobs");
         let class_name = pagination.class_name.clone();
         let queue_name = pagination.queue_name.clone();
+        let error_like = pagination.error_like.clone();
 
         match db
             .transaction::<_, u64, DbErr>(|txn| {
@@ -264,6 +275,9 @@ impl ControlPlane {
                             &table_config,
                             class_name.as_deref(),
                             queue_name.as_deref(),
+                            since,
+                            until,
+                            error_like.as_deref(),
                         )
                         .await?;
                     Ok(count)
@@ -288,6 +302,11 @@ impl ControlPlane {
         Query(pagination): Query<Pagination>,
         headers: HeaderMap,
     ) -> Response {
+        let (since, until) = match parse_time_bounds(&pagination) {
+            Ok(v) => v,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        };
+
         let db = match state.ctx.get_db().await {
             Ok(db) => db,
             Err(_) => return Self::error_response(),
@@ -297,6 +316,7 @@ impl ControlPlane {
         let redirect = Self::referer_without_page_or(&headers, "/failed-jobs");
         let class_name = pagination.class_name.clone();
         let queue_name = pagination.queue_name.clone();
+        let error_like = pagination.error_like.clone();
 
         match db
             .transaction::<_, u64, DbErr>(|txn| {
@@ -307,6 +327,9 @@ impl ControlPlane {
                             &table_config,
                             class_name.as_deref(),
                             queue_name.as_deref(),
+                            since,
+                            until,
+                            error_like.as_deref(),
                         )
                         .await?;
                     Ok(count)
@@ -324,4 +347,36 @@ impl ControlPlane {
             }
         }
     }
+}
+
+/// Parse the optional `since` / `until` query strings into `NaiveDateTime`.
+/// Accepted formats: RFC 3339 with timezone (`2026-05-17T12:00:00Z`),
+/// naive ISO (`2026-05-17T12:00:00`), or `YYYY-MM-DD HH:MM:SS`. RFC 3339
+/// values are normalized to UTC before being stripped of the offset, matching
+/// how `created_at` is stored in the DB.
+fn parse_time_bounds(
+    pagination: &Pagination,
+) -> Result<(Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>), String> {
+    let parse = |raw: &str| -> Result<chrono::NaiveDateTime, String> {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+            return Ok(dt.naive_utc());
+        }
+        chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
+            .map_err(|e| format!("invalid timestamp '{raw}': {e}"))
+    };
+
+    let since = pagination
+        .since
+        .as_deref()
+        .map(parse)
+        .transpose()
+        .map_err(|e| format!("since: {e}"))?;
+    let until = pagination
+        .until
+        .as_deref()
+        .map(parse)
+        .transpose()
+        .map_err(|e| format!("until: {e}"))?;
+    Ok((since, until))
 }

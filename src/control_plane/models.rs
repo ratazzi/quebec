@@ -27,6 +27,17 @@ pub struct Pagination {
     pub class_name: Option<String>,
     pub queue_name: Option<String>,
     pub status: Option<String>,
+    /// Lower bound on `failed_executions.created_at`. Accepted as a
+    /// chrono-parseable ISO 8601 / RFC 3339-ish string; handlers reject
+    /// unparseable input with 400. Currently only honoured by the
+    /// /failed-jobs/all/retry and /failed-jobs/all/delete endpoints.
+    pub since: Option<String>,
+    /// Upper bound on `failed_executions.created_at`. See `since`.
+    pub until: Option<String>,
+    /// SQL `LIKE` pattern matched against the stored error message
+    /// (e.g. `Process+crashed%`). Currently only honoured by the
+    /// /failed-jobs/all/retry and /failed-jobs/all/delete endpoints.
+    pub error_like: Option<String>,
 }
 
 fn default_page() -> u64 {
