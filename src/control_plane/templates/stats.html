@@ -28,3 +28,22 @@
     <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ finished_jobs_count }}</span>
   </template>
 </turbo-stream>
+
+{# Per-queue live counters. Anchored to id="queue-count-{slug}" and
+   id="queue-status-{slug}" in queues.html. The queues page is the only one
+   that renders these anchors; on other pages the targets simply don't exist
+   and Turbo silently no-ops, so this loop is cheap to ship unconditionally. #}
+{% for q in queue_counts %}
+<turbo-stream action="update" target="queue-count-{{ q.slug }}">
+  <template>
+    <div class="text-sm text-gray-900">{{ q.jobs_count }}</div>
+  </template>
+</turbo-stream>
+<turbo-stream action="update" target="queue-status-{{ q.slug }}">
+  <template>
+    <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full {% if q.status == 'active' %}bg-green-100 text-green-800{% else %}bg-yellow-100 text-yellow-800{% endif %}">
+      {{ q.status | title }}
+    </span>
+  </template>
+</turbo-stream>
+{% endfor %}

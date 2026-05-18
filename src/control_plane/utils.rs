@@ -8,6 +8,7 @@ use tera::Context;
 use tracing::{debug, error, info};
 use url::Url;
 
+use crate::control_plane::models::{queue_slug, QueueInfo};
 use crate::query_builder;
 
 use super::{templates, ControlPlane};
@@ -138,6 +139,32 @@ impl ControlPlane {
         let finished_count =
             query_builder::jobs::count_finished(db, table_config, None, None).await? as i64;
         context.insert("finished_jobs_count", &finished_count);
+
+        // Per-queue ready-execution counts + paused-state snapshot, so the
+        // /stats turbo-stream can update each row of the queues table in sync
+        // with the top nav counters. Two extra queries (one GROUP BY on the
+        // ready table, one full table read of pauses) — both cheap because the
+        // working sets are small by design.
+        let queue_counts_map =
+            query_builder::ready_executions::count_by_queue(db, table_config).await?;
+        let paused_queue_names =
+            query_builder::pauses::find_all_queue_names(db, table_config).await?;
+        let all_queue_names = query_builder::jobs::get_queue_names(db, table_config).await?;
+
+        let queue_counts: Vec<QueueInfo> = all_queue_names
+            .into_iter()
+            .map(|name| QueueInfo {
+                slug: queue_slug(&name),
+                jobs_count: *queue_counts_map.get(&name).unwrap_or(&0),
+                status: if paused_queue_names.contains(&name) {
+                    "paused".to_string()
+                } else {
+                    "active".to_string()
+                },
+                name,
+            })
+            .collect();
+        context.insert("queue_counts", &queue_counts);
 
         Ok(())
     }

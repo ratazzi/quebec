@@ -529,14 +529,21 @@
             this.fetchSnapshot()
             this.startPolling()
           } else {
-            // SSE's first tick fires immediately on connect — no explicit
-            // snapshot needed, and skipping it avoids a render race where
-            // a stale fetch response could overwrite fresher SSE data.
+            // SSE's first tick fires immediately on connect — but proxies or
+            // a slow first DB roundtrip can still delay it. Pull a snapshot
+            // now and let SSE overwrite once it catches up.
+            this.fetchSnapshot()
             this.startSSE()
           }
         }
         document.addEventListener("visibilitychange", this._onVisibility)
-        if (!document.hidden) this.startSSE()
+        if (!document.hidden) {
+          // Eager snapshot on first paint: even though the page is SSR'd
+          // with current counts, the data may have drifted between server
+          // render and browser parse. SSE/polling will refresh again shortly.
+          this.fetchSnapshot()
+          this.startSSE()
+        }
       }
 
       async fetchSnapshot() {
@@ -564,6 +571,9 @@
           if (!received) {
             this.stopSSE()
             this._usePolling = true
+            // setInterval waits a full interval before its first callback,
+            // so fetch immediately to avoid a multi-second blank window.
+            this.fetchSnapshot()
             this.startPolling()
           }
         }
@@ -619,22 +629,22 @@
           </a>
 
           <a href="{{ base_path }}/failed-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            Failed jobs <span id="failed-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+            Failed jobs <span id="failed-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ nav_failed_jobs | default(value=0) }}</span>
           </a>
           <a href="{{ base_path }}/in-progress-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            In Progress jobs <span id="in-progress-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+            In Progress jobs <span id="in-progress-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ nav_in_progress_jobs | default(value=0) }}</span>
           </a>
           <a href="{{ base_path }}/blocked-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            Blocked jobs <span id="blocked-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+            Blocked jobs <span id="blocked-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ nav_blocked_jobs | default(value=0) }}</span>
           </a>
           <a href="{{ base_path }}/scheduled-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            Scheduled jobs <span id="scheduled-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+            Scheduled jobs <span id="scheduled-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ nav_scheduled_jobs | default(value=0) }}</span>
           </a>
           <a href="{{ base_path }}/recurring-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Recurring jobs
           </a>
           <a href="{{ base_path }}/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">0</span>
+            Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ finished_jobs_count | default(value=0) }}</span>
           </a>
 
           <a href="{{ base_path }}/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">

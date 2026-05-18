@@ -13,7 +13,7 @@ use std::time::Instant;
 use tracing::{debug, error};
 
 use crate::control_plane::{
-    models::{Pagination, QueueInfo},
+    models::{queue_slug, Pagination, QueueInfo},
     ControlPlane,
 };
 use crate::query_builder;
@@ -42,39 +42,11 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let table_config = &state.ctx.table_config;
-        let ready_table = Alias::new(&table_config.ready_executions);
 
         // Count only ready executions per queue (matching Solid Queue's Queue#size)
-        let query = SeaQuery::select()
-            .column(Alias::new("queue_name"))
-            .expr_as(
-                Expr::col(Alias::new("queue_name")).count(),
-                Alias::new("count"),
-            )
-            .from(ready_table)
-            .group_by_col(Alias::new("queue_name"))
-            .to_owned();
-
-        let (sql, values) = match db.get_database_backend() {
-            DbBackend::Postgres => query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-            DbBackend::MySql => query.build(MysqlQueryBuilder),
-        };
-
-        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-
-        // Get queue counts with unfinished jobs
-        let queue_counts_map: HashMap<String, i64> = db
-            .query_all(stmt)
+        let queue_counts_map = query_builder::ready_executions::count_by_queue(db, table_config)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .into_iter()
-            .map(|row| {
-                let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
-                let count: i64 = row.try_get("", "count").unwrap_or_default();
-                (queue_name, count)
-            })
-            .collect();
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Ensure all queues are included in results, even if they have no unfinished jobs
         let queue_counts: Vec<(String, i64)> = all_queue_names
@@ -102,13 +74,14 @@ impl ControlPlane {
         let queue_infos: Vec<QueueInfo> = queue_counts
             .into_iter()
             .map(|(name, count)| QueueInfo {
-                name: name.clone(),
-                jobs_count: count,
+                slug: queue_slug(&name),
                 status: if paused_queue_names.contains(&name) {
                     "paused".to_string()
                 } else {
                     "active".to_string()
                 },
+                name,
+                jobs_count: count,
             })
             .filter(|queue| {
                 // Apply status filter if provided

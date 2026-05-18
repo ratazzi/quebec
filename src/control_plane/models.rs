@@ -3,8 +3,42 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize)]
 pub struct QueueInfo {
     pub name: String,
+    /// HTML-id-safe version of `name` used as the anchor for turbo-stream
+    /// updates. Non `[A-Za-z0-9_-]` characters are replaced with `_`.
+    pub slug: String,
     pub jobs_count: i64,
     pub status: String,
+}
+
+/// Encode a queue name into an HTML-id-safe slug with **no collisions**.
+/// Used to anchor per-queue turbo-stream targets (`queue-count-{slug}`,
+/// `queue-status-{slug}`).
+///
+/// Standard URL percent-encoding semantics, byte-by-byte: `[A-Za-z0-9_-]`
+/// pass through unchanged, everything else becomes `%HH` (uppercase hex of
+/// the UTF-8 byte). Guarantees a one-to-one mapping — a naive "replace
+/// with `_`" strategy would collapse `a.b`, `a/b`, `a b` onto the same DOM
+/// element and silently freeze all but the first one's live counter.
+///
+/// `%` in an HTML `id` attribute is legal; turbo-stream `target=` looks the
+/// element up via `document.getElementById`, which doesn't need CSS-style
+/// escaping.
+///
+/// Examples:
+///   * `"auto"`           → `"auto"`
+///   * `"a.b"`            → `"a%2Eb"`
+///   * `"a/b"`            → `"a%2Fb"`
+///   * `"中"`             → `"%E4%B8%AD"`
+pub fn queue_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Serialize)]
