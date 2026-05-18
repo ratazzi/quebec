@@ -2244,9 +2244,14 @@ impl Worker {
             let process_id = process.id;
             let process_pid = process.pid;
             let process_hostname = process.hostname.clone();
-            let error_msg = format!(
-                "Worker process {process_id} (pid={process_pid}, host={process_hostname:?}) stopped responding"
-            );
+            let error_msg = serde_json::json!({
+                "exception_class": "ProcessPrunedError",
+                "message": format!(
+                    "Worker process {process_id} (pid={process_pid}, host={process_hostname:?}) stopped responding"
+                ),
+                "backtrace": Vec::<String>::new(),
+            })
+            .to_string();
 
             let ctx = self.ctx.clone();
             let tc = table_config.clone();
