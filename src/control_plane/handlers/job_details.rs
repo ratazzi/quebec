@@ -343,8 +343,24 @@ impl ControlPlane {
             // Format arguments for display
             job_details.arguments = Self::parse_arguments(&job_details.arguments);
 
+            // Surface arguments.exception_executions (class → retry count) so the
+            // template can list it. ActiveJob doesn't persist message/backtrace
+            // for retried exceptions; this map is the only signal that survives.
+            let exception_executions: Option<serde_json::Map<String, serde_json::Value>> =
+                serde_json::from_str::<serde_json::Value>(&job_details.arguments)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("exception_executions")
+                            .and_then(|m| m.as_object())
+                            .cloned()
+                    })
+                    .filter(|m| !m.is_empty());
+
             let mut context = tera::Context::new();
             context.insert("job", &job_details);
+            if let Some(map) = &exception_executions {
+                context.insert("exception_executions", map);
+            }
             context.insert(
                 "active_page",
                 match status.as_str() {

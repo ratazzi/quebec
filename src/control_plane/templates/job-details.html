@@ -197,8 +197,18 @@
             {% endif %}
           </div>
           {% endfor %}
-          {% else %}
+          {% elif not exception_executions %}
           <div class="p-4 text-sm text-gray-500">No execution history available.</div>
+          {% endif %}
+          {% if exception_executions %}
+          <div class="p-4">
+            <div class="text-xs font-medium text-gray-700 mb-2">exception_executions</div>
+            <div class="space-y-1 text-sm">
+              {% for class_name, count in exception_executions %}
+              <div><span class="font-mono text-gray-900">{{ class_name }}</span>: {{ count }}</div>
+              {% endfor %}
+            </div>
+          </div>
           {% endif %}
         </div>
       </div>
