@@ -198,15 +198,21 @@ impl Runnable {
             // Call the concurrency_key method with the job arguments
             let result = concurrency_key_attr.call(py_args.bind(py), Some(&py_kwargs.bind(py)))?;
 
-            // Check if the result is None or empty string - if so, no concurrency control
-            if result.is_none() {
-                return Ok(None);
-            }
-
-            let raw_key = result.extract::<String>()?;
-            if raw_key.is_empty() {
-                return Ok(None);
-            }
+            // Mirror Solid Queue's `[group, key].compact.join("/")` semantics:
+            // when the user's `concurrency_key` returns None or empty string,
+            // fall back to a group-only key instead of silently dropping
+            // concurrency control. `warn!` so users who forgot `return` (Python
+            // default-returns None) discover the misconfiguration via logs.
+            let raw_key = if result.is_none() {
+                None
+            } else {
+                let s = result.extract::<String>()?;
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            };
 
             // Get concurrency_group (defaults to class name)
             let concurrency_group = if instance.hasattr("concurrency_group")? {
@@ -215,8 +221,20 @@ impl Runnable {
                 self.class_name.clone()
             };
 
-            // Build final concurrency_key as "group/key"
-            let key = format!("{concurrency_group}/{raw_key}");
+            // Build final concurrency_key — "group/key" when key is non-empty,
+            // otherwise group-only (matches Solid Queue's behaviour).
+            let key = match &raw_key {
+                Some(k) => format!("{concurrency_group}/{k}"),
+                None => {
+                    warn!(
+                        class = self.class_name,
+                        "concurrency_key returned None or empty string; falling back to \
+                         group-only key '{concurrency_group}'. Implement the method to \
+                         return a non-empty per-instance string for proper isolation."
+                    );
+                    concurrency_group.clone()
+                }
+            };
 
             // Return explicit limit or default to 1 (per Solid Queue spec)
             let limit = self.concurrency_limit.unwrap_or(1);
@@ -1787,6 +1805,25 @@ impl Worker {
                     .unwrap_or(false))
             })()
             .unwrap_or(false);
+
+            // Solid Queue's `limits_concurrency key:` is a mandatory keyword;
+            // matching that intent: if the user set concurrency_limit or
+            // concurrency_duration but the class exposes no concurrency_key,
+            // refuse to register rather than silently dropping the controls.
+            // concurrency_on_conflict is intentionally NOT part of the trigger
+            // because its default (Block) can't be distinguished from "user
+            // explicitly chose Block".
+            if !has_concurrency_control
+                && (concurrency_limit.is_some() || concurrency_duration.is_some())
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{class_name}: concurrency_limit/duration is set but \
+                     `concurrency_key` is missing — concurrency control would silently \
+                     not apply. Define `def concurrency_key(self, *args, **kwargs) -> str:` \
+                     (returning a non-empty key) or remove the concurrency_limit / \
+                     concurrency_duration attributes."
+                )));
+            }
 
             let module_path = bound
                 .getattr("__module__")
