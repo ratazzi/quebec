@@ -134,6 +134,22 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Stream-level extras: live resource data that the /stats turbo-stream
+    /// broadcasts on top of `populate_nav_stats`. Explicitly invoked only by
+    /// the `/stats` handler and the `/events` SSE loop — page handlers that
+    /// just need their own resource (e.g. /workers) should query it
+    /// themselves, so that a failure in this broader live-data computation
+    /// doesn't take down individual page renders.
+    ///
+    /// Keeping this separate also means errors here surface in a single
+    /// place (the stream loop / poll handler), not deep inside
+    /// `render_template`.
+    pub async fn populate_stream_extras(&self, context: &mut Context) -> Result<(), DbErr> {
+        let workers_info = self.fetch_workers_info().await?;
+        context.insert("workers", &workers_info);
+        Ok(())
+    }
+
     /// Check if a queue is paused using query_builder
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
         let db = self.ctx.get_db().await?;

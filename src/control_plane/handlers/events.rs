@@ -25,12 +25,15 @@ impl ControlPlane {
                     }
                 }
 
+                // Nav stats are added implicitly by render_template. Stream
+                // extras (workers, ...) are this loop's explicit
+                // responsibility: failure here skips a tick rather than
+                // blowing up unrelated page renders elsewhere.
                 let mut context = tera::Context::new();
-                if let Err(e) = state.populate_nav_stats(&mut context).await {
-                    debug!("SSE stats error: {}", e);
+                if let Err(e) = state.populate_stream_extras(&mut context).await {
+                    debug!("SSE stream extras error: {}", e);
                     continue;
                 }
-
                 match state.render_template("stats.html", &mut context).await {
                     Ok(html) => {
                         yield Ok(Event::default().event("message").data(html));

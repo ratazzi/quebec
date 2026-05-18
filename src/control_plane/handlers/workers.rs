@@ -11,42 +11,32 @@ use crate::control_plane::{models::WorkerInfo, ControlPlane};
 use crate::query_builder;
 
 impl ControlPlane {
-    pub async fn workers(
-        State(state): State<Arc<ControlPlane>>,
-    ) -> Result<Html<String>, (StatusCode, String)> {
+    /// Query and assemble the live worker list. Shared between the full
+    /// `/workers` page render and the `/stats` turbo-stream that drives
+    /// live refresh (SSE in standalone mode, polling fallback under ASGI).
+    pub(crate) async fn fetch_workers_info(&self) -> Result<Vec<WorkerInfo>, sea_orm::DbErr> {
         let start = Instant::now();
-        let db = state
-            .ctx
-            .get_db()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let db = self.ctx.get_db().await?;
         let db = db.as_ref();
-        let table_config = &state.ctx.table_config;
+        let table_config = &self.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // Query all worker processes using query_builder
-        let workers = query_builder::processes::find_all_by_heartbeat(db, table_config)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let workers = query_builder::processes::find_all_by_heartbeat(db, table_config).await?;
 
-        // Calculate time since last heartbeat for each worker
-        let workers_info: Vec<WorkerInfo> = workers
+        let threshold_seconds = self.ctx.process_alive_threshold.as_secs() as i64;
+        let now = chrono::Utc::now().naive_utc();
+
+        Ok(workers
             .into_iter()
             .map(|worker| {
                 let last_heartbeat = worker.last_heartbeat_at;
-                let now = chrono::Utc::now().naive_utc();
-                // Calculate time difference (seconds)
-                let duration = now.signed_duration_since(last_heartbeat);
-                let seconds_since_heartbeat = duration.num_seconds();
-
-                // Use process_alive_threshold from context to determine worker status
-                let threshold_seconds = state.ctx.process_alive_threshold.as_secs() as i64;
+                let seconds_since_heartbeat =
+                    now.signed_duration_since(last_heartbeat).num_seconds();
                 let status = if seconds_since_heartbeat > threshold_seconds {
                     "dead"
                 } else {
                     "alive"
                 };
-
                 let quiet = worker
                     .metadata
                     .as_deref()
@@ -66,7 +56,20 @@ impl ControlPlane {
                     quiet,
                 }
             })
-            .collect();
+            .collect())
+    }
+
+    pub async fn workers(
+        State(state): State<Arc<ControlPlane>>,
+    ) -> Result<Html<String>, (StatusCode, String)> {
+        // Page-context: /workers owns its core data. Querying it here (rather
+        // than via populate_nav_stats) keeps the page robust against nav-stats
+        // failures and surfaces a 5xx from this handler — not from deep inside
+        // render_template — if the processes query itself fails.
+        let workers_info = state
+            .fetch_workers_info()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let mut context = tera::Context::new();
         context.insert("workers", &workers_info);
@@ -83,9 +86,12 @@ impl ControlPlane {
     ) -> Result<impl IntoResponse, (StatusCode, String)> {
         let mut context = tera::Context::new();
 
-        // Use populate_nav_stats method to fill statistics
+        // Stream-context: extras beyond nav stats (workers, ...). Nav stats
+        // are populated implicitly by render_template; here we add the
+        // resource-level live data that stats.html broadcasts as a
+        // turbo-stream.
         state
-            .populate_nav_stats(&mut context)
+            .populate_stream_extras(&mut context)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
