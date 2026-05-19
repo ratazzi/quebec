@@ -1013,9 +1013,21 @@ impl PyQuebec {
             .set_proc_title("worker", Some(&self.ctx.worker_threads.to_string()));
 
         let worker = self.worker.clone();
-        let _ = self.rt.spawn(async move {
+        // Track the handle in self.handles so graceful_shutdown's block_on
+        // actually waits for run_main_loop's `quit.cancelled()` branch to
+        // finish — otherwise release_all_claimed_executions + on_stop race
+        // against process::exit and the process row leaks.
+        let handle = self.rt.spawn(async move {
             let _ = worker.run_main_loop().await;
         });
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
+            .push(handle);
 
         Ok(())
     }
@@ -1024,9 +1036,17 @@ impl PyQuebec {
         self.ctx.set_proc_title("dispatcher", None);
 
         let dispatcher = self.dispatcher.clone();
-        let _ = self.rt.spawn(async move {
+        let handle = self.rt.spawn(async move {
             let _ = dispatcher.run().await;
         });
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
+            .push(handle);
 
         Ok(())
     }
@@ -1035,9 +1055,17 @@ impl PyQuebec {
         self.ctx.set_proc_title("scheduler", None);
 
         let scheduler = self.scheduler.clone();
-        let _ = self.rt.spawn(async move {
+        let handle = self.rt.spawn(async move {
             let _ = scheduler.run().await;
         });
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
+            .push(handle);
 
         Ok(())
     }
