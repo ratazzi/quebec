@@ -2615,6 +2615,330 @@ impl PyQuebec {
             })
         })
     }
+
+    /// Promote a single blocked job back to the ready queue.
+    ///
+    /// Inserts a ready_execution mirroring the blocked row's queue and
+    /// priority, then removes the blocked_execution. This **bypasses the
+    /// concurrency semaphore** — call sites are typically admin recovery
+    /// paths where the user is explicitly overriding the lock; the
+    /// dispatcher's auto-unblock path (`expires_at` sweep) is the one that
+    /// respects the semaphore.
+    ///
+    /// Returns:
+    ///     bool: True if a blocked execution existed and was promoted to
+    ///           ready, False if no blocked execution exists for ``job_id``.
+    fn unblock(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    Box::pin(async move {
+                        let blocked = crate::query_builder::blocked_executions::find_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        let Some(blocked) = blocked else {
+                            return Ok(false);
+                        };
+                        crate::query_builder::ready_executions::insert(
+                            txn,
+                            &table_config,
+                            blocked.job_id,
+                            &blocked.queue_name,
+                            blocked.priority,
+                        )
+                        .await?;
+                        crate::query_builder::blocked_executions::delete_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        Ok(true)
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to unblock job {job_id}: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Cancel a blocked job: remove both the blocked_execution and the job
+    /// row entirely.
+    ///
+    /// Mirrors the control-plane ``POST /blocked-jobs/:id/cancel`` action.
+    ///
+    /// Returns:
+    ///     bool: True if a blocked execution existed and was cancelled,
+    ///           False if no blocked execution exists for ``job_id``.
+    fn cancel_blocked(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    Box::pin(async move {
+                        let rows = crate::query_builder::blocked_executions::delete_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        if rows == 0 {
+                            return Ok(false);
+                        }
+                        crate::query_builder::jobs::delete_by_id(txn, &table_config, job_id)
+                            .await?;
+                        Ok(true)
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to cancel blocked job {job_id}: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Bulk promote matching blocked jobs back to the ready queue. All
+    /// filters are optional and combined with AND. Like :func:`unblock`,
+    /// this **bypasses the concurrency semaphore**.
+    ///
+    /// Args:
+    ///     class_name: Match exact class name (e.g. ``"MyJob"``).
+    ///     queue_name: Match exact queue name.
+    ///
+    /// Returns:
+    ///     int: Number of blocked executions promoted to ready.
+    #[pyo3(signature = (class_name=None, queue_name=None))]
+    fn unblock_all(
+        &self,
+        py: Python<'_>,
+        class_name: Option<String>,
+        queue_name: Option<String>,
+    ) -> PyResult<u64> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    let class_name = class_name.clone();
+                    let queue_name = queue_name.clone();
+                    Box::pin(async move {
+                        let rows = crate::query_builder::blocked_executions::find_all_filtered(
+                            txn,
+                            &table_config,
+                            class_name.as_deref(),
+                            queue_name.as_deref(),
+                        )
+                        .await?;
+                        if rows.is_empty() {
+                            return Ok(0);
+                        }
+                        let ready_rows: Vec<(i64, &str, i32)> = rows
+                            .iter()
+                            .map(|m| (m.job_id, m.queue_name.as_str(), m.priority))
+                            .collect();
+                        crate::query_builder::ready_executions::insert_all(
+                            txn,
+                            &table_config,
+                            &ready_rows,
+                        )
+                        .await?;
+                        let mut deleted: u64 = 0;
+                        for blocked in &rows {
+                            deleted += crate::query_builder::blocked_executions::delete_by_id(
+                                txn,
+                                &table_config,
+                                blocked.id,
+                            )
+                            .await?;
+                        }
+                        Ok(deleted)
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to unblock all blocked jobs: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Cancel a scheduled job: mark it finished and remove the
+    /// scheduled_execution row.
+    ///
+    /// Mirrors the control-plane ``POST /scheduled-jobs/:id/cancel`` action.
+    ///
+    /// Returns:
+    ///     bool: True if a scheduled execution existed and was cancelled,
+    ///           False if no scheduled execution exists for ``job_id``.
+    fn cancel_scheduled(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    Box::pin(async move {
+                        let rows = crate::query_builder::scheduled_executions::delete_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        if rows == 0 {
+                            return Ok(false);
+                        }
+                        crate::query_builder::jobs::mark_finished(txn, &table_config, job_id)
+                            .await?;
+                        Ok(true)
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to cancel scheduled job {job_id}: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Enqueue a recurring task immediately, bypassing its cron schedule.
+    ///
+    /// Mirrors the control-plane ``POST /recurring-jobs/:id/run-now`` action,
+    /// but takes the task ``key`` (the schedule's user-facing name) instead
+    /// of the internal row id. Each call uses ``now()`` for the recurring
+    /// run's ``scheduled_at``, so back-to-back calls each enqueue a fresh
+    /// job.
+    ///
+    /// Returns:
+    ///     bool: True if the task was found and a job was enqueued, False if
+    ///           no recurring task exists with that key. (Also False in the
+    ///           rare case where another scheduler claims the same
+    ///           ``(task_key, scheduled_at)`` slot first.)
+    fn run_recurring_now(&self, py: Python<'_>, key: String) -> PyResult<bool> {
+        use crate::context::ScheduledEntry;
+        use crate::scheduler::enqueue_job;
+        use sea_orm::{ConnectionTrait, Statement, Value as DbValue};
+
+        let ctx = self.ctx.clone();
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let db_ref = db.as_ref();
+                let backend = db_ref.get_database_backend();
+                let p1 = match backend {
+                    DbBackend::Postgres => "$1",
+                    DbBackend::MySql | DbBackend::Sqlite => "?",
+                };
+
+                let sql = format!(
+                    "SELECT class_name, queue_name, priority, arguments FROM {} WHERE key = {}",
+                    table_config.recurring_tasks, p1
+                );
+                let row = db_ref
+                    .query_one(Statement::from_sql_and_values(
+                        backend,
+                        &sql,
+                        [DbValue::from(key.clone())],
+                    ))
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to look up recurring task {key}: {e}"
+                        ))
+                    })?;
+
+                let Some(row) = row else {
+                    return Ok(false);
+                };
+
+                let class_name: String = row.try_get("", "class_name").unwrap_or_default();
+                let queue_name: Option<String> = row.try_get("", "queue_name").ok();
+                let priority: Option<i32> = row.try_get("", "priority").ok();
+                let arguments: Option<String> = row.try_get("", "arguments").ok();
+
+                let args = arguments
+                    .as_ref()
+                    .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+                    .map(|v| {
+                        v.into_iter()
+                            .map(|j| serde_yaml::to_value(&j).unwrap_or(serde_yaml::Value::Null))
+                            .collect()
+                    });
+
+                let entry = ScheduledEntry {
+                    key: Some(key.clone()),
+                    class: class_name,
+                    queue: queue_name,
+                    priority,
+                    args,
+                    schedule: String::new(),
+                };
+
+                let now = chrono::Utc::now().naive_utc();
+                let enqueued_queue = db_ref
+                    .transaction::<_, Option<String>, sea_orm::DbErr>(|txn| {
+                        let entry = entry.clone();
+                        let ctx = ctx.clone();
+                        Box::pin(async move { enqueue_job(&ctx, txn, entry, now).await })
+                    })
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to enqueue recurring task {key}: {e}"
+                        ))
+                    })?;
+
+                if let Some(ref queue) = enqueued_queue {
+                    if crate::notify::should_send_notify(&ctx, queue) {
+                        let _ = crate::notify::NotifyManager::send_notify(&ctx.name, db_ref, queue)
+                            .await;
+                    }
+                }
+
+                Ok(enqueued_queue.is_some())
+            })
+        })
+    }
 }
 
 #[pyclass(name = "ActiveJob", subclass, from_py_object)]

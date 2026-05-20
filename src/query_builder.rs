@@ -1850,6 +1850,57 @@ pub mod blocked_executions {
         execute_select(db, query).await
     }
 
+    /// Find a blocked execution by job_id (unique column).
+    pub async fn find_by_job_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_id: i64,
+    ) -> Result<Option<quebec_blocked_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.blocked_executions);
+        let query = Query::select()
+            .column(Asterisk)
+            .from(table)
+            .and_where(Expr::col(col("job_id")).eq(job_id))
+            .to_owned();
+
+        execute_select_one(db, query).await
+    }
+
+    /// Find all blocked executions matching the optional class_name /
+    /// queue_name filters (same predicates as [`delete_all`]).
+    pub async fn find_all_filtered<C>(
+        db: &C,
+        table_config: &TableConfig,
+        class_name: Option<&str>,
+        queue_name: Option<&str>,
+    ) -> Result<Vec<quebec_blocked_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.blocked_executions);
+        let jobs_table = Alias::new(&table_config.jobs);
+        let mut select = Query::select();
+        select.column((table.clone(), Asterisk));
+        select.from(table.clone());
+        if class_name.is_some() {
+            select.inner_join(
+                jobs_table.clone(),
+                Expr::col((table.clone(), col("job_id"))).equals((jobs_table.clone(), col("id"))),
+            );
+            if let Some(cn) = class_name {
+                select.and_where(Expr::col((jobs_table, col("class_name"))).eq(cn));
+            }
+        }
+        if let Some(qn) = queue_name {
+            select.and_where(Expr::col((table, col("queue_name"))).eq(qn));
+        }
+
+        execute_select(db, select).await
+    }
+
     /// Delete a blocked execution by job_id
     pub async fn delete_by_job_id<C>(
         db: &C,
