@@ -2616,6 +2616,219 @@ impl PyQuebec {
         })
     }
 
+    /// Retry a single failed job by moving it back to the ready queue.
+    ///
+    /// Returns:
+    ///     bool: True if the failed execution was found and retried,
+    ///           False if no failed execution exists for ``job_id``.
+    fn retry_failed(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        use crate::entities::quebec_failed_executions::Retryable;
+        let table_config = self.ctx.table_config.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    Box::pin(async move {
+                        let failed = crate::query_builder::failed_executions::find_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        match failed {
+                            Some(model) => {
+                                model.retry(txn, &table_config).await?;
+                                Ok(true)
+                            }
+                            None => Ok(false),
+                        }
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to retry job {job_id}: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Discard a single failed job: mark it finished and remove the failed
+    /// execution row.
+    ///
+    /// Returns:
+    ///     bool: True if the failed execution was found and discarded,
+    ///           False if no failed execution exists for ``job_id``.
+    fn discard_failed(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        use crate::entities::quebec_failed_executions::Discardable;
+        let table_config = self.ctx.table_config.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    Box::pin(async move {
+                        let failed = crate::query_builder::failed_executions::find_by_job_id(
+                            txn,
+                            &table_config,
+                            job_id,
+                        )
+                        .await?;
+                        match failed {
+                            Some(model) => {
+                                model.discard(txn, &table_config).await?;
+                                Ok(true)
+                            }
+                            None => Ok(false),
+                        }
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to discard job {job_id}: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Bulk retry failed jobs matching the given filters. All filters are
+    /// optional and combined with AND.
+    ///
+    /// Args:
+    ///     class_name: Match exact class name (e.g. ``"MyJob"``).
+    ///     queue_name: Match exact queue name.
+    ///     since: Lower bound on ``failed_executions.created_at``, seconds
+    ///            since epoch.
+    ///     until: Upper bound on ``failed_executions.created_at``, seconds
+    ///            since epoch.
+    ///     error_like: SQL ``LIKE`` pattern against the stored error blob
+    ///            (e.g. ``"%TimeoutError%"``).
+    ///
+    /// Returns:
+    ///     int: Number of failed executions retried.
+    #[pyo3(signature = (class_name=None, queue_name=None, since=None, until=None, error_like=None))]
+    fn retry_all_failed(
+        &self,
+        py: Python<'_>,
+        class_name: Option<String>,
+        queue_name: Option<String>,
+        since: Option<f64>,
+        until: Option<f64>,
+        error_like: Option<String>,
+    ) -> PyResult<u64> {
+        use crate::entities::quebec_failed_executions::{
+            Entity as FailedExecutionEntity, Retryable,
+        };
+        let table_config = self.ctx.table_config.clone();
+        let since = parse_optional_timestamp(since, "since")?;
+        let until = parse_optional_timestamp(until, "until")?;
+
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    let class_name = class_name.clone();
+                    let queue_name = queue_name.clone();
+                    let error_like = error_like.clone();
+                    Box::pin(async move {
+                        FailedExecutionEntity
+                            .retry_all(
+                                txn,
+                                &table_config,
+                                class_name.as_deref(),
+                                queue_name.as_deref(),
+                                since,
+                                until,
+                                error_like.as_deref(),
+                            )
+                            .await
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to retry all failed jobs: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Bulk discard failed jobs matching the given filters. Same signature
+    /// as :func:`retry_all_failed`; returns the number of failed executions
+    /// discarded.
+    #[pyo3(signature = (class_name=None, queue_name=None, since=None, until=None, error_like=None))]
+    fn discard_all_failed(
+        &self,
+        py: Python<'_>,
+        class_name: Option<String>,
+        queue_name: Option<String>,
+        since: Option<f64>,
+        until: Option<f64>,
+        error_like: Option<String>,
+    ) -> PyResult<u64> {
+        use crate::entities::quebec_failed_executions::{
+            Discardable, Entity as FailedExecutionEntity,
+        };
+        let table_config = self.ctx.table_config.clone();
+        let since = parse_optional_timestamp(since, "since")?;
+        let until = parse_optional_timestamp(until, "until")?;
+
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
+                    let table_config = table_config.clone();
+                    let class_name = class_name.clone();
+                    let queue_name = queue_name.clone();
+                    let error_like = error_like.clone();
+                    Box::pin(async move {
+                        FailedExecutionEntity
+                            .discard_all(
+                                txn,
+                                &table_config,
+                                class_name.as_deref(),
+                                queue_name.as_deref(),
+                                since,
+                                until,
+                                error_like.as_deref(),
+                            )
+                            .await
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to discard all failed jobs: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
     /// Pause a queue so workers stop claiming jobs from it. Dispatched/ready
     /// rows continue to be produced by the dispatcher; they just won't be
     /// picked up by workers while the queue is paused. Idempotent.
@@ -2803,6 +3016,39 @@ impl PyQuebec {
             })
         })
     }
+}
+
+fn parse_optional_timestamp(
+    ts: Option<f64>,
+    field: &str,
+) -> PyResult<Option<chrono::NaiveDateTime>> {
+    let Some(ts) = ts else {
+        return Ok(None);
+    };
+    if ts.is_nan() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{field} cannot be NaN"
+        )));
+    }
+    if ts.is_infinite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{field} cannot be infinite"
+        )));
+    }
+    // Use floor() so negative fractional timestamps round toward -inf instead
+    // of toward 0. Otherwise -0.5 would land at the epoch instead of half a
+    // second before it, since `as i64` truncates and `as u32` saturates on
+    // negative floats.
+    let floor = ts.floor();
+    let secs = floor as i64;
+    let nsecs = ((ts - floor) * 1_000_000_000.0) as u32;
+    chrono::DateTime::from_timestamp(secs, nsecs)
+        .map(|dt| Some(dt.naive_utc()))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{field}: timestamp {ts} is out of range"
+            ))
+        })
 }
 
 #[pyclass(name = "ActiveJob", subclass, from_py_object)]
