@@ -4,7 +4,8 @@ use crate::error::Result;
 use crate::query_builder;
 use async_trait::async_trait;
 use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -12,6 +13,57 @@ use pyo3::prelude::*;
 #[cfg(feature = "python")]
 use tracing::trace;
 use tracing::{info, warn};
+
+/// Short revision identifier of the process at the time the first call
+/// landed. Currently probed once via `git rev-parse --short HEAD` and cached
+/// for the lifetime of the process; returns ``None`` if git is unavailable,
+/// the cwd is not a git repo, or the command fails. Surfaced in the worker's
+/// heartbeat metadata so the control plane can show which revision each
+/// process is running.
+pub fn process_revision() -> Option<&'static str> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let output = Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let sha = String::from_utf8(output.stdout).ok()?;
+            let trimmed = sha.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .as_deref()
+}
+
+/// Build the JSON metadata blob written to the `processes.metadata` column
+/// each heartbeat. Includes ``revision`` whenever :func:`process_revision`
+/// returns a value, plus ``quiet:true`` when the caller passes ``quiet =
+/// true``. Returns ``None`` when both fields would be absent so the column
+/// stays untouched.
+pub fn build_runtime_metadata(quiet: bool) -> Option<String> {
+    let revision = process_revision();
+    if !quiet && revision.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if quiet {
+        obj.insert("quiet".to_string(), serde_json::Value::Bool(true));
+    }
+    if let Some(s) = revision {
+        obj.insert(
+            "revision".to_string(),
+            serde_json::Value::String(s.to_string()),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(obj)).ok()
+}
 
 #[cfg(feature = "python")]
 pub fn is_running_in_pyo3() -> bool {
@@ -150,11 +202,12 @@ pub trait ProcessTrait: Send + Sync {
         None
     }
 
-    /// Runtime metadata refreshed every heartbeat. Default returns `None`
-    /// (don't touch the metadata column). Override to surface dynamic state
-    /// — e.g. Worker returns `{"quiet":true}` while in quiet mode.
+    /// Runtime metadata refreshed every heartbeat. Default surfaces the
+    /// process's revision (see :func:`process_revision`) when one is
+    /// available; override to merge in role-specific dynamic state — e.g.
+    /// Worker also reports `quiet:true` while in quiet mode.
     fn runtime_metadata(&self) -> Option<String> {
-        None
+        build_runtime_metadata(false)
     }
 
     async fn heartbeat(

@@ -3151,10 +3151,6 @@ impl ProcessTrait for Worker {
     }
 
     fn runtime_metadata(&self) -> Option<String> {
-        if self.ctx.quiet.is_cancelled() {
-            Some(r#"{"quiet":true}"#.to_string())
-        } else {
-            None
-        }
+        crate::process::build_runtime_metadata(self.ctx.quiet.is_cancelled())
     }
 }
