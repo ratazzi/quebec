@@ -2615,6 +2615,194 @@ impl PyQuebec {
             })
         })
     }
+
+    /// Pause a queue so workers stop claiming jobs from it. Dispatched/ready
+    /// rows continue to be produced by the dispatcher; they just won't be
+    /// picked up by workers while the queue is paused. Idempotent.
+    ///
+    /// Returns:
+    ///     bool: True if a new pause record was inserted, False if the queue was already paused.
+    fn pause_queue(&self, py: Python<'_>, queue_name: &str) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        let queue_name = queue_name.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let inserted_id = crate::query_builder::pauses::insert(
+                    db.as_ref(),
+                    &table_config,
+                    &queue_name,
+                    chrono::Utc::now().naive_utc(),
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to pause queue: {e}"))
+                })?;
+                Ok(inserted_id != 0)
+            })
+        })
+    }
+
+    /// Resume a paused queue.
+    ///
+    /// Returns:
+    ///     bool: True if a pause record was removed, False if the queue was not paused.
+    fn resume_queue(&self, py: Python<'_>, queue_name: &str) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        let queue_name = queue_name.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let deleted = crate::query_builder::pauses::delete_by_queue_name(
+                    db.as_ref(),
+                    &table_config,
+                    &queue_name,
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to resume queue: {e}"
+                    ))
+                })?;
+                Ok(deleted > 0)
+            })
+        })
+    }
+
+    /// Check whether a specific queue is currently paused.
+    fn queue_paused(&self, py: Python<'_>, queue_name: &str) -> PyResult<bool> {
+        let table_config = self.ctx.table_config.clone();
+        let queue_name = queue_name.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let found = crate::query_builder::pauses::find_by_queue_name(
+                    db.as_ref(),
+                    &table_config,
+                    &queue_name,
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to check pause state: {e}"
+                    ))
+                })?;
+                Ok(found.is_some())
+            })
+        })
+    }
+
+    /// Return the list of currently paused queue names (sorted).
+    fn paused_queues(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let mut names =
+                    crate::query_builder::pauses::find_all_queue_names(db.as_ref(), &table_config)
+                        .await
+                        .map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "Failed to list paused queues: {e}"
+                            ))
+                        })?;
+                names.sort();
+                Ok(names)
+            })
+        })
+    }
+
+    /// Pause every queue that has at least one job. Already-paused queues are skipped.
+    ///
+    /// Returns:
+    ///     int: Number of queues that were newly paused.
+    fn pause_all(&self, py: Python<'_>) -> PyResult<u64> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                let queue_names =
+                    crate::query_builder::jobs::get_queue_names(db.as_ref(), &table_config)
+                        .await
+                        .map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "Failed to enumerate queues: {e}"
+                            ))
+                        })?;
+                let already_paused =
+                    crate::query_builder::pauses::find_all_queue_names(db.as_ref(), &table_config)
+                        .await
+                        .map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "Failed to list paused queues: {e}"
+                            ))
+                        })?;
+                let now = chrono::Utc::now().naive_utc();
+                let mut paused: u64 = 0;
+                for name in &queue_names {
+                    if already_paused.contains(name) {
+                        continue;
+                    }
+                    let inserted =
+                        crate::query_builder::pauses::insert(db.as_ref(), &table_config, name, now)
+                            .await
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "Failed to pause queue {name}: {e}"
+                                ))
+                            })?;
+                    if inserted != 0 {
+                        paused += 1;
+                    }
+                }
+                Ok(paused)
+            })
+        })
+    }
+
+    /// Resume every paused queue.
+    ///
+    /// Returns:
+    ///     int: Number of pause records deleted.
+    fn resume_all(&self, py: Python<'_>) -> PyResult<u64> {
+        let table_config = self.ctx.table_config.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Database connection failed: {e}"
+                    ))
+                })?;
+                crate::query_builder::pauses::delete_all(db.as_ref(), &table_config)
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to resume all queues: {e}"
+                        ))
+                    })
+            })
+        })
+    }
 }
 
 #[pyclass(name = "ActiveJob", subclass, from_py_object)]
