@@ -59,12 +59,14 @@ where
         return Ok(true);
     }
 
-    // Semaphore already exists, try to decrement if value > 0 (attempt_decrement)
-    // But first check the limit == 1 case (check_limit_or_decrement)
-    if concurrency_limit == 1 {
-        return Ok(false); // limit == 1, don't try to decrement
-    }
-
+    // Semaphore already exists, try to decrement if value > 0. The `WHERE
+    // value > 0` predicate naturally covers limit == 1 too: a freed slot has
+    // value = limit (= 1), which satisfies > 0, so decrement-to-0 atomically
+    // re-acquires. The old `if concurrency_limit == 1 { return false; }`
+    // short-circuit here mistook a row's existence for "held" and forced
+    // callers to wait for `expires_at` to elapse before the dispatcher's
+    // delete_expired sweep cleared the row — turning concurrency_duration
+    // into a minimum cooldown rather than a crash-safety TTL.
     let decrement_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres => {
             format!(
