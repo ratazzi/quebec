@@ -52,6 +52,7 @@ pub struct WorkerInfo {
     pub seconds_since_heartbeat: i64,
     pub status: String,
     pub quiet: bool,
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

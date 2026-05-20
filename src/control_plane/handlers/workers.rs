@@ -47,12 +47,18 @@ impl ControlPlane {
                     "alive"
                 };
 
-                let quiet = worker
+                let metadata = worker
                     .metadata
                     .as_deref()
-                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok());
+                let quiet = metadata
+                    .as_ref()
                     .and_then(|v| v.get("quiet").and_then(|q| q.as_bool()))
                     .unwrap_or(false);
+                let revision = metadata
+                    .as_ref()
+                    .and_then(|v| v.get("revision").and_then(|s| s.as_str()))
+                    .map(|s| s.to_string());
 
                 WorkerInfo {
                     id: worker.id,
@@ -64,6 +70,7 @@ impl ControlPlane {
                     seconds_since_heartbeat,
                     status: status.to_string(),
                     quiet,
+                    revision,
                 }
             })
             .collect();
