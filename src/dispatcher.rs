@@ -105,17 +105,21 @@ impl Dispatcher {
                               vec![now.into(), batch_size.into()],
                           )).await?;
 
-                          if expired_keys_result.is_empty() {
-                              trace!("No expired concurrency keys found to unblock");
-                          } else {
-                              info!("Found {} expired concurrency keys to unblock", expired_keys_result.len());
-                          }
-
                           // Collect expired concurrency keys
                           let expired_keys: Vec<String> = expired_keys_result
                               .iter()
                               .filter_map(|row| row.try_get::<String>("", "concurrency_key").ok())
                               .collect();
+
+                          if expired_keys.is_empty() {
+                              trace!("No expired concurrency keys found to unblock");
+                          } else {
+                              info!(
+                                  "Found {} expired concurrency keys to unblock: {:?}",
+                                  expired_keys.len(),
+                                  expired_keys
+                              );
+                          }
 
                           // Pre-filter: batch check semaphores (like Solid Queue's releasable)
                           // Keys without semaphore OR with value > 0 are releasable
