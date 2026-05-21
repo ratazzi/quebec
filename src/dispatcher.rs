@@ -212,20 +212,146 @@ impl Dispatcher {
                           let jobs = query_builder::jobs::find_by_ids(txn, &ctx.table_config, job_ids.clone()).await?;
                           let job_map: std::collections::HashMap<i64, _> = jobs.into_iter().map(|j| (j.id, j)).collect();
 
-                          // Prepare batch data for ready_executions insert
-                          let mut ready_data: Vec<(i64, &str, i32)> = Vec::with_capacity(scheduled_executions.len());
+                          // Split scheduled-due jobs into two groups so we can
+                          // bulk-promote the unrestricted ones but still enforce
+                          // concurrency limits on the rest (matches Solid Queue's
+                          // `Job.dispatch_all` partition between
+                          // `dispatch_all_at_once` and `dispatch_all_one_by_one`).
+                          // Without this split, every retry / wait_until / wait
+                          // path bypassed the semaphore at promotion time and
+                          // could violate the declared concurrency_limit.
+                          let mut ready_data: Vec<(i64, &str, i32)> = Vec::new();
+                          let mut concurrency_limited: Vec<&_> = Vec::new();
                           for se in &scheduled_executions {
                               let Some(job) = job_map.get(&se.job_id) else {
                                   warn!("Job {} not found for scheduled execution {}", se.job_id, se.id);
                                   continue;
                               };
-                              ready_data.push((se.job_id, &job.queue_name, job.priority));
-                              notified_queues.insert(job.queue_name.clone());
+                              let has_key = job
+                                  .concurrency_key
+                                  .as_deref()
+                                  .map(|k| !k.is_empty())
+                                  .unwrap_or(false);
+                              if has_key {
+                                  concurrency_limited.push(job);
+                              } else {
+                                  ready_data.push((se.job_id, &job.queue_name, job.priority));
+                                  notified_queues.insert(job.queue_name.clone());
+                              }
                           }
 
-                          // Batch insert ready_executions + batch delete scheduled_executions
-                          query_builder::ready_executions::insert_all(txn, &ctx.table_config, &ready_data).await?;
-                          query_builder::scheduled_executions::delete_by_job_ids(txn, &ctx.table_config, &job_ids).await?;
+                          // Bulk insert the unrestricted ones in a single round-trip.
+                          if !ready_data.is_empty() {
+                              query_builder::ready_executions::insert_all(
+                                  txn,
+                                  &ctx.table_config,
+                                  &ready_data,
+                              )
+                              .await?;
+                          }
+
+                          // Concurrency-limited ones go one-by-one so each can
+                          // acquire the semaphore and route to ready / blocked /
+                          // discarded per its on_conflict policy.
+                          for job in concurrency_limited {
+                              let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
+                              let (limit, duration_opt, on_conflict) = {
+                                  #[cfg(feature = "python")]
+                                  {
+                                      ctx.runnables
+                                          .read()
+                                          .ok()
+                                          .and_then(|runnables| {
+                                              runnables.get(&job.class_name).map(|r| {
+                                                  (
+                                                      r.concurrency_limit.unwrap_or(1),
+                                                      r.concurrency_duration
+                                                          .map(|s| chrono::Duration::seconds(s as i64)),
+                                                      r.concurrency_on_conflict,
+                                                  )
+                                              })
+                                          })
+                                          .unwrap_or((1, None, ConcurrencyConflict::Block))
+                                  }
+                                  #[cfg(not(feature = "python"))]
+                                  {
+                                      (1, None, ConcurrencyConflict::Block)
+                                  }
+                              };
+
+                              let acquired = acquire_semaphore(
+                                  txn,
+                                  &ctx.table_config,
+                                  concurrency_key.to_string(),
+                                  limit,
+                                  duration_opt,
+                              )
+                              .await?;
+
+                              if acquired {
+                                  query_builder::ready_executions::insert(
+                                      txn,
+                                      &ctx.table_config,
+                                      job.id,
+                                      &job.queue_name,
+                                      job.priority,
+                                  )
+                                  .await?;
+                                  notified_queues.insert(job.queue_name.clone());
+                              } else {
+                                  let duration = duration_opt.unwrap_or_else(|| {
+                                      chrono::Duration::from_std(
+                                          ctx.default_concurrency_control_period,
+                                      )
+                                      .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                                  });
+                                  match on_conflict {
+                                      ConcurrencyConflict::Discard => {
+                                          warn!(
+                                              job_id = job.id,
+                                              concurrency_key,
+                                              "Scheduled job `{}' discarded due to concurrency limit",
+                                              job.class_name
+                                          );
+                                          query_builder::jobs::mark_finished(
+                                              txn,
+                                              &ctx.table_config,
+                                              job.id,
+                                          )
+                                          .await?;
+                                      }
+                                      ConcurrencyConflict::Block => {
+                                          let now = chrono::Utc::now().naive_utc();
+                                          info!(
+                                              job_id = job.id,
+                                              concurrency_key,
+                                              "Scheduled job `{}' blocked due to concurrency limit",
+                                              job.class_name
+                                          );
+                                          query_builder::blocked_executions::insert(
+                                              txn,
+                                              &ctx.table_config,
+                                              job.id,
+                                              &job.queue_name,
+                                              job.priority,
+                                              concurrency_key,
+                                              now + duration,
+                                          )
+                                          .await?;
+                                      }
+                                  }
+                              }
+                          }
+
+                          // Delete all scheduled_executions rows we processed
+                          // (regardless of whether each landed in ready, blocked,
+                          // or finished).
+                          query_builder::scheduled_executions::delete_by_job_ids(
+                              txn,
+                              &ctx.table_config,
+                              &job_ids,
+                          )
+                          .await?;
 
                           if size > 0 {
                               info!("Dispatch scheduled jobs size: {}", size);

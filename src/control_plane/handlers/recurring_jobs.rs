@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
 };
-use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait, Value};
+use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, TransactionTrait, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -102,10 +102,14 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
+        let p1 = match backend {
+            DbBackend::Postgres => "$1",
+            DbBackend::MySql | DbBackend::Sqlite => "?",
+        };
 
         let sql = clean_sql(&format!(
-            "SELECT key, class_name, queue_name, priority, arguments FROM {} WHERE id = $1",
-            table_config.recurring_tasks
+            "SELECT key, class_name, queue_name, priority, arguments FROM {} WHERE id = {}",
+            table_config.recurring_tasks, p1
         ));
 
         let row = db

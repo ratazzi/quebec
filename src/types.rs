@@ -2624,6 +2624,7 @@ impl PyQuebec {
     fn retry_failed(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
         use crate::entities::quebec_failed_executions::Retryable;
         let table_config = self.ctx.table_config.clone();
+        let ctx = self.ctx.clone();
 
         py.detach(|| {
             self.rt.block_on(async {
@@ -2634,6 +2635,7 @@ impl PyQuebec {
                 })?;
                 db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
                     let table_config = table_config.clone();
+                    let ctx = ctx.clone();
                     Box::pin(async move {
                         let failed = crate::query_builder::failed_executions::find_by_job_id(
                             txn,
@@ -2643,7 +2645,7 @@ impl PyQuebec {
                         .await?;
                         match failed {
                             Some(model) => {
-                                model.retry(txn, &table_config).await?;
+                                model.retry(txn, &table_config, &ctx).await?;
                                 Ok(true)
                             }
                             None => Ok(false),
@@ -2734,6 +2736,7 @@ impl PyQuebec {
             Entity as FailedExecutionEntity, Retryable,
         };
         let table_config = self.ctx.table_config.clone();
+        let ctx = self.ctx.clone();
         let since = parse_optional_timestamp(since, "since")?;
         let until = parse_optional_timestamp(until, "until")?;
 
@@ -2746,6 +2749,7 @@ impl PyQuebec {
                 })?;
                 db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
                     let table_config = table_config.clone();
+                    let ctx = ctx.clone();
                     let class_name = class_name.clone();
                     let queue_name = queue_name.clone();
                     let error_like = error_like.clone();
@@ -2754,6 +2758,7 @@ impl PyQuebec {
                             .retry_all(
                                 txn,
                                 &table_config,
+                                &ctx,
                                 class_name.as_deref(),
                                 queue_name.as_deref(),
                                 since,

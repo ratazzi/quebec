@@ -156,11 +156,13 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let ctx = state.ctx.clone();
         let redirect = Self::referer_or(&headers, "/failed-jobs");
 
         match db
             .transaction::<_, (), DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     let failed_execution =
                         query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
@@ -168,7 +170,7 @@ impl ControlPlane {
 
                     match failed_execution {
                         Some(execution) => {
-                            execution.retry(txn, &table_config).await?;
+                            execution.retry(txn, &table_config, &ctx).await?;
                             Ok(())
                         }
                         None => Err(DbErr::Custom(format!(
@@ -261,6 +263,7 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
+        let ctx = state.ctx.clone();
         let redirect = Self::referer_without_page_or(&headers, "/failed-jobs");
         let class_name = pagination.class_name.clone();
         let queue_name = pagination.queue_name.clone();
@@ -268,11 +271,13 @@ impl ControlPlane {
 
         match db
             .transaction::<_, u64, DbErr>(|txn| {
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     let count = FailedExecutionEntity
                         .retry_all(
                             txn,
                             &table_config,
+                            &ctx,
                             class_name.as_deref(),
                             queue_name.as_deref(),
                             since,

@@ -313,3 +313,33 @@ def test_run_recurring_now_consecutive_calls_both_enqueue(qc_with_sqlalchemy) ->
         )
         == 2
     )
+
+
+def test_run_recurring_now_respects_concurrency_limit(qc_with_sqlalchemy) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(ExclusiveJob)
+    blocker = ExclusiveJob.perform_later(qc)
+    session.expire_all()
+    assert _count(session, prefix, "ready_executions") == 1
+
+    _insert_recurring_task(
+        session, prefix, key="exclusive-recurring", class_name=ExclusiveJob.__qualname__
+    )
+    assert qc.run_recurring_now("exclusive-recurring") is True
+
+    session.expire_all()
+    assert _count(session, prefix, "recurring_executions") == 1
+    assert _count(session, prefix, "ready_executions") == 1
+    ready_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_ready_executions")
+    ).scalar()
+    assert ready_job_id == blocker.id
+
+    assert _count(session, prefix, "blocked_executions") == 1
+    blocked_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_blocked_executions")
+    ).scalar()
+    assert blocked_job_id != blocker.id
