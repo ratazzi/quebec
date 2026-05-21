@@ -20,6 +20,18 @@ class OtherFailingJob(quebec.ActiveJob):
         raise RuntimeError("nope")
 
 
+class ConcurrencyFailingJob(quebec.ActiveJob):
+    queue_as = "default"
+    concurrency_limit = 1
+
+    @staticmethod
+    def concurrency_key(*args, **kwargs) -> str:
+        return "exclusive-resource"
+
+    def perform(self, *args, **kwargs):
+        raise ValueError("boom")
+
+
 def _enqueue_and_fail(qc, job_cls):
     """Enqueue a job and run it to completion so it lands in failed_executions."""
     enqueued = job_cls.perform_later(qc)
@@ -57,6 +69,39 @@ def test_retry_failed_moves_failed_execution_to_ready(qc_with_sqlalchemy) -> Non
         )
         == 1
     )
+
+
+def test_retry_failed_respects_held_semaphore(qc_with_sqlalchemy) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(ConcurrencyFailingJob)
+
+    failed = _enqueue_and_fail(qc, ConcurrencyFailingJob)
+    session.expire_all()
+    assert _count(session, prefix, "failed_executions") == 1
+    assert _count(session, prefix, "ready_executions") == 0
+
+    blocker = ConcurrencyFailingJob.perform_later(qc)
+    session.expire_all()
+    assert _count(session, prefix, "ready_executions") == 1
+
+    assert qc.retry_failed(failed.id) is True
+
+    session.expire_all()
+    assert _count(session, prefix, "failed_executions") == 0
+    assert _count(session, prefix, "ready_executions") == 1
+    ready_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_ready_executions")
+    ).scalar()
+    assert ready_job_id == blocker.id
+
+    assert _count(session, prefix, "blocked_executions") == 1
+    blocked_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_blocked_executions")
+    ).scalar()
+    assert blocked_job_id == failed.id
 
 
 def test_retry_failed_unknown_id_returns_false(qc) -> None:
@@ -109,6 +154,40 @@ def test_retry_all_failed_without_filters_retries_everything(
     session.expire_all()
     assert _count(session, prefix, "failed_executions") == 0
     assert _count(session, prefix, "ready_executions") == 2
+
+
+def test_retry_all_failed_respects_held_semaphore(qc_with_sqlalchemy) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(ConcurrencyFailingJob)
+
+    failed = _enqueue_and_fail(qc, ConcurrencyFailingJob)
+    session.expire_all()
+    assert _count(session, prefix, "failed_executions") == 1
+    assert _count(session, prefix, "ready_executions") == 0
+
+    blocker = ConcurrencyFailingJob.perform_later(qc)
+    session.expire_all()
+    assert _count(session, prefix, "ready_executions") == 1
+
+    count = qc.retry_all_failed()
+    assert count == 1
+
+    session.expire_all()
+    assert _count(session, prefix, "failed_executions") == 0
+    assert _count(session, prefix, "ready_executions") == 1
+    ready_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_ready_executions")
+    ).scalar()
+    assert ready_job_id == blocker.id
+
+    assert _count(session, prefix, "blocked_executions") == 1
+    blocked_job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_blocked_executions")
+    ).scalar()
+    assert blocked_job_id == failed.id
 
 
 def test_retry_all_failed_filters_by_class_name(qc_with_sqlalchemy) -> None:
