@@ -3,9 +3,7 @@ use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "python")]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -345,6 +343,11 @@ pub struct AppContext {
     #[cfg(feature = "python")]
     pub runnables: Arc<RwLock<HashMap<String, crate::worker::Runnable>>>, // Store job class runnables
     pub concurrency_enabled: Arc<RwLock<HashSet<String>>>, // Store job classes with concurrency control enabled
+    /// EXPERIMENTAL: per-queue concurrency limits enforced at worker
+    /// claim time by acquiring a `queue:<name>` semaphore. Naming and
+    /// semantics may change. Use to isolate misbehaving queues during
+    /// remediation. Queues not present here are unlimited.
+    pub experimental_queue_concurrency: HashMap<String, i32>,
     pub runtime_handle: Option<Handle>,
     pub table_config: TableConfig, // Dynamic table name configuration
     /// Optional notifier for idle worker threads - when set, signals main loop to poll for new jobs
@@ -564,6 +567,39 @@ impl AppContext {
             if let Some(v) = get_u64("worker_threads") {
                 ctx.worker_threads = v;
             }
+            // EXPERIMENTAL: per-queue concurrency overrides via a Python dict
+            // {queue_name: limit}. Invalid entries are skipped with a warning;
+            // the whole field is opt-in so leaving it unset preserves prior
+            // behaviour.
+            if let Some(val) = options.get("experimental_queue_concurrency") {
+                match val.extract::<HashMap<String, i32>>(py) {
+                    Ok(map) => {
+                        let mut accepted: HashMap<String, i32> = HashMap::new();
+                        for (k, v) in map {
+                            let trimmed = k.trim();
+                            if trimmed.is_empty() {
+                                warn!("experimental_queue_concurrency: skipping empty queue name");
+                                continue;
+                            }
+                            if v <= 0 {
+                                warn!(
+                                    "experimental_queue_concurrency['{}']={} ignored \
+                                     (limit must be > 0; use no entry to mean unlimited)",
+                                    trimmed, v
+                                );
+                                continue;
+                            }
+                            accepted.insert(trimmed.to_string(), v);
+                        }
+                        ctx.experimental_queue_concurrency = accepted;
+                    }
+                    Err(_) => warn!(
+                        "Config 'experimental_queue_concurrency': expected dict[str, int], \
+                         got {:?}",
+                        val.bind(py).get_type()
+                    ),
+                }
+            }
             // force_override_queue: kwargs win over the env var the Default
             // already read. Empty / whitespace-only strings clear the override
             // so callers can explicitly opt out from Python even when
@@ -675,6 +711,7 @@ impl AppContext {
             #[cfg(feature = "python")]
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
+            experimental_queue_concurrency: HashMap::new(),
             runtime_handle: None,
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
@@ -763,6 +800,7 @@ impl AppContext {
             #[cfg(feature = "python")]
             runnables: self.runnables.clone(),
             concurrency_enabled: self.concurrency_enabled.clone(),
+            experimental_queue_concurrency: self.experimental_queue_concurrency.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
             idle_notify: Arc::new(RwLock::new(None)),

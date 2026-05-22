@@ -921,6 +921,52 @@ impl PyQuebec {
         })
     }
 
+    /// Drain up to ``batch_size`` ready jobs via the same batch-claim path
+    /// the real worker uses internally. Exposes ``Worker::claim_jobs`` so
+    /// tests can verify ``experimental_queue_concurrency`` partitioning
+    /// behaviour deterministically. Returns the freshly-claimed Execution
+    /// list (jobs are now in ``claimed_executions``; perform them via
+    /// :meth:`Execution.perform` or release them via worker shutdown).
+    fn drain_batch(&self, py: Python<'_>, batch_size: u64) -> PyResult<Vec<Execution>> {
+        let worker = self.worker.clone();
+        let ctx = self.ctx.clone();
+
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let claimed = worker.claim_jobs(batch_size).await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "claim_jobs failed: {e}"
+                    ))
+                })?;
+
+                let db = ctx.get_db().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                })?;
+                let mut out: Vec<Execution> = Vec::with_capacity(claimed.len());
+                for c in claimed {
+                    let job = crate::query_builder::jobs::find_by_id(
+                        db.as_ref(),
+                        &ctx.table_config,
+                        c.job_id,
+                    )
+                    .await
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                    .ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Job record not found")
+                    })?;
+                    let runnable = Python::attach(|_py| ctx.get_runnable(&job.class_name))
+                        .map_err(|e| {
+                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                                "Job handler not found: {e}"
+                            ))
+                        })?;
+                    out.push(Execution::new(ctx.clone(), c, job, runnable));
+                }
+                Ok(out)
+            })
+        })
+    }
+
     async fn post_job(&self) -> crate::error::Result<()> {
         let _ = self.rt.spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;

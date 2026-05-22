@@ -1171,6 +1171,10 @@ impl Execution {
             .runnable
             .concurrency_duration
             .map(|s| chrono::Duration::seconds(s as i64));
+        // EXPERIMENTAL queue-level concurrency: release is delegated to
+        // `Worker::release_queue_slot` which looks up the limit from `ctx`
+        // at call time.
+        let queue_name = job.queue_name.clone();
         let table_config_orig = self.ctx.table_config.clone();
         let ctx = self.ctx.clone();
 
@@ -1206,9 +1210,11 @@ impl Execution {
             let concurrency_key = concurrency_key.clone();
             let ctx = ctx.clone();
             let claimed = claimed.clone();
+            let queue_name = queue_name.clone();
 
             transaction_result = db
                 .transaction::<_, bool, DbErr>(|txn| {
+                    let queue_name = queue_name.clone();
                     Box::pin(async move {
                         if let Some((scheduled_at, ref arguments)) = retry_job_data {
                             Self::schedule_retry_job(
@@ -1294,6 +1300,13 @@ impl Execution {
                                     .ok();
                             }
                         }
+
+                        // EXPERIMENTAL: release queue-level semaphore
+                        // acquired at claim time. No release_next_blocked
+                        // counterpart because queue-throttled jobs stay in
+                        // ready, not blocked — the next worker poll picks
+                        // them up.
+                        Worker::release_queue_slot(&ctx, txn, &table_config, &queue_name).await?;
 
                         Ok(failed)
                     })
@@ -1909,10 +1922,15 @@ impl Worker {
         let queue_selector = self.ctx.worker_queues.clone();
         let use_skip_locked = self.ctx.use_skip_locked;
         let process_id = *self.process_id.lock().await;
+        // EXPERIMENTAL: queue-level concurrency overrides — acquired here at
+        // claim time via `try_acquire_queue_slot`, released by
+        // `after_executed` (or the cleanup paths) via `release_queue_slot`.
+        let ctx = self.ctx.clone();
 
         let job = db
             .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     let paused_queues =
                         query_builder::pauses::find_all_queue_names(txn, &table_config).await?;
@@ -1925,24 +1943,59 @@ impl Worker {
                         .as_ref()
                         .map_or_else(|| vec![(false, "*".to_string())], |q| q.ordered_patterns());
 
-                    // Helper macro to avoid duplicating find + claim logic
+                    // Helper macro to avoid duplicating find + claim logic.
+                    // When `experimental_queue_concurrency` is empty (the
+                    // common case), skip the per-record acquire path
+                    // entirely so feature-off workers pay zero overhead
+                    // beyond a single `is_empty()` check per claim.
+                    let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+
+                    // For queues listed in `experimental_queue_concurrency`,
+                    // attempt the `queue:<name>` semaphore between find and
+                    // claim via `try_acquire_queue_slot`; if the slot is
+                    // full, add the queue to a local exclude list and re-find
+                    // so the next candidate (potentially from a different
+                    // queue) gets a chance. Without this retry, a single
+                    // throttled candidate from the wildcard pattern would
+                    // block claims from every other queue in this poll.
                     macro_rules! try_claim_one {
                         ($filter:expr, $exclude:expr) => {{
-                            let record = query_builder::ready_executions::find_one_for_update(
-                                txn,
-                                &table_config,
-                                $filter,
-                                $exclude,
-                                use_skip_locked,
-                            )
-                            .await?;
-                            if let Some(ref execution) = record {
+                            let mut local_throttled: Vec<String> = Vec::new();
+                            loop {
+                                let mut effective_exclude: Vec<String> =
+                                    $exclude.iter().cloned().collect();
+                                effective_exclude.extend(local_throttled.iter().cloned());
+                                let record = query_builder::ready_executions::find_one_for_update(
+                                    txn,
+                                    &table_config,
+                                    $filter,
+                                    &effective_exclude,
+                                    use_skip_locked,
+                                )
+                                .await?;
+                                let Some(ref execution) = record else { break };
+
+                                if queue_concurrency_enabled {
+                                    let acquired = Self::try_acquire_queue_slot(
+                                        &ctx,
+                                        txn,
+                                        &table_config,
+                                        &execution.queue_name,
+                                    )
+                                    .await?;
+                                    if !acquired {
+                                        local_throttled.push(execution.queue_name.clone());
+                                        continue;
+                                    }
+                                }
+
                                 if let Some(claimed) =
                                     Self::claim_execution(txn, &table_config, execution, process_id)
                                         .await?
                                 {
                                     return Ok(claimed);
                                 }
+                                break;
                             }
                         }};
                     }
@@ -1993,10 +2046,13 @@ impl Worker {
         let table_config = self.ctx.table_config.clone();
         let queue_selector = self.ctx.worker_queues.clone();
         let process_id = *self.process_id.lock().await;
+        // EXPERIMENTAL: shared `ctx` for per-record queue-level acquire below.
+        let ctx = self.ctx.clone();
 
         let jobs = db
             .transaction::<_, Vec<quebec_claimed_executions::Model>, DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     // Get list of paused queues
                     let paused_queues =
@@ -2015,52 +2071,131 @@ impl Worker {
                         .as_ref()
                         .map_or_else(|| vec![(false, "*".to_string())], |q| q.ordered_patterns()); // Default to all
 
-                    // Helper macro to claim jobs from a queue (batch insert + batch delete)
+                    // When `experimental_queue_concurrency` is empty (the
+                    // common case), `claim_from_queue!` skips the per-record
+                    // acquire path entirely so feature-off workers pay zero
+                    // overhead beyond a single `is_empty()` check per claim.
+                    let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+
+                    // Helper macro to claim jobs from a queue (batch insert + batch delete).
+                    // EXPERIMENTAL: when `experimental_queue_concurrency` is
+                    // configured, each candidate goes through
+                    // `try_acquire_queue_slot` before being added to the
+                    // batch. Throttled candidates stay in ready_executions
+                    // so the next poll re-attempts them; the queue's
+                    // throttled state is cached locally inside this batch
+                    // to avoid redundant acquire calls when many candidates
+                    // share the same queue.
                     macro_rules! claim_from_queue {
                         ($filter:expr, $exclude:expr) => {{
-                            let records = query_builder::ready_executions::find_many_for_update(
-                                txn,
-                                &table_config,
-                                $filter,
-                                $exclude,
-                                use_skip_locked,
-                                remaining,
-                            )
-                            .await?;
+                            // Loop in the same transaction: when the first
+                            // find returns rows that are all from throttled
+                            // queues, add them to `local_throttled` and
+                            // re-find so unrelated queues' rows can still
+                            // be claimed this poll. Without this, a single
+                            // throttled queue sitting at the head of the
+                            // priority order (e.g. `default` with limit=1
+                            // already held) would block claims from every
+                            // other queue until the next poll tick.
+                            let mut local_throttled = std::collections::HashSet::<String>::new();
+                            loop {
+                                if remaining == 0 {
+                                    break;
+                                }
+                                let mut effective_exclude: Vec<String> =
+                                    $exclude.iter().cloned().collect();
+                                effective_exclude.extend(local_throttled.iter().cloned());
+                                let requested = remaining;
+                                let records =
+                                    query_builder::ready_executions::find_many_for_update(
+                                        txn,
+                                        &table_config,
+                                        $filter,
+                                        &effective_exclude,
+                                        use_skip_locked,
+                                        requested,
+                                    )
+                                    .await?;
+                                if records.is_empty() {
+                                    break;
+                                }
+                                // If DB returned fewer than we asked for,
+                                // there are no more matching rows beyond
+                                // this batch — stop after processing.
+                                let exhausted = (records.len() as u64) < requested;
 
-                            if !records.is_empty() {
-                                let now = chrono::Utc::now().naive_utc();
-                                let insert_data: Vec<(i64, Option<i64>, chrono::NaiveDateTime)> =
-                                    records
+                                let mut accepted: Vec<&quebec_ready_executions::Model> = Vec::new();
+                                if !queue_concurrency_enabled {
+                                    // Feature disabled: accept every found
+                                    // record verbatim — no per-record
+                                    // HashMap lookup, no async helper call.
+                                    accepted.extend(records.iter());
+                                } else {
+                                    for record in &records {
+                                        if local_throttled.contains(&record.queue_name) {
+                                            continue;
+                                        }
+                                        let acquired = Self::try_acquire_queue_slot(
+                                            &ctx,
+                                            txn,
+                                            &table_config,
+                                            &record.queue_name,
+                                        )
+                                        .await?;
+                                        if !acquired {
+                                            local_throttled.insert(record.queue_name.clone());
+                                            continue;
+                                        }
+                                        accepted.push(record);
+                                    }
+                                }
+
+                                if !accepted.is_empty() {
+                                    let now = chrono::Utc::now().naive_utc();
+                                    let insert_data: Vec<(
+                                        i64,
+                                        Option<i64>,
+                                        chrono::NaiveDateTime,
+                                    )> = accepted
                                         .iter()
                                         .map(|r| (r.job_id, process_id, now))
                                         .collect();
-                                let ready_ids: Vec<i64> = records.iter().map(|r| r.id).collect();
-                                let job_ids: Vec<i64> = records.iter().map(|r| r.job_id).collect();
+                                    let ready_ids: Vec<i64> =
+                                        accepted.iter().map(|r| r.id).collect();
+                                    let job_ids: Vec<i64> =
+                                        accepted.iter().map(|r| r.job_id).collect();
 
-                                // Batch insert claimed (RETURNING *) + batch delete ready
-                                let mut claimed =
-                                    query_builder::claimed_executions::insert_all_returning(
+                                    // Batch insert claimed (RETURNING *) + batch delete ready
+                                    let mut claimed =
+                                        query_builder::claimed_executions::insert_all_returning(
+                                            txn,
+                                            &table_config,
+                                            &insert_data,
+                                        )
+                                        .await?;
+                                    query_builder::ready_executions::delete_by_ids(
                                         txn,
                                         &table_config,
-                                        &insert_data,
+                                        &ready_ids,
                                     )
                                     .await?;
-                                query_builder::ready_executions::delete_by_ids(
-                                    txn,
-                                    &table_config,
-                                    &ready_ids,
-                                )
-                                .await?;
 
-                                // Reorder to match original priority/job_id selection order
-                                let order_map: std::collections::HashMap<i64, usize> =
-                                    job_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-                                claimed.sort_by_key(|c| {
-                                    order_map.get(&c.job_id).copied().unwrap_or(usize::MAX)
-                                });
-                                claimed_jobs.extend(claimed);
-                                remaining = remaining.saturating_sub(records.len() as u64);
+                                    // Reorder to match original priority/job_id selection order
+                                    let order_map: std::collections::HashMap<i64, usize> = job_ids
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &id)| (id, i))
+                                        .collect();
+                                    claimed.sort_by_key(|c| {
+                                        order_map.get(&c.job_id).copied().unwrap_or(usize::MAX)
+                                    });
+                                    claimed_jobs.extend(claimed);
+                                    remaining = remaining.saturating_sub(accepted.len() as u64);
+                                }
+
+                                if exhausted {
+                                    break;
+                                }
                             }
                         }};
                     }
@@ -2381,18 +2516,22 @@ impl Worker {
 
         for execution in claimed {
             let table_config = table_config.clone();
+            let ctx = self.ctx.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
 
             db.transaction::<_, (), DbErr>(|txn| {
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     if let Some(job) =
                         query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
                     {
-                        // Bypass concurrency limits: the job already holds a semaphore
-                        // slot from when it was dispatched. Put it back to ready directly
-                        // so the dispatcher can re-claim it without re-acquiring the slot.
-                        // Matches Solid Queue's dispatch_bypassing_concurrency_limits.
+                        // Bypass class-level concurrency limits: the job
+                        // already holds the class-level semaphore slot from
+                        // when it was dispatched. Put it back to ready
+                        // directly so the dispatcher can re-claim it
+                        // without re-acquiring. Matches Solid Queue's
+                        // `dispatch_bypassing_concurrency_limits`.
                         query_builder::ready_executions::insert(
                             txn,
                             &table_config,
@@ -2401,6 +2540,11 @@ impl Worker {
                             job.priority,
                         )
                         .await?;
+                        // EXPERIMENTAL queue-level slot was acquired at
+                        // claim time and must be released here — the next
+                        // worker that re-claims this job will re-acquire.
+                        Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
+                            .await?;
                     } else {
                         warn!(
                             "Job {} not found, dropping claimed execution {}",
@@ -2441,10 +2585,12 @@ impl Worker {
         let mut released = 0usize;
         for row in claimed {
             let table_config = table_config.clone();
+            let ctx = ctx.clone();
             let job_id = row.job_id;
             let execution_id = row.id;
             if let Err(e) = db
                 .transaction::<_, (), DbErr>(|txn| {
+                    let ctx = ctx.clone();
                     Box::pin(async move {
                         if let Some(job) =
                             query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
@@ -2457,6 +2603,10 @@ impl Worker {
                                 job.priority,
                             )
                             .await?;
+                            // EXPERIMENTAL queue-level slot release on
+                            // requeue (see `release_all_claimed_executions`).
+                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
+                                .await?;
                         }
                         query_builder::claimed_executions::delete_by_id(
                             txn,
@@ -2580,6 +2730,11 @@ impl Worker {
         let Some(job) = query_builder::jobs::find_by_id(db, table_config, job_id).await? else {
             return Ok(());
         };
+
+        // EXPERIMENTAL: release queue-level slot first so it's freed even
+        // when the job has no class-level concurrency_key.
+        Self::release_queue_slot(ctx, db, table_config, &job.queue_name).await?;
+
         let Some(key) = job.concurrency_key.as_ref().filter(|k| !k.is_empty()) else {
             return Ok(());
         };
@@ -2605,6 +2760,76 @@ impl Worker {
                 .ok();
         }
 
+        Ok(())
+    }
+
+    /// EXPERIMENTAL: attempt to acquire the `queue:<name>` semaphore at
+    /// claim time. Returns `Ok(true)` when the queue has no override or
+    /// the slot was acquired; `Ok(false)` when the queue is throttled and
+    /// no slot is currently free.
+    ///
+    /// Zero-overhead fast path when the override map is empty: a single
+    /// `is_empty()` check returns immediately, skipping the per-queue
+    /// HashMap lookup, hash, and async work.
+    pub(crate) async fn try_acquire_queue_slot<C>(
+        ctx: &Arc<AppContext>,
+        db: &C,
+        table_config: &TableConfig,
+        queue_name: &str,
+    ) -> std::result::Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if ctx.experimental_queue_concurrency.is_empty() {
+            return Ok(true);
+        }
+        let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
+            return Ok(true);
+        };
+        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        crate::semaphore::acquire_semaphore(
+            db,
+            table_config,
+            format!("queue:{}", queue_name),
+            limit,
+            duration,
+        )
+        .await
+    }
+
+    /// EXPERIMENTAL: release the `queue:<name>` semaphore. No-op when the
+    /// queue isn't in the override map. Called from every code path that
+    /// removes a row from `claimed_executions` (normal completion, requeue
+    /// on graceful shutdown, dispatch failure batch release, orphan
+    /// recovery) so the slot doesn't leak until the TTL sweep.
+    ///
+    /// Zero-overhead fast path when the override map is empty: a single
+    /// `is_empty()` check returns immediately.
+    pub(crate) async fn release_queue_slot<C>(
+        ctx: &Arc<AppContext>,
+        db: &C,
+        table_config: &TableConfig,
+        queue_name: &str,
+    ) -> std::result::Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if ctx.experimental_queue_concurrency.is_empty() {
+            return Ok(());
+        }
+        let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
+            return Ok(());
+        };
+        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        let _ = release_semaphore(
+            db,
+            table_config,
+            format!("queue:{}", queue_name),
+            limit,
+            duration,
+        )
+        .await
+        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e));
         Ok(())
     }
 
