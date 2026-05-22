@@ -80,6 +80,7 @@ impl ControlPlane {
                 } else {
                     "active".to_string()
                 },
+                concurrency_limit: state.ctx.experimental_queue_concurrency.get(&name).copied(),
                 name,
                 jobs_count: count,
             })
