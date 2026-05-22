@@ -8,6 +8,12 @@ pub struct QueueInfo {
     pub slug: String,
     pub jobs_count: i64,
     pub status: String,
+    /// EXPERIMENTAL queue-level concurrency limit (from
+    /// `experimental_queue_concurrency`). `None` means no global cap is in
+    /// effect for this queue. Surfaced in the queues page so operators can
+    /// see at a glance which queues are currently throttled and to what
+    /// level.
+    pub concurrency_limit: Option<i32>,
 }
 
 /// Encode a queue name into an HTML-id-safe slug with **no collisions**.

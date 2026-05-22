@@ -161,6 +161,7 @@ impl ControlPlane {
                 } else {
                     "active".to_string()
                 },
+                concurrency_limit: self.ctx.experimental_queue_concurrency.get(&name).copied(),
                 name,
             })
             .collect();
