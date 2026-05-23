@@ -191,6 +191,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsgiRequest>()?;
     m.add_class::<ConcurrencyStrategy>()?;
     m.add_class::<ConcurrencyConflict>()?;
+    m.add_class::<RateLimitConflict>()?;
     m.add_class::<RescueStrategy>()?;
     m.add_class::<RetryStrategy>()?;
     m.add_class::<DiscardStrategy>()?;

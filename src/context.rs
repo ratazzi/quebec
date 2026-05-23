@@ -70,6 +70,38 @@ impl ConcurrencyConflict {
     }
 }
 
+/// Rate limit conflict strategy — what to do when the sliding window is exhausted.
+#[cfg_attr(feature = "python", pyclass(eq, eq_int, from_py_object))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateLimitConflict {
+    /// Reschedule the throttled job to a future scheduled_executions row (default).
+    #[default]
+    Reschedule = 0,
+    /// Mark the throttled job as finished without executing (dedup-style).
+    Discard = 1,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl RateLimitConflict {
+    #[staticmethod]
+    fn reschedule() -> Self {
+        RateLimitConflict::Reschedule
+    }
+
+    #[staticmethod]
+    fn discard() -> Self {
+        RateLimitConflict::Discard
+    }
+
+    fn __repr__(&self) -> String {
+        match self {
+            RateLimitConflict::Reschedule => "RateLimitConflict.Reschedule".to_string(),
+            RateLimitConflict::Discard => "RateLimitConflict.Discard".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub jobs: String,
