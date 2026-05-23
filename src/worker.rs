@@ -297,14 +297,25 @@ impl Runnable {
 
             // Decode the args envelope. Tolerate any shape — bad JSON or
             // missing "arguments" just means call with empty args.
-            let parsed: serde_json::Value =
-                serde_json::from_str(arguments_json).unwrap_or(serde_json::Value::Null);
-            let args_array = match &parsed {
-                serde_json::Value::Object(o) => match o.get("arguments") {
-                    Some(serde_json::Value::Array(arr)) => arr.clone(),
-                    _ => Vec::new(),
-                },
-                serde_json::Value::Array(arr) => arr.clone(),
+            //
+            // Solid Queue / Quebec wraps the args dict more than once
+            // depending on the enqueue path (perform_later vs scheduler);
+            // mirror Execution::parse_job_arguments_from_json (worker.rs:634)
+            // and walk nested `arguments` keys until we reach the Array.
+            let mut v = serde_json::from_str::<serde_json::Value>(arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            while let serde_json::Value::Object(ref o) = v {
+                match o.get("arguments") {
+                    Some(serde_json::Value::Array(_)) => {
+                        v = o["arguments"].clone();
+                        break;
+                    }
+                    Some(serde_json::Value::Object(_)) => v = o["arguments"].clone(),
+                    _ => break,
+                }
+            }
+            let args_array = match v {
+                serde_json::Value::Array(arr) => arr,
                 _ => Vec::new(),
             };
 
@@ -2192,8 +2203,13 @@ impl Worker {
         // `after_executed` (or the cleanup paths) via `release_queue_slot`.
         let ctx = self.ctx.clone();
 
+        // Return Option here (not Err) so any rate-throttle side-effects
+        // (DELETE ready + INSERT scheduled / mark_finished) inside the tx
+        // commit even when no candidate was successfully claimed. The
+        // pre-existing "No ready job to claim" error is re-raised at the
+        // outer level.
         let job = db
-            .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
+            .transaction::<_, Option<quebec_claimed_executions::Model>, DbErr>(|txn| {
                 let table_config = table_config.clone();
                 let ctx = ctx.clone();
                 Box::pin(async move {
@@ -2281,7 +2297,7 @@ impl Worker {
                                     Self::claim_execution(txn, &table_config, execution, process_id)
                                         .await?
                                 {
-                                    return Ok(claimed);
+                                    return Ok(Some(claimed));
                                 }
                                 break;
                             }
@@ -2316,10 +2332,11 @@ impl Worker {
                         }
                     }
 
-                    Err(DbErr::Custom("No job found".into()))
+                    Ok(None)
                 })
             })
-            .await?;
+            .await?
+            .ok_or_else(|| QuebecError::Database(DbErr::Custom("No job found".into())))?;
 
         Ok(job)
     }
