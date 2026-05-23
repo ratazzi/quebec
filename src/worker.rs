@@ -2058,16 +2058,25 @@ impl Worker {
             // Mirror rate limit config into the AppContext registry so the
             // worker claim path can `.is_empty()` short-circuit when no
             // class uses the feature.
-            if let (Some(max), Some(win_secs)) = (rate_limit_max, rate_limit_window_seconds) {
-                if let Ok(mut reg) = self.ctx.rate_limited_classes.write() {
-                    reg.insert(
-                        class_name.to_string(),
-                        crate::context::RateLimitConfig {
-                            max,
-                            window: chrono::Duration::seconds(win_secs as i64),
-                            on_throttle: rate_limit_on_throttle,
-                        },
-                    );
+            //
+            // Re-registration of the same class without `rate_limit_max` must
+            // also clear any stale config — otherwise the prior config keeps
+            // throttling silently in long-lived processes / test reuse.
+            if let Ok(mut reg) = self.ctx.rate_limited_classes.write() {
+                match (rate_limit_max, rate_limit_window_seconds) {
+                    (Some(max), Some(win_secs)) => {
+                        reg.insert(
+                            class_name.to_string(),
+                            crate::context::RateLimitConfig {
+                                max,
+                                window: chrono::Duration::seconds(win_secs as i64),
+                                on_throttle: rate_limit_on_throttle,
+                            },
+                        );
+                    }
+                    _ => {
+                        reg.remove(&class_name.to_string());
+                    }
                 }
             }
             Ok(())
@@ -2265,6 +2274,7 @@ impl Worker {
                                 .await?;
                                 let Some(ref execution) = record else { break };
 
+                                let mut queue_slot_held = false;
                                 if queue_concurrency_enabled {
                                     let acquired = Self::try_acquire_queue_slot(
                                         &ctx,
@@ -2277,6 +2287,7 @@ impl Worker {
                                         local_throttled.push(execution.queue_name.clone());
                                         continue;
                                     }
+                                    queue_slot_held = true;
                                 }
 
                                 if rate_limit_enabled {
@@ -2289,7 +2300,25 @@ impl Worker {
                                     .await?
                                     {
                                         RateGateResult::Granted => {}
-                                        RateGateResult::Routed => continue,
+                                        RateGateResult::Routed => {
+                                            // Job left ready_executions (moved
+                                            // to scheduled / mark_finished),
+                                            // so it will never reach
+                                            // `after_executed` to release the
+                                            // queue slot we just took.
+                                            // Release here, otherwise the
+                                            // slot leaks until the TTL sweep.
+                                            if queue_slot_held {
+                                                Self::release_queue_slot(
+                                                    &ctx,
+                                                    txn,
+                                                    &table_config,
+                                                    &execution.queue_name,
+                                                )
+                                                .await?;
+                                            }
+                                            continue;
+                                        }
                                     }
                                 }
 
@@ -2444,6 +2473,7 @@ impl Worker {
                                     accepted.extend(records.iter());
                                 } else {
                                     for record in &records {
+                                        let mut queue_slot_held = false;
                                         if queue_concurrency_enabled {
                                             if local_throttled.contains(&record.queue_name) {
                                                 continue;
@@ -2459,6 +2489,7 @@ impl Worker {
                                                 local_throttled.insert(record.queue_name.clone());
                                                 continue;
                                             }
+                                            queue_slot_held = true;
                                         }
                                         if rate_limit_enabled {
                                             match Self::try_consume_rate_for_candidate(
@@ -2470,7 +2501,24 @@ impl Worker {
                                             .await?
                                             {
                                                 RateGateResult::Granted => {}
-                                                RateGateResult::Routed => continue,
+                                                RateGateResult::Routed => {
+                                                    // Release the queue slot
+                                                    // taken just above — the
+                                                    // job moved out of
+                                                    // ready_executions so
+                                                    // `after_executed` never
+                                                    // fires for it.
+                                                    if queue_slot_held {
+                                                        Self::release_queue_slot(
+                                                            &ctx,
+                                                            txn,
+                                                            &table_config,
+                                                            &record.queue_name,
+                                                        )
+                                                        .await?;
+                                                    }
+                                                    continue;
+                                                }
                                             }
                                         }
                                         accepted.push(record);
