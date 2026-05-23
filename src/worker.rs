@@ -1985,6 +1985,18 @@ impl Worker {
                         "{class_name}: rate_limit_window too large, got {total}s"
                     )));
                 }
+                // The sliding-window math operates in integer seconds (window
+                // bucket index = floor(epoch / window_secs)). Silently truncating
+                // 1.9s → 1s would loosen the limit by ~50%, so refuse instead of
+                // guessing whether the user wanted floor/ceil/round.
+                if total.fract().abs() > f64::EPSILON {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window must be a whole number \
+                         of seconds, got {total}s. The sliding-window algorithm \
+                         operates in 1-second buckets — fractional windows would \
+                         be silently rounded."
+                    )));
+                }
                 rate_limit_window_seconds = Some(total as i32);
 
                 if bound.hasattr("rate_limit_on_throttle")? {

@@ -138,6 +138,23 @@ def test_register_job_rejects_subsecond_window(qc_with_sqlalchemy):
         qc.register_job(TooFast)
 
 
+def test_register_job_rejects_fractional_window(qc_with_sqlalchemy):
+    """1.9s would silently truncate to 1s under `as i32`, loosening the
+    declared limit by ~50%. Refuse rather than guess floor/ceil/round.
+    """
+    qc = qc_with_sqlalchemy["qc"]
+
+    class FractionalWindow(quebec.BaseClass):
+        rate_limit_max = 5
+        rate_limit_window = timedelta(seconds=1, milliseconds=900)
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    with pytest.raises(ValueError, match="whole number of seconds"):
+        qc.register_job(FractionalWindow)
+
+
 def test_register_job_rejects_max_without_window(qc_with_sqlalchemy):
     qc = qc_with_sqlalchemy["qc"]
 
