@@ -384,6 +384,71 @@ pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
         .or_else(|| s.parse::<u64>().ok().map(Duration::from_secs))
 }
 
+/// Build the `<basename>@<sha>` suffix appended to `set_proc_title`. Pure
+/// function (path + revision in, string out) so it can be reasoned about
+/// without spinning up an `AppContext`. Either component is dropped when
+/// absent, leaving:
+/// - "release-id@a1b2c3d" when both present
+/// - "release-id"          when no git available
+/// - "@a1b2c3d"            when path has no usable last component
+/// - None                  when neither is available
+///
+/// `cwd` is canonicalized so Capistrano-style deploys where the working
+/// dir is `<root>/current` (a symlink to `<root>/releases/<id>`) surface
+/// the release id rather than the literal "current".
+pub(crate) fn proctitle_suffix(cwd: &std::path::Path, revision: Option<&str>) -> Option<String> {
+    let resolved = std::fs::canonicalize(cwd).ok();
+    let basename = resolved
+        .as_deref()
+        .unwrap_or(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    match (basename, revision) {
+        (Some(b), Some(s)) => Some(format!("{b}@{s}")),
+        (Some(b), None) => Some(b),
+        (None, Some(s)) => Some(format!("@{s}")),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod proctitle_suffix_tests {
+    use super::proctitle_suffix;
+    use std::path::Path;
+
+    #[test]
+    fn both_present_joins_with_at() {
+        let cwd = std::env::current_dir().unwrap();
+        let basename = cwd.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(
+            proctitle_suffix(&cwd, Some("a1b2c3d")),
+            Some(format!("{basename}@a1b2c3d"))
+        );
+    }
+
+    #[test]
+    fn only_basename_when_revision_absent() {
+        let cwd = std::env::current_dir().unwrap();
+        let basename = cwd.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(proctitle_suffix(&cwd, None), Some(basename));
+    }
+
+    #[test]
+    fn only_revision_when_basename_absent() {
+        assert_eq!(
+            proctitle_suffix(Path::new("/"), Some("a1b2c3d")),
+            Some("@a1b2c3d".to_string())
+        );
+    }
+
+    #[test]
+    fn none_when_both_missing() {
+        assert_eq!(proctitle_suffix(Path::new("/"), None), None);
+    }
+}
+
 /// Class-level scheduling metadata captured at `register_job_class` time.
 /// Plain Rust types only — readable without the GIL.
 #[derive(Debug, Clone)]
@@ -934,27 +999,41 @@ impl AppContext {
     }
 
     /// Set process title for better visibility in system tools (htop, ps, etc.)
-    /// Base format: `quebec-app_name [process_type:details]`. When the
-    /// context has a `proc_slot = Some((entry, within))` (set by
-    /// `apply_worker_config` / `apply_dispatcher_config` in supervisor
-    /// children), the role becomes `process_type#<entry>/<within>` so
-    /// sibling workers / dispatchers can be told apart in `ps`. `#N`
-    /// names the queue.yml entry, `/M` the process index inside it.
+    /// Base format: `quebec-app_name [role:details] <cwd_basename>@<git_sha>`.
+    ///
+    /// `role` is `process_type` by default; when the context has
+    /// `proc_slot = Some((entry, within))` (set by `apply_worker_config` /
+    /// `apply_dispatcher_config` in supervisor children) it becomes
+    /// `process_type#<entry>/<within>` so sibling workers / dispatchers
+    /// can be told apart in `ps` — `#N` names the queue.yml entry, `/M`
+    /// the process index inside it.
+    ///
+    /// The suffix is computed by [`proctitle_suffix`] from the running
+    /// process's cwd (with symlinks resolved, so a Capistrano-style
+    /// `current` → `releases/<id>` deploy surfaces `<id>` instead of
+    /// `current`) and the cached `git rev-parse --short HEAD` output.
+    /// Either component is dropped when missing, so the suffix is omitted
+    /// entirely for plain checkouts without `.git` in a path with no last
+    /// component.
     /// Examples:
-    /// - quebec-myapp [worker:3]              (standalone, no supervisor)
-    /// - quebec-myapp [worker#0/1:5]          (supervised, entry 0, 2nd process)
-    /// - quebec-myapp [dispatcher#1/0]        (supervised, entry 1, 1st process)
-    /// - quebec-myapp [supervisor]            (parent, no slot)
-    /// - quebec-myapp [scheduler]             (single-process role)
+    /// - quebec-myapp [worker:3] myapp@a1b2c3d              (standalone local)
+    /// - quebec-coms [worker:10] 20260523-1738-b5b146b@b5b146b  (Capistrano)
+    /// - quebec-coms [worker#0/1:5] release@sha             (supervised, slot 1)
+    /// - quebec-coms [dispatcher#1/0] release@sha           (supervised dispatcher)
+    /// - quebec-myapp [dispatcher] myapp                    (no git available)
     pub fn set_proc_title(&self, process_type: &str, details: Option<&str>) {
         let role = match self.proc_slot {
             Some((entry, within)) => format!("{process_type}#{entry}/{within}"),
             None => process_type.to_string(),
         };
-        let title = if let Some(details) = details {
+        let base = if let Some(details) = details {
             format!("quebec-{} [{}:{}]", self.name, role, details)
         } else {
             format!("quebec-{} [{}]", self.name, role)
+        };
+        let title = match proctitle_suffix(&self.cwd, crate::process::process_revision()) {
+            Some(suffix) => format!("{base} {suffix}"),
+            None => base,
         };
 
         #[cfg(target_os = "macos")]
