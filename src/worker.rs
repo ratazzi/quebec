@@ -86,6 +86,12 @@ pub struct Runnable {
     /// Continuation info for interrupted jobs (step name, cursor, original args)
     pub(crate) continuation_info: Option<ContinuationInfo>,
     pub hooks: HookFlags,
+    /// Experimental sliding-window rate limit. `rate_limit_max.is_some()` is
+    /// the discriminator — when None, the claim path's `rate_limit_enabled`
+    /// gate short-circuits without ever calling into this struct.
+    pub rate_limit_max: Option<i32>,
+    pub rate_limit_window_seconds: Option<i32>,
+    pub rate_limit_on_throttle: crate::context::RateLimitConflict,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +121,9 @@ impl Runnable {
             concurrency_on_conflict: ConcurrencyConflict::default(),
             continuation_info: None,
             hooks: HookFlags::default(),
+            rate_limit_max: None,
+            rate_limit_window_seconds: None,
+            rate_limit_on_throttle: crate::context::RateLimitConflict::default(),
         }
     }
 
@@ -132,6 +141,9 @@ impl Runnable {
             concurrency_on_conflict: self.concurrency_on_conflict,
             continuation_info: self.continuation_info.clone(),
             hooks: self.hooks.clone(),
+            rate_limit_max: self.rate_limit_max,
+            rate_limit_window_seconds: self.rate_limit_window_seconds,
+            rate_limit_on_throttle: self.rate_limit_on_throttle,
         }
     }
 
@@ -1838,6 +1850,66 @@ impl Worker {
                 )));
             }
 
+            // Extract rate_limit_* declarations (optional). `rate_limit_max`
+            // is the discriminator — when None, the entire feature is off
+            // for this class.
+            let mut rate_limit_max: Option<i32> = None;
+            let mut rate_limit_window_seconds: Option<i32> = None;
+            let mut rate_limit_on_throttle = crate::context::RateLimitConflict::default();
+
+            if bound.hasattr("rate_limit_max")? {
+                let attr = bound.getattr("rate_limit_max")?;
+                if !attr.is_none() {
+                    let max = attr.extract::<i32>()?;
+                    if max <= 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "{class_name}: rate_limit_max must be positive, got {max}"
+                        )));
+                    }
+                    rate_limit_max = Some(max);
+                }
+            }
+
+            if rate_limit_max.is_some() {
+                if !bound.hasattr("rate_limit_window")? {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_max is set but \
+                         `rate_limit_window` is missing — declare \
+                         `rate_limit_window = timedelta(seconds=N)` (N >= 1) \
+                         on the class."
+                    )));
+                }
+                let td = bound.getattr("rate_limit_window")?;
+                let total: f64 = td.call_method0("total_seconds")?.extract()?;
+                if total < 1.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window must be >= 1 second, \
+                         got {total}s. Sub-second windows make jitter and \
+                         retry_at solver precision insufficient."
+                    )));
+                }
+                if total > i32::MAX as f64 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window too large, got {total}s"
+                    )));
+                }
+                rate_limit_window_seconds = Some(total as i32);
+
+                if bound.hasattr("rate_limit_on_throttle")? {
+                    let attr = bound.getattr("rate_limit_on_throttle")?;
+                    let is_descriptor = attr
+                        .get_type()
+                        .qualname()
+                        .map(|n| n.contains("descriptor"))
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false);
+                    if !is_descriptor {
+                        rate_limit_on_throttle =
+                            attr.extract::<crate::context::RateLimitConflict>()?;
+                    }
+                }
+            }
+
             let module_path = bound
                 .getattr("__module__")
                 .and_then(|m| m.extract::<String>())
@@ -1876,6 +1948,9 @@ impl Worker {
                 concurrency_on_conflict,
                 continuation_info: None,
                 hooks,
+                rate_limit_max,
+                rate_limit_window_seconds,
+                rate_limit_on_throttle,
             };
             info!("Registered job: {:?}", runnable);
 
@@ -1886,6 +1961,22 @@ impl Worker {
             // Only store concurrency info if concurrency control is actually enabled
             if has_concurrency_control {
                 self.ctx.enable_concurrency_control(class_name.to_string());
+            }
+
+            // Mirror rate limit config into the AppContext registry so the
+            // worker claim path can `.is_empty()` short-circuit when no
+            // class uses the feature.
+            if let (Some(max), Some(win_secs)) = (rate_limit_max, rate_limit_window_seconds) {
+                if let Ok(mut reg) = self.ctx.rate_limited_classes.write() {
+                    reg.insert(
+                        class_name.to_string(),
+                        crate::context::RateLimitConfig {
+                            max,
+                            window: chrono::Duration::seconds(win_secs as i64),
+                            on_throttle: rate_limit_on_throttle,
+                        },
+                    );
+                }
             }
             Ok(())
         })

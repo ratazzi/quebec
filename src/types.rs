@@ -2200,6 +2200,29 @@ impl PyQuebec {
         Ok(format!("Quebec(url={})", self.url))
     }
 
+    /// Debug accessor — returns the rate limit config for a registered class
+    /// as a dict, or None when the class did not declare `rate_limit_max`.
+    #[pyo3(name = "_rate_limit_config_for")]
+    fn rate_limit_config_for<'py>(
+        &self,
+        py: Python<'py>,
+        class_name: String,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let registry = self.worker.ctx.rate_limited_classes.read().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("rate_limited_classes RwLock poisoned")
+        })?;
+        match registry.get(&class_name) {
+            None => Ok(None),
+            Some(cfg) => {
+                let dict = PyDict::new(py);
+                dict.set_item("max", cfg.max)?;
+                dict.set_item("window_seconds", cfg.window.num_seconds())?;
+                dict.set_item("on_throttle", cfg.on_throttle)?;
+                Ok(Some(dict))
+            }
+        }
+    }
+
     // implment a decorator to register job class
     fn register_job(&self, py: Python, job_class: Py<PyAny>) -> PyResult<Py<PyAny>> {
         let dup = job_class.clone();
