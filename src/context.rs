@@ -357,6 +357,13 @@ pub struct AppContext {
     /// if it no longer matches (i.e. the supervisor died and we got reparented
     /// to init/launchd). Zero means "not supervised, do not check".
     pub supervisor_pid: AtomicI32,
+    /// `(entry_index, within_entry)` populated by `apply_worker_config` /
+    /// `apply_dispatcher_config` after fork so `set_proc_title` can show
+    /// `[worker.<entry>.<within>:threads]` instead of all sibling processes
+    /// sharing the same `[worker:threads]` line. `None` for standalone
+    /// (non-supervised) runs, the supervisor parent itself, and the
+    /// scheduler (which is always a single process).
+    pub proc_slot: Option<(usize, usize)>,
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -781,6 +788,7 @@ impl AppContext {
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
             supervisor_pid: AtomicI32::new(0),
+            proc_slot: None,
         }
     }
 
@@ -871,6 +879,9 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
+            // Preserve so re-forks (or apply_*_config re-using a forked ctx)
+            // keep the slot label until explicitly reset by apply_*_config.
+            proc_slot: self.proc_slot,
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),
@@ -988,22 +999,37 @@ impl AppContext {
     }
 
     /// Set process title for better visibility in system tools (htop, ps, etc.)
-    /// Format: `quebec-app_name [process_type:details] <cwd_basename>@<git_sha>`
-    /// where the suffix is computed by [`proctitle_suffix`] from the running
+    /// Base format: `quebec-app_name [role:details] <cwd_basename>@<git_sha>`.
+    ///
+    /// `role` is `process_type` by default; when the context has
+    /// `proc_slot = Some((entry, within))` (set by `apply_worker_config` /
+    /// `apply_dispatcher_config` in supervisor children) it becomes
+    /// `process_type#<entry>/<within>` so sibling workers / dispatchers
+    /// can be told apart in `ps` — `#N` names the queue.yml entry, `/M`
+    /// the process index inside it.
+    ///
+    /// The suffix is computed by [`proctitle_suffix`] from the running
     /// process's cwd (with symlinks resolved, so a Capistrano-style
     /// `current` → `releases/<id>` deploy surfaces `<id>` instead of
-    /// `current`) and the cached `git rev-parse --short HEAD` output. Either
-    /// component is dropped when missing, so the suffix is omitted entirely
-    /// for plain checkouts without `.git` in a path with no last component.
+    /// `current`) and the cached `git rev-parse --short HEAD` output.
+    /// Either component is dropped when missing, so the suffix is omitted
+    /// entirely for plain checkouts without `.git` in a path with no last
+    /// component.
     /// Examples:
-    /// - quebec-myapp [worker:3] myapp@a1b2c3d        (local checkout)
+    /// - quebec-myapp [worker:3] myapp@a1b2c3d              (standalone local)
     /// - quebec-coms [worker:10] 20260523-1738-b5b146b@b5b146b  (Capistrano)
-    /// - quebec-myapp [dispatcher] myapp              (no git available)
+    /// - quebec-coms [worker#0/1:5] release@sha             (supervised, slot 1)
+    /// - quebec-coms [dispatcher#1/0] release@sha           (supervised dispatcher)
+    /// - quebec-myapp [dispatcher] myapp                    (no git available)
     pub fn set_proc_title(&self, process_type: &str, details: Option<&str>) {
+        let role = match self.proc_slot {
+            Some((entry, within)) => format!("{process_type}#{entry}/{within}"),
+            None => process_type.to_string(),
+        };
         let base = if let Some(details) = details {
-            format!("quebec-{} [{}:{}]", self.name, process_type, details)
+            format!("quebec-{} [{}:{}]", self.name, role, details)
         } else {
-            format!("quebec-{} [{}]", self.name, process_type)
+            format!("quebec-{} [{}]", self.name, role)
         };
         let title = match proctitle_suffix(&self.cwd, crate::process::process_revision()) {
             Some(suffix) => format!("{base} {suffix}"),
