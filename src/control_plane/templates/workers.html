@@ -37,10 +37,17 @@
             <div class="text-sm text-gray-900">{{ worker.hostname | default(value="unknown") }}</div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
-            <div class="text-sm text-gray-900">{{ worker.pid }}</div>
-            {% if worker.revision %}
-              <div class="text-xs text-gray-500" title="Process revision reported at heartbeat (git SHA when available)">{{ worker.revision }}</div>
-            {% endif %}
+            <div class="flex items-center gap-1.5 text-sm text-gray-900">
+              <span>{{ worker.pid }}</span>
+              {% if worker.revision %}
+                <svg class="h-3.5 w-3.5 text-gray-400" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+                  <circle cx="12" cy="12" r="3"></circle>
+                  <line x1="3" x2="9" y1="12" y2="12"></line>
+                  <line x1="15" x2="21" y1="12" y2="12"></line>
+                </svg>
+                <span class="font-mono text-xs text-gray-500" title="Process revision reported at heartbeat (git SHA when available)">{{ worker.revision }}</span>
+              {% endif %}
+            </div>
           </td>
           <td class="px-6 py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></div>
