@@ -2198,6 +2198,12 @@ impl Worker {
                     let duration = runnable
                         .concurrency_duration
                         .map(|s| chrono::Duration::seconds(s as i64));
+                    // Propagate release errors (lock timeout, conn drop, ...)
+                    // so the whole rate-routed transaction rolls back. The
+                    // ready-delete + scheduled-insert / mark_finished writes
+                    // above MUST stay consistent with the semaphore state —
+                    // a silently-failed release would re-create the very slot
+                    // leak this code path was added to prevent.
                     let released = crate::semaphore::release_semaphore(
                         txn,
                         table_config,
@@ -2205,18 +2211,12 @@ impl Worker {
                         limit,
                         duration,
                     )
-                    .await
-                    .inspect_err(|e| {
-                        warn!(
-                            jid = job.active_job_id.as_deref(),
-                            concurrency_key = key,
-                            "rate-limit: failed to release concurrency semaphore: {:?}",
-                            e
-                        )
-                    })
-                    .unwrap_or(false);
+                    .await?;
 
                     if released {
+                        // Promoting one blocked job is an optimization (dispatcher's
+                        // periodic sweep also handles blocked→ready); keep it
+                        // best-effort so it can't poison the rate-route txn.
                         Self::release_next_blocked_job(ctx, txn, key, limit)
                             .await
                             .inspect_err(|e| {
@@ -3255,7 +3255,13 @@ impl Worker {
             return Ok(());
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
-        let _ = release_semaphore(
+        // Propagate failures: callers already `.await?` this helper, expecting
+        // a release failure to abort the enclosing tx. Silently swallowing the
+        // DbErr would leave the slot accounted as held in `solid_queue_semaphores`
+        // while the caller's state change (claimed deleted, ready re-inserted,
+        // scheduled inserted, etc.) commits — the exact slot-leak class of bug
+        // we already saw reintroduced through every claim/throttle path.
+        release_semaphore(
             db,
             table_config,
             format!("queue:{}", queue_name),
@@ -3263,7 +3269,7 @@ impl Worker {
             duration,
         )
         .await
-        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e));
+        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e))?;
         Ok(())
     }
 
