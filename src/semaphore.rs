@@ -382,18 +382,24 @@ fn solve_retry_at(
         now_secs + ((window_secs as f64) * decay_fraction).ceil() as i64
     };
 
-    // Deterministic jitter: spread throttled jobs from the same bucket across
-    // the next window using job_id as the seed. Keeps reproductions trivial
-    // (same job → same offset) versus stochastic `rand`.
-    let jitter_secs = ((job_id.unsigned_abs() % 1000) as i64 * window_secs) / 1000;
-    let target = base_secs.saturating_add(jitter_secs);
-    // Never schedule into the past — clock skew or fast loops can push base
-    // before `now`; clamp to now + 1 so the dispatcher always has a future
-    // scheduled_at to promote against.
-    let final_secs = target.max(now_secs + 1);
+    // Deterministic sub-second jitter: spread throttled jobs from the same
+    // bucket across the next window using job_id as the seed. Keeps
+    // reproductions trivial (same job → same offset) versus stochastic `rand`.
+    //
+    // Computed in nanoseconds so the smallest supported window (1s) still
+    // produces a meaningful spread. With integer-second jitter, every
+    // throttled job at window=1s landed at the same exact second, defeating
+    // the anti-stampede goal.
+    let jitter_nanos = ((job_id.unsigned_abs() % 1000) as i64 * window_secs * 1_000_000_000) / 1000;
+    let jitter_duration = chrono::Duration::nanoseconds(jitter_nanos);
 
-    chrono::DateTime::from_timestamp(final_secs, 0)
-        .map(|dt| dt.naive_utc())
+    // Clamp base to (now, ...) — clock skew or fast loops can push base into
+    // the past before jitter is applied; make sure the dispatcher always has
+    // a future scheduled_at to promote against.
+    let base_secs = base_secs.max(now_secs + 1);
+
+    chrono::DateTime::from_timestamp(base_secs, 0)
+        .map(|dt| dt.naive_utc() + jitter_duration)
         .ok_or_else(|| DbErr::Custom("rate-limit: invalid retry_at timestamp".into()))
 }
 

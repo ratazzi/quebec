@@ -656,3 +656,57 @@ def test_rate_discard_releases_concurrency_key_slot(qc_with_sqlalchemy):
         f"blocked={blocked_count} — concurrency slot leak (Discard path)"
     )
     assert blocked_count == 0
+
+
+class JitterSpreadJob(quebec.BaseClass):
+    queue_as = "default"
+    rate_limit_max = 1
+    rate_limit_window = timedelta(seconds=1)
+    calls: list[int] = []
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_jitter_spreads_throttled_jobs_within_one_second_window(qc_with_sqlalchemy):
+    """retry_at must use sub-second resolution. With integer-second jitter,
+    every throttled job at window=1s landed on the exact same wall-clock
+    second, defeating the anti-stampede design. After the fix, distinct
+    job_ids produce distinct sub-second offsets.
+    """
+    JitterSpreadJob.calls = []
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(JitterSpreadJob)
+    # First grant consumes the only token.
+    JitterSpreadJob.perform_later(qc, 0)
+    e1 = _drain_silently(qc)
+    assert e1 is not None
+    e1.perform()
+
+    # Enqueue several more in the same window — all throttle and
+    # reschedule. Without sub-second jitter their scheduled_at values
+    # collapse onto one timestamp.
+    for i in range(1, 8):
+        JitterSpreadJob.perform_later(qc, i)
+    for _ in range(7):
+        assert _drain_silently(qc) is None
+
+    rows = session.execute(
+        text(
+            f"SELECT s.scheduled_at FROM {prefix}_scheduled_executions s "
+            f"JOIN {prefix}_jobs j ON j.id = s.job_id "
+            "WHERE j.class_name = 'JitterSpreadJob' "
+            "ORDER BY s.scheduled_at"
+        )
+    ).all()
+    assert len(rows) == 7
+    distinct_times = {row[0] for row in rows}
+    # Allow some collision (job_id % 1000 hash) but require meaningful
+    # spread — at minimum half the jobs land at unique sub-second offsets.
+    assert len(distinct_times) >= 4, (
+        f"jitter collapsed: {len(distinct_times)} distinct scheduled_at across "
+        f"7 throttled jobs — expected sub-second spread. rows={rows}"
+    )
