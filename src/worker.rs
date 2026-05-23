@@ -347,12 +347,23 @@ impl Runnable {
                 }
             }
 
-            let result = attr.call(py_args, Some(&py_kwargs))?;
-            let s: String = result.extract()?;
-            if s.is_empty() {
-                Ok(self.class_name.clone())
-            } else {
-                Ok(s)
+            // Fall back to class name on any user-side failure (raise,
+            // non-str, None). Surfacing PyErr would bounce the claim_job tx
+            // and leave the candidate spinning in ready until the user fixes
+            // their code.
+            match attr
+                .call(py_args, Some(&py_kwargs))
+                .and_then(|r| r.extract::<String>())
+            {
+                Ok(s) if !s.is_empty() => Ok(s),
+                Ok(_) => Ok(self.class_name.clone()),
+                Err(e) => {
+                    warn!(
+                        class = self.class_name,
+                        "rate_limit_key failed ({e}); using class name as bucket"
+                    );
+                    Ok(self.class_name.clone())
+                }
             }
         })
         .map_err(|e: PyErr| QuebecError::Python(format!("compute_rate_limit_key: {e}")))
@@ -1972,6 +1983,15 @@ impl Worker {
                     )));
                 }
                 let td = bound.getattr("rate_limit_window")?;
+                // Type-check upfront so users get a clear error instead of
+                // the cryptic `AttributeError: 'int' object has no attribute
+                // 'total_seconds'` that surfaces if any non-timedelta is set.
+                if !td.is_instance_of::<pyo3::types::PyDelta>() {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{class_name}: rate_limit_window must be a datetime.timedelta, got {}",
+                        td.get_type().qualname()?
+                    )));
+                }
                 let total: f64 = td.call_method0("total_seconds")?.extract()?;
                 if total < 1.0 {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(

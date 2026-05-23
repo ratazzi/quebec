@@ -791,3 +791,70 @@ def test_large_window_jitter_no_overflow(qc_with_sqlalchemy):
             f"job {jid}: retry_at {scheduled_at} is implausible (delta={delta}); "
             "jitter overflow suspected"
         )
+
+
+def test_register_job_rejects_non_timedelta_window(qc_with_sqlalchemy):
+    """Non-timedelta `rate_limit_window` used to surface as a cryptic
+    `AttributeError: 'int' object has no attribute 'total_seconds'`.
+    The upfront is_instance check now reports the actual problem.
+    """
+    qc = qc_with_sqlalchemy["qc"]
+
+    class BadWindowInt(quebec.BaseClass):
+        rate_limit_max = 1
+        rate_limit_window = 2  # int, not timedelta
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    with pytest.raises(TypeError, match="must be a datetime.timedelta"):
+        qc.register_job(BadWindowInt)
+
+    class BadWindowStr(quebec.BaseClass):
+        rate_limit_max = 1
+        rate_limit_window = "2 seconds"  # str
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    with pytest.raises(TypeError, match="must be a datetime.timedelta"):
+        qc.register_job(BadWindowStr)
+
+
+@pytest.mark.parametrize(
+    "bad_return",
+    [
+        pytest.param("raise", id="raises"),
+        pytest.param(None, id="returns_none"),
+        pytest.param(42, id="returns_int"),
+    ],
+)
+def test_rate_limit_key_failure_falls_back_to_class_name(
+    qc_with_sqlalchemy, bad_return
+):
+    """A broken user `rate_limit_key` (raise / None / non-str) must not poison
+    the claim loop. Surfacing the PyErr would roll claim_job back, leave the
+    candidate in ready, and next poll would hit the same error.
+    """
+    qc = qc_with_sqlalchemy["qc"]
+
+    class Job(quebec.BaseClass):
+        rate_limit_max = 1
+        rate_limit_window = timedelta(seconds=2)
+
+        def rate_limit_key(self, *args, **kwargs):
+            if bad_return == "raise":
+                raise RuntimeError("user bug")
+            return bad_return
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    qc.register_job(Job)
+    Job.perform_later(qc)
+    e1 = _drain_silently(qc)
+    assert e1 is not None  # granted via fallback class-name bucket
+    e1.perform()
+    Job.perform_later(qc)
+    # Throttled via the same fallback bucket — no crash, no loop.
+    assert _drain_silently(qc) is None
