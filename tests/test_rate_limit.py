@@ -405,3 +405,90 @@ def test_burst_respects_max_within_window(qc_with_sqlalchemy):
         text(f"SELECT count(*) FROM {prefix}_scheduled_executions")
     ).scalar()
     assert rescheduled == 20 - granted
+
+
+class QueueRateJob(quebec.BaseClass):
+    """Used in test_rate_throttle_releases_queue_slot."""
+
+    queue_as = "default"
+    rate_limit_max = 1
+    rate_limit_window = timedelta(seconds=2)
+    calls: list[int] = []
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_rate_throttle_releases_queue_slot(db_url, test_prefix):
+    """REVIEW.md 2026-05-23 14:12 P1: when both queue concurrency and rate
+    limit are enabled, a rate-throttled job must release the queue:<name>
+    semaphore slot it took during the earlier queue-acquire step. Otherwise
+    the queue is stuck "full" until the TTL sweep, blocking unrelated jobs
+    on the same queue.
+    """
+    QueueRateJob.calls = []
+    instance = quebec.Quebec(
+        db_url,
+        table_name_prefix=test_prefix,
+        experimental_queue_concurrency={"default": 1},
+    )
+    assert instance.create_tables() is True
+    try:
+        instance.register_job(QueueRateJob)
+        QueueRateJob.perform_later(instance, 1)
+        QueueRateJob.perform_later(instance, 2)
+        QueueRateJob.perform_later(instance, 3)
+
+        # First drain consumes the only rate token AND the only queue slot.
+        e1 = _drain_silently(instance)
+        assert e1 is not None
+        e1.perform()  # releases the queue slot via after_executed
+
+        # Second drain: queue slot acquired (1/1), then rate gate denies
+        # (token already consumed in window). The buggy implementation
+        # would leak the queue slot here — subsequent perform_later jobs
+        # to the same queue would silently sit in ready_executions until
+        # TTL even though no claimed jobs hold the slot.
+        assert _drain_silently(instance) is None
+
+        # Third drain must still be possible (queue slot was released even
+        # though the rate gate routed the second candidate). With the
+        # bug present, this would also return None and the assertion
+        # below on PlainJob would also fail.
+        instance.register_job(PlainJob)
+        PlainJob.calls = []
+        PlainJob.perform_later(instance, 99)
+        e3 = _drain_silently(instance)
+        assert e3 is not None, (
+            "queue:default semaphore leaked; PlainJob can't claim its slot"
+        )
+        e3.perform()
+        assert PlainJob.calls == [99]
+    finally:
+        instance.close()
+
+
+def test_reregister_without_rate_limit_clears_stale_config(qc_with_sqlalchemy):
+    """REVIEW.md 2026-05-23 14:12 P3: re-registering a class without
+    `rate_limit_max` must clear the previously-stored rate config — otherwise
+    long-lived processes / test reuse keep throttling against stale settings.
+    """
+    qc = qc_with_sqlalchemy["qc"]
+
+    class Reused(quebec.BaseClass):
+        rate_limit_max = 1
+        rate_limit_window = timedelta(seconds=2)
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    qc.register_job(Reused)
+    assert qc._rate_limit_config_for(Reused.__qualname__) is not None
+
+    # Re-define the same class name without rate limit and re-register.
+    class Reused(quebec.BaseClass):  # noqa: F811 — intentional shadow
+        def perform(self, *args, **kwargs):
+            pass
+
+    qc.register_job(Reused)
+    assert qc._rate_limit_config_for(Reused.__qualname__) is None
