@@ -386,12 +386,18 @@ fn solve_retry_at(
     // bucket across the next window using job_id as the seed. Keeps
     // reproductions trivial (same job → same offset) versus stochastic `rand`.
     //
-    // Computed in nanoseconds so the smallest supported window (1s) still
-    // produces a meaningful spread. With integer-second jitter, every
-    // throttled job at window=1s landed at the same exact second, defeating
-    // the anti-stampede goal.
-    let jitter_nanos = ((job_id.unsigned_abs() % 1000) as i64 * window_secs * 1_000_000_000) / 1000;
-    let jitter_duration = chrono::Duration::nanoseconds(jitter_nanos);
+    // We split into whole seconds + sub-second nanoseconds *before* scaling
+    // up to nanoseconds. The earlier `seed * window_secs * 1e9 / 1000` form
+    // overflowed i64 once `window_secs > ~9.2M` (~107d), so a legal
+    // `timedelta(days=365)` window panicked on overflow at throttle time.
+    // Splitting keeps every intermediate product within i64 for the full
+    // supported window range (≤ i32::MAX seconds).
+    let seed = (job_id.unsigned_abs() % 1000) as i64;
+    let scaled = seed * window_secs; // max ~999 * 2.1e9 = ~2.1e12, well within i64
+    let jitter_whole_secs = scaled / 1000;
+    let jitter_sub_nanos = (scaled % 1000) * 1_000_000;
+    let jitter_duration = chrono::Duration::seconds(jitter_whole_secs)
+        + chrono::Duration::nanoseconds(jitter_sub_nanos);
 
     // Clamp base to (now, ...) — clock skew or fast loops can push base into
     // the past before jitter is applied; make sure the dispatcher always has

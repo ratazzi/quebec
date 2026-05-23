@@ -710,3 +710,84 @@ def test_jitter_spreads_throttled_jobs_within_one_second_window(qc_with_sqlalche
         f"jitter collapsed: {len(distinct_times)} distinct scheduled_at across "
         f"7 throttled jobs — expected sub-second spread. rows={rows}"
     )
+
+
+class LargeWindowJob(quebec.BaseClass):
+    """Maximum-supported window — exercises the jitter overflow boundary.
+
+    Pre-fix formula `seed * window_secs * 1_000_000_000 / 1000` overflows
+    i64 once `seed * window_secs > i64::MAX / 1e9 ≈ 9.22e9`. With
+    `window_secs ≈ i32::MAX (~2.15e9)`, any `seed >= 5` overflows.
+    `cargo` dev profile enables overflow-checks → panic in tests; release
+    builds wrap silently → wildly wrong retry_at. Either way the fix
+    (split into seconds + sub-second nanos before scaling) keeps every
+    intermediate product within i64 across the full supported range.
+    """
+
+    queue_as = "default"
+    rate_limit_max = 1
+    # i32::MAX seconds — the upper bound accepted by register_job_class.
+    rate_limit_window = timedelta(seconds=2_147_483_647)
+    calls: list[int] = []
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_large_window_jitter_no_overflow(qc_with_sqlalchemy):
+    LargeWindowJob.calls = []
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(LargeWindowJob)
+
+    # Burn through job ids 1..=4 with a granted-then-completed cycle (max=1
+    # in a multi-decade window, so only the very first per-window grants).
+    # We need a throttled job with seed >= 5 to trip the overflow boundary
+    # at max window. Easiest path: enqueue several jobs and pick one with
+    # an id >= 5; the rate-throttle will move it to scheduled.
+    LargeWindowJob.perform_later(qc, 1)
+    e1 = _drain_silently(qc)
+    assert e1 is not None
+    e1.perform()
+
+    # Enqueue several more so subsequent throttles span seeds across the
+    # overflow boundary (seed >= 5).
+    for value in range(2, 8):
+        LargeWindowJob.perform_later(qc, value)
+
+    # All six are throttled and rescheduled. With the bug, jobs whose
+    # id % 1000 >= 5 panic on overflow (dev profile) or wrap to a
+    # nonsensical retry_at (release profile). With the fix, every call
+    # produces a sane future timestamp.
+    for _ in range(6):
+        assert _drain_silently(qc) is None
+
+    rows = session.execute(
+        text(
+            f"SELECT s.scheduled_at, s.job_id "
+            f"FROM {prefix}_scheduled_executions s "
+            f"JOIN {prefix}_jobs j ON j.id = s.job_id "
+            "WHERE j.class_name = 'LargeWindowJob' "
+            "ORDER BY s.job_id"
+        )
+    ).all()
+    assert len(rows) == 6, rows
+
+    from datetime import datetime, timezone, timedelta as td
+
+    now = datetime.now(timezone.utc)
+    # base scheduled_at is now + ~window_secs (since prev=0, retry_at jumps
+    # to window_end). Plus jitter (0..window). Allow up to 2x window slack.
+    upper = now + td(seconds=LargeWindowJob.rate_limit_window.total_seconds() * 2)
+    for scheduled_at, jid in rows:
+        if isinstance(scheduled_at, str):
+            scheduled_at = datetime.fromisoformat(scheduled_at)
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+        delta = scheduled_at - now
+        assert td(seconds=0) < delta < upper - now, (
+            f"job {jid}: retry_at {scheduled_at} is implausible (delta={delta}); "
+            "jitter overflow suspected"
+        )
