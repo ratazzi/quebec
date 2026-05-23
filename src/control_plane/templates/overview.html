@@ -2,7 +2,7 @@
 
 {% block content %}
 <turbo-frame id="content">
-  <div class="max-w-7xl mx-auto p-4" data-controller="charts">
+  <div data-controller="charts">
 
     <!-- Time Range Selector -->
     <div class="flex justify-end mb-6" data-controller="filter">
@@ -113,23 +113,23 @@
         <table class="min-w-full divide-y divide-gray-200">
           <thead>
             <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue Name</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Jobs Processed</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg. Duration</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed Rate</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue Name</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Jobs Processed</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Avg. Duration</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed Rate</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
             </tr>
           </thead>
           <tbody class="bg-white divide-y divide-gray-200">
             {% for queue in queue_stats %}
             <tr>
-              <td class="px-6 py-4 whitespace-nowrap">
+              <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
                 <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-gray-900 hover:underline">{{ queue.name }}</a>
               </td>
-              <td class="px-6 py-4 whitespace-nowrap">{{ queue.jobs_processed }}</td>
-              <td class="px-6 py-4 whitespace-nowrap">{{ queue.avg_duration }}</td>
-              <td class="px-6 py-4 whitespace-nowrap">{{ queue.failed_rate }}%</td>
-              <td class="px-6 py-4 whitespace-nowrap">
+              <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">{{ queue.jobs_processed }}</td>
+              <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">{{ queue.avg_duration }}</td>
+              <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">{{ queue.failed_rate }}%</td>
+              <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
                 {% if queue.status == "paused" %}
                 <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">Paused</span>
                 {% else %}
@@ -150,44 +150,44 @@
         <table class="min-w-full divide-y divide-gray-200">
           <thead>
             <tr>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Job ID</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class Name</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed At</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Error</th>
-              <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Job ID</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Class Name</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Queue</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Failed At</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Error</th>
+              <th class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
             </tr>
           </thead>
           <tbody class="bg-white divide-y divide-gray-200">
             {% if recent_failed_jobs|length > 0 %}
               {% for job in recent_failed_jobs %}
               <tr>
-                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm">
                   {{ job.id }}
                 </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm">
                   {{ job.class_name }}
                 </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm">
                   {{ job.queue_name }}
                 </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm">
                   <span data-controller="localtime" data-localtime-datetime-value="{{ job.failed_at }}">{{ job.failed_at }}</span>
                 </td>
-                <td class="px-6 py-4 text-sm max-w-xs truncate">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 text-sm max-w-xs truncate">
                   <div class="tooltip">
                     <span>{{ job.error|truncate(length=50) }}</span>
                     <span class="tooltip-text">{{ job.error }}</span>
                   </div>
                 </td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm">
+                <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-sm">
                   <a href="{{ base_path }}/jobs/{{ job.id }}" data-turbo-action="advance" class="text-gray-900 hover:underline">Details</a>
                 </td>
               </tr>
               {% endfor %}
             {% else %}
               <tr>
-                <td colspan="6" class="px-6 py-4 text-center text-sm text-gray-500">
+                <td colspan="6" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
                   No failed jobs in the selected time period
                 </td>
               </tr>

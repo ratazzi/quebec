@@ -2,12 +2,58 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="base-path" content="{{ base_path }}">
   <title>{% block title %}Control Plane{% endblock %}</title>
   <script src="{{ base_path }}/static/tailwindcss.js?v={{ version }}"></script>
   <script type="module" src="{{ base_path }}/static/turbo.es2017-esm.min.js?v={{ version }}"></script>
   <script src="{{ base_path }}/static/chart.min.js?v={{ version }}"></script>
+
+  <style>
+    @supports (padding: env(safe-area-inset-bottom)) {
+      body {
+        padding-left: env(safe-area-inset-left);
+        padding-right: env(safe-area-inset-right);
+        padding-bottom: env(safe-area-inset-bottom);
+      }
+    }
+
+    .qc-nav-scroll {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+      scroll-snap-type: x proximity;
+    }
+    .qc-nav-scroll::-webkit-scrollbar { display: none; }
+    .qc-nav-scroll > a { scroll-snap-align: start; }
+    @media (max-width: 1023px) {
+      .qc-nav-scroll {
+        mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 24px), transparent 100%);
+        -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 24px), transparent 100%);
+      }
+      .overflow-x-auto:not(.qc-nav-scroll) {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(0, 0, 0, 0.25) transparent;
+      }
+      .overflow-x-auto:not(.qc-nav-scroll)[data-scroll-x="start"] {
+        mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 20px), transparent 100%);
+        -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 20px), transparent 100%);
+      }
+      .overflow-x-auto:not(.qc-nav-scroll)[data-scroll-x="middle"] {
+        mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+        -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 calc(100% - 20px), transparent 100%);
+      }
+      .overflow-x-auto:not(.qc-nav-scroll)[data-scroll-x="end"] {
+        mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 100%);
+        -webkit-mask-image: linear-gradient(to right, transparent 0, #000 20px, #000 100%);
+      }
+      .overflow-x-auto:not(.qc-nav-scroll)::-webkit-scrollbar { height: 6px; }
+      .overflow-x-auto:not(.qc-nav-scroll)::-webkit-scrollbar-thumb {
+        background: rgba(0, 0, 0, 0.25);
+        border-radius: 3px;
+      }
+      .overflow-x-auto:not(.qc-nav-scroll)::-webkit-scrollbar-track { background: transparent; }
+    }
+  </style>
 
   <script type="module">
     import { Application, Controller } from "{{ base_path | safe }}/static/stimulus.min.js?v={{ version | safe }}"
@@ -467,7 +513,7 @@
 
     // Navigation controller - manages navigation and active page state
     Stimulus.register("nav", class extends Controller {
-      static targets = ["navItem", "content"]
+      static targets = ["navItem", "content", "navSelect"]
       static values = {
         activeClass: { type: String, default: "border-b-2 border-black" }
       }
@@ -478,13 +524,27 @@
 
       setActivePageFromUrl() {
         const path = window.location.pathname
+        let matched = null
         this.navItemTargets.forEach(item => {
           const href = item.getAttribute('href')
           this.removeActiveClass(item)
           if (href === path) {
-            this.addActiveClass(item)
+            matched = item
           }
         })
+        if (!matched) {
+          // Sub-pages (e.g. /queues/low, /jobs/123) — highlight the closest section
+          matched = this.navItemTargets
+            .filter(item => {
+              const href = item.getAttribute('href')
+              return href !== '/' && path.startsWith(href + '/')
+            })
+            .sort((a, b) => b.getAttribute('href').length - a.getAttribute('href').length)[0]
+        }
+        if (matched) this.addActiveClass(matched)
+        if (this.hasNavSelectTarget) {
+          this.navSelectTarget.value = matched ? matched.getAttribute('href') : ''
+        }
       }
 
       navigate(event) {
@@ -498,9 +558,24 @@
           this.addActiveClass(event.currentTarget)
 
           const href = event.currentTarget.getAttribute('href')
-          this.contentTarget.setAttribute('src', href)
-          history.pushState({}, '', href)
+          if (this.hasNavSelectTarget) this.navSelectTarget.value = href
+          this._goto(href)
         }
+      }
+
+      navigateSelect(event) {
+        const href = event.currentTarget.value
+        if (!href) return
+        this.navItemTargets.forEach(item => {
+          this.removeActiveClass(item)
+          if (item.getAttribute('href') === href) this.addActiveClass(item)
+        })
+        this._goto(href)
+      }
+
+      _goto(href) {
+        this.contentTarget.setAttribute('src', href)
+        history.pushState({}, '', href)
       }
 
       addActiveClass(element) {
@@ -602,11 +677,41 @@
       }
     })
   </script>
+
+  <script>
+    (function () {
+      const SELECTOR = '.overflow-x-auto:not(.qc-nav-scroll)'
+      const update = (el) => {
+        const max = el.scrollWidth - el.clientWidth
+        if (max <= 1) { el.dataset.scrollX = 'fit'; return }
+        if (el.scrollLeft <= 0) { el.dataset.scrollX = 'start' }
+        else if (el.scrollLeft >= max - 1) { el.dataset.scrollX = 'end' }
+        else { el.dataset.scrollX = 'middle' }
+      }
+      const ro = new ResizeObserver((entries) => {
+        for (const e of entries) update(e.target)
+      })
+      const scan = () => {
+        document.querySelectorAll(SELECTOR).forEach((el) => {
+          update(el)
+          ro.observe(el)
+          if (!el.dataset.scrollHintBound) {
+            el.addEventListener('scroll', () => update(el), { passive: true })
+            el.dataset.scrollHintBound = '1'
+          }
+        })
+      }
+      document.addEventListener('DOMContentLoaded', scan)
+      document.addEventListener('turbo:load', scan)
+      document.addEventListener('turbo:frame-load', scan)
+    })()
+
+  </script>
 </head>
 <body class="bg-white text-black min-h-screen flex flex-col">
-  <div class="max-w-screen-2xl mx-auto p-4 md:p-6 w-full flex-grow flex flex-col">
-    <div class="flex items-center gap-3 mb-6">
-      <h1 class="text-3xl font-bold">Control Plane</h1>
+  <div class="max-w-screen-2xl mx-auto p-3 sm:p-4 md:p-6 w-full flex-grow flex flex-col">
+    <div class="flex flex-wrap items-center gap-2 sm:gap-3 mb-4 sm:mb-6">
+      <h1 class="text-2xl sm:text-3xl font-bold">Control Plane</h1>
       {% if force_override_queue %}
         <span title="QUEBEC_FORCE_OVERRIDE_QUEUE is active — every enqueue is rewritten to this queue, ignoring class queue config and any `.set(queue=...)` call. Intended for multi-branch dev isolation; do not leave this set in production."
               class="inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-900">
@@ -620,7 +725,27 @@
 
     <div data-controller="nav" data-nav-active-class-value="border-b-2 border-black" class="flex flex-col flex-grow">
       <turbo-frame id="nav-frame">
-        <nav class="flex flex-nowrap border-b mb-6">
+        <div class="relative sm:hidden mb-4">
+          <select data-nav-target="navSelect" data-action="change->nav#navigateSelect"
+                  class="w-full appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm font-medium text-gray-900 focus:outline-none focus:ring-1 focus:ring-black focus:border-black">
+            <option value="" disabled hidden data-nav-fallback>— Detail page —</option>
+            <option value="{{ base_path }}/">Overview</option>
+            <option value="{{ base_path }}/queues">Queues</option>
+            <option id="nav-option-failed-jobs" value="{{ base_path }}/failed-jobs">Failed jobs · {{ nav_failed_jobs | default(value=0) }}</option>
+            <option id="nav-option-in-progress-jobs" value="{{ base_path }}/in-progress-jobs">In Progress jobs · {{ nav_in_progress_jobs | default(value=0) }}</option>
+            <option id="nav-option-blocked-jobs" value="{{ base_path }}/blocked-jobs">Blocked jobs · {{ nav_blocked_jobs | default(value=0) }}</option>
+            <option id="nav-option-scheduled-jobs" value="{{ base_path }}/scheduled-jobs">Scheduled jobs · {{ nav_scheduled_jobs | default(value=0) }}</option>
+            <option value="{{ base_path }}/recurring-jobs">Recurring jobs</option>
+            <option id="nav-option-finished-jobs" value="{{ base_path }}/finished-jobs">Finished jobs · {{ finished_jobs_count | default(value=0) }}</option>
+            <option value="{{ base_path }}/workers">Workers</option>
+          </select>
+          <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+            <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+            </svg>
+          </div>
+        </div>
+        <nav class="qc-nav-scroll hidden sm:flex flex-nowrap border-b mb-4 sm:mb-6 overflow-x-auto">
           <a href="{{ base_path }}/" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Overview
           </a>
@@ -661,24 +786,24 @@
 
       <!-- Footer -->
       <div class="mt-8 pt-4 border-t border-gray-200 mt-auto">
-        <div class="flex flex-col md:flex-row justify-between items-center text-sm text-gray-500">
-          <div class="mb-2 md:mb-0">
+        <div class="flex flex-col md:flex-row md:justify-between md:items-center gap-2 text-sm text-gray-500">
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span>Version: {{ version }}</span>
-            <span class="mx-2">|</span>
-            <span class="inline-flex items-center">
+            <span class="hidden sm:inline">|</span>
+            <span class="hidden sm:inline-flex items-center">
               <span class="h-2 w-2 rounded-full bg-green-500 mr-1"></span>
               <span>Operational</span>
             </span>
             {% if db_info %}
-            <span class="mx-2">|</span>
-            <span class="inline-flex items-center">
-              <span class="h-2 w-2 rounded-full {% if db_info.status == 'Connected' %}bg-green-500{% else %}bg-red-500{% endif %} mr-1"></span>
-              <span>{{ db_info.database_type }} ({{ db_info.connection_type }})</span>
-              <span class="ml-1 text-xs text-gray-400" title="{{ db_info.dsn }}">{{ db_info.dsn }}</span>
+            <span class="hidden sm:inline">|</span>
+            <span class="inline-flex items-center min-w-0 ml-auto sm:ml-0">
+              <span class="h-2 w-2 rounded-full {% if db_info.status == 'Connected' %}bg-green-500{% else %}bg-red-500{% endif %} mr-1 shrink-0"></span>
+              <span class="shrink-0">{{ db_info.database_type }} ({{ db_info.connection_type }})</span>
+              <span class="hidden sm:inline ml-1 text-xs text-gray-400 truncate" title="{{ db_info.dsn }}">{{ db_info.dsn }}</span>
             </span>
             {% endif %}
           </div>
-          <div class="flex space-x-4 items-center">
+          <div class="hidden sm:flex space-x-4 items-center">
             <a href="https://github.com/ratazzi/quebec" target="_blank" class="hover:text-black">Documentation</a>
             <a href="https://github.com/ratazzi/quebec" class="hover:text-black flex items-center">
               <svg class="h-4 w-4 mr-1" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
@@ -688,7 +813,7 @@
             </a>
           </div>
         </div>
-        <div class="mt-2 text-xs text-gray-400 text-right">
+        <div class="hidden sm:block mt-2 text-xs text-gray-400 text-left md:text-right">
           Last updated: <span id="current-time"></span>
         </div>
       </div>
