@@ -355,3 +355,53 @@ def test_zero_overhead_plain_job_still_claims(qc_with_sqlalchemy):
     assert e is not None
     e.perform()
     assert PlainJob.calls == [42]
+
+
+class BurstJob(quebec.BaseClass):
+    queue_as = "default"
+    rate_limit_max = 5
+    rate_limit_window = timedelta(seconds=5)
+    calls: list[int] = []
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_burst_respects_max_within_window(qc_with_sqlalchemy):
+    """Enqueue many jobs in tight succession; assert the rate limit caps
+    granted claims at ``max`` within the configured window.
+
+    Note: SQLite serializes all transactions, so threaded multi-worker
+    contention can't be exercised here — a sequential burst already
+    surfaces the invariant. True multi-process / multi-worker stress
+    testing is deferred to PG-backed integration runs during soak.
+    """
+    BurstJob.calls = []
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(BurstJob)
+    for i in range(20):
+        BurstJob.perform_later(qc, i)
+
+    granted = 0
+    for _ in range(20):
+        e = _drain_silently(qc)
+        if e is None:
+            break
+        granted += 1
+        e.perform()
+
+    # Sliding window allows up to ~2% over the configured max.
+    assert granted <= BurstJob.rate_limit_max + 1, (
+        f"granted {granted} exceeds max={BurstJob.rate_limit_max} + 2% tolerance"
+    )
+    assert granted >= BurstJob.rate_limit_max, (
+        f"granted {granted} is below max={BurstJob.rate_limit_max}; rate gate too strict"
+    )
+
+    rescheduled = session.execute(
+        text(f"SELECT count(*) FROM {prefix}_scheduled_executions")
+    ).scalar()
+    assert rescheduled == 20 - granted
