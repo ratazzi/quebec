@@ -357,6 +357,13 @@ pub struct AppContext {
     /// if it no longer matches (i.e. the supervisor died and we got reparented
     /// to init/launchd). Zero means "not supervised, do not check".
     pub supervisor_pid: AtomicI32,
+    /// `(entry_index, within_entry)` populated by `apply_worker_config` /
+    /// `apply_dispatcher_config` after fork so `set_proc_title` can show
+    /// `[worker.<entry>.<within>:threads]` instead of all sibling processes
+    /// sharing the same `[worker:threads]` line. `None` for standalone
+    /// (non-supervised) runs, the supervisor parent itself, and the
+    /// scheduler (which is always a single process).
+    pub proc_slot: Option<(usize, usize)>,
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -716,6 +723,7 @@ impl AppContext {
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
             supervisor_pid: AtomicI32::new(0),
+            proc_slot: None,
         }
     }
 
@@ -806,6 +814,9 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
+            // Preserve so re-forks (or apply_*_config re-using a forked ctx)
+            // keep the slot label until explicitly reset by apply_*_config.
+            proc_slot: self.proc_slot,
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),
@@ -923,16 +934,27 @@ impl AppContext {
     }
 
     /// Set process title for better visibility in system tools (htop, ps, etc.)
-    /// Format: quebec-app_name [process_type:details]
+    /// Base format: `quebec-app_name [process_type:details]`. When the
+    /// context has a `proc_slot = Some((entry, within))` (set by
+    /// `apply_worker_config` / `apply_dispatcher_config` in supervisor
+    /// children), the role becomes `process_type#<entry>/<within>` so
+    /// sibling workers / dispatchers can be told apart in `ps`. `#N`
+    /// names the queue.yml entry, `/M` the process index inside it.
     /// Examples:
-    /// - quebec-myapp [worker:3]
-    /// - quebec-myapp [dispatcher]
-    /// - quebec-myapp [scheduler]
+    /// - quebec-myapp [worker:3]              (standalone, no supervisor)
+    /// - quebec-myapp [worker#0/1:5]          (supervised, entry 0, 2nd process)
+    /// - quebec-myapp [dispatcher#1/0]        (supervised, entry 1, 1st process)
+    /// - quebec-myapp [supervisor]            (parent, no slot)
+    /// - quebec-myapp [scheduler]             (single-process role)
     pub fn set_proc_title(&self, process_type: &str, details: Option<&str>) {
+        let role = match self.proc_slot {
+            Some((entry, within)) => format!("{process_type}#{entry}/{within}"),
+            None => process_type.to_string(),
+        };
         let title = if let Some(details) = details {
-            format!("quebec-{} [{}:{}]", self.name, process_type, details)
+            format!("quebec-{} [{}:{}]", self.name, role, details)
         } else {
-            format!("quebec-{} [{}]", self.name, process_type)
+            format!("quebec-{} [{}]", self.name, role)
         };
 
         #[cfg(target_os = "macos")]

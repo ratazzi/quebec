@@ -201,6 +201,32 @@ class TestApplyConfig:
         except Exception as exc:
             pytest.fail(f"unexpected exception: {exc!r}")
 
+    def test_apply_worker_config_without_yml_still_sets_proc_slot(
+        self, qc, monkeypatch, tmp_path
+    ):
+        # Embedded-services path: queue.yml present but has no workers section
+        # (or no yml at all). supervisor passes slot_index straight through.
+        # proc_slot must still be set so children get distinguishable proctitles
+        # (`worker#0/N`) instead of all sharing `[worker:threads]`.
+        empty = tmp_path / "empty.yml"
+        empty.write_text("development: {}\n")
+        monkeypatch.setenv("QUEBEC_CONFIG", str(empty))
+
+        assert qc._proc_slot() is None
+        qc.apply_worker_config(2)
+        assert qc._proc_slot() == (0, 2)
+
+    def test_apply_dispatcher_config_without_yml_still_sets_proc_slot(
+        self, qc, monkeypatch, tmp_path
+    ):
+        empty = tmp_path / "empty.yml"
+        empty.write_text("development: {}\n")
+        monkeypatch.setenv("QUEBEC_CONFIG", str(empty))
+
+        assert qc._proc_slot() is None
+        qc.apply_dispatcher_config(1)
+        assert qc._proc_slot() == (0, 1)
+
 
 class TestSupervisorPlanFromConfig:
     def test_returns_dict_or_none(self, qc):
