@@ -88,3 +88,29 @@ def test_register_job_rejects_max_without_window(qc_with_sqlalchemy):
 
     with pytest.raises(ValueError, match="rate_limit_window"):
         qc.register_job(MissingWindow)
+
+
+def test_default_rate_limit_key_is_class_name():
+    class Foo(quebec.BaseClass):
+        rate_limit_max = 5
+        rate_limit_window = timedelta(seconds=1)
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    assert Foo().rate_limit_key() == "Foo"
+
+
+def test_rate_limit_key_can_be_overridden():
+    class Bar(quebec.BaseClass):
+        rate_limit_max = 5
+        rate_limit_window = timedelta(seconds=1)
+
+        def rate_limit_key(self, region="us"):
+            return f"bar:{region}"
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    assert Bar().rate_limit_key(region="eu") == "bar:eu"
+    assert Bar().rate_limit_key() == "bar:us"
