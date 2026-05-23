@@ -125,9 +125,7 @@ pub struct InProgressJobInfo {
 pub struct QueueJobInfo {
     pub id: i64,
     pub class_name: String,
-    pub status: String,
     pub created_at: String,
-    pub execution_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

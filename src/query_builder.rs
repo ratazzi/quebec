@@ -1313,6 +1313,51 @@ pub mod ready_executions {
         Ok(out)
     }
 
+    /// Count ready executions for a single queue
+    pub async fn count_by_queue_name<C>(
+        db: &C,
+        table_config: &TableConfig,
+        queue_name: &str,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(table)
+            .and_where(Expr::col(col("queue_name")).eq(queue_name))
+            .to_owned();
+
+        execute_count(db, query).await
+    }
+
+    /// Find ready executions for a queue with pagination, ordered by priority then id
+    /// (matching the order workers will pull jobs in).
+    pub async fn find_by_queue_paginated<C>(
+        db: &C,
+        table_config: &TableConfig,
+        queue_name: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<quebec_ready_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.ready_executions);
+        let query = Query::select()
+            .column(Asterisk)
+            .from(table)
+            .and_where(Expr::col(col("queue_name")).eq(queue_name))
+            .order_by(col("priority"), Order::Asc)
+            .order_by(col("job_id"), Order::Asc)
+            .offset(offset)
+            .limit(limit)
+            .to_owned();
+
+        execute_select(db, query).await
+    }
+
     /// Get the oldest ready execution's created_at for pending latency calculation
     pub async fn oldest_created_at<C>(
         db: &C,
