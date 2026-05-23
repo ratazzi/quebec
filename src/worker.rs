@@ -2183,6 +2183,53 @@ impl Worker {
                         query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
                     }
                 }
+                // Release the class-level concurrency_key semaphore (if any).
+                // Without this, a rate-rescheduled job stays "in flight" from
+                // concurrency_key's perspective even though it's no longer in
+                // ready_executions — the next scheduled→ready promotion would
+                // try to re-acquire the slot the job already holds and route
+                // it to blocked_executions until concurrency_duration TTL.
+                // For Discard, the slot would stay held for a finished job
+                // until TTL. Mirrors after_executed (worker.rs around the
+                // release_semaphore call) so concurrency accounting stays
+                // consistent across both code paths.
+                if let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) {
+                    let limit = runnable.concurrency_limit.unwrap_or(1);
+                    let duration = runnable
+                        .concurrency_duration
+                        .map(|s| chrono::Duration::seconds(s as i64));
+                    let released = crate::semaphore::release_semaphore(
+                        txn,
+                        table_config,
+                        key.to_string(),
+                        limit,
+                        duration,
+                    )
+                    .await
+                    .inspect_err(|e| {
+                        warn!(
+                            jid = job.active_job_id.as_deref(),
+                            concurrency_key = key,
+                            "rate-limit: failed to release concurrency semaphore: {:?}",
+                            e
+                        )
+                    })
+                    .unwrap_or(false);
+
+                    if released {
+                        Self::release_next_blocked_job(ctx, txn, key, limit)
+                            .await
+                            .inspect_err(|e| {
+                                warn!(
+                                    jid = job.active_job_id.as_deref(),
+                                    concurrency_key = key,
+                                    "rate-limit: failed to release next blocked: {:?}",
+                                    e
+                                )
+                            })
+                            .ok();
+                    }
+                }
                 Ok(RateGateResult::Routed)
             }
         }

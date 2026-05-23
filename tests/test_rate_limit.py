@@ -509,3 +509,150 @@ def test_reregister_without_rate_limit_clears_stale_config(qc_with_sqlalchemy):
 
     qc.register_job(Reused)
     assert qc._rate_limit_config_for(Reused.__qualname__) is None
+
+
+class CombinedClassRateJob(quebec.BaseClass):
+    """concurrency_limit=1 + rate_limit_max=1 + rate_limit_window=2s.
+
+    Used by test_rate_throttle_releases_concurrency_key_slot to exercise
+    the interaction between class-level concurrency_key (acquired at
+    enqueue) and rate gating (deciding at claim time).
+    """
+
+    queue_as = "default"
+    concurrency_limit = 1
+    rate_limit_max = 1
+    rate_limit_window = timedelta(seconds=2)
+    calls: list[int] = []
+
+    @staticmethod
+    def concurrency_key(*args, **kwargs) -> str:
+        return "combined-key"
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_rate_throttle_releases_concurrency_key_slot(qc_with_sqlalchemy):
+    """When a class has both concurrency_limit and rate_limit_max:
+
+    - enqueue acquires concurrency slot
+    - claim consults rate gate
+    - if rate throttles (Reschedule or Discard), the concurrency slot must
+      be released, otherwise:
+       * Reschedule path: dispatcher promotes the scheduled job, tries to
+         re-acquire the same key, fails (slot still held by the very job
+         being promoted), routes it to blocked_executions — job stalls
+         until concurrency_duration TTL (default 60s).
+       * Discard path: slot stays held for an already-finished job until
+         TTL.
+
+    This test exercises the Reschedule path by enqueuing a follow-up job
+    after a rate-throttle and asserting it can immediately acquire (proves
+    the slot was freed).
+    """
+    CombinedClassRateJob.calls = []
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(CombinedClassRateJob)
+
+    # job1: enqueue → acquire slot (used 1/1) → ready. Claim, perform,
+    # after_executed releases the slot (used 0/1) and consumes 1 rate
+    # token.
+    CombinedClassRateJob.perform_later(qc, 1)
+    e1 = _drain_silently(qc)
+    assert e1 is not None
+    e1.perform()
+
+    # job2: enqueue inside the same rate window → re-acquire slot (1/1) →
+    # ready. Claim consults rate gate; token is exhausted → Reschedule.
+    # With the bug, the slot stays at 1/1 even though job2 left ready.
+    # With the fix, the slot is released back to 0/1.
+    CombinedClassRateJob.perform_later(qc, 2)
+    assert _drain_silently(qc) is None  # rate-throttled, moved to scheduled
+
+    # job3: enqueue → must successfully acquire (slot expected to be 0/1
+    # under the fix) → land in ready_executions, NOT blocked_executions.
+    # With the bug, acquire fails → job3 goes to blocked.
+    CombinedClassRateJob.perform_later(qc, 3)
+
+    ready_count = session.execute(
+        text(
+            f"SELECT count(*) FROM {prefix}_ready_executions e "
+            f"JOIN {prefix}_jobs j ON j.id = e.job_id "
+            "WHERE j.class_name = 'CombinedClassRateJob'"
+        )
+    ).scalar()
+    blocked_count = session.execute(
+        text(
+            f"SELECT count(*) FROM {prefix}_blocked_executions e "
+            f"JOIN {prefix}_jobs j ON j.id = e.job_id "
+            "WHERE j.class_name = 'CombinedClassRateJob'"
+        )
+    ).scalar()
+    assert ready_count == 1, (
+        f"expected job3 in ready_executions; ready={ready_count}, "
+        f"blocked={blocked_count} — concurrency slot leak suspected"
+    )
+    assert blocked_count == 0
+
+
+class CombinedDiscardJob(quebec.BaseClass):
+    queue_as = "default"
+    concurrency_limit = 1
+    rate_limit_max = 1
+    rate_limit_window = timedelta(seconds=2)
+    rate_limit_on_throttle = quebec.RateLimitConflict.Discard
+    calls: list[int] = []
+
+    @staticmethod
+    def concurrency_key(*args, **kwargs) -> str:
+        return "discard-key"
+
+    def perform(self, value: int = 0) -> None:
+        type(self).calls.append(value)
+
+
+def test_rate_discard_releases_concurrency_key_slot(qc_with_sqlalchemy):
+    """Same intent as above but exercises the Discard branch."""
+    CombinedDiscardJob.calls = []
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(CombinedDiscardJob)
+
+    CombinedDiscardJob.perform_later(qc, 1)
+    e1 = _drain_silently(qc)
+    assert e1 is not None
+    e1.perform()
+
+    # job2 enters in-window → throttled, Discard mode marks it finished.
+    # Without the fix, the concurrency slot stays held for the finished
+    # job until TTL.
+    CombinedDiscardJob.perform_later(qc, 2)
+    assert _drain_silently(qc) is None
+
+    # job3 must acquire the freshly-released slot and land in ready.
+    CombinedDiscardJob.perform_later(qc, 3)
+    ready_count = session.execute(
+        text(
+            f"SELECT count(*) FROM {prefix}_ready_executions e "
+            f"JOIN {prefix}_jobs j ON j.id = e.job_id "
+            "WHERE j.class_name = 'CombinedDiscardJob'"
+        )
+    ).scalar()
+    blocked_count = session.execute(
+        text(
+            f"SELECT count(*) FROM {prefix}_blocked_executions e "
+            f"JOIN {prefix}_jobs j ON j.id = e.job_id "
+            "WHERE j.class_name = 'CombinedDiscardJob'"
+        )
+    ).scalar()
+    assert ready_count == 1, (
+        f"expected job3 in ready_executions; ready={ready_count}, "
+        f"blocked={blocked_count} — concurrency slot leak (Discard path)"
+    )
+    assert blocked_count == 0
