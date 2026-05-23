@@ -71,6 +71,17 @@ pub struct HookFlags {
     pub after_discard: bool,
 }
 
+/// Outcome of `Worker::try_consume_rate_for_candidate`.
+#[derive(Debug, Clone, Copy)]
+enum RateGateResult {
+    /// The candidate may proceed to claim.
+    Granted,
+    /// The candidate has been removed from `ready_executions` and routed
+    /// (rescheduled or marked finished). The caller must skip to the next
+    /// candidate.
+    Routed,
+}
+
 #[pyclass(name = "Runnable", subclass)]
 #[derive(Debug)]
 pub struct Runnable {
@@ -264,6 +275,76 @@ impl Runnable {
             }))
         })
         .map_err(|e: PyErr| QuebecError::Python(format!("get_concurrency_constraint: {e}")))
+    }
+
+    /// Call the Python instance's `rate_limit_key(*args, **kwargs)` method.
+    /// `arguments_json` is the raw `jobs.arguments` column (a Solid-Queue-style
+    /// envelope `{ "arguments": [...], ... }`). Falls back to the class name
+    /// if the method is missing for any reason — defensive only, since
+    /// `BaseClass` always provides a default.
+    pub fn compute_rate_limit_key(&self, arguments_json: &str) -> Result<String> {
+        Python::attach(|py| -> PyResult<String> {
+            let bound = self.handler.bind(py);
+            let instance = bound.call0()?;
+
+            if !instance.hasattr("rate_limit_key")? {
+                return Ok(self.class_name.clone());
+            }
+            let attr = instance.getattr("rate_limit_key")?;
+            if !attr.is_callable() {
+                return Ok(self.class_name.clone());
+            }
+
+            // Decode the args envelope. Tolerate any shape — bad JSON or
+            // missing "arguments" just means call with empty args.
+            let parsed: serde_json::Value =
+                serde_json::from_str(arguments_json).unwrap_or(serde_json::Value::Null);
+            let args_array = match &parsed {
+                serde_json::Value::Object(o) => match o.get("arguments") {
+                    Some(serde_json::Value::Array(arr)) => arr.clone(),
+                    _ => Vec::new(),
+                },
+                serde_json::Value::Array(arr) => arr.clone(),
+                _ => Vec::new(),
+            };
+
+            // Split off `_quebec_kwargs` marker dict at tail (mirrors
+            // parse_job_arguments_from_json on the Execution side).
+            let (positional, kwargs_map): (Vec<serde_json::Value>, Option<serde_json::Map<_, _>>) =
+                match args_array.last() {
+                    Some(serde_json::Value::Object(obj)) if obj.contains_key("_quebec_kwargs") => {
+                        let mut p = args_array.clone();
+                        p.pop();
+                        let mut kw = obj.clone();
+                        kw.remove("_quebec_kwargs");
+                        kw.remove("_aj_symbol_keys");
+                        (p, Some(kw))
+                    }
+                    _ => (args_array, None),
+                };
+
+            let py_list = pyo3::types::PyList::empty(py);
+            for v in &positional {
+                py_list.append(json_to_py(py, v)?)?;
+            }
+            let py_args = pyo3::types::PyTuple::new(py, py_list.iter())?;
+
+            let py_kwargs = pyo3::types::PyDict::new(py);
+            if let Some(kw) = kwargs_map {
+                for (k, v) in kw {
+                    py_kwargs.set_item(k, json_to_py(py, &v)?)?;
+                }
+            }
+
+            let result = attr.call(py_args, Some(&py_kwargs))?;
+            let s: String = result.extract()?;
+            if s.is_empty() {
+                Ok(self.class_name.clone())
+            } else {
+                Ok(s)
+            }
+        })
+        .map_err(|e: PyErr| QuebecError::Python(format!("compute_rate_limit_key: {e}")))
     }
 
     /// Check if should retry, return matching retry strategy and its exception key.
@@ -1982,6 +2063,99 @@ impl Worker {
         })
     }
 
+    /// EXPERIMENTAL: sliding-window rate-limit gate.
+    /// Called between picking a ready row and inserting claimed_executions
+    /// (only when at least one class has declared `rate_limit_max`).
+    ///
+    /// Returns `Granted` when the candidate may proceed to claim, or `Routed`
+    /// when the candidate has been removed from `ready_executions` and either
+    /// rescheduled (default) or marked finished (Discard mode). The caller
+    /// should `continue` on `Routed` and re-find the next candidate.
+    async fn try_consume_rate_for_candidate<C: ConnectionTrait>(
+        ctx: &Arc<crate::context::AppContext>,
+        txn: &C,
+        table_config: &crate::context::TableConfig,
+        execution: &quebec_ready_executions::Model,
+    ) -> std::result::Result<RateGateResult, DbErr> {
+        let job = query_builder::jobs::find_by_id(txn, table_config, execution.job_id).await?;
+        let Some(job) = job else {
+            // Ready row pointing at a vanished job — let the normal claim
+            // flow handle it (it will fail downstream and surface the bug).
+            return Ok(RateGateResult::Granted);
+        };
+
+        let cfg = {
+            let reg = ctx
+                .rate_limited_classes
+                .read()
+                .map_err(|_| DbErr::Custom("rate_limited_classes RwLock poisoned".into()))?;
+            reg.get(&job.class_name).cloned()
+        };
+        let Some(cfg) = cfg else {
+            return Ok(RateGateResult::Granted);
+        };
+
+        let runnable = ctx.get_runnable(&job.class_name).map_err(|e| {
+            DbErr::Custom(format!(
+                "rate-limit: get_runnable({}) failed: {e}",
+                job.class_name
+            ))
+        })?;
+        let arguments = job.arguments.clone().unwrap_or_default();
+        let user_key = runnable
+            .compute_rate_limit_key(&arguments)
+            .map_err(|e| DbErr::Custom(format!("rate-limit: {e}")))?;
+
+        let result = crate::semaphore::try_consume_rate_token(
+            txn,
+            table_config,
+            &job.class_name,
+            &user_key,
+            cfg.window,
+            cfg.max,
+            job.id,
+        )
+        .await?;
+
+        match result {
+            crate::semaphore::ConsumeResult::Granted => Ok(RateGateResult::Granted),
+            crate::semaphore::ConsumeResult::Throttled { retry_at } => {
+                query_builder::ready_executions::delete_by_id(txn, table_config, execution.id)
+                    .await?;
+                match cfg.on_throttle {
+                    crate::context::RateLimitConflict::Reschedule => {
+                        debug!(
+                            jid = job.active_job_id.as_deref(),
+                            class = job.class_name,
+                            user_key = user_key,
+                            retry_at = ?retry_at,
+                            "rate-limit: throttled, rescheduling"
+                        );
+                        query_builder::scheduled_executions::insert(
+                            txn,
+                            table_config,
+                            job.id,
+                            &job.queue_name,
+                            job.priority,
+                            retry_at,
+                        )
+                        .await?;
+                    }
+                    crate::context::RateLimitConflict::Discard => {
+                        debug!(
+                            jid = job.active_job_id.as_deref(),
+                            class = job.class_name,
+                            user_key = user_key,
+                            "rate-limit: throttled, discarding"
+                        );
+                        query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
+                    }
+                }
+                Ok(RateGateResult::Routed)
+            }
+        }
+    }
+
     /// Helper: claim a single execution (insert claimed, delete ready, return model)
     async fn claim_execution<C: ConnectionTrait>(
         txn: &C,
@@ -2040,6 +2214,15 @@ impl Worker {
                     // entirely so feature-off workers pay zero overhead
                     // beyond a single `is_empty()` check per claim.
                     let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+                    // EXPERIMENTAL: per-class sliding-window rate limit.
+                    // Same zero-overhead pattern: when no class declared
+                    // `rate_limit_max`, the entire rate gate is skipped
+                    // (one `is_empty()` check per claim).
+                    let rate_limit_enabled = ctx
+                        .rate_limited_classes
+                        .read()
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
 
                     // For queues listed in `experimental_queue_concurrency`,
                     // attempt the `queue:<name>` semaphore between find and
@@ -2077,6 +2260,20 @@ impl Worker {
                                     if !acquired {
                                         local_throttled.push(execution.queue_name.clone());
                                         continue;
+                                    }
+                                }
+
+                                if rate_limit_enabled {
+                                    match Self::try_consume_rate_for_candidate(
+                                        &ctx,
+                                        txn,
+                                        &table_config,
+                                        execution,
+                                    )
+                                    .await?
+                                    {
+                                        RateGateResult::Granted => {}
+                                        RateGateResult::Routed => continue,
                                     }
                                 }
 
@@ -2167,6 +2364,13 @@ impl Worker {
                     // acquire path entirely so feature-off workers pay zero
                     // overhead beyond a single `is_empty()` check per claim.
                     let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+                    // EXPERIMENTAL: same zero-overhead pattern for the
+                    // sliding-window rate gate.
+                    let rate_limit_enabled = ctx
+                        .rate_limited_classes
+                        .read()
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
 
                     // Helper macro to claim jobs from a queue (batch insert + batch delete).
                     // EXPERIMENTAL: when `experimental_queue_concurrency` is
@@ -2216,26 +2420,41 @@ impl Worker {
                                 let exhausted = (records.len() as u64) < requested;
 
                                 let mut accepted: Vec<&quebec_ready_executions::Model> = Vec::new();
-                                if !queue_concurrency_enabled {
-                                    // Feature disabled: accept every found
-                                    // record verbatim — no per-record
+                                if !queue_concurrency_enabled && !rate_limit_enabled {
+                                    // Both feature flags off: accept every
+                                    // found record verbatim — no per-record
                                     // HashMap lookup, no async helper call.
                                     accepted.extend(records.iter());
                                 } else {
                                     for record in &records {
-                                        if local_throttled.contains(&record.queue_name) {
-                                            continue;
+                                        if queue_concurrency_enabled {
+                                            if local_throttled.contains(&record.queue_name) {
+                                                continue;
+                                            }
+                                            let acquired = Self::try_acquire_queue_slot(
+                                                &ctx,
+                                                txn,
+                                                &table_config,
+                                                &record.queue_name,
+                                            )
+                                            .await?;
+                                            if !acquired {
+                                                local_throttled.insert(record.queue_name.clone());
+                                                continue;
+                                            }
                                         }
-                                        let acquired = Self::try_acquire_queue_slot(
-                                            &ctx,
-                                            txn,
-                                            &table_config,
-                                            &record.queue_name,
-                                        )
-                                        .await?;
-                                        if !acquired {
-                                            local_throttled.insert(record.queue_name.clone());
-                                            continue;
+                                        if rate_limit_enabled {
+                                            match Self::try_consume_rate_for_candidate(
+                                                &ctx,
+                                                txn,
+                                                &table_config,
+                                                record,
+                                            )
+                                            .await?
+                                            {
+                                                RateGateResult::Granted => {}
+                                                RateGateResult::Routed => continue,
+                                            }
                                         }
                                         accepted.push(record);
                                     }
