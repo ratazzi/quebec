@@ -4,7 +4,7 @@ use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -320,6 +320,14 @@ pub struct AppContext {
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
+    /// When a quiet signal (SIGUSR1/SIGTSTP) is received, also exit the process
+    /// once all of this worker's in-flight and claimed jobs have drained — with
+    /// no time limit, matching Sidekiq Enterprise's USR2 rolling restart. Opt-in
+    /// (default false). Standalone-only: ignored under the fork supervisor, where
+    /// a self-exited child would just be reforked — use a supervisor-level
+    /// rolling restart there instead. Independent of `shutdown_timeout`, which
+    /// still bounds the SIGTERM graceful-shutdown path.
+    pub quiet_then_exit: bool,
     pub silence_polling: bool,
     pub preserve_finished_jobs: bool,
     pub clear_finished_jobs_after: Duration,
@@ -357,6 +365,13 @@ pub struct AppContext {
     /// if it no longer matches (i.e. the supervisor died and we got reparented
     /// to init/launchd). Zero means "not supervised, do not check".
     pub supervisor_pid: AtomicI32,
+    /// True while a worker claim transaction is in flight (from before the quiet
+    /// gate in `process_available_jobs` until the claimed jobs have been
+    /// dispatched). `should_drain_exit` requires this to be false so a job that
+    /// passed the quiet check just before quiet was signalled cannot be missed
+    /// by the idle snapshot, which would otherwise let the process self-exit
+    /// while that batch is still being published.
+    pub claim_in_progress: AtomicBool,
     /// `(entry_index, within_entry)` populated by `apply_worker_config` /
     /// `apply_dispatcher_config` after fork so `set_proc_title` can show
     /// `[worker.<entry>.<within>:threads]` instead of all sibling processes
@@ -617,6 +632,9 @@ impl AppContext {
             if let Some(v) = get_bool("silence_polling") {
                 ctx.silence_polling = v;
             }
+            if let Some(v) = get_bool("quiet_then_exit") {
+                ctx.quiet_then_exit = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -806,6 +824,7 @@ impl AppContext {
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
             silence_polling: true,
+            quiet_then_exit: false,
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
             cleanup_batch_size: 500,
@@ -829,6 +848,7 @@ impl AppContext {
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
             supervisor_pid: AtomicI32::new(0),
+            claim_in_progress: AtomicBool::new(false),
             proc_slot: None,
             in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
@@ -896,6 +916,7 @@ impl AppContext {
             process_alive_threshold: self.process_alive_threshold,
             shutdown_timeout: self.shutdown_timeout,
             silence_polling: self.silence_polling,
+            quiet_then_exit: self.quiet_then_exit,
             preserve_finished_jobs: self.preserve_finished_jobs,
             clear_finished_jobs_after: self.clear_finished_jobs_after,
             cleanup_batch_size: self.cleanup_batch_size,
@@ -921,6 +942,7 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
+            claim_in_progress: AtomicBool::new(false),
             // Preserve so re-forks (or apply_*_config re-using a forked ctx)
             // keep the slot label until explicitly reset by apply_*_config.
             proc_slot: self.proc_slot,
