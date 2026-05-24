@@ -2541,33 +2541,54 @@ impl Worker {
             count
         );
 
+        let mut failed = 0usize;
         for execution in orphaned {
             let ctx = self.ctx.clone();
             let tc = table_config.clone();
             let job_id = execution.job_id;
+            let execution_id = execution.id;
+            let process_id = execution.process_id;
 
-            db.transaction::<_, (), DbErr>(|txn| {
-                Box::pin(async move {
-                    Self::fail_claimed_execution(
-                        &ctx,
-                        txn,
-                        &tc,
-                        job_id,
-                        execution.id,
-                        "Process crashed or was killed before job completion",
-                    )
-                    .await
+            // Per-row best-effort: a failure here (e.g. an experimental
+            // queue-slot release error) must not abort the sweep of the
+            // remaining orphaned rows. The crash-recovery path is the last
+            // line of defense, so one bad row is logged and skipped, left for
+            // the next sweep tick / another process to retry, instead of
+            // propagating and leaving every other orphan un-reclaimed.
+            let result = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        Self::fail_claimed_execution(
+                            &ctx,
+                            txn,
+                            &tc,
+                            job_id,
+                            execution_id,
+                            "Process crashed or was killed before job completion",
+                        )
+                        .await
+                    })
                 })
-            })
-            .await?;
+                .await;
 
-            debug!(
-                "Marked orphaned job {} as failed (was claimed by process {:?})",
-                job_id, execution.process_id
-            );
+            match result {
+                Ok(()) => {
+                    failed += 1;
+                    debug!(
+                        "Marked orphaned job {} as failed (was claimed by process {:?})",
+                        job_id, process_id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to reclaim orphaned execution {} (job {}, claimed by process {:?}): {:?}; leaving it for a later sweep",
+                        execution_id, job_id, process_id, e
+                    );
+                }
+            }
         }
 
-        Ok(count)
+        Ok(failed)
     }
 
     /// Prune dead processes and fail their claimed executions

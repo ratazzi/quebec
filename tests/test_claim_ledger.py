@@ -21,7 +21,8 @@ empty. These tests pin those transitions deterministically.
 from __future__ import annotations
 
 import quebec
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 
 def _claimed_id(session, prefix: str, job_id: int) -> int:
@@ -61,6 +62,39 @@ def _seed_claimed(session, prefix: str, process_id: int) -> int:
     )
     session.commit()
     return _claimed_id(session, prefix, job_id)
+
+
+def _seed_orphan(session, prefix: str, *, queue_name: str = "default") -> int:
+    """Seed a job + a process-less (orphaned) claimed_executions row.
+
+    ``process_id`` is NULL, so the DB orphan-sweep (``find_orphaned``) reclaims
+    it as a crashed-worker leftover. The job's ``queue_name`` drives whether the
+    sweep's per-row ``unblock_next_job`` calls the EXPERIMENTAL
+    ``release_queue_slot`` (only for queues in ``experimental_queue_concurrency``).
+    Returns the new job_id.
+    """
+    now_sql = "CURRENT_TIMESTAMP"
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_jobs "
+            f"(queue_name, class_name, arguments, priority, active_job_id, "
+            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+            f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+            f"{now_sql}, {now_sql})"
+        ),
+        {"queue": queue_name},
+    )
+    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_claimed_executions "
+            f"(job_id, process_id, created_at) "
+            f"VALUES (:job_id, NULL, {now_sql})"
+        ),
+        {"job_id": job_id},
+    )
+    session.commit()
+    return job_id
 
 
 class _IdleJob(quebec.ActiveJob):
@@ -571,4 +605,104 @@ def test_should_drain_exit_ignores_cleanup_pending(db_url, test_prefix):
         qc._set_ledger_state(902, 1)
         assert qc.should_drain_exit() is False
     finally:
+        qc.close()
+
+
+def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_prefix):
+    """The DB orphan-sweep is per-row best-effort (F4 regression).
+
+    The crash-path safety net (``fail_orphaned_executions`` in the worker, and
+    the equivalent loop in ``Supervisor::run_maintenance``) must keep reclaiming
+    the remaining orphaned ``claimed_executions`` rows even when one row's
+    cleanup raises. A sibling fix made the EXPERIMENTAL ``release_queue_slot``
+    propagate semaphore-release errors with ``?``; the orphan loop used ``?`` on
+    the per-row ``fail_claimed_execution`` call, so a single failing row aborted
+    the whole sweep and left every OTHER orphan un-reclaimed — weakening the
+    last line of defense. After the fix the failing row is logged and skipped
+    while the others are still reclaimed.
+
+    Deterministic single-row failure of exactly the guarded class (a queue-slot
+    release error inside the per-row transaction): with
+    ``experimental_queue_concurrency={"locked": 1}`` set, an orphan on the
+    "locked" queue makes the sweep's ``unblock_next_job`` call
+    ``release_queue_slot`` → ``release_semaphore``; dropping the ``semaphores``
+    table out from under the Rust query makes that UPDATE error and rolls back
+    that row. An orphan on the unthrottled "free" queue skips
+    ``release_queue_slot`` entirely and is reclaimed cleanly. This mirrors the
+    table-drop injection idiom used by the emergency-cleanup/on-db-error tests
+    above; no production injection flag is added.
+    """
+    qc = quebec.Quebec(
+        db_url,
+        table_name_prefix=test_prefix,
+        experimental_queue_concurrency={"locked": 1},
+    )
+    assert qc.create_tables() is True
+
+    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
+    engine = create_engine(sa_url)
+    session = sessionmaker(bind=engine)()
+    try:
+        bad_job = _seed_orphan(session, test_prefix, queue_name="locked")
+        good_job = _seed_orphan(session, test_prefix, queue_name="free")
+        assert (
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions")
+            ).scalar()
+            == 2
+        )
+
+        # Drop the semaphores table so the "locked"-queue orphan's
+        # release_queue_slot errors, rolling back its per-row transaction; the
+        # "free"-queue orphan never touches the experimental queue slot.
+        session.execute(text(f"DROP TABLE {test_prefix}_semaphores"))
+        session.commit()
+
+        # Global orphan-sweep. The bad row aborts its own transaction; the sweep
+        # must NOT propagate — it returns Ok and reports only the
+        # successfully-reclaimed count.
+        pruned, orphaned = qc.supervisor_run_maintenance(None)
+        assert orphaned == 1, (
+            "the sweep must reclaim the free-queue orphan even though the "
+            "locked-queue orphan's cleanup failed; per-row best-effort, not "
+            "abort-on-first-error"
+        )
+
+        session.expire_all()
+        # Good orphan: claimed row gone, failure recorded so it can be retried.
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": good_job},
+            ).scalar()
+            == 0
+        )
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_failed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": good_job},
+            ).scalar()
+            == 1
+        )
+        # Bad orphan: its transaction rolled back, so the claimed row is still
+        # there, left for the next sweep tick / another process to retry.
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": bad_job},
+            ).scalar()
+            == 1
+        )
+    finally:
+        session.close()
+        engine.dispose()
         qc.close()

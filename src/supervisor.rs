@@ -129,32 +129,47 @@ impl Supervisor {
         // raced or skipped releasing claims.
         let orphaned =
             query_builder::claimed_executions::find_orphaned(db.as_ref(), &table_config).await?;
-        let orphaned_count = orphaned.len();
-        if orphaned_count > 0 {
+        let found_orphaned = orphaned.len();
+        if found_orphaned > 0 {
             info!(
                 "Supervisor maintenance: failing {} orphaned claimed execution(s)",
-                orphaned_count
+                found_orphaned
             );
         }
+        let mut orphaned_count = 0usize;
         for execution in orphaned {
             let ctx = self.ctx.clone();
             let tc = table_config.clone();
             let job_id = execution.job_id;
             let exec_id = execution.id;
-            db.transaction::<_, (), DbErr>(|txn| {
-                Box::pin(async move {
-                    Worker::fail_claimed_execution(
-                        &ctx,
-                        txn,
-                        &tc,
-                        job_id,
-                        exec_id,
-                        "Process crashed or was killed before job completion",
-                    )
-                    .await
+            // Per-row best-effort: a failing row (e.g. an experimental
+            // queue-slot release error) must not abort the sweep of the
+            // remaining orphaned rows. This is the crash-recovery safety net,
+            // so one bad row is logged and skipped, left for the next
+            // maintenance tick / another process to retry.
+            let result = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        Worker::fail_claimed_execution(
+                            &ctx,
+                            txn,
+                            &tc,
+                            job_id,
+                            exec_id,
+                            "Process crashed or was killed before job completion",
+                        )
+                        .await
+                    })
                 })
-            })
-            .await?;
+                .await;
+
+            match result {
+                Ok(()) => orphaned_count += 1,
+                Err(e) => warn!(
+                    "Supervisor maintenance: failed to reclaim orphaned execution {} (job {}): {}; leaving it for a later sweep",
+                    exec_id, job_id, e
+                ),
+            }
         }
 
         Ok((pruned, orphaned_count))
