@@ -320,6 +320,12 @@ pub struct AppContext {
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
+    /// When a quiet signal (SIGUSR1/SIGTSTP) is received, also exit the process
+    /// once all of this worker's in-flight and claimed jobs have drained — with
+    /// no time limit, matching Sidekiq Enterprise's USR2 rolling restart. Opt-in
+    /// (default false). Independent of `shutdown_timeout`, which still bounds the
+    /// SIGTERM graceful-shutdown path.
+    pub quiet_then_exit: bool,
     pub silence_polling: bool,
     pub preserve_finished_jobs: bool,
     pub clear_finished_jobs_after: Duration,
@@ -617,6 +623,9 @@ impl AppContext {
             if let Some(v) = get_bool("silence_polling") {
                 ctx.silence_polling = v;
             }
+            if let Some(v) = get_bool("quiet_then_exit") {
+                ctx.quiet_then_exit = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -806,6 +815,7 @@ impl AppContext {
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
             silence_polling: true,
+            quiet_then_exit: false,
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
             cleanup_batch_size: 500,
@@ -896,6 +906,7 @@ impl AppContext {
             process_alive_threshold: self.process_alive_threshold,
             shutdown_timeout: self.shutdown_timeout,
             silence_polling: self.silence_polling,
+            quiet_then_exit: self.quiet_then_exit,
             preserve_finished_jobs: self.preserve_finished_jobs,
             clear_finished_jobs_after: self.clear_finished_jobs_after,
             cleanup_batch_size: self.cleanup_batch_size,

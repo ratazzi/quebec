@@ -1171,6 +1171,50 @@ impl PyQuebec {
         self.ctx.worker_threads
     }
 
+    /// Whether the process should now exit because a quiet signal was received
+    /// with `quiet_then_exit` enabled and this worker has fully drained: no jobs
+    /// in flight (being performed) and none claimed-but-not-yet-running. The
+    /// Python wait loop polls this to trigger graceful_shutdown once the worker
+    /// is idle, with no time limit (Sidekiq Enterprise USR2 rolling-restart
+    /// semantics). Quiet has already stopped new claims, so an empty result is
+    /// terminal — no new work can arrive to make it non-empty again.
+    fn should_drain_exit(&self, py: Python<'_>) -> bool {
+        if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
+            return false;
+        }
+        let in_flight_empty = self
+            .ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !in_flight_empty {
+            return false;
+        }
+        let worker = self.worker.clone();
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let process_id = match *worker.process_id_handle().lock().await {
+                    Some(id) => id,
+                    None => return false,
+                };
+                let Ok(db) = ctx.get_db().await else {
+                    return false;
+                };
+                matches!(
+                    crate::query_builder::claimed_executions::count_by_process_id(
+                        db.as_ref(),
+                        &ctx.table_config,
+                        process_id,
+                    )
+                    .await,
+                    Ok(0)
+                )
+            })
+        })
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {
