@@ -198,43 +198,58 @@ async fn fail_claimed_by_process_id_inner(
         "Child process {process_id} (pid={process_pid}, host={process_hostname:?}) crashed"
     );
 
-    let ctx = ctx.clone();
-    let tc = table_config.clone();
-    let deleted_count = db
-        .transaction::<_, u64, DbErr>(|txn| {
-            let ctx = ctx.clone();
-            let tc = tc.clone();
-            let error_msg = error_msg.clone();
-            Box::pin(async move {
-                let claimed =
-                    query_builder::claimed_executions::find_by_process_id(txn, &tc, process_id)
-                        .await?;
-                let deleted_count = claimed.len() as u64;
+    let claimed =
+        query_builder::claimed_executions::find_by_process_id(db, &table_config, process_id)
+            .await?;
 
-                for execution in &claimed {
-                    Worker::fail_claimed_execution(
-                        &ctx,
-                        txn,
-                        &tc,
-                        execution.job_id,
-                        execution.id,
-                        &error_msg,
-                    )
-                    .await?;
-                }
-
-                query_builder::processes::prune(txn, &tc, process_id).await?;
-                Ok(deleted_count)
+    // Per-row best-effort. We deliberately trade the old single-transaction
+    // atomicity (fail-all-rows + prune as one unit) for best-effort cleanup
+    // backed by the orphan-sweep: each row's `fail_claimed_execution` runs in
+    // its OWN small transaction so a single row's failure (e.g. an experimental
+    // queue-slot release error) rolls back only that row, not its siblings or
+    // the process prune. The process row is pruned regardless of whether some
+    // rows failed — once the row is gone, `fail_orphaned_executions` (which
+    // matches claimed rows whose process row no longer exists) becomes the
+    // safety net that reclaims the leftovers.
+    let mut failed = 0u64;
+    for execution in &claimed {
+        let ctx = ctx.clone();
+        let tc = table_config.clone();
+        let error_msg = error_msg.clone();
+        let job_id = execution.job_id;
+        let execution_id = execution.id;
+        let result = db
+            .transaction::<_, (), DbErr>(|txn| {
+                Box::pin(async move {
+                    Worker::fail_claimed_execution(&ctx, txn, &tc, job_id, execution_id, &error_msg)
+                        .await
+                })
             })
-        })
-        .await?;
+            .await;
+
+        match result {
+            Ok(()) => failed += 1,
+            Err(e) => warn!(
+                "Supervisor: failed to fail claimed execution {} (job {}) for process {}: {}; leaving it for the orphan-sweep",
+                execution_id, job_id, process_id, e
+            ),
+        }
+    }
+
+    // Prune the process row even if some rows failed: this hands the leftovers
+    // to the orphan-sweep.
+    query_builder::processes::prune(db, &table_config, process_id).await?;
 
     warn!(
-        "Supervisor reaped process {} (pid={}, host={:?}), failed {} claimed job(s)",
-        process_id, process_pid, process_hostname, deleted_count
+        "Supervisor reaped process {} (pid={}, host={:?}), failed {} of {} claimed job(s)",
+        process_id,
+        process_pid,
+        process_hostname,
+        failed,
+        claimed.len()
     );
 
-    Ok(deleted_count)
+    Ok(failed)
 }
 
 #[async_trait]

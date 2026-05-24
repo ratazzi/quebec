@@ -2628,8 +2628,19 @@ impl Worker {
             count, threshold
         );
 
+        // Per-row AND per-process best-effort. We deliberately trade the old
+        // single-transaction atomicity (fail-all-rows + prune as one unit) for
+        // best-effort cleanup backed by the orphan-sweep: each row's
+        // `fail_claimed_execution` runs in its OWN small transaction so a single
+        // row's failure (e.g. an experimental queue-slot release error) rolls
+        // back only that row, not its siblings or the process prune. The process
+        // row is pruned regardless of whether some rows failed — once the row is
+        // gone, `fail_orphaned_executions` (which matches claimed rows whose
+        // process row no longer exists) becomes the safety net that reclaims the
+        // leftovers. A failure pruning one process is logged and skipped so it
+        // does not block pruning the remaining stale processes.
+        let mut pruned = 0usize;
         for process in stale_processes {
-            let table_config = table_config.clone();
             let process_id = process.id;
             let process_pid = process.pid;
             let process_hostname = process.hostname.clone();
@@ -2642,44 +2653,79 @@ impl Worker {
             })
             .to_string();
 
-            let ctx = self.ctx.clone();
-            let tc = table_config.clone();
-            let deleted_count = db
-                .transaction::<_, u64, DbErr>(|txn| {
-                    let tc = tc.clone();
-                    let error_msg = error_msg.clone();
-                    Box::pin(async move {
-                        let claimed = query_builder::claimed_executions::find_by_process_id(
-                            txn, &tc, process_id,
-                        )
-                        .await?;
-                        let deleted_count = claimed.len() as u64;
+            let claimed = match query_builder::claimed_executions::find_by_process_id(
+                db.as_ref(),
+                &table_config,
+                process_id,
+            )
+            .await
+            {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    warn!(
+                        "Failed to list claimed jobs for stale process {} (pid={}, host={:?}): {:?}; skipping this process for now",
+                        process_id, process_pid, process_hostname, e
+                    );
+                    continue;
+                }
+            };
 
-                        for execution in &claimed {
+            let mut failed = 0u64;
+            for execution in &claimed {
+                let ctx = self.ctx.clone();
+                let tc = table_config.clone();
+                let error_msg = error_msg.clone();
+                let job_id = execution.job_id;
+                let execution_id = execution.id;
+                let result = db
+                    .transaction::<_, (), DbErr>(|txn| {
+                        Box::pin(async move {
                             Self::fail_claimed_execution(
                                 &ctx,
                                 txn,
                                 &tc,
-                                execution.job_id,
-                                execution.id,
+                                job_id,
+                                execution_id,
                                 &error_msg,
                             )
-                            .await?;
-                        }
-
-                        query_builder::processes::prune(txn, &tc, process_id).await?;
-                        Ok(deleted_count)
+                            .await
+                        })
                     })
-                })
-                .await?;
+                    .await;
 
+                match result {
+                    Ok(()) => failed += 1,
+                    Err(e) => warn!(
+                        "Failed to fail claimed execution {} (job {}) for stale process {}: {:?}; leaving it for the orphan-sweep",
+                        execution_id, job_id, process_id, e
+                    ),
+                }
+            }
+
+            // Prune the process row even if some rows failed: this hands the
+            // leftovers to the orphan-sweep.
+            if let Err(e) =
+                query_builder::processes::prune(db.as_ref(), &table_config, process_id).await
+            {
+                warn!(
+                    "Failed to prune stale process {} (pid={}, host={:?}): {:?}; will retry next tick",
+                    process_id, process_pid, process_hostname, e
+                );
+                continue;
+            }
+
+            pruned += 1;
             warn!(
-                "Pruned stale process {} (pid={}, host={:?}), failed {} claimed job(s)",
-                process_id, process_pid, process_hostname, deleted_count
+                "Pruned stale process {} (pid={}, host={:?}), failed {} of {} claimed job(s)",
+                process_id,
+                process_pid,
+                process_hostname,
+                failed,
+                claimed.len()
             );
         }
 
-        Ok(count)
+        Ok(pruned)
     }
 
     /// Clear finished jobs older than the configured threshold.

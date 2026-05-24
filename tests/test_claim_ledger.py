@@ -97,6 +97,59 @@ def _seed_orphan(session, prefix: str, *, queue_name: str = "default") -> int:
     return job_id
 
 
+def _seed_stale_process(session, prefix: str) -> int:
+    """Insert a Worker process row whose heartbeat is far in the past.
+
+    ``find_prunable`` selects rows with ``last_heartbeat_at`` older than
+    ``now - process_alive_threshold`` (default 300s), so a year-2000 heartbeat
+    is reliably stale. Returns the new processes.id.
+    """
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_processes "
+            f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
+            f"VALUES ('Worker', '2000-01-01 00:00:00', 4242, 'stale-host', NULL, "
+            f"'2000-01-01 00:00:00', 'Worker-4242')"
+        )
+    )
+    process_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    session.commit()
+    return process_id
+
+
+def _seed_claimed_for_process(
+    session, prefix: str, process_id: int, *, queue_name: str = "default"
+) -> int:
+    """Seed a job + a claimed_executions row owned by ``process_id``.
+
+    The job's ``queue_name`` drives whether the prune path's per-row
+    ``unblock_next_job`` calls the EXPERIMENTAL ``release_queue_slot`` (only for
+    queues in ``experimental_queue_concurrency``). Returns the new job_id.
+    """
+    now_sql = "CURRENT_TIMESTAMP"
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_jobs "
+            f"(queue_name, class_name, arguments, priority, active_job_id, "
+            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+            f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+            f"{now_sql}, {now_sql})"
+        ),
+        {"queue": queue_name},
+    )
+    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_claimed_executions "
+            f"(job_id, process_id, created_at) "
+            f"VALUES (:job_id, :process_id, {now_sql})"
+        ),
+        {"job_id": job_id, "process_id": process_id},
+    )
+    session.commit()
+    return job_id
+
+
 class _IdleJob(quebec.ActiveJob):
     def perform(self, *args, **kwargs):
         return True
@@ -785,6 +838,115 @@ def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_pr
         )
         # Bad orphan: its transaction rolled back, so the claimed row is still
         # there, left for the next sweep tick / another process to retry.
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": bad_job},
+            ).scalar()
+            == 1
+        )
+    finally:
+        session.close()
+        engine.dispose()
+        qc.close()
+
+
+def test_stale_process_pruning_is_per_row_best_effort(db_url, test_prefix):
+    """Stale-process pruning is per-row AND per-process best-effort (Finding C).
+
+    ``prune_dead_processes`` (worker) and ``fail_claimed_by_process_id_inner``
+    (supervisor, driven here via ``supervisor_run_maintenance``) used to fail a
+    stale process's claimed rows + prune the process row inside a SINGLE
+    transaction with ``?`` on each row. One row's cleanup error (e.g. an
+    experimental queue-slot release error) rolled back the WHOLE transaction:
+    none of the rows were failed AND the process row was NOT pruned. Because the
+    orphan-sweep only reclaims rows whose process row is gone, that un-pruned
+    process wedged crash-recovery for itself and every later stale process.
+
+    The fix runs each row's cleanup in its own small transaction and prunes the
+    process row regardless of partial row failure — handing the leftovers to the
+    orphan-sweep (which now reclaims them once the process row is gone). This
+    test pins both halves: the process is STILL pruned and the good row is
+    failed, while the bad row is left for the orphan-sweep.
+
+    Same deterministic injection idiom as the F4 orphan-sweep test: with
+    ``experimental_queue_concurrency={"locked": 1}`` a row on the "locked" queue
+    makes the per-row ``unblock_next_job`` call ``release_queue_slot`` →
+    ``release_semaphore``; dropping the ``semaphores`` table makes that UPDATE
+    error. The "free"-queue row skips ``release_queue_slot`` and is reclaimed.
+    """
+    qc = quebec.Quebec(
+        db_url,
+        table_name_prefix=test_prefix,
+        experimental_queue_concurrency={"locked": 1},
+    )
+    assert qc.create_tables() is True
+
+    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
+    engine = create_engine(sa_url)
+    session = sessionmaker(bind=engine)()
+    try:
+        process_id = _seed_stale_process(session, test_prefix)
+        bad_job = _seed_claimed_for_process(
+            session, test_prefix, process_id, queue_name="locked"
+        )
+        good_job = _seed_claimed_for_process(
+            session, test_prefix, process_id, queue_name="free"
+        )
+        assert (
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions")
+            ).scalar()
+            == 2
+        )
+
+        # Drop the semaphores table so the "locked"-queue row's
+        # release_queue_slot errors, rolling back only that row's transaction.
+        session.execute(text(f"DROP TABLE {test_prefix}_semaphores"))
+        session.commit()
+
+        # Prune stale processes (no excluded id). One bad row must NOT abort the
+        # whole process cleanup: the process is still pruned and the good row is
+        # failed; the call must NOT raise.
+        pruned, orphaned = qc.supervisor_run_maintenance(None)
+        assert pruned == 1, "the stale process must still be pruned despite a bad row"
+
+        session.expire_all()
+        # The stale process row is gone — this is what lets the orphan-sweep
+        # reclaim the leftover bad row on a later tick.
+        assert (
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {test_prefix}_processes WHERE id = :p"),
+                {"p": process_id},
+            ).scalar()
+            == 0
+        )
+        # Good row: failed + claimed row removed.
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": good_job},
+            ).scalar()
+            == 0
+        )
+        assert (
+            session.execute(
+                text(
+                    f"SELECT COUNT(*) FROM {test_prefix}_failed_executions "
+                    f"WHERE job_id = :j"
+                ),
+                {"j": good_job},
+            ).scalar()
+            == 1
+        )
+        # Bad row: its transaction rolled back, so the claimed row is still there,
+        # now orphaned (process row gone) and left for the orphan-sweep.
         assert (
             session.execute(
                 text(
