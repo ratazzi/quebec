@@ -1230,6 +1230,31 @@ impl PyQuebec {
         self.ctx.claim_in_progress.store(value, Ordering::SeqCst);
     }
 
+    /// Test-only: read a claimed execution's ledger state
+    /// (0=Dispatched, 1=InFlight, 2=CleanupPending; None if absent).
+    fn _ledger_state(&self, id: i64) -> Option<u8> {
+        self.ctx
+            .claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .map(|s| match s {
+                crate::context::ClaimState::Dispatched => 0,
+                crate::context::ClaimState::InFlight => 1,
+                crate::context::ClaimState::CleanupPending => 2,
+            })
+    }
+
+    /// Test-only: force a ledger state (to exercise CleanupPending / Dispatched paths).
+    fn _set_ledger_state(&self, id: i64, state: u8) {
+        let s = match state {
+            0 => crate::context::ClaimState::Dispatched,
+            1 => crate::context::ClaimState::InFlight,
+            _ => crate::context::ClaimState::CleanupPending,
+        };
+        self.ctx.ledger_set(id, s);
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {
