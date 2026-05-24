@@ -1275,7 +1275,17 @@ impl PyQuebec {
     /// is idle, with no time limit (Sidekiq Enterprise USR2 rolling-restart
     /// semantics). Quiet has already stopped new claims, so an empty result is
     /// terminal — no new work can arrive to make it non-empty again.
-    fn should_drain_exit(&self, py: Python<'_>) -> bool {
+    ///
+    /// Drain-exit is **ledger-authoritative**: the worker-local ledger is the
+    /// truth about *this* worker's graceful-path work (`Dispatched` = claimed
+    /// but not running, `InFlight` = performing). We deliberately do NOT consult
+    /// `count_by_process_id` here. A claimed row may linger in the DB after its
+    /// ledger entry has gone `CleanupPending` (job executed, only row cleanup
+    /// failed) or dropped entirely (crash/error residue). Those rows are owned
+    /// by the DB orphan-sweep, which can only reclaim them once this process row
+    /// is gone — so waiting on the DB count would hang quiet_then_exit forever.
+    /// Once the four guard checks below pass, the worker is drained.
+    fn should_drain_exit(&self) -> bool {
         if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
             return false;
         }
@@ -1286,7 +1296,7 @@ impl PyQuebec {
             return false;
         }
         // A claim that passed the quiet gate before quiet was signalled may still
-        // be publishing work; wait for it so the idle snapshot below is not taken
+        // be publishing work; wait for it so the idle snapshot is not taken
         // mid-claim (which could let the process exit and subject that batch to
         // graceful_shutdown's bounded drain).
         if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
@@ -1295,31 +1305,7 @@ impl PyQuebec {
         // CleanupPending entries don't block drain: those jobs already executed and
         // only the DB orphan-sweep owns their leftover rows. The worker is drainable
         // once no Dispatched/InFlight (active) work remains.
-        if self.ctx.ledger_has_active() {
-            return false;
-        }
-        let worker = self.worker.clone();
-        let ctx = self.ctx.clone();
-        py.detach(|| {
-            self.rt.block_on(async move {
-                let process_id = match *worker.process_id_handle().lock().await {
-                    Some(id) => id,
-                    None => return false,
-                };
-                let Ok(db) = ctx.get_db().await else {
-                    return false;
-                };
-                matches!(
-                    crate::query_builder::claimed_executions::count_by_process_id(
-                        db.as_ref(),
-                        &ctx.table_config,
-                        process_id,
-                    )
-                    .await,
-                    Ok(0)
-                )
-            })
-        })
+        !self.ctx.ledger_has_active()
     }
 
     /// Test-only: directly set the claim-in-progress flag so a regression test

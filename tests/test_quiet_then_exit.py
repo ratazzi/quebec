@@ -36,7 +36,13 @@ def test_should_drain_exit_true_when_drained(db_url, test_prefix):
 
 
 def test_should_drain_exit_false_with_claimed_job(db_url, test_prefix):
-    """A claimed-but-not-yet-run job blocks self-exit until it drains."""
+    """A claimed-but-not-yet-run job (Dispatched in the ledger) blocks self-exit.
+
+    Drain-exit is ledger-authoritative, so the blocking signal is a Dispatched
+    ledger entry, not a DB row. ``drain_batch`` claims via the real batch path
+    that records the entry (``drain_one`` bypasses the ledger and would no longer
+    block — that DB-only residue is the orphan-sweep's job, not a drain blocker).
+    """
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
     assert qc.create_tables() is True
 
@@ -49,9 +55,10 @@ def test_should_drain_exit_false_with_claimed_job(db_url, test_prefix):
         qc.register_worker_process()
         qc.quiet()
         IdleJob.perform_later(qc)
-        qc.drain_one()  # claimed, not performed
+        (execution,) = qc.drain_batch(1)  # Dispatched in the ledger, not performed
         # Still has a claimed job → must not self-exit.
         assert qc.should_drain_exit() is False
+        del execution
     finally:
         qc.close()
 

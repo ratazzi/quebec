@@ -653,6 +653,48 @@ def test_should_drain_exit_ignores_cleanup_pending(db_url, test_prefix):
         qc.close()
 
 
+def test_should_drain_exit_with_lingering_claimed_row(db_url, test_prefix):
+    """Drain-exit is ledger-authoritative even when a claimed row lingers in DB.
+
+    Regression for the quiet_then_exit hang: a CleanupPending ledger entry is
+    created precisely when the job executed but its claimed-row cleanup failed,
+    so the claimed_executions row is intentionally left in the DB for the
+    orphan-sweep to reclaim. The sweep can only reclaim it once this process row
+    is gone, so a DB-count gate (the old ``count_by_process_id`` query) would see
+    the lingering row, report non-empty, and hang the drain-exit forever. The
+    ledger says no active work, so should_drain_exit must return True.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+
+    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
+    engine = create_engine(sa_url)
+    session = sessionmaker(bind=engine)()
+    try:
+        process_id = qc.register_worker_process()
+        qc.quiet()
+
+        # Seed a real claimed row owned by THIS worker's process, then mark its
+        # ledger entry CleanupPending — the exact shape of a failed-cleanup job.
+        claimed_id = _seed_claimed(session, test_prefix, process_id)
+        qc._set_ledger_state(claimed_id, 2)
+        assert qc._ledger_state(claimed_id) == 2
+
+        # Confirm the lingering row is really present and owned by this process.
+        count = session.execute(
+            text(f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions"),
+        ).scalar()
+        assert count == 1
+
+        # Old behaviour: count_by_process_id == 1 → False (hang). Now: ledger has
+        # no active work → drainable.
+        assert qc.should_drain_exit() is True
+    finally:
+        qc.close()
+        session.close()
+        engine.dispose()
+
+
 def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_prefix):
     """The DB orphan-sweep is per-row best-effort (F4 regression).
 
