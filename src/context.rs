@@ -553,6 +553,20 @@ impl AppContext {
             .is_empty()
     }
 
+    /// True when the ledger holds any `Dispatched` or `InFlight` entry, i.e. work
+    /// that is still pending dispatch or actively executing. `CleanupPending`
+    /// entries do NOT count as active: the job already finished executing and only
+    /// the DB orphan-sweep is left to reclaim the row, so a worker carrying solely
+    /// `CleanupPending` entries (or none at all) is fully drained. Poison-recovering;
+    /// single locked pass, never held across an await.
+    pub fn ledger_has_active(&self) -> bool {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|s| matches!(s, ClaimState::Dispatched | ClaimState::InFlight))
+    }
+
     /// Snapshot the claim ledger so callers can inspect states without holding
     /// the lock. Poison-recovering.
     pub fn ledger_snapshot(&self) -> std::collections::HashMap<i64, ClaimState> {

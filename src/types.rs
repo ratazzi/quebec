@@ -1292,8 +1292,10 @@ impl PyQuebec {
         if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
             return false;
         }
-        let in_flight_empty = self.ctx.ledger_is_empty();
-        if !in_flight_empty {
+        // CleanupPending entries don't block drain: those jobs already executed and
+        // only the DB orphan-sweep owns their leftover rows. The worker is drainable
+        // once no Dispatched/InFlight (active) work remains.
+        if self.ctx.ledger_has_active() {
             return false;
         }
         let worker = self.worker.clone();

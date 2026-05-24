@@ -372,3 +372,31 @@ def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
         assert qc.should_drain_exit() is False
     finally:
         qc.close()
+
+
+def test_should_drain_exit_ignores_cleanup_pending(db_url, test_prefix):
+    """A ledger holding ONLY CleanupPending entries is still drainable.
+
+    CleanupPending means the job already executed successfully and only the DB
+    orphan-sweep is left to reclaim the row; the worker has no active work, so
+    quiet_then_exit must be allowed to exit rather than hang forever waiting for
+    cleanup that may never succeed. A Dispatched or InFlight entry, by contrast,
+    is real pending/active work and must block the exit.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        qc.quiet()
+        # Only CleanupPending in the ledger → no active work → drainable.
+        qc._set_ledger_state(901, 2)
+        assert qc._ledger_state(901) == 2
+        assert qc.should_drain_exit() is True
+        # Add a Dispatched entry → active work → must not exit.
+        qc._set_ledger_state(902, 0)
+        assert qc.should_drain_exit() is False
+        # Flip it to InFlight → still active work → must not exit.
+        qc._set_ledger_state(902, 1)
+        assert qc.should_drain_exit() is False
+    finally:
+        qc.close()
