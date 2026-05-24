@@ -424,6 +424,112 @@ def test_fail_claimed_by_id_clears_ledger_on_db_error(qc_with_sqlalchemy, db_ass
     assert qc._ledger_state(claimed_id) is None
 
 
+def test_emergency_cleanup_verify_present_marks_cleanup_pending(
+    qc_with_sqlalchemy, db_assert
+):
+    """after_executed's emergency tail marks CleanupPending when the row remains.
+
+    The job already executed; the normal cleanup and fail_claimed both failed,
+    but the fallback delete left the claimed row in place. The verification
+    re-check confirms the row is still present, so the ledger entry must become
+    CleanupPending: the shutdown release must NOT requeue an already-executed
+    job, and the DB orphan-sweep reclaims the lingering row.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    qc.register_job(_IdleJob)
+    qc.register_worker_process()
+
+    enqueued = _IdleJob.perform_later(qc)
+    (execution,) = qc.drain_batch(1)
+
+    session.expire_all()
+    claimed_id = _claimed_id(session, prefix, enqueued.id)
+    assert db_assert.count_claimed_executions() == 1
+
+    # Row is still present → Ok(Some) arm → CleanupPending.
+    execution._resolve_emergency_cleanup_ledger()
+
+    assert qc._ledger_state(claimed_id) == 2
+    del execution
+
+
+def test_emergency_cleanup_verify_gone_removes_ledger(qc_with_sqlalchemy, db_assert):
+    """after_executed's emergency tail removes the ledger entry when the row is gone.
+
+    The fallback delete above succeeded: the verification re-check finds no row
+    (Ok(None)), so the ledger entry must be cleared rather than left dangling.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    qc.register_job(_IdleJob)
+    qc.register_worker_process()
+
+    enqueued = _IdleJob.perform_later(qc)
+    (execution,) = qc.drain_batch(1)
+
+    session.expire_all()
+    claimed_id = _claimed_id(session, prefix, enqueued.id)
+
+    # Simulate the fallback delete having removed the claimed row.
+    session.execute(
+        text(f"DELETE FROM {prefix}_claimed_executions WHERE id = :cid"),
+        {"cid": claimed_id},
+    )
+    session.commit()
+    assert db_assert.count_claimed_executions() == 0
+
+    # Row confirmed gone → Ok(None) arm → ledger entry removed.
+    execution._resolve_emergency_cleanup_ledger()
+
+    assert qc._ledger_state(claimed_id) is None
+    del execution
+
+
+def test_emergency_cleanup_verify_error_removes_ledger(qc_with_sqlalchemy, db_assert):
+    """after_executed's emergency tail removes the ledger entry when verify ERRORS.
+
+    This is the F2 regression: if the verification find_by_id itself errors, the
+    old code collapsed to CleanupPending and left a permanent zombie ledger entry
+    (the fallback delete may have already removed the row, so nothing could ever
+    reconcile it). The three-way match must instead remove the entry on Err and
+    defer to the DB orphan-sweep. We force the verification query to error by
+    dropping the claimed_executions table out from under the Rust query, exactly
+    mirroring the delete/fail on_db_error tests.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    qc.register_job(_IdleJob)
+    qc.register_worker_process()
+
+    enqueued = _IdleJob.perform_later(qc)
+    (execution,) = qc.drain_batch(1)
+
+    session.expire_all()
+    claimed_id = _claimed_id(session, prefix, enqueued.id)
+    assert qc._ledger_state(claimed_id) == 0
+
+    # Drop the table so the Rust find_by_id verification errors → Err arm.
+    session.execute(text(f"DROP TABLE {prefix}_claimed_executions"))
+    session.commit()
+
+    # Verification could not be performed → Err arm → ledger entry removed
+    # (NOT left as a permanent CleanupPending zombie).
+    execution._resolve_emergency_cleanup_ledger()
+
+    assert qc._ledger_state(claimed_id) is None
+    del execution
+
+
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
     """should_drain_exit is gated on the ledger being empty."""
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)

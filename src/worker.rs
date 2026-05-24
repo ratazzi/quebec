@@ -1422,23 +1422,14 @@ impl Execution {
 
                 // The job already executed. Decide CleanupPending vs ledger_remove
                 // on whether the claimed row STILL EXISTS, not on a fallback
-                // delete's row count: if the row is gone the ledger entry can be
-                // cleared; if it is still present mark CleanupPending so the
-                // shutdown release does NOT requeue an executed job.
-                let claimed_gone = query_builder::claimed_executions::find_by_id(
+                // delete's row count.
+                self.resolve_emergency_cleanup_ledger(
                     cleanup_db.as_ref(),
                     &table_config_orig,
+                    job_id,
                     claimed_id,
                 )
-                .await
-                .map(|row| row.is_none())
-                .unwrap_or(false);
-                if claimed_gone {
-                    self.ctx.ledger_remove(self.claimed.id);
-                } else {
-                    self.ctx
-                        .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
-                }
+                .await;
             } else {
                 // Could not even get a DB handle: the claimed row is still present
                 // and the job already ran. Mark CleanupPending to block requeue.
@@ -1478,6 +1469,48 @@ impl Execution {
             Err(e) => Err(QuebecError::Transaction(format!(
                 "Database error during job processing: {e}"
             ))),
+        }
+    }
+
+    /// Resolve the worker-local ledger after the emergency-cleanup tail of
+    /// `after_executed`. The job has already executed; the fallback delete of
+    /// the claimed row was already attempted. Three outcomes from re-checking
+    /// whether the claimed row still exists:
+    ///
+    /// * `Ok(Some)` — row confirmed present: mark `CleanupPending` so the
+    ///   shutdown release does NOT requeue an already-executed job; the DB
+    ///   orphan-sweep reclaims the lingering row.
+    /// * `Ok(None)` — row confirmed gone: clear the ledger entry.
+    /// * `Err` — verification could not be performed: do NOT mark
+    ///   `CleanupPending`. The fallback delete above may have already removed
+    ///   the row, and even if it didn't the orphan-sweep reclaims it straight
+    ///   from the DB (it never reads the ledger). Marking `CleanupPending` on
+    ///   an unverifiable result would risk a permanent zombie ledger entry that
+    ///   nothing can ever clear, so remove it and defer to the orphan-sweep.
+    async fn resolve_emergency_cleanup_ledger<C>(
+        &self,
+        db: &C,
+        table_config: &crate::context::TableConfig,
+        job_id: i64,
+        claimed_id: i64,
+    ) where
+        C: sea_orm::ConnectionTrait,
+    {
+        match query_builder::claimed_executions::find_by_id(db, table_config, claimed_id).await {
+            Ok(Some(_)) => {
+                self.ctx
+                    .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
+            }
+            Ok(None) => {
+                self.ctx.ledger_remove(self.claimed.id);
+            }
+            Err(e) => {
+                warn!(
+                    "Could not verify claimed_execution {} after emergency cleanup of job {}: {:?}; removing ledger entry and deferring to orphan-sweep",
+                    claimed_id, job_id, e
+                );
+                self.ctx.ledger_remove(self.claimed.id);
+            }
         }
     }
 }
@@ -1552,6 +1585,39 @@ impl Execution {
         }
 
         Ok(())
+    }
+
+    /// Test-only hook for `after_executed`'s emergency-cleanup verification tail.
+    /// Drives `resolve_emergency_cleanup_ledger` directly so a regression test
+    /// can pin all three decision arms (row present → CleanupPending, row gone →
+    /// remove, verification error → remove), including the `Err` arm that is
+    /// otherwise unreachable from Python without the full triple-failure path.
+    fn _resolve_emergency_cleanup_ledger(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = self.ctx.get_runtime_handle().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Tokio runtime handle not initialized",
+            )
+        })?;
+        let table_config = self.ctx.table_config.clone();
+        let job_id = self.claimed.job_id;
+        let claimed_id = self.claimed.id;
+        py.detach(|| {
+            handle.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to get DB: {e}"
+                    ))
+                })?;
+                self.resolve_emergency_cleanup_ledger(
+                    db.as_ref(),
+                    &table_config,
+                    job_id,
+                    claimed_id,
+                )
+                .await;
+                Ok(())
+            })
+        })
     }
 
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
