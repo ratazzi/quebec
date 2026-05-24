@@ -1063,8 +1063,11 @@ impl PyQuebec {
 
         self.pyqueue_mode.store(true, Ordering::Relaxed);
 
-        // Use tokio::spawn to start async task
-        self.rt.spawn(async move {
+        // Use tokio::spawn to start async task. Track the handle so
+        // graceful_shutdown / close await the pump's unwind before exiting —
+        // otherwise the process can tear down (Python queue, held Execution, DB
+        // refs) while the pump is still mid-iteration.
+        let pump_handle = self.rt.spawn(async move {
             loop {
                 // pick_job returns Err when the dispatch channel is closed or
                 // graceful shutdown has begun. In both cases the pump stops so
@@ -1095,6 +1098,14 @@ impl PyQuebec {
                 });
             }
         });
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
+            .push(pump_handle);
 
         let handle = self.rt.spawn(async move {
             graceful_shutdown.cancelled().await;

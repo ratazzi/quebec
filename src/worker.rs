@@ -3048,7 +3048,10 @@ impl Worker {
             return Ok(());
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
-        let _ = release_semaphore(
+        // Propagate failure: every caller runs inside the same transaction that
+        // deletes the claim, so a release error must roll back the whole unit
+        // rather than commit the claim deletion while leaking the queue slot.
+        release_semaphore(
             db,
             table_config,
             format!("queue:{}", queue_name),
@@ -3056,7 +3059,7 @@ impl Worker {
             duration,
         )
         .await
-        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e));
+        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e))?;
         Ok(())
     }
 
@@ -3322,6 +3325,9 @@ impl Worker {
                     // fraction of shutdown_timeout so the outer graceful_shutdown
                     // block_on still has budget to run the release and on_stop
                     // below before its own timeout fires.
+                    // With a very small or zero shutdown_timeout the deadline is
+                    // effectively now: the loop still checks in_flight once, then
+                    // falls through to release rather than draining.
                     let drain_deadline = tokio::time::Instant::now()
                         + self.ctx.shutdown_timeout.mul_f64(0.8);
                     loop {
@@ -3338,14 +3344,18 @@ impl Worker {
                         if no_in_flight {
                             break;
                         }
-                        if tokio::time::Instant::now() >= drain_deadline {
+                        let now = tokio::time::Instant::now();
+                        if now >= drain_deadline {
                             warn!(
                                 "Shutdown drain timed out with jobs still inside perform(); \
                                  leaving them claimed to avoid a double-execution race"
                             );
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        // Cap the nap at the remaining budget so we never oversleep
+                        // past the deadline and eat into the release + on_stop time.
+                        let nap = (drain_deadline - now).min(std::time::Duration::from_millis(50));
+                        tokio::time::sleep(nap).await;
                     }
 
                     // Release jobs that never started running (still queued in the
