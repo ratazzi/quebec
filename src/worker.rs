@@ -2297,6 +2297,13 @@ impl Worker {
             })
             .await?;
 
+        // Record each claimed row as Dispatched. It stays Dispatched until
+        // `pick_job` hands it to the Python side and flips it to InFlight.
+        for row in &jobs {
+            self.ctx
+                .ledger_set(row.id, crate::context::ClaimState::Dispatched);
+        }
+
         trace!("elpased: {:?}", timer.elapsed());
         Ok(jobs)
     }
@@ -3181,8 +3188,17 @@ impl Worker {
                     let drain_deadline = tokio::time::Instant::now()
                         + self.ctx.shutdown_timeout.mul_f64(0.8);
                     loop {
-                        let in_flight_empty = self.ctx.ledger_is_empty();
-                        if in_flight_empty {
+                        // pick_job stops once shutdown begins, so Dispatched
+                        // rows never advance to InFlight. Drain only waits for
+                        // rows already inside perform() (InFlight); the
+                        // un-started Dispatched rows are requeued by
+                        // release_all_claimed_executions immediately below.
+                        let no_in_flight = self
+                            .ctx
+                            .ledger_snapshot()
+                            .values()
+                            .all(|s| *s != crate::context::ClaimState::InFlight);
+                        if no_in_flight {
                             break;
                         }
                         if tokio::time::Instant::now() >= drain_deadline {
