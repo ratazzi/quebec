@@ -3131,17 +3131,44 @@ impl Worker {
                         }
                     });
 
-                    // Release remaining claimed executions back to ready state BEFORE
-                    // deleting the process record, to avoid a race where another worker's
-                    // fail_orphaned_executions sees them as orphans and marks them failed.
-                    // Only jobs that have NOT started running are released (claimed but
-                    // still queued in the mpsc channel / Python work queue). Jobs currently
-                    // inside perform() are tracked in ctx.in_flight_executions and left
-                    // claimed: graceful_shutdown ends with process::exit(0), which kills the
-                    // Python perform threads before their after_executed() can run, so
-                    // releasing an in-flight job here would let a neighbour worker claim and
-                    // run it concurrently (duplicate execution). Those rows are reaped by a
-                    // neighbour's prune_dead_processes after this process stops heart-beating.
+                    // Wait for jobs currently inside perform() to finish before
+                    // releasing anything. Once shutdown starts the Python
+                    // ThreadedRunner stops pulling new jobs (it polls
+                    // is_shutting_down), so in_flight drains as running jobs
+                    // complete via after_executed(), which removes their claimed
+                    // row. Bounded by shutdown_timeout so a stuck job cannot block
+                    // shutdown forever.
+                    let drain_deadline =
+                        tokio::time::Instant::now() + self.ctx.shutdown_timeout;
+                    loop {
+                        let in_flight_empty = self
+                            .ctx
+                            .in_flight_executions
+                            .lock()
+                            .map(|s| s.is_empty())
+                            .unwrap_or(true);
+                        if in_flight_empty {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= drain_deadline {
+                            warn!(
+                                "Shutdown drain timed out with jobs still inside perform(); \
+                                 leaving them claimed to avoid a double-execution race"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+
+                    // Release jobs that never started running (still queued in the
+                    // mpsc channel or the Python work queue) back to ready so the
+                    // dispatcher can re-claim them. Jobs that finished perform()
+                    // during the drain above are already gone from
+                    // claimed_executions. If the drain timed out, rows still
+                    // in_flight are skipped (release_all_claimed_executions filters
+                    // them) to avoid handing a running job to a neighbour; those are
+                    // reaped later by the supervisor's orphan sweep or a restarting
+                    // worker's fail_orphaned_executions.
                     if let Err(e) = self.release_all_claimed_executions(process.id).await {
                         warn!("Failed to release claimed executions on shutdown: {}", e);
                     }
@@ -3400,6 +3427,17 @@ impl Worker {
             return Err(QuebecError::runtime("No job found"));
         }
         let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
+        // Mark in-flight the moment a job leaves the dispatch channel for the
+        // Python side. From here it may sit buffered in the Python work queue
+        // before perform() begins; tracking it now means the shutdown drain
+        // waits for it and release_all_claimed_executions never hands it back
+        // to ready underneath a runner that is about to execute it. The
+        // InFlightGuard in Execution::invoke re-inserts (idempotent) and
+        // removes the id on completion, so the entry is cleared once perform
+        // finishes via after_executed.
+        if let Ok(mut set) = self.ctx.in_flight_executions.lock() {
+            set.insert(execution.claimed.id);
+        }
         Ok(execution)
     }
 
