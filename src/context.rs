@@ -389,18 +389,21 @@ pub struct InFlightGuard {
 
 impl InFlightGuard {
     pub fn new(set: Arc<std::sync::Mutex<HashSet<i64>>>, id: i64) -> Self {
-        if let Ok(mut guard) = set.lock() {
-            guard.insert(id);
-        }
+        // Recover from poisoning: the set is a plain HashSet that stays
+        // consistent even if a holder panicked, and silently skipping the
+        // insert would let the shutdown release treat a running job as
+        // releasable.
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
         Self { set, id }
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.set.lock() {
-            guard.remove(&self.id);
-        }
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
     }
 }
 

@@ -960,9 +960,11 @@ impl Drop for Execution {
         // clears it. If a picked Execution is dropped without ever running
         // perform() (e.g. it failed to enqueue to the Python work queue), clear
         // the entry here so the shutdown drain is not left waiting on it.
-        if let Ok(mut set) = self.ctx.in_flight_executions.lock() {
-            set.remove(&self.claimed.id);
-        }
+        self.ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.claimed.id);
     }
 }
 
@@ -2563,12 +2565,14 @@ impl Worker {
 
         // Skip executions that are actively running inside perform(); releasing
         // them would create a duplicate-execution race with a neighbour worker.
+        // Recover from poisoning rather than treating it as an empty set, which
+        // would let a running job be released back to ready (double-run).
         let in_flight: std::collections::HashSet<i64> = self
             .ctx
             .in_flight_executions
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let claimed: Vec<_> = claimed
             .into_iter()
             .filter(|execution| !in_flight.contains(&execution.id))
@@ -3165,8 +3169,8 @@ impl Worker {
                             .ctx
                             .in_flight_executions
                             .lock()
-                            .map(|s| s.is_empty())
-                            .unwrap_or(true);
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_empty();
                         if in_flight_empty {
                             break;
                         }
@@ -3471,10 +3475,14 @@ impl Worker {
         // and removes the id on completion; Execution's Drop clears it too, so a
         // picked job that never reaches perform() cannot leak its entry.
         {
-            let mut set = match self.ctx.in_flight_executions.lock() {
-                Ok(set) => set,
-                Err(_) => return Ok(execution),
-            };
+            // Recover from poisoning rather than failing open: returning Ok here
+            // would bypass the shutdown recheck and hand a possibly-released job
+            // to Python. The set stays consistent across a panic.
+            let mut set = self
+                .ctx
+                .in_flight_executions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if self.ctx.graceful_shutdown.is_cancelled() {
                 return Err(QuebecError::runtime("shutting down"));
             }
