@@ -323,15 +323,18 @@ def test_dispatch_reconcile_requeues_residual(qc_with_sqlalchemy, db_assert):
     assert qc._ledger_state(claimed_id) is None
 
 
-def test_missing_ledger_entry_is_released_on_shutdown(qc_with_sqlalchemy, db_assert):
-    """A claimed row with NO ledger entry is treated as releasable Dispatched.
+def test_missing_ledger_entry_is_skipped_on_shutdown(qc_with_sqlalchemy, db_assert):
+    """A claimed row with NO ledger entry is NOT requeued by graceful release.
 
-    The ledger is worker-local and lost on a hard crash. The REAL crash path
-    reclaims orphaned DB claimed rows via ``fail_orphaned_executions`` (purely
-    DB-based, ledger-independent), not this graceful release. This test only
-    pins that the graceful release does not silently SKIP a claimed row just
-    because it has no ledger entry: a missing entry must be treated as a
-    releasable Dispatched claim, never as InFlight/CleanupPending.
+    Release is ledger-authoritative: it requeues ONLY rows the ledger still
+    records as ``Dispatched``. ``claim_jobs`` records every claim as
+    ``Dispatched``, so a claimed row with no ledger entry is error /
+    ``Execution::Drop`` residue, never a live Dispatched claim. Requeuing it is
+    the duplicate-run hazard where an executed-but-cleanup-failed claim lost its
+    ledger entry. So graceful release SKIPS it and leaves it claimed for the DB
+    orphan-sweep, which reclaims it once ``on_stop`` deletes the process row.
+    (The real crash path is handled entirely by ``fail_orphaned_executions``,
+    not this graceful release.)
     """
     ctx = qc_with_sqlalchemy
     qc = ctx["qc"]
@@ -341,7 +344,7 @@ def test_missing_ledger_entry_is_released_on_shutdown(qc_with_sqlalchemy, db_ass
     process_id = qc.register_worker_process()
 
     # Seed the claim directly (no drain_batch), so the worker-local ledger has
-    # no entry for it — the crash-fallback shape.
+    # no entry for it — the error/Drop-residue shape.
     claimed_id = _seed_claimed(session, prefix, process_id)
     assert qc._ledger_state(claimed_id) is None
     assert db_assert.count_claimed_executions() == 1
@@ -349,10 +352,12 @@ def test_missing_ledger_entry_is_released_on_shutdown(qc_with_sqlalchemy, db_ass
 
     released = qc.release_claimed_for_shutdown(process_id)
 
-    assert released == 1
+    # Not requeued: the row stays claimed (left for the orphan-sweep), nothing
+    # goes back to ready.
+    assert released == 0
     session.expire_all()
-    assert db_assert.count_claimed_executions() == 0
-    assert db_assert.count_ready_executions() == 1
+    assert db_assert.count_claimed_executions() == 1
+    assert db_assert.count_ready_executions() == 0
 
 
 def test_dispatched_release_clears_ledger_on_shutdown(qc_with_sqlalchemy, db_assert):

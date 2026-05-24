@@ -110,8 +110,14 @@ def test_claimed_but_not_started_job_is_released_on_shutdown(qc_with_sqlalchemy)
     process_id = qc.register_worker_process()
 
     IdleJob.perform_later(qc)
-    # Claim it (now in claimed_executions) but do NOT call perform().
-    qc.drain_one()
+    # Claim it via the real batch path so the worker-local ledger records it as
+    # Dispatched, then do NOT perform it. Release is ledger-authoritative, so a
+    # claimed-but-not-started job must carry its Dispatched entry to be released
+    # (drain_one bypasses the ledger and no longer represents a production
+    # claim). Keep the Execution alive so its Drop backstop doesn't clear the
+    # entry before release runs.
+    claimed = qc.drain_batch(1)
+    assert len(claimed) == 1
 
     session.expire_all()
     assert _count(session, prefix, "claimed_executions") == 1
@@ -123,3 +129,4 @@ def test_claimed_but_not_started_job_is_released_on_shutdown(qc_with_sqlalchemy)
     session.expire_all()
     assert _count(session, prefix, "claimed_executions") == 0
     assert _count(session, prefix, "ready_executions") == 1
+    del claimed

@@ -2823,29 +2823,30 @@ impl Worker {
         )
         .await?;
 
-        // Skip executions that are actively running inside perform()
-        // (`InFlight`) or that already ran but whose claimed-row cleanup failed
-        // (`CleanupPending`); releasing either would create a duplicate-execution
-        // race with a neighbour worker. `ledger_snapshot` recovers from poisoning
-        // rather than treating the ledger as empty, which would let such a job be
-        // released back to ready (double-run). Claimed rows with no ledger entry
-        // (the crash-fallback case) are treated as releasable.
-        let skip: std::collections::HashSet<i64> = self
-            .ctx
-            .ledger_snapshot()
-            .into_iter()
-            .filter(|(_, s)| {
-                matches!(
-                    s,
-                    crate::context::ClaimState::InFlight
-                        | crate::context::ClaimState::CleanupPending
-                )
-            })
-            .map(|(id, _)| id)
-            .collect();
+        // Release is ledger-authoritative: requeue ONLY rows the ledger still
+        // records as `Dispatched` (claimed, queued, never performed). Skip
+        // everything else:
+        //   * `InFlight` — the drain above waits for it to finish;
+        //   * `CleanupPending` — already executed; requeuing would double-run it;
+        //   * no ledger entry — error / `Execution::Drop` residue, NOT a live
+        //     Dispatched claim (`claim_jobs` records every claim as `Dispatched`,
+        //     so a missing entry means some path already removed it). Requeuing a
+        //     missing-entry row is the duplicate-run hazard where an
+        //     executed-but-cleanup-failed claim lost its ledger entry. Leave it
+        //     claimed for the DB orphan-sweep, which reclaims it once `on_stop`
+        //     deletes this process's row.
+        // This mirrors `should_drain_exit`'s ledger-authoritative gate.
+        // `ledger_snapshot` recovers from poisoning rather than treating the
+        // ledger as empty (which would skip a genuine Dispatched claim).
+        let ledger = self.ctx.ledger_snapshot();
         let claimed: Vec<_> = claimed
             .into_iter()
-            .filter(|execution| !skip.contains(&execution.id))
+            .filter(|execution| {
+                matches!(
+                    ledger.get(&execution.id),
+                    Some(crate::context::ClaimState::Dispatched)
+                )
+            })
             .collect();
 
         if claimed.is_empty() {
