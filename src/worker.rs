@@ -974,19 +974,30 @@ pub struct Execution {
 
 impl Drop for Execution {
     fn drop(&mut self) {
-        // Backstop for the claim ledger: pick_job marks a job in-flight when it
-        // leaves the dispatch channel and after_executed normally clears it. If a
-        // picked Execution is dropped without ever running perform() (e.g. it
-        // failed to enqueue to the Python work queue), clear the entry here so the
-        // shutdown drain is not left waiting on it. A CleanupPending mark (set by
-        // after_executed when the claimed row could not be deleted) is preserved:
-        // the job already ran, so the ledger must keep blocking its requeue.
+        // Backstop for the claim ledger, by state. `release_all_claimed_executions`
+        // is ledger-authoritative: it requeues only `Dispatched` rows.
+        //   * `InFlight` — pick_job marked it in-flight but the Execution is being
+        //     dropped without `after_executed` (e.g. it failed to enqueue to the
+        //     Python work queue). Whether perform() ran is ambiguous, so REMOVE
+        //     the entry: this unblocks the shutdown drain (which waits on InFlight)
+        //     and leaves the claimed row for the orphan-sweep rather than risking a
+        //     double-run by requeuing it.
+        //   * `Dispatched` — the Execution was pulled from the dispatch channel but
+        //     dropped BEFORE pick_job marked it InFlight (the pre-perform shutdown
+        //     race). The job never ran, so LEAVE the entry: graceful release then
+        //     requeues it, honouring the "claimed-but-not-started → released"
+        //     guarantee. (A Dispatched entry is only dropped here during shutdown;
+        //     in normal operation pick_job transitions it to InFlight.)
+        //   * `CleanupPending` — already executed; preserve so requeue stays blocked.
         let mut ledger = self
             .ctx
             .claim_ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if ledger.get(&self.claimed.id) != Some(&crate::context::ClaimState::CleanupPending) {
+        if matches!(
+            ledger.get(&self.claimed.id),
+            Some(crate::context::ClaimState::InFlight)
+        ) {
             ledger.remove(&self.claimed.id);
         }
     }
