@@ -3460,12 +3460,17 @@ impl Worker {
                                 .instrument(tracing::info_span!("listener", consumed = total_notifies))
                                 .await;
 
-                            let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
-                            let timeout_duration = tokio::time::Duration::from_secs(1);
-
-                            if tokio::time::timeout(timeout_duration, process_future).await.is_err() {
-                                warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
-                            }
+                            // Run to completion: this call claims rows (committing
+                            // claimed_executions + Dispatched ledger entries) before
+                            // sending them to the channel / stashing into
+                            // dispatch_retry. Cancelling it mid-claim would leave rows
+                            // claimed in the DB and Dispatched in the ledger but absent
+                            // from both the channel and dispatch_retry, so reconcile
+                            // could never recover them — leaking ledger entries that
+                            // block should_drain_exit and burn claim capacity. The DB
+                            // ops inside already honour the pool's own timeouts, so a
+                            // slow batch should just take the time it needs.
+                            self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY").await;
                         } else {
                             trace!("Ignoring NOTIFY for queue not in worker config");
                         }
