@@ -953,6 +953,21 @@ pub struct Execution {
     idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
+impl Drop for Execution {
+    fn drop(&mut self) {
+        // Backstop for the in-flight set: pick_job marks a job in-flight when it
+        // leaves the dispatch channel and the InFlightGuard in invoke() normally
+        // clears it. If a picked Execution is dropped without ever running
+        // perform() (e.g. it failed to enqueue to the Python work queue), clear
+        // the entry here so the shutdown drain is not left waiting on it.
+        self.ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.claimed.id);
+    }
+}
+
 impl Execution {
     pub fn new(
         ctx: Arc<AppContext>,
@@ -1001,6 +1016,17 @@ impl Execution {
     }
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
+        // Mark this claimed_execution as in-flight for the whole perform()
+        // window. `release_all_claimed_executions` (graceful shutdown) skips
+        // ids still in this set so a job actively inside perform() is never
+        // handed back to a neighbour worker. The guard clears the id when this
+        // function returns (after `after_executed` has deleted the claimed
+        // row) or unwinds, so the entry never outlives the perform.
+        let _in_flight = crate::context::InFlightGuard::new(
+            self.ctx.in_flight_executions.clone(),
+            self.claimed.id,
+        );
+
         self.timer = Instant::now();
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
@@ -1686,6 +1712,24 @@ impl Worker {
 
     pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
         self.process_id.clone()
+    }
+
+    /// Register a worker process record and store its id, mirroring the
+    /// `on_start` step of `run_main_loop`. Test-only hook so a regression test
+    /// can claim jobs under a known process id and then exercise
+    /// `release_all_claimed_executions` deterministically.
+    pub(crate) async fn register_process_for_test(&self) -> Result<i64> {
+        let db = self.ctx.get_db().await?;
+        let process = self.on_start(&db).await?;
+        *self.process_id.lock().await = Some(process.id);
+        Ok(process.id)
+    }
+
+    /// Test-only wrapper around the private `release_all_claimed_executions`
+    /// so the graceful-shutdown release path can be driven from pytest without
+    /// spinning up the full main loop and signalling SIGTERM.
+    pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
+        self.release_all_claimed_executions(process_id).await
     }
 
     fn register_handler(
@@ -2492,8 +2536,20 @@ impl Worker {
         Ok(total_deleted)
     }
 
-    /// Release all claimed executions for a process back to ready state.
-    /// Called during graceful shutdown for jobs claimed but not yet started.
+    /// Release claimed executions for a process back to ready state during
+    /// graceful shutdown. Releases jobs that have not started running — those
+    /// still sitting in the dispatch channel — so the dispatcher can re-claim
+    /// them immediately. Jobs that have been handed to the Python side (tracked
+    /// in `ctx.in_flight_executions`) are skipped: the shutdown drain waits for
+    /// that set to empty first, so in normal shutdown there are none left here.
+    /// Any that remain (the drain hit `shutdown_timeout`) are left in
+    /// `claimed_executions` rather than released, because releasing a job whose
+    /// perform thread is still running would let a neighbour run it a second
+    /// time; those leftovers are reclaimed by the supervisor's orphan sweep or a
+    /// restarting worker's `fail_orphaned_executions` (both match claims whose
+    /// process row no longer exists — `prune_dead_processes`, which only finds
+    /// stale-but-present rows, would miss them since this process deletes its
+    /// own row right after).
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
     /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
     async fn release_all_claimed_executions(&self, process_id: i64) -> Result<usize> {
@@ -2506,6 +2562,21 @@ impl Worker {
             process_id,
         )
         .await?;
+
+        // Skip executions that are actively running inside perform(); releasing
+        // them would create a duplicate-execution race with a neighbour worker.
+        // Recover from poisoning rather than treating it as an empty set, which
+        // would let a running job be released back to ready (double-run).
+        let in_flight: std::collections::HashSet<i64> = self
+            .ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let claimed: Vec<_> = claimed
+            .into_iter()
+            .filter(|execution| !in_flight.contains(&execution.id))
+            .collect();
 
         if claimed.is_empty() {
             return Ok(0);
@@ -3082,12 +3153,46 @@ impl Worker {
                         }
                     });
 
-                    // Release remaining claimed executions back to ready state BEFORE
-                    // deleting the process record, to avoid a race where another worker's
-                    // fail_orphaned_executions sees them as orphans and marks them failed.
-                    // Python side calls t.join() first, so actively-running jobs complete
-                    // normally via after_executed(). This handles jobs that were claimed
-                    // but not yet started (sitting in the mpsc channel).
+                    // Wait for jobs already handed to the Python side to finish
+                    // before releasing anything. pick_job stops feeding the
+                    // Python work queue once shutdown begins (it returns Err on
+                    // the cancellation token), so the ThreadedRunner drains the
+                    // buffered jobs and in_flight empties as each completes via
+                    // after_executed(), which removes its claimed row. Use a
+                    // fraction of shutdown_timeout so the outer graceful_shutdown
+                    // block_on still has budget to run the release and on_stop
+                    // below before its own timeout fires.
+                    let drain_deadline = tokio::time::Instant::now()
+                        + self.ctx.shutdown_timeout.mul_f64(0.8);
+                    loop {
+                        let in_flight_empty = self
+                            .ctx
+                            .in_flight_executions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_empty();
+                        if in_flight_empty {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= drain_deadline {
+                            warn!(
+                                "Shutdown drain timed out with jobs still inside perform(); \
+                                 leaving them claimed to avoid a double-execution race"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+
+                    // Release jobs that never started running (still queued in the
+                    // mpsc channel or the Python work queue) back to ready so the
+                    // dispatcher can re-claim them. Jobs that finished perform()
+                    // during the drain above are already gone from
+                    // claimed_executions. If the drain timed out, rows still
+                    // in_flight are skipped (release_all_claimed_executions filters
+                    // them) to avoid handing a running job to a neighbour; those are
+                    // reaped later by the supervisor's orphan sweep or a restarting
+                    // worker's fail_orphaned_executions.
                     if let Err(e) = self.release_all_claimed_executions(process.id).await {
                         warn!("Failed to release claimed executions on shutdown: {}", e);
                     }
@@ -3341,11 +3446,48 @@ impl Worker {
     pub async fn pick_job(&self) -> Result<Execution> {
         let rx = self.dispatch_receiver.clone();
         let mut receiver = rx.lock().await;
-        let execution = receiver.recv().await;
-        if execution.is_none() {
-            return Err(QuebecError::runtime("No job found"));
-        }
+        // Stop handing channel jobs to the Python side once graceful shutdown
+        // begins. The shutdown release path runs concurrently; if we kept
+        // picking here we could mark a job in-flight and enqueue it to Python
+        // *after* release has snapshotted it as releasable, double-running it.
+        // Cancelling the recv leaves the job in the channel so the release
+        // returns it to ready (it never started). `biased` checks shutdown
+        // first so a job is never pulled after cancellation.
+        let execution = tokio::select! {
+            biased;
+            _ = self.ctx.graceful_shutdown.cancelled() => {
+                return Err(QuebecError::runtime("shutting down"));
+            }
+            execution = receiver.recv() => execution,
+        };
         let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
+        // Mark in-flight the moment a job leaves the dispatch channel for the
+        // Python side, holding the same lock the shutdown release takes its
+        // snapshot under and re-checking the shutdown token while held. The
+        // `select!` above only blocks pulls observed *before* recv() returns;
+        // shutdown can still begin between recv() and this insert, and a
+        // concurrent release could snapshot in_flight without this id. The
+        // recheck under the lock closes that window: if shutdown has begun we
+        // bail out, leaving the job's claimed row in the DB and out of
+        // in_flight so the release returns it to ready instead of us handing it
+        // to Python and double-running it. Outside shutdown this is a single
+        // insert. The InFlightGuard in Execution::invoke re-inserts (idempotent)
+        // and removes the id on completion; Execution's Drop clears it too, so a
+        // picked job that never reaches perform() cannot leak its entry.
+        {
+            // Recover from poisoning rather than failing open: returning Ok here
+            // would bypass the shutdown recheck and hand a possibly-released job
+            // to Python. The set stays consistent across a panic.
+            let mut set = self
+                .ctx
+                .in_flight_executions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.ctx.graceful_shutdown.is_cancelled() {
+                return Err(QuebecError::runtime("shutting down"));
+            }
+            set.insert(execution.claimed.id);
+        }
         Ok(execution)
     }
 

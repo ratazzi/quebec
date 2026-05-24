@@ -985,6 +985,44 @@ impl PyQuebec {
         Ok(())
     }
 
+    /// Register a worker process record and store its id on the worker, the
+    /// same `on_start` step the real main loop performs. Returns the process
+    /// id. Test-only: lets a regression test claim jobs under a known process
+    /// id and then drive `release_claimed_for_shutdown` deterministically.
+    fn register_worker_process(&self, py: Python<'_>) -> PyResult<i64> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.register_process_for_test().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "register_worker_process failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Run the graceful-shutdown release path (`release_all_claimed_executions`)
+    /// for the given process id and return how many claimed jobs were released
+    /// back to ready. Test-only hook: exercises the shutdown release without
+    /// the full main loop / SIGTERM dance so a regression test can assert that
+    /// a job currently inside perform() is NOT released.
+    fn release_claimed_for_shutdown(&self, py: Python<'_>, process_id: i64) -> PyResult<usize> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .release_claimed_for_test(process_id)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "release_claimed_for_shutdown failed: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
     fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone();
@@ -996,16 +1034,18 @@ impl PyQuebec {
         // Use tokio::spawn to start async task
         self.rt.spawn(async move {
             loop {
-                let result = worker.pick_job().await;
+                // pick_job returns Err when the dispatch channel is closed or
+                // graceful shutdown has begun. In both cases the pump stops so
+                // it cannot hand a job to Python concurrently with the shutdown
+                // release path (which would race a double-run).
+                let res = match worker.pick_job().await {
+                    Ok(res) => res,
+                    Err(_) => break,
+                };
 
                 // Get GIL and send result to Python queue
                 Python::attach(|py| {
                     let queue = queue.bind(py);
-
-                    let Ok(res) = result else {
-                        debug!("No job available");
-                        return;
-                    };
 
                     // Determine which method to use based on queue type
                     let method_name = if queue.hasattr("put_nowait").unwrap_or(false) {

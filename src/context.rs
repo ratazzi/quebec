@@ -364,6 +364,47 @@ pub struct AppContext {
     /// (non-supervised) runs, the supervisor parent itself, and the
     /// scheduler (which is always a single process).
     pub proc_slot: Option<(usize, usize)>,
+    /// claimed_execution ids that have been handed to the Python side and have
+    /// not finished yet. Inserted in `Worker::pick_job` (when a job leaves the
+    /// dispatch channel for the Python work queue) and again at the start of
+    /// `Execution::invoke` (idempotent). Removed when `perform()` finishes (the
+    /// `InFlightGuard`), and on `Execution`'s `Drop` as a backstop for a job
+    /// that is picked but never performed. `release_all_claimed_executions`
+    /// skips these during graceful shutdown and the shutdown drain waits for
+    /// the set to empty, so a running or about-to-run job is never handed back
+    /// to a neighbour worker (which would run it a second time). Plain
+    /// `Mutex<HashSet>`: the guarded section is a single
+    /// insert/remove/contains, never held across an await.
+    pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
+}
+
+/// RAII guard that marks a claimed_execution as in-flight for the lifetime of
+/// a `perform()` call. Inserts the id on construction and removes it on drop,
+/// so the entry is cleared on every exit path — normal completion, error, or a
+/// panic propagating out of `Execution::invoke`.
+pub struct InFlightGuard {
+    set: Arc<std::sync::Mutex<HashSet<i64>>>,
+    id: i64,
+}
+
+impl InFlightGuard {
+    pub fn new(set: Arc<std::sync::Mutex<HashSet<i64>>>, id: i64) -> Self {
+        // Recover from poisoning: the set is a plain HashSet that stays
+        // consistent even if a holder panicked, and silently skipping the
+        // insert would let the shutdown release treat a running job as
+        // releasable.
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        Self { set, id }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -789,6 +830,7 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             supervisor_pid: AtomicI32::new(0),
             proc_slot: None,
+            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -882,6 +924,10 @@ impl AppContext {
             // Preserve so re-forks (or apply_*_config re-using a forked ctx)
             // keep the slot label until explicitly reset by apply_*_config.
             proc_slot: self.proc_slot,
+            // Fresh per-process tracking: the child runs its own worker /
+            // dispatch channel, so in-flight ids must not be shared with the
+            // parent (whose claims belong to a different process record).
+            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),
