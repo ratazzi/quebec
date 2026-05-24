@@ -2684,63 +2684,81 @@ impl Worker {
             return Ok(0);
         }
 
-        let count = claimed.len();
-        info!("Releasing {} claimed job(s) back to ready state", count);
+        let total = claimed.len();
+        info!("Releasing {} claimed job(s) back to ready state", total);
 
+        let mut released = 0usize;
         for execution in claimed {
             let table_config = table_config.clone();
             let ctx = self.ctx.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
 
-            db.transaction::<_, (), DbErr>(|txn| {
-                let ctx = ctx.clone();
-                Box::pin(async move {
-                    if let Some(job) =
-                        query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                    {
-                        // Bypass class-level concurrency limits: the job
-                        // already holds the class-level semaphore slot from
-                        // when it was dispatched. Put it back to ready
-                        // directly so the dispatcher can re-claim it
-                        // without re-acquiring. Matches Solid Queue's
-                        // `dispatch_bypassing_concurrency_limits`.
-                        query_builder::ready_executions::insert(
+            let result = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    let ctx = ctx.clone();
+                    Box::pin(async move {
+                        if let Some(job) =
+                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
+                        {
+                            // Bypass class-level concurrency limits: the job
+                            // already holds the class-level semaphore slot from
+                            // when it was dispatched. Put it back to ready
+                            // directly so the dispatcher can re-claim it
+                            // without re-acquiring. Matches Solid Queue's
+                            // `dispatch_bypassing_concurrency_limits`.
+                            query_builder::ready_executions::insert(
+                                txn,
+                                &table_config,
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                            )
+                            .await?;
+                            // EXPERIMENTAL queue-level slot was acquired at
+                            // claim time and must be released here — the next
+                            // worker that re-claims this job will re-acquire.
+                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
+                                .await?;
+                        } else {
+                            warn!(
+                                "Job {} not found, dropping claimed execution {}",
+                                job_id, execution_id
+                            );
+                        }
+
+                        query_builder::claimed_executions::delete_by_id(
                             txn,
                             &table_config,
-                            job.id,
-                            &job.queue_name,
-                            job.priority,
+                            execution_id,
                         )
                         .await?;
-                        // EXPERIMENTAL queue-level slot was acquired at
-                        // claim time and must be released here — the next
-                        // worker that re-claims this job will re-acquire.
-                        Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                            .await?;
-                    } else {
-                        warn!(
-                            "Job {} not found, dropping claimed execution {}",
-                            job_id, execution_id
-                        );
-                    }
 
-                    query_builder::claimed_executions::delete_by_id(
-                        txn,
-                        &table_config,
-                        execution_id,
-                    )
-                    .await?;
-
-                    Ok(())
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
+                .await;
 
-            debug!("Released job {} back to ready state", job_id);
+            // Per-row best-effort: a failure here must not abort the release of
+            // the remaining rows. A row left claimed is recovered later by the
+            // orphan sweep / restarting worker's `fail_orphaned_executions`,
+            // whereas aborting would orphan every still-claimed row once
+            // `on_stop` deletes this process's row.
+            match result {
+                Ok(()) => {
+                    released += 1;
+                    debug!("Released job {} back to ready state", job_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to release claimed execution {} (job {}) on shutdown: {:?}; leaving it claimed for recovery",
+                        execution_id, job_id, e
+                    );
+                }
+            }
         }
 
-        Ok(count)
+        Ok(released)
     }
 
     /// Release a batch of claimed executions back to ready state (best-effort).

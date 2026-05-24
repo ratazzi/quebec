@@ -32,6 +32,37 @@ def _claimed_id(session, prefix: str, job_id: int) -> int:
     ).scalar()
 
 
+def _seed_claimed(session, prefix: str, process_id: int) -> int:
+    """Seed a job + claimed_executions row directly (no ledger entry).
+
+    Mirrors the seeding in test_supervisor.py / test_supervisor_pruned_race.py:
+    bypassing ``drain_batch`` means the worker-local ledger never learns about
+    this claim, reproducing the crash-fallback case where the in-process ledger
+    was lost. Returns the new claimed_executions.id.
+    """
+    now_sql = "CURRENT_TIMESTAMP"
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_jobs "
+            f"(queue_name, class_name, arguments, priority, active_job_id, "
+            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+            f"VALUES ('default', 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+            f"{now_sql}, {now_sql})"
+        )
+    )
+    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    session.execute(
+        text(
+            f"INSERT INTO {prefix}_claimed_executions "
+            f"(job_id, process_id, created_at) "
+            f"VALUES (:job_id, :process_id, {now_sql})"
+        ),
+        {"job_id": job_id, "process_id": process_id},
+    )
+    session.commit()
+    return _claimed_id(session, prefix, job_id)
+
+
 class _IdleJob(quebec.ActiveJob):
     def perform(self, *args, **kwargs):
         return True
@@ -203,6 +234,38 @@ def test_dispatch_reconcile_requeues_residual(qc_with_sqlalchemy, db_assert):
     assert db_assert.count_claimed_executions() == 0
     assert db_assert.count_ready_executions() == 1
     assert qc._ledger_state(claimed_id) is None
+
+
+def test_missing_ledger_entry_is_released_on_shutdown(qc_with_sqlalchemy, db_assert):
+    """A claimed row with NO ledger entry is treated as releasable Dispatched.
+
+    The ledger is worker-local and lost on a hard crash. The REAL crash path
+    reclaims orphaned DB claimed rows via ``fail_orphaned_executions`` (purely
+    DB-based, ledger-independent), not this graceful release. This test only
+    pins that the graceful release does not silently SKIP a claimed row just
+    because it has no ledger entry: a missing entry must be treated as a
+    releasable Dispatched claim, never as InFlight/CleanupPending.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    process_id = qc.register_worker_process()
+
+    # Seed the claim directly (no drain_batch), so the worker-local ledger has
+    # no entry for it — the crash-fallback shape.
+    claimed_id = _seed_claimed(session, prefix, process_id)
+    assert qc._ledger_state(claimed_id) is None
+    assert db_assert.count_claimed_executions() == 1
+    assert db_assert.count_ready_executions() == 0
+
+    released = qc.release_claimed_for_shutdown(process_id)
+
+    assert released == 1
+    session.expire_all()
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_ready_executions() == 1
 
 
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
