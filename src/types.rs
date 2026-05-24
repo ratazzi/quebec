@@ -1354,6 +1354,31 @@ impl PyQuebec {
         self.ctx.ledger_set(id, s);
     }
 
+    /// Test-only: drive `InFlightGuard`'s panic-only `Drop` for the given id.
+    ///
+    /// Constructs an `InFlightGuard` against the real ledger (which inserts the
+    /// id as InFlight), then drops it. When `panicking` is true the guard is
+    /// dropped while a panic unwinds (mirroring a panic between
+    /// `InFlightGuard::new` and `after_executed` in `Execution::invoke`), so its
+    /// `Drop` must remove the InFlight entry. When `panicking` is false the
+    /// guard is dropped normally, so its `Drop` must leave the entry untouched
+    /// (the normal-path transition belongs to `after_executed`). Caller reads
+    /// `_ledger_state(id)` afterwards to assert the outcome.
+    fn _drop_in_flight_guard(&self, id: i64, panicking: bool) {
+        let ledger = self.ctx.claim_ledger.clone();
+        if panicking {
+            // Drop the guard mid-unwind: construct it inside the unwinding
+            // closure so std::thread::panicking() is true at drop time.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = crate::context::InFlightGuard::new(ledger, id);
+                panic!("forced panic to exercise InFlightGuard::drop");
+            }));
+        } else {
+            let _guard = crate::context::InFlightGuard::new(ledger, id);
+            // Normal drop at end of scope.
+        }
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {

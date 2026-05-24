@@ -398,8 +398,11 @@ pub struct AppContext {
     /// for the Python work queue) and again at the start of `Execution::invoke`
     /// (idempotent, via `InFlightGuard`), removed by `after_executed` once the
     /// claimed row is deleted — or marked `CleanupPending` there if that cleanup
-    /// fails — and removed on `Execution`'s `Drop` as a backstop for a job that
-    /// is picked but never performed (preserving any `CleanupPending` mark).
+    /// fails — removed on `Execution`'s `Drop` as a backstop for a job that
+    /// is picked but never performed (preserving any `CleanupPending` mark), and
+    /// removed on `InFlightGuard`'s `Drop` when `invoke` unwinds on a panic (so
+    /// the InFlight entry can't leak even if the `Execution` is kept alive by
+    /// the Python runner and thus never dropped).
     /// `release_all_claimed_executions` skips in-flight and cleanup-pending ids
     /// during graceful shutdown and the shutdown drain waits for the ledger to
     /// empty, so a running or about-to-run job is never handed back to a
@@ -410,10 +413,14 @@ pub struct AppContext {
 }
 
 /// Marks a claimed_execution as in-flight at the start of a `perform()` call.
-/// Construction inserts the id as `ClaimState::InFlight`; removal is NOT done
-/// here. The ledger entry is cleared by `after_executed`, which tracks the real
-/// DB cleanup outcome (remove on success, mark `CleanupPending` on failure).
-pub struct InFlightGuard;
+/// Construction inserts the id as `ClaimState::InFlight`. Normal-path removal is
+/// NOT done here: the ledger entry is cleared by `after_executed`, which tracks
+/// the real DB cleanup outcome (remove on success, mark `CleanupPending` on
+/// failure). The only thing `Drop` does is a panic-only backstop (see below).
+pub struct InFlightGuard {
+    ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
+    id: i64,
+}
 
 impl InFlightGuard {
     pub fn new(
@@ -427,14 +434,38 @@ impl InFlightGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, ClaimState::InFlight);
-        Self
+        Self { ledger, id }
     }
 }
 
-// No Drop impl: ledger removal is owned by `after_executed`, which tracks the
-// real DB cleanup outcome (remove on success, CleanupPending on failure).
-// Removing the entry here would wipe a CleanupPending mark, because the guard
-// drops immediately after `after_executed` returns.
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        // Panic-only backstop. On a NORMAL drop do nothing: `after_executed`
+        // owns the normal-path transition (remove on cleanup success,
+        // CleanupPending on failure), and removing here would wipe a
+        // CleanupPending mark since the guard drops right after
+        // `after_executed` returns.
+        //
+        // On a PANIC unwind, however, `after_executed` never ran, so the
+        // InFlight entry would otherwise leak forever and `ledger_has_active`
+        // would block the quiet_then_exit drain. The guard is a stack local of
+        // `Execution::invoke`, so it is reliably dropped when that frame
+        // unwinds (the owning `Execution` may be kept alive on the Python side,
+        // so its own Drop backstop may not fire). Remove the entry ONLY if it
+        // is still InFlight, handing the residual claimed DB row off to the
+        // orphan-sweep (which reads the DB, not the ledger, and marks it
+        // failed). Note: `std::thread::panicking()` detects panic unwinding,
+        // NOT async task cancellation — a dropped future is not a panic, and
+        // that normal-drop case is already covered by `Execution::Drop`.
+        if !std::thread::panicking() {
+            return;
+        }
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(ledger.get(&self.id), Some(ClaimState::InFlight)) {
+            ledger.remove(&self.id);
+        }
+    }
+}
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
 fn parse_bool_env(s: &str) -> Option<bool> {

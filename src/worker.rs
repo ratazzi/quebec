@@ -1043,9 +1043,15 @@ impl Execution {
         // Mark this claimed_execution as in-flight for the whole perform()
         // window. `release_all_claimed_executions` (graceful shutdown) skips
         // ids still in this state so a job actively inside perform() is never
-        // handed back to a neighbour worker. The guard clears the id when this
-        // function returns (after `after_executed` has deleted the claimed
-        // row) or unwinds, so the entry never outlives the perform.
+        // handed back to a neighbour worker. Clearing model:
+        //   * normal path: `after_executed` clears the entry — removes it on
+        //     cleanup success, marks it `CleanupPending` on cleanup failure;
+        //   * `Execution::Drop` is the backstop when a picked Execution is
+        //     dropped before finishing `after_executed`;
+        //   * `InFlightGuard::Drop` clears the entry specifically when this
+        //     frame unwinds on a panic (it does nothing on a normal drop), so
+        //     the InFlight entry can't leak even if the owning `Execution` is
+        //     kept alive by the Python runner and thus never dropped.
         let _in_flight =
             crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 

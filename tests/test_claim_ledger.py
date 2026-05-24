@@ -564,6 +564,51 @@ def test_emergency_cleanup_verify_error_removes_ledger(qc_with_sqlalchemy, db_as
     del execution
 
 
+def test_in_flight_guard_clears_entry_on_panic(db_url, test_prefix):
+    """InFlightGuard's Drop clears the InFlight entry when invoke unwinds (F3).
+
+    A Rust panic between ``InFlightGuard::new`` and the completion of
+    ``after_executed`` skips the normal ledger clearing. ``Execution::Drop`` only
+    covers this if the ``Execution`` is dropped during unwinding, but the Python
+    runner may keep it alive, so the InFlight entry would leak forever and
+    ``ledger_has_active`` would block the quiet_then_exit drain. ``InFlightGuard``
+    is a stack local of ``invoke``, so its panic-only ``Drop`` reliably removes
+    the InFlight entry on a panic unwind, handing the residual claimed row off to
+    the DB orphan-sweep. The hook builds a real guard against the live ledger and
+    drops it inside a genuine ``catch_unwind`` panic.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        # Guard inserts id=777 as InFlight, then a real panic unwinds through
+        # its Drop, which must remove the InFlight entry.
+        qc._drop_in_flight_guard(777, True)
+        assert qc._ledger_state(777) is None
+    finally:
+        qc.close()
+
+
+def test_in_flight_guard_normal_drop_keeps_entry(db_url, test_prefix):
+    """InFlightGuard's Drop is a no-op on a normal (non-panicking) drop.
+
+    On the normal path ``after_executed`` owns the transition (remove on cleanup
+    success, CleanupPending on failure); a removal in ``Drop`` would wipe a
+    CleanupPending mark since the guard drops right after ``after_executed``
+    returns. So a normal drop must leave the InFlight entry exactly as the guard
+    inserted it.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        # Guard inserts id=778 as InFlight, then drops normally → entry stays.
+        qc._drop_in_flight_guard(778, False)
+        assert qc._ledger_state(778) == 1
+    finally:
+        qc.close()
+
+
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
     """should_drain_exit is gated on the ledger being empty."""
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
