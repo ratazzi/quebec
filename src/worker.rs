@@ -3458,14 +3458,26 @@ impl Worker {
         };
         let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
         // Mark in-flight the moment a job leaves the dispatch channel for the
-        // Python side. From here it may sit buffered in the Python work queue
-        // before perform() begins; tracking it now means the shutdown drain
-        // waits for it and release_all_claimed_executions never hands it back
-        // to ready underneath a runner that is about to execute it. The
-        // InFlightGuard in Execution::invoke re-inserts (idempotent) and
-        // removes the id on completion; Execution's Drop clears it too, so a
+        // Python side, holding the same lock the shutdown release takes its
+        // snapshot under and re-checking the shutdown token while held. The
+        // `select!` above only blocks pulls observed *before* recv() returns;
+        // shutdown can still begin between recv() and this insert, and a
+        // concurrent release could snapshot in_flight without this id. The
+        // recheck under the lock closes that window: if shutdown has begun we
+        // bail out, leaving the job's claimed row in the DB and out of
+        // in_flight so the release returns it to ready instead of us handing it
+        // to Python and double-running it. Outside shutdown this is a single
+        // insert. The InFlightGuard in Execution::invoke re-inserts (idempotent)
+        // and removes the id on completion; Execution's Drop clears it too, so a
         // picked job that never reaches perform() cannot leak its entry.
-        if let Ok(mut set) = self.ctx.in_flight_executions.lock() {
+        {
+            let mut set = match self.ctx.in_flight_executions.lock() {
+                Ok(set) => set,
+                Err(_) => return Ok(execution),
+            };
+            if self.ctx.graceful_shutdown.is_cancelled() {
+                return Err(QuebecError::runtime("shutting down"));
+            }
             set.insert(execution.claimed.id);
         }
         Ok(execution)
