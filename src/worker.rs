@@ -1001,6 +1001,17 @@ impl Execution {
     }
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
+        // Mark this claimed_execution as in-flight for the whole perform()
+        // window. `release_all_claimed_executions` (graceful shutdown) skips
+        // ids still in this set so a job actively inside perform() is never
+        // handed back to a neighbour worker. The guard clears the id when this
+        // function returns (after `after_executed` has deleted the claimed
+        // row) or unwinds, so the entry never outlives the perform.
+        let _in_flight = crate::context::InFlightGuard::new(
+            self.ctx.in_flight_executions.clone(),
+            self.claimed.id,
+        );
+
         self.timer = Instant::now();
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
@@ -1686,6 +1697,24 @@ impl Worker {
 
     pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
         self.process_id.clone()
+    }
+
+    /// Register a worker process record and store its id, mirroring the
+    /// `on_start` step of `run_main_loop`. Test-only hook so a regression test
+    /// can claim jobs under a known process id and then exercise
+    /// `release_all_claimed_executions` deterministically.
+    pub(crate) async fn register_process_for_test(&self) -> Result<i64> {
+        let db = self.ctx.get_db().await?;
+        let process = self.on_start(&db).await?;
+        *self.process_id.lock().await = Some(process.id);
+        Ok(process.id)
+    }
+
+    /// Test-only wrapper around the private `release_all_claimed_executions`
+    /// so the graceful-shutdown release path can be driven from pytest without
+    /// spinning up the full main loop and signalling SIGTERM.
+    pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
+        self.release_all_claimed_executions(process_id).await
     }
 
     fn register_handler(
@@ -2492,8 +2521,15 @@ impl Worker {
         Ok(total_deleted)
     }
 
-    /// Release all claimed executions for a process back to ready state.
-    /// Called during graceful shutdown for jobs claimed but not yet started.
+    /// Release claimed executions for a process back to ready state during
+    /// graceful shutdown. Releases jobs that have not yet started running —
+    /// those still sitting in the dispatch channel or the Python work queue —
+    /// so the dispatcher can re-claim them immediately. Jobs currently inside
+    /// `perform()` (tracked in `ctx.in_flight_executions`) are deliberately
+    /// left in `claimed_executions`: releasing them would let a neighbour
+    /// worker claim and run the same job concurrently while this process's
+    /// perform thread is still executing it. Those rows are reaped later by a
+    /// neighbour's `prune_dead_processes` once this process stops heart-beating.
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
     /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
     async fn release_all_claimed_executions(&self, process_id: i64) -> Result<usize> {
@@ -2506,6 +2542,19 @@ impl Worker {
             process_id,
         )
         .await?;
+
+        // Skip executions that are actively running inside perform(); releasing
+        // them would create a duplicate-execution race with a neighbour worker.
+        let in_flight: std::collections::HashSet<i64> = self
+            .ctx
+            .in_flight_executions
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let claimed: Vec<_> = claimed
+            .into_iter()
+            .filter(|execution| !in_flight.contains(&execution.id))
+            .collect();
 
         if claimed.is_empty() {
             return Ok(0);
@@ -3085,9 +3134,14 @@ impl Worker {
                     // Release remaining claimed executions back to ready state BEFORE
                     // deleting the process record, to avoid a race where another worker's
                     // fail_orphaned_executions sees them as orphans and marks them failed.
-                    // Python side calls t.join() first, so actively-running jobs complete
-                    // normally via after_executed(). This handles jobs that were claimed
-                    // but not yet started (sitting in the mpsc channel).
+                    // Only jobs that have NOT started running are released (claimed but
+                    // still queued in the mpsc channel / Python work queue). Jobs currently
+                    // inside perform() are tracked in ctx.in_flight_executions and left
+                    // claimed: graceful_shutdown ends with process::exit(0), which kills the
+                    // Python perform threads before their after_executed() can run, so
+                    // releasing an in-flight job here would let a neighbour worker claim and
+                    // run it concurrently (duplicate execution). Those rows are reaped by a
+                    // neighbour's prune_dead_processes after this process stops heart-beating.
                     if let Err(e) = self.release_all_claimed_executions(process.id).await {
                         warn!("Failed to release claimed executions on shutdown: {}", e);
                     }
