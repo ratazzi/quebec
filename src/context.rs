@@ -41,12 +41,10 @@ pub struct ConcurrencyConstraint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimState {
     /// Claimed; queued in the mpsc channel / Python work queue; not yet performing.
-    #[allow(dead_code)]
     Dispatched,
     /// Inside perform().
     InFlight,
     /// Performed, but after_executed cleanup failed — already executed, must NOT requeue.
-    #[allow(dead_code)]
     CleanupPending,
 }
 
@@ -398,9 +396,11 @@ pub struct AppContext {
     /// matching the semantics of the previous `in_flight_executions` set:
     /// inserted in `Worker::pick_job` (when a job leaves the dispatch channel
     /// for the Python work queue) and again at the start of `Execution::invoke`
-    /// (idempotent), removed when `perform()` finishes (the `InFlightGuard`),
-    /// and on `Execution`'s `Drop` as a backstop for a job that is picked but
-    /// never performed. `release_all_claimed_executions` skips in-flight ids
+    /// (idempotent, via `InFlightGuard`), removed by `after_executed` once the
+    /// claimed row is deleted — or marked `CleanupPending` there if that cleanup
+    /// fails — and removed on `Execution`'s `Drop` as a backstop for a job that
+    /// is picked but never performed (preserving any `CleanupPending` mark).
+    /// `release_all_claimed_executions` skips in-flight and cleanup-pending ids
     /// during graceful shutdown and the shutdown drain waits for the ledger to
     /// empty, so a running or about-to-run job is never handed back to a
     /// neighbour worker (which would run it a second time). Plain
@@ -409,14 +409,11 @@ pub struct AppContext {
     pub claim_ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
 }
 
-/// RAII guard that marks a claimed_execution as in-flight for the lifetime of
-/// a `perform()` call. Inserts the id on construction and removes it on drop,
-/// so the entry is cleared on every exit path — normal completion, error, or a
-/// panic propagating out of `Execution::invoke`.
-pub struct InFlightGuard {
-    ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
-    id: i64,
-}
+/// Marks a claimed_execution as in-flight at the start of a `perform()` call.
+/// Construction inserts the id as `ClaimState::InFlight`; removal is NOT done
+/// here. The ledger entry is cleared by `after_executed`, which tracks the real
+/// DB cleanup outcome (remove on success, mark `CleanupPending` on failure).
+pub struct InFlightGuard;
 
 impl InFlightGuard {
     pub fn new(
@@ -430,18 +427,14 @@ impl InFlightGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, ClaimState::InFlight);
-        Self { ledger, id }
+        Self
     }
 }
 
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.ledger
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
-    }
-}
+// No Drop impl: ledger removal is owned by `after_executed`, which tracks the
+// real DB cleanup outcome (remove on success, CleanupPending on failure).
+// Removing the entry here would wipe a CleanupPending mark, because the guard
+// drops immediately after `after_executed` returns.
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
 fn parse_bool_env(s: &str) -> Option<bool> {

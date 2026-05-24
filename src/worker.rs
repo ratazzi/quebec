@@ -975,11 +975,20 @@ pub struct Execution {
 impl Drop for Execution {
     fn drop(&mut self) {
         // Backstop for the claim ledger: pick_job marks a job in-flight when it
-        // leaves the dispatch channel and the InFlightGuard in invoke() normally
-        // clears it. If a picked Execution is dropped without ever running
-        // perform() (e.g. it failed to enqueue to the Python work queue), clear
-        // the entry here so the shutdown drain is not left waiting on it.
-        self.ctx.ledger_remove(self.claimed.id);
+        // leaves the dispatch channel and after_executed normally clears it. If a
+        // picked Execution is dropped without ever running perform() (e.g. it
+        // failed to enqueue to the Python work queue), clear the entry here so the
+        // shutdown drain is not left waiting on it. A CleanupPending mark (set by
+        // after_executed when the claimed row could not be deleted) is preserved:
+        // the job already ran, so the ledger must keep blocking its requeue.
+        let mut ledger = self
+            .ctx
+            .claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ledger.get(&self.claimed.id) != Some(&crate::context::ClaimState::CleanupPending) {
+            ledger.remove(&self.claimed.id);
+        }
     }
 }
 
@@ -1357,6 +1366,13 @@ impl Execution {
             }
         }
 
+        // Cleanup succeeded: the transaction committed and the claimed row was
+        // deleted, so the ledger entry is no longer needed. Removal lives here
+        // (not in InFlightGuard::drop) so it tracks the real DB outcome.
+        if transaction_result.is_ok() {
+            self.ctx.ledger_remove(self.claimed.id);
+        }
+
         // Emergency cleanup: if the transaction failed after all retries, mark the job
         // as failed and release the concurrency semaphore to prevent permanent deadlock.
         if transaction_result.is_err() {
@@ -1380,13 +1396,13 @@ impl Execution {
                     "Emergency cleanup: after_executed transaction failed after all retries",
                 )
                 .await;
-                if let Err(e) = fail_result {
+                let claimed_deleted = if let Err(e) = fail_result {
                     // Fallback: at minimum delete the claimed record to unblock the worker
                     warn!(
                     "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
                     job_id, e
                 );
-                    let _ = query_builder::claimed_executions::delete_by_id(
+                    query_builder::claimed_executions::delete_by_id(
                         cleanup_db.as_ref(),
                         &table_config_orig,
                         claimed_id,
@@ -1397,8 +1413,28 @@ impl Execution {
                             "Emergency cleanup also failed for claimed_execution {}: {:?}",
                             claimed_id, e2
                         );
-                    });
+                    })
+                    .map(|deleted| deleted > 0)
+                    .unwrap_or(false)
+                } else {
+                    // fail_claimed_execution deleted the claimed row.
+                    true
+                };
+
+                // The job already executed. If the claimed row is gone the ledger
+                // entry can be cleared; if it is still present mark CleanupPending
+                // so the shutdown release does NOT requeue an executed job.
+                if claimed_deleted {
+                    self.ctx.ledger_remove(self.claimed.id);
+                } else {
+                    self.ctx
+                        .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
                 }
+            } else {
+                // Could not even get a DB handle: the claimed row is still present
+                // and the job already ran. Mark CleanupPending to block requeue.
+                self.ctx
+                    .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
             }
         }
 
@@ -2560,9 +2596,12 @@ impl Worker {
     /// graceful shutdown. Releases jobs that have not started running — those
     /// still sitting in the dispatch channel — so the dispatcher can re-claim
     /// them immediately. Jobs that have been handed to the Python side (tracked
-    /// as `ClaimState::InFlight` in `ctx.claim_ledger`) are skipped: the
-    /// shutdown drain waits for the ledger to empty first, so in normal
-    /// shutdown there are none left here.
+    /// as `ClaimState::InFlight` in `ctx.claim_ledger`) are skipped, as are jobs
+    /// that already executed but whose claimed-row cleanup failed
+    /// (`ClaimState::CleanupPending`) — releasing either would let a neighbour
+    /// run an in-flight or already-finished job a second time. The shutdown
+    /// drain waits for the ledger to empty first, so in normal shutdown there
+    /// are none left here.
     /// Any that remain (the drain hit `shutdown_timeout`) are left in
     /// `claimed_executions` rather than released, because releasing a job whose
     /// perform thread is still running would let a neighbour run it a second
@@ -2584,21 +2623,29 @@ impl Worker {
         )
         .await?;
 
-        // Skip executions that are actively running inside perform(); releasing
-        // them would create a duplicate-execution race with a neighbour worker.
-        // `ledger_snapshot` recovers from poisoning rather than treating the
-        // ledger as empty, which would let a running job be released back to
-        // ready (double-run).
-        let in_flight: std::collections::HashSet<i64> = self
+        // Skip executions that are actively running inside perform()
+        // (`InFlight`) or that already ran but whose claimed-row cleanup failed
+        // (`CleanupPending`); releasing either would create a duplicate-execution
+        // race with a neighbour worker. `ledger_snapshot` recovers from poisoning
+        // rather than treating the ledger as empty, which would let such a job be
+        // released back to ready (double-run). Claimed rows with no ledger entry
+        // (the crash-fallback case) are treated as releasable.
+        let skip: std::collections::HashSet<i64> = self
             .ctx
             .ledger_snapshot()
             .into_iter()
-            .filter(|(_, state)| *state == crate::context::ClaimState::InFlight)
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    crate::context::ClaimState::InFlight
+                        | crate::context::ClaimState::CleanupPending
+                )
+            })
             .map(|(id, _)| id)
             .collect();
         let claimed: Vec<_> = claimed
             .into_iter()
-            .filter(|execution| !in_flight.contains(&execution.id))
+            .filter(|execution| !skip.contains(&execution.id))
             .collect();
 
         if claimed.is_empty() {
