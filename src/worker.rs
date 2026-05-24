@@ -1048,10 +1048,11 @@ impl Execution {
         //     cleanup success, marks it `CleanupPending` on cleanup failure;
         //   * `Execution::Drop` is the backstop when a picked Execution is
         //     dropped before finishing `after_executed`;
-        //   * `InFlightGuard::Drop` clears the entry specifically when this
-        //     frame unwinds on a panic (it does nothing on a normal drop), so
-        //     the InFlight entry can't leak even if the owning `Execution` is
-        //     kept alive by the Python runner and thus never dropped.
+        //   * `InFlightGuard::Drop` marks the entry `CleanupPending` when this
+        //     frame unwinds on a panic (it does nothing on a normal drop), so a
+        //     possibly-executed InFlight job is skipped by graceful shutdown's
+        //     release (never requeued) rather than leaking, even if the owning
+        //     `Execution` is kept alive by the Python runner and never dropped.
         let _in_flight =
             crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 

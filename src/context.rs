@@ -400,9 +400,10 @@ pub struct AppContext {
     /// claimed row is deleted — or marked `CleanupPending` there if that cleanup
     /// fails — removed on `Execution`'s `Drop` as a backstop for a job that
     /// is picked but never performed (preserving any `CleanupPending` mark), and
-    /// removed on `InFlightGuard`'s `Drop` when `invoke` unwinds on a panic (so
-    /// the InFlight entry can't leak even if the `Execution` is kept alive by
-    /// the Python runner and thus never dropped).
+    /// marked `CleanupPending` by `InFlightGuard`'s `Drop` when `invoke` unwinds
+    /// on a panic (so a possibly-executed InFlight job is never requeued, even
+    /// if the `Execution` is kept alive by the Python runner and thus never
+    /// dropped).
     /// `release_all_claimed_executions` skips in-flight and cleanup-pending ids
     /// during graceful shutdown and the shutdown drain waits for the ledger to
     /// empty, so a running or about-to-run job is never handed back to a
@@ -451,18 +452,26 @@ impl Drop for InFlightGuard {
         // would block the quiet_then_exit drain. The guard is a stack local of
         // `Execution::invoke`, so it is reliably dropped when that frame
         // unwinds (the owning `Execution` may be kept alive on the Python side,
-        // so its own Drop backstop may not fire). Remove the entry ONLY if it
-        // is still InFlight, handing the residual claimed DB row off to the
-        // orphan-sweep (which reads the DB, not the ledger, and marks it
-        // failed). Note: `std::thread::panicking()` detects panic unwinding,
-        // NOT async task cancellation — a dropped future is not a panic, and
-        // that normal-drop case is already covered by `Execution::Drop`.
+        // so its own Drop backstop may not fire). Mark the entry
+        // `CleanupPending` ONLY if it is still InFlight: the job was inside
+        // perform() and may have committed side effects, so it must NOT be
+        // requeued. CleanupPending puts the id in
+        // `release_all_claimed_executions`'s skip-set (a graceful shutdown that
+        // survives the panic will not hand the row to a neighbour → no
+        // duplicate run), counts as non-active so it does not block the drain
+        // (`ledger_has_active` treats CleanupPending as drained), and the
+        // residual claimed DB row is reclaimed by the orphan-sweep once this
+        // process exits. This mirrors `after_executed`'s "cleanup failed →
+        // CleanupPending" semantics. Note: `std::thread::panicking()` detects
+        // panic unwinding, NOT async task cancellation — a dropped future is
+        // not a panic, and that normal-drop case is already covered by
+        // `Execution::Drop`.
         if !std::thread::panicking() {
             return;
         }
         let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
         if matches!(ledger.get(&self.id), Some(ClaimState::InFlight)) {
-            ledger.remove(&self.id);
+            ledger.insert(self.id, ClaimState::CleanupPending);
         }
     }
 }

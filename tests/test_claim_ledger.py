@@ -564,27 +564,33 @@ def test_emergency_cleanup_verify_error_removes_ledger(qc_with_sqlalchemy, db_as
     del execution
 
 
-def test_in_flight_guard_clears_entry_on_panic(db_url, test_prefix):
-    """InFlightGuard's Drop clears the InFlight entry when invoke unwinds (F3).
+def test_in_flight_guard_marks_cleanup_pending_on_panic(db_url, test_prefix):
+    """InFlightGuard's Drop marks the InFlight entry CleanupPending on unwind (F3).
 
     A Rust panic between ``InFlightGuard::new`` and the completion of
-    ``after_executed`` skips the normal ledger clearing. ``Execution::Drop`` only
-    covers this if the ``Execution`` is dropped during unwinding, but the Python
-    runner may keep it alive, so the InFlight entry would leak forever and
+    ``after_executed`` skips the normal ledger transition. ``Execution::Drop``
+    only covers this if the ``Execution`` is dropped during unwinding, but the
+    Python runner may keep it alive, so the InFlight entry would leak forever and
     ``ledger_has_active`` would block the quiet_then_exit drain. ``InFlightGuard``
-    is a stack local of ``invoke``, so its panic-only ``Drop`` reliably removes
-    the InFlight entry on a panic unwind, handing the residual claimed row off to
-    the DB orphan-sweep. The hook builds a real guard against the live ledger and
-    drops it inside a genuine ``catch_unwind`` panic.
+    is a stack local of ``invoke``, so its panic-only ``Drop`` reliably handles
+    the entry on a panic unwind. It must NOT remove it: the job was inside
+    ``perform()`` and may have committed side effects, and a removed entry leaves
+    no ledger record — so if this process survives the panic and later gets a
+    graceful shutdown, ``release_all_claimed_executions`` would treat the claimed
+    row as releasable and requeue it (duplicate run). Instead it marks the entry
+    ``CleanupPending``, which is skipped by the shutdown release, counts as
+    non-active so it does not block drain, and leaves the DB row for the
+    orphan-sweep. The hook builds a real guard against the live ledger and drops
+    it inside a genuine ``catch_unwind`` panic.
     """
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
     assert qc.create_tables() is True
     try:
         qc.register_worker_process()
         # Guard inserts id=777 as InFlight, then a real panic unwinds through
-        # its Drop, which must remove the InFlight entry.
+        # its Drop, which must mark the entry CleanupPending (not remove it).
         qc._drop_in_flight_guard(777, True)
-        assert qc._ledger_state(777) is None
+        assert qc._ledger_state(777) == 2
     finally:
         qc.close()
 
