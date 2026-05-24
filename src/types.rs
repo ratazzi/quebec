@@ -1034,16 +1034,18 @@ impl PyQuebec {
         // Use tokio::spawn to start async task
         self.rt.spawn(async move {
             loop {
-                let result = worker.pick_job().await;
+                // pick_job returns Err when the dispatch channel is closed or
+                // graceful shutdown has begun. In both cases the pump stops so
+                // it cannot hand a job to Python concurrently with the shutdown
+                // release path (which would race a double-run).
+                let res = match worker.pick_job().await {
+                    Ok(res) => res,
+                    Err(_) => break,
+                };
 
                 // Get GIL and send result to Python queue
                 Python::attach(|py| {
                     let queue = queue.bind(py);
-
-                    let Ok(res) = result else {
-                        debug!("No job available");
-                        return;
-                    };
 
                     // Determine which method to use based on queue type
                     let method_name = if queue.hasattr("put_nowait").unwrap_or(false) {

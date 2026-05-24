@@ -953,6 +953,19 @@ pub struct Execution {
     idle_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
+impl Drop for Execution {
+    fn drop(&mut self) {
+        // Backstop for the in-flight set: pick_job marks a job in-flight when it
+        // leaves the dispatch channel and the InFlightGuard in invoke() normally
+        // clears it. If a picked Execution is dropped without ever running
+        // perform() (e.g. it failed to enqueue to the Python work queue), clear
+        // the entry here so the shutdown drain is not left waiting on it.
+        if let Ok(mut set) = self.ctx.in_flight_executions.lock() {
+            set.remove(&self.claimed.id);
+        }
+    }
+}
+
 impl Execution {
     pub fn new(
         ctx: Arc<AppContext>,
@@ -2522,14 +2535,19 @@ impl Worker {
     }
 
     /// Release claimed executions for a process back to ready state during
-    /// graceful shutdown. Releases jobs that have not yet started running —
-    /// those still sitting in the dispatch channel or the Python work queue —
-    /// so the dispatcher can re-claim them immediately. Jobs currently inside
-    /// `perform()` (tracked in `ctx.in_flight_executions`) are deliberately
-    /// left in `claimed_executions`: releasing them would let a neighbour
-    /// worker claim and run the same job concurrently while this process's
-    /// perform thread is still executing it. Those rows are reaped later by a
-    /// neighbour's `prune_dead_processes` once this process stops heart-beating.
+    /// graceful shutdown. Releases jobs that have not started running — those
+    /// still sitting in the dispatch channel — so the dispatcher can re-claim
+    /// them immediately. Jobs that have been handed to the Python side (tracked
+    /// in `ctx.in_flight_executions`) are skipped: the shutdown drain waits for
+    /// that set to empty first, so in normal shutdown there are none left here.
+    /// Any that remain (the drain hit `shutdown_timeout`) are left in
+    /// `claimed_executions` rather than released, because releasing a job whose
+    /// perform thread is still running would let a neighbour run it a second
+    /// time; those leftovers are reclaimed by the supervisor's orphan sweep or a
+    /// restarting worker's `fail_orphaned_executions` (both match claims whose
+    /// process row no longer exists — `prune_dead_processes`, which only finds
+    /// stale-but-present rows, would miss them since this process deletes its
+    /// own row right after).
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
     /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
     async fn release_all_claimed_executions(&self, process_id: i64) -> Result<usize> {
@@ -3131,15 +3149,17 @@ impl Worker {
                         }
                     });
 
-                    // Wait for jobs currently inside perform() to finish before
-                    // releasing anything. Once shutdown starts the Python
-                    // ThreadedRunner stops pulling new jobs (it polls
-                    // is_shutting_down), so in_flight drains as running jobs
-                    // complete via after_executed(), which removes their claimed
-                    // row. Bounded by shutdown_timeout so a stuck job cannot block
-                    // shutdown forever.
-                    let drain_deadline =
-                        tokio::time::Instant::now() + self.ctx.shutdown_timeout;
+                    // Wait for jobs already handed to the Python side to finish
+                    // before releasing anything. pick_job stops feeding the
+                    // Python work queue once shutdown begins (it returns Err on
+                    // the cancellation token), so the ThreadedRunner drains the
+                    // buffered jobs and in_flight empties as each completes via
+                    // after_executed(), which removes its claimed row. Use a
+                    // fraction of shutdown_timeout so the outer graceful_shutdown
+                    // block_on still has budget to run the release and on_stop
+                    // below before its own timeout fires.
+                    let drain_deadline = tokio::time::Instant::now()
+                        + self.ctx.shutdown_timeout.mul_f64(0.8);
                     loop {
                         let in_flight_empty = self
                             .ctx
@@ -3422,10 +3442,20 @@ impl Worker {
     pub async fn pick_job(&self) -> Result<Execution> {
         let rx = self.dispatch_receiver.clone();
         let mut receiver = rx.lock().await;
-        let execution = receiver.recv().await;
-        if execution.is_none() {
-            return Err(QuebecError::runtime("No job found"));
-        }
+        // Stop handing channel jobs to the Python side once graceful shutdown
+        // begins. The shutdown release path runs concurrently; if we kept
+        // picking here we could mark a job in-flight and enqueue it to Python
+        // *after* release has snapshotted it as releasable, double-running it.
+        // Cancelling the recv leaves the job in the channel so the release
+        // returns it to ready (it never started). `biased` checks shutdown
+        // first so a job is never pulled after cancellation.
+        let execution = tokio::select! {
+            biased;
+            _ = self.ctx.graceful_shutdown.cancelled() => {
+                return Err(QuebecError::runtime("shutting down"));
+            }
+            execution = receiver.recv() => execution,
+        };
         let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
         // Mark in-flight the moment a job leaves the dispatch channel for the
         // Python side. From here it may sit buffered in the Python work queue
@@ -3433,8 +3463,8 @@ impl Worker {
         // waits for it and release_all_claimed_executions never hands it back
         // to ready underneath a runner that is about to execute it. The
         // InFlightGuard in Execution::invoke re-inserts (idempotent) and
-        // removes the id on completion, so the entry is cleared once perform
-        // finishes via after_executed.
+        // removes the id on completion; Execution's Drop clears it too, so a
+        // picked job that never reaches perform() cannot leak its entry.
         if let Ok(mut set) = self.ctx.in_flight_executions.lock() {
             set.insert(execution.claimed.id);
         }

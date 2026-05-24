@@ -364,14 +364,17 @@ pub struct AppContext {
     /// (non-supervised) runs, the supervisor parent itself, and the
     /// scheduler (which is always a single process).
     pub proc_slot: Option<(usize, usize)>,
-    /// claimed_execution ids that have been pulled off the dispatch channel
-    /// and are currently inside a Python `perform()`. Populated at the start
-    /// of `Execution::invoke` and cleared in `after_executed`. Consulted by
-    /// `release_all_claimed_executions` during graceful shutdown so an
-    /// actively-running job is not handed back to a neighbour worker (which
-    /// would run it a second time concurrently). Plain `Mutex<HashSet>`: the
-    /// guarded section is a single insert/remove/contains, never held across
-    /// an await.
+    /// claimed_execution ids that have been handed to the Python side and have
+    /// not finished yet. Inserted in `Worker::pick_job` (when a job leaves the
+    /// dispatch channel for the Python work queue) and again at the start of
+    /// `Execution::invoke` (idempotent). Removed when `perform()` finishes (the
+    /// `InFlightGuard`), and on `Execution`'s `Drop` as a backstop for a job
+    /// that is picked but never performed. `release_all_claimed_executions`
+    /// skips these during graceful shutdown and the shutdown drain waits for
+    /// the set to empty, so a running or about-to-run job is never handed back
+    /// to a neighbour worker (which would run it a second time). Plain
+    /// `Mutex<HashSet>`: the guarded section is a single
+    /// insert/remove/contains, never held across an await.
     pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
 }
 
