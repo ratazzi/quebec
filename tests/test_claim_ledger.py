@@ -358,6 +358,72 @@ def test_fail_claimed_by_id_clears_ledger(qc_with_sqlalchemy, db_assert):
     assert qc._ledger_state(claimed_id) is None
 
 
+def test_delete_claimed_by_id_clears_ledger_on_db_error(qc_with_sqlalchemy, db_assert):
+    """The job-record-missing path clears the ledger even when the DB delete fails.
+
+    If ``delete_claimed_by_id`` cannot delete the residual claimed row (DB
+    hiccup), the row is correctly left for the DB orphan-sweep — but the
+    worker-local ledger entry must still be dropped, otherwise it stays
+    Dispatched forever and blocks ``should_drain_exit``. We force the failure
+    deterministically by dropping the claimed_executions table out from under
+    the Rust query.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    process_id = qc.register_worker_process()
+    claimed_id = _seed_claimed(session, prefix, process_id)
+
+    qc._set_ledger_state(claimed_id, 0)
+    assert qc._ledger_state(claimed_id) == 0
+
+    # Drop the table so the Rust delete_by_id errors → failure arm runs.
+    session.execute(text(f"DROP TABLE {prefix}_claimed_executions"))
+    session.commit()
+
+    qc._delete_claimed_by_id(claimed_id)
+
+    # The delete could not complete, but the ledger entry is cleared so it no
+    # longer blocks drain; the residual is left for the orphan-sweep.
+    assert qc._ledger_state(claimed_id) is None
+
+
+def test_fail_claimed_by_id_clears_ledger_on_db_error(qc_with_sqlalchemy, db_assert):
+    """The unregistered-runnable path clears the ledger even when the txn fails.
+
+    If ``fail_claimed_by_id``'s transaction cannot complete (DB hiccup), the
+    claimed row is left for the DB orphan-sweep — but the ledger entry must
+    still be dropped so it stops blocking drain. We force the failure by
+    dropping the failed_executions table so the in-transaction insert errors.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    process_id = qc.register_worker_process()
+    claimed_id = _seed_claimed(session, prefix, process_id)
+    job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_claimed_executions WHERE id = :cid"),
+        {"cid": claimed_id},
+    ).scalar()
+
+    qc._set_ledger_state(claimed_id, 0)
+    assert qc._ledger_state(claimed_id) == 0
+
+    # Drop failed_executions so the transaction's insert errors → failure arm.
+    session.execute(text(f"DROP TABLE {prefix}_failed_executions"))
+    session.commit()
+
+    qc._fail_claimed_by_id(claimed_id, job_id, "Job handler not found: CrashJob")
+
+    # The transaction rolled back, but the ledger entry is cleared so it no
+    # longer blocks drain; the residual is left for the orphan-sweep.
+    assert qc._ledger_state(claimed_id) is None
+
+
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
     """should_drain_exit is gated on the ledger being empty."""
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)

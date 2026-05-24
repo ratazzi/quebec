@@ -2920,6 +2920,9 @@ impl Worker {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for delete_claimed_by_id: {:?}", e);
         }) else {
+            // Terminal row: hand off the residual claim to the DB orphan-sweep
+            // and stop tracking it locally so it can't block drain forever.
+            ctx.ledger_remove(execution_id);
             return;
         };
         let table_config = ctx.table_config.clone();
@@ -2940,6 +2943,10 @@ impl Worker {
                     "Failed to delete orphaned claimed execution {}: {:?}",
                     execution_id, e
                 );
+                // Delete failed: leave the residual claimed row for the DB
+                // orphan-sweep, but drop the ledger entry so it stops blocking
+                // drain. This row is terminal and must never be requeued.
+                ctx.ledger_remove(execution_id);
             }
         }
     }
@@ -2954,6 +2961,9 @@ impl Worker {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for fail_claimed_by_id: {:?}", e);
         }) else {
+            // Terminal row: hand off the residual claim to the DB orphan-sweep
+            // and stop tracking it locally so it can't block drain forever.
+            ctx.ledger_remove(execution_id);
             return;
         };
         let table_config = ctx.table_config.clone();
@@ -2988,6 +2998,11 @@ impl Worker {
                     "Failed to clean up claimed execution {}: {:?}",
                     execution_id, e
                 );
+                // Transaction failed: leave the residual claimed row for the DB
+                // orphan-sweep, but drop the ledger entry so it stops blocking
+                // drain. This row is terminal (unregistered runnable) and must
+                // never be requeued.
+                ctx.ledger_remove(execution_id);
             }
         }
     }
