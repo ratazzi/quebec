@@ -952,24 +952,51 @@ impl PyQuebec {
                 let db = ctx.get_db().await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
+
+                // `claim_jobs` inserted a `Dispatched` ledger entry for every
+                // claimed row. If any post-claim lookup/build below fails we
+                // must clear those entries before returning, or the
+                // worker-local ledger leaks. Capture the claimed ids so the
+                // error path can clean up regardless of how far the loop got.
+                let claimed_ids: Vec<i64> = claimed.iter().map(|c| c.id).collect();
+                let clear_ledger = || {
+                    for id in &claimed_ids {
+                        ctx.ledger_remove(*id);
+                    }
+                };
+
                 let mut out: Vec<Execution> = Vec::with_capacity(claimed.len());
                 for c in claimed {
-                    let job = crate::query_builder::jobs::find_by_id(
+                    let job = match crate::query_builder::jobs::find_by_id(
                         db.as_ref(),
                         &ctx.table_config,
                         c.job_id,
                     )
                     .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-                    .ok_or_else(|| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Job record not found")
-                    })?;
-                    let runnable = Python::attach(|_py| ctx.get_runnable(&job.class_name))
-                        .map_err(|e| {
-                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                                "Job handler not found: {e}"
-                            ))
-                        })?;
+                    {
+                        Ok(Some(job)) => job,
+                        Ok(None) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                "Job record not found",
+                            ));
+                        }
+                        Err(e) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                e.to_string(),
+                            ));
+                        }
+                    };
+                    let runnable = match Python::attach(|_py| ctx.get_runnable(&job.class_name)) {
+                        Ok(runnable) => runnable,
+                        Err(e) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                format!("Job handler not found: {e}"),
+                            ));
+                        }
+                    };
                     out.push(Execution::new(ctx.clone(), c, job, runnable));
                 }
                 Ok(out)
