@@ -1722,6 +1722,13 @@ pub struct Worker {
     idle_notify: Arc<tokio::sync::Notify>,
     /// Process ID for this worker (set after on_start)
     process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
+    /// Claimed rows whose dispatch-failure requeue (`release_claimed_batch`)
+    /// also failed (e.g. DB transiently down). They stay claimed in the DB and
+    /// `Dispatched` in the ledger, counting against the per-process in-flight
+    /// limit and blocking `should_drain_exit`. The maintenance tick retries
+    /// these so they eventually return to ready while the process is alive,
+    /// rather than waiting for the post-death orphan sweep.
+    dispatch_retry: Arc<tokio::sync::Mutex<Vec<quebec_claimed_executions::Model>>>,
 }
 
 impl Worker {
@@ -1756,6 +1763,7 @@ impl Worker {
             sink_receiver,
             idle_notify,
             process_id: Arc::new(tokio::sync::Mutex::new(None)),
+            dispatch_retry: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1779,6 +1787,30 @@ impl Worker {
     /// spinning up the full main loop and signalling SIGTERM.
     pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
         self.release_all_claimed_executions(process_id).await
+    }
+
+    /// Test-only: run exactly the dispatch-failure reconcile the maintenance
+    /// tick runs (drain the retry set, retry release, drop ledger entries for
+    /// the rows that now requeue, re-stash the rest).
+    pub(crate) async fn run_dispatch_reconcile_once_for_test(&self) {
+        let ctx = self.ctx.clone();
+        self.reconcile_dispatch_retry(&ctx).await;
+    }
+
+    /// Test-only: load the persisted `claimed_executions` row by id and push it
+    /// into the dispatch-retry set so a regression test can seed a residual
+    /// deterministically.
+    pub(crate) async fn add_dispatch_retry_for_test(&self, claimed_id: i64) -> Result<()> {
+        let db = self.ctx.get_db().await?;
+        let row = query_builder::claimed_executions::find_by_id(
+            db.as_ref(),
+            &self.ctx.table_config,
+            claimed_id,
+        )
+        .await?
+        .ok_or_else(|| QuebecError::runtime(format!("claimed execution {claimed_id} not found")))?;
+        self.dispatch_retry.lock().await.push(row);
+        Ok(())
     }
 
     fn register_handler(
@@ -2712,18 +2744,26 @@ impl Worker {
     }
 
     /// Release a batch of claimed executions back to ready state (best-effort).
-    /// Used when a transient error prevents dispatching claimed jobs to worker threads.
+    /// Used when a transient error prevents dispatching claimed jobs to worker
+    /// threads.
+    ///
+    /// For each row that requeues successfully, its ledger entry is removed
+    /// (the claim no longer exists, so it must not count against the in-flight
+    /// limit or block drain). Returns the rows that FAILED to requeue (e.g. DB
+    /// down) so the caller can stash them for a later retry; their ledger
+    /// entries are left intact (still `Dispatched`) until they succeed.
     async fn release_claimed_batch(
         ctx: &Arc<AppContext>,
         claimed: &[quebec_claimed_executions::Model],
-    ) {
+    ) -> Vec<quebec_claimed_executions::Model> {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for release_claimed_batch: {:?}", e);
         }) else {
-            return;
+            // No DB connection: nothing could be released, all rows fail.
+            return claimed.to_vec();
         };
         let table_config = ctx.table_config.clone();
-        let mut released = 0usize;
+        let mut failed: Vec<quebec_claimed_executions::Model> = Vec::new();
         for row in claimed {
             let table_config = table_config.clone();
             let ctx = ctx.clone();
@@ -2764,16 +2804,62 @@ impl Worker {
                     "Failed to release claimed execution {} back to ready: {:?}",
                     execution_id, e
                 );
+                failed.push(row.clone());
             } else {
-                released += 1;
+                // Requeued: the claim is gone, drop it from the ledger so it
+                // stops counting against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
             }
         }
-        if released > 0 || !claimed.is_empty() {
+        if !claimed.is_empty() {
             info!(
                 "Released {}/{} claimed execution(s) back to ready state",
-                released,
+                claimed.len() - failed.len(),
                 claimed.len()
             );
+        }
+        failed
+    }
+
+    /// Append rows that failed to requeue to the worker-local retry set so the
+    /// maintenance tick can retry them. No-op for an empty list.
+    async fn stash_dispatch_retry(&self, failed: Vec<quebec_claimed_executions::Model>) {
+        if failed.is_empty() {
+            return;
+        }
+        warn!(
+            "Stashing {} claimed execution(s) for dispatch-failure retry",
+            failed.len()
+        );
+        self.dispatch_retry.lock().await.extend(failed);
+    }
+
+    /// Retry requeuing the residual claimed rows that earlier failed to release
+    /// (their dispatch failed AND the requeue failed). Drains the retry set,
+    /// retries `release_claimed_batch` (which removes the ledger entry for each
+    /// row that now succeeds), and puts the still-failing rows back for the next
+    /// tick. Called from the maintenance tick of `run_main_loop` next to
+    /// `prune_dead_processes`. Only touches rows that genuinely failed to
+    /// requeue — normal in-channel `Dispatched` rows never enter this path.
+    async fn reconcile_dispatch_retry(&self, ctx: &Arc<AppContext>) {
+        let pending: Vec<quebec_claimed_executions::Model> = {
+            let mut guard = self.dispatch_retry.lock().await;
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        let count = pending.len();
+        debug!("Reconciling {} dispatch-failure residual(s)", count);
+        let still_failed = Self::release_claimed_batch(ctx, &pending).await;
+        if !still_failed.is_empty() {
+            warn!(
+                "{}/{} dispatch-failure residual(s) still could not be requeued; \
+                 will retry next maintenance tick",
+                still_failed.len(),
+                count
+            );
+            self.dispatch_retry.lock().await.extend(still_failed);
         }
     }
 
@@ -3193,6 +3279,10 @@ impl Worker {
                     if let Err(e) = self.prune_dead_processes(Some(process.id)).await {
                         warn!("Failed to prune dead processes: {}", e);
                     }
+                    // Retry requeuing claimed rows whose dispatch-failure release
+                    // also failed. Left unhandled they stay claimed + Dispatched,
+                    // counting against in-flight and blocking should_drain_exit.
+                    self.reconcile_dispatch_retry(&ctx).await;
                 }
                 // Periodic cleanup: clear finished jobs older than threshold (if enabled)
                 _ = cleanup_interval.tick(), if cleanup_enabled => {
@@ -3454,8 +3544,11 @@ impl Worker {
                 Err(e) => {
                     error!("Failed to fetch job data: {:?}", e);
                     // Release all claimed executions back to ready state to avoid
-                    // leaving them permanently stuck in claimed_executions
-                    Self::release_claimed_batch(ctx, &claimed).await;
+                    // leaving them permanently stuck in claimed_executions. Rows
+                    // that fail to requeue (release itself errored) are stashed
+                    // for the maintenance tick to retry.
+                    let failed = Self::release_claimed_batch(ctx, &claimed).await;
+                    self.stash_dispatch_retry(failed).await;
                     return;
                 }
             }
@@ -3513,11 +3606,17 @@ impl Worker {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(leaked)) => {
                     warn!("Channel unexpectedly full, releasing claimed execution back to ready");
-                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                    let failed =
+                        Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed))
+                            .await;
+                    self.stash_dispatch_retry(failed).await;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(leaked)) => {
                     error!("Dispatch channel closed, releasing claimed execution");
-                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                    let failed =
+                        Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed))
+                            .await;
+                    self.stash_dispatch_retry(failed).await;
                 }
             }
         }

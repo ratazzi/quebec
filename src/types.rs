@@ -1023,6 +1023,38 @@ impl PyQuebec {
         })
     }
 
+    /// Run exactly the dispatch-failure reconcile the maintenance tick runs:
+    /// drain the dispatch-retry set, retry the requeue, drop the ledger entry
+    /// for each row that now succeeds, and re-stash the rest. Test-only hook so
+    /// a regression test can drive the reconcile without the full main loop.
+    fn _run_dispatch_reconcile_once(&self, py: Python<'_>) {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.run_dispatch_reconcile_once_for_test().await;
+            })
+        })
+    }
+
+    /// Load the persisted `claimed_executions` row by id and push it into the
+    /// dispatch-retry set, simulating a residual whose dispatch-failure requeue
+    /// also failed. Test-only hook for seeding a reconcile scenario.
+    fn _add_dispatch_retry(&self, py: Python<'_>, claimed_id: i64) -> PyResult<()> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .add_dispatch_retry_for_test(claimed_id)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "_add_dispatch_retry failed: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
     fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone();

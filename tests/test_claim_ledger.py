@@ -162,6 +162,49 @@ def test_in_flight_not_released_on_shutdown(qc_with_sqlalchemy, db_assert):
     assert db_assert.count_ready_executions() == 0
 
 
+def test_dispatch_reconcile_requeues_residual(qc_with_sqlalchemy, db_assert):
+    """A residual whose dispatch-failure requeue also failed is requeued by the
+    maintenance reconcile, its ledger entry cleared, and a re-run is a no-op."""
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    qc.register_job(_IdleJob)
+    qc.register_worker_process()
+
+    enqueued = _IdleJob.perform_later(qc)
+    # Claim the job so a claimed_executions row exists for this process.
+    qc.drain_batch(1)
+
+    session.expire_all()
+    claimed_id = _claimed_id(session, prefix, enqueued.id)
+    assert db_assert.count_claimed_executions() == 1
+    assert db_assert.count_ready_executions() == 0
+
+    # Simulate a dispatch failure whose requeue also failed: the row is still
+    # claimed + Dispatched in the ledger and stashed in the dispatch-retry set.
+    qc._set_ledger_state(claimed_id, 0)
+    qc._add_dispatch_retry(claimed_id)
+    assert qc._ledger_state(claimed_id) == 0
+
+    # The maintenance reconcile retries the requeue.
+    qc._run_dispatch_reconcile_once()
+
+    session.expire_all()
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_ready_executions() == 1
+    assert qc._ledger_state(claimed_id) is None
+
+    # A second reconcile is a no-op: the retry set is empty and nothing changes.
+    qc._run_dispatch_reconcile_once()
+
+    session.expire_all()
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_ready_executions() == 1
+    assert qc._ledger_state(claimed_id) is None
+
+
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
     """should_drain_exit is gated on the ledger being empty."""
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
