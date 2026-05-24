@@ -1182,6 +1182,19 @@ impl PyQuebec {
         if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
             return false;
         }
+        // Standalone-only: under the fork supervisor a self-exited worker child
+        // would just be reforked, so quiet_then_exit is a no-op there. Supervised
+        // deployments should use a supervisor-level rolling restart instead.
+        if self.ctx.supervisor_pid.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        // A claim that passed the quiet gate before quiet was signalled may still
+        // be publishing work; wait for it so the idle snapshot below is not taken
+        // mid-claim (which could let the process exit and subject that batch to
+        // graceful_shutdown's bounded drain).
+        if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
         let in_flight_empty = self
             .ctx
             .in_flight_executions

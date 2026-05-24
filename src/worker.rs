@@ -933,6 +933,25 @@ impl Metric {
     }
 }
 
+/// RAII flag set for the duration of a worker claim transaction so
+/// `should_drain_exit` (quiet_then_exit self-exit) cannot observe an empty idle
+/// snapshot while a batch that passed the quiet gate is still being claimed and
+/// dispatched. Set on construction, cleared on drop.
+struct ClaimInProgressGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> ClaimInProgressGuard<'a> {
+    fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for ClaimInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[pyclass(name = "Execution", subclass)]
 #[derive(Debug)]
 pub struct Execution {
@@ -3253,6 +3272,12 @@ impl Worker {
         thread_id: &str,
         source: &str,
     ) {
+        // Mark a claim transaction in progress for the whole body (before the
+        // quiet gate, through dispatch) so quiet_then_exit's should_drain_exit
+        // cannot see an empty idle snapshot while a batch that passed the quiet
+        // gate is still being claimed/dispatched.
+        let _claim_guard = ClaimInProgressGuard::new(&ctx.claim_in_progress);
+
         // Sidekiq-style quiet mode: keep running but stop claiming new work
         // so in-flight jobs can drain. Used for seamless restarts.
         if ctx.quiet.is_cancelled() {
