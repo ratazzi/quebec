@@ -974,16 +974,12 @@ pub struct Execution {
 
 impl Drop for Execution {
     fn drop(&mut self) {
-        // Backstop for the in-flight set: pick_job marks a job in-flight when it
+        // Backstop for the claim ledger: pick_job marks a job in-flight when it
         // leaves the dispatch channel and the InFlightGuard in invoke() normally
         // clears it. If a picked Execution is dropped without ever running
         // perform() (e.g. it failed to enqueue to the Python work queue), clear
         // the entry here so the shutdown drain is not left waiting on it.
-        self.ctx
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.claimed.id);
+        self.ctx.ledger_remove(self.claimed.id);
     }
 }
 
@@ -1037,14 +1033,12 @@ impl Execution {
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
         // Mark this claimed_execution as in-flight for the whole perform()
         // window. `release_all_claimed_executions` (graceful shutdown) skips
-        // ids still in this set so a job actively inside perform() is never
+        // ids still in this state so a job actively inside perform() is never
         // handed back to a neighbour worker. The guard clears the id when this
         // function returns (after `after_executed` has deleted the claimed
         // row) or unwinds, so the entry never outlives the perform.
-        let _in_flight = crate::context::InFlightGuard::new(
-            self.ctx.in_flight_executions.clone(),
-            self.claimed.id,
-        );
+        let _in_flight =
+            crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 
         self.timer = Instant::now();
         let now = chrono::Utc::now().naive_utc();
@@ -2559,8 +2553,9 @@ impl Worker {
     /// graceful shutdown. Releases jobs that have not started running — those
     /// still sitting in the dispatch channel — so the dispatcher can re-claim
     /// them immediately. Jobs that have been handed to the Python side (tracked
-    /// in `ctx.in_flight_executions`) are skipped: the shutdown drain waits for
-    /// that set to empty first, so in normal shutdown there are none left here.
+    /// as `ClaimState::InFlight` in `ctx.claim_ledger`) are skipped: the
+    /// shutdown drain waits for the ledger to empty first, so in normal
+    /// shutdown there are none left here.
     /// Any that remain (the drain hit `shutdown_timeout`) are left in
     /// `claimed_executions` rather than released, because releasing a job whose
     /// perform thread is still running would let a neighbour run it a second
@@ -2584,14 +2579,16 @@ impl Worker {
 
         // Skip executions that are actively running inside perform(); releasing
         // them would create a duplicate-execution race with a neighbour worker.
-        // Recover from poisoning rather than treating it as an empty set, which
-        // would let a running job be released back to ready (double-run).
+        // `ledger_snapshot` recovers from poisoning rather than treating the
+        // ledger as empty, which would let a running job be released back to
+        // ready (double-run).
         let in_flight: std::collections::HashSet<i64> = self
             .ctx
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .ledger_snapshot()
+            .into_iter()
+            .filter(|(_, state)| *state == crate::context::ClaimState::InFlight)
+            .map(|(id, _)| id)
+            .collect();
         let claimed: Vec<_> = claimed
             .into_iter()
             .filter(|execution| !in_flight.contains(&execution.id))
@@ -3184,12 +3181,7 @@ impl Worker {
                     let drain_deadline = tokio::time::Instant::now()
                         + self.ctx.shutdown_timeout.mul_f64(0.8);
                     loop {
-                        let in_flight_empty = self
-                            .ctx
-                            .in_flight_executions
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .is_empty();
+                        let in_flight_empty = self.ctx.ledger_is_empty();
                         if in_flight_empty {
                             break;
                         }
@@ -3493,25 +3485,30 @@ impl Worker {
         // shutdown can still begin between recv() and this insert, and a
         // concurrent release could snapshot in_flight without this id. The
         // recheck under the lock closes that window: if shutdown has begun we
-        // bail out, leaving the job's claimed row in the DB and out of
-        // in_flight so the release returns it to ready instead of us handing it
+        // bail out, leaving the job's claimed row in the DB and out of the
+        // ledger so the release returns it to ready instead of us handing it
         // to Python and double-running it. Outside shutdown this is a single
         // insert. The InFlightGuard in Execution::invoke re-inserts (idempotent)
         // and removes the id on completion; Execution's Drop clears it too, so a
         // picked job that never reaches perform() cannot leak its entry.
+        //
+        // The insert and shutdown recheck must happen under the same lock the
+        // release snapshots under, so this takes the ledger lock directly rather
+        // than going through `ledger_set` (which would drop the lock between the
+        // recheck and the insert, reopening the race).
         {
             // Recover from poisoning rather than failing open: returning Ok here
             // would bypass the shutdown recheck and hand a possibly-released job
-            // to Python. The set stays consistent across a panic.
-            let mut set = self
+            // to Python. The ledger stays consistent across a panic.
+            let mut ledger = self
                 .ctx
-                .in_flight_executions
+                .claim_ledger
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if self.ctx.graceful_shutdown.is_cancelled() {
                 return Err(QuebecError::runtime("shutting down"));
             }
-            set.insert(execution.claimed.id);
+            ledger.insert(execution.claimed.id, crate::context::ClaimState::InFlight);
         }
         Ok(execution)
     }

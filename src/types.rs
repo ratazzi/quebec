@@ -1195,12 +1195,7 @@ impl PyQuebec {
         if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
             return false;
         }
-        let in_flight_empty = self
-            .ctx
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
+        let in_flight_empty = self.ctx.ledger_is_empty();
         if !in_flight_empty {
             return false;
         }

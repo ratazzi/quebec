@@ -37,6 +37,19 @@ pub struct ConcurrencyConstraint {
     pub on_conflict: ConcurrencyConflict,
 }
 
+/// Lifecycle state of a claimed execution owned by this worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    /// Claimed; queued in the mpsc channel / Python work queue; not yet performing.
+    #[allow(dead_code)]
+    Dispatched,
+    /// Inside perform().
+    InFlight,
+    /// Performed, but after_executed cleanup failed — already executed, must NOT requeue.
+    #[allow(dead_code)]
+    CleanupPending,
+}
+
 /// Concurrency conflict strategy - what to do when concurrency limit is reached
 /// Matches Solid Queue's concurrency_on_conflict option
 #[cfg_attr(feature = "python", pyclass(eq, eq_int, from_py_object))]
@@ -379,18 +392,21 @@ pub struct AppContext {
     /// (non-supervised) runs, the supervisor parent itself, and the
     /// scheduler (which is always a single process).
     pub proc_slot: Option<(usize, usize)>,
-    /// claimed_execution ids that have been handed to the Python side and have
-    /// not finished yet. Inserted in `Worker::pick_job` (when a job leaves the
-    /// dispatch channel for the Python work queue) and again at the start of
-    /// `Execution::invoke` (idempotent). Removed when `perform()` finishes (the
-    /// `InFlightGuard`), and on `Execution`'s `Drop` as a backstop for a job
-    /// that is picked but never performed. `release_all_claimed_executions`
-    /// skips these during graceful shutdown and the shutdown drain waits for
-    /// the set to empty, so a running or about-to-run job is never handed back
-    /// to a neighbour worker (which would run it a second time). Plain
-    /// `Mutex<HashSet>`: the guarded section is a single
-    /// insert/remove/contains, never held across an await.
-    pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// Authoritative ledger of claimed_execution ids owned by this worker,
+    /// keyed by `claimed_executions.id` and mapped to their lifecycle
+    /// `ClaimState`. As of Task 1 the only state used is `ClaimState::InFlight`,
+    /// matching the semantics of the previous `in_flight_executions` set:
+    /// inserted in `Worker::pick_job` (when a job leaves the dispatch channel
+    /// for the Python work queue) and again at the start of `Execution::invoke`
+    /// (idempotent), removed when `perform()` finishes (the `InFlightGuard`),
+    /// and on `Execution`'s `Drop` as a backstop for a job that is picked but
+    /// never performed. `release_all_claimed_executions` skips in-flight ids
+    /// during graceful shutdown and the shutdown drain waits for the ledger to
+    /// empty, so a running or about-to-run job is never handed back to a
+    /// neighbour worker (which would run it a second time). Plain
+    /// `Mutex<HashMap>`: the guarded section is a single
+    /// insert/remove/contains/clone, never held across an await.
+    pub claim_ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
 }
 
 /// RAII guard that marks a claimed_execution as in-flight for the lifetime of
@@ -398,24 +414,29 @@ pub struct AppContext {
 /// so the entry is cleared on every exit path — normal completion, error, or a
 /// panic propagating out of `Execution::invoke`.
 pub struct InFlightGuard {
-    set: Arc<std::sync::Mutex<HashSet<i64>>>,
+    ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
     id: i64,
 }
 
 impl InFlightGuard {
-    pub fn new(set: Arc<std::sync::Mutex<HashSet<i64>>>, id: i64) -> Self {
-        // Recover from poisoning: the set is a plain HashSet that stays
-        // consistent even if a holder panicked, and silently skipping the
-        // insert would let the shutdown release treat a running job as
-        // releasable.
-        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
-        Self { set, id }
+    pub fn new(
+        ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
+        id: i64,
+    ) -> Self {
+        // Recover from poisoning: the ledger stays consistent even if a holder
+        // panicked, and silently skipping the insert would let the shutdown
+        // release treat a running job as releasable.
+        ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, ClaimState::InFlight);
+        Self { ledger, id }
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.set
+        self.ledger
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.id);
@@ -514,6 +535,40 @@ pub struct RunnableDefaults {
 }
 
 impl AppContext {
+    /// Record `id` in the claim ledger with the given state. Poison-recovering;
+    /// never held across an await.
+    pub fn ledger_set(&self, id: i64, state: ClaimState) {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, state);
+    }
+
+    /// Remove `id` from the claim ledger. Poison-recovering.
+    pub fn ledger_remove(&self, id: i64) {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    /// True when the claim ledger has no tracked entries. Poison-recovering.
+    pub fn ledger_is_empty(&self) -> bool {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// Snapshot the claim ledger so callers can inspect states without holding
+    /// the lock. Poison-recovering.
+    pub fn ledger_snapshot(&self) -> std::collections::HashMap<i64, ClaimState> {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     #[cfg(feature = "python")]
     pub fn new(
         dsn: DatabaseUrl,
@@ -850,7 +905,7 @@ impl AppContext {
             supervisor_pid: AtomicI32::new(0),
             claim_in_progress: AtomicBool::new(false),
             proc_slot: None,
-            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            claim_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -947,9 +1002,9 @@ impl AppContext {
             // keep the slot label until explicitly reset by apply_*_config.
             proc_slot: self.proc_slot,
             // Fresh per-process tracking: the child runs its own worker /
-            // dispatch channel, so in-flight ids must not be shared with the
+            // dispatch channel, so claim-ledger ids must not be shared with the
             // parent (whose claims belong to a different process record).
-            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            claim_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),
