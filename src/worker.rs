@@ -2541,7 +2541,7 @@ impl Worker {
             count
         );
 
-        let mut failed = 0usize;
+        let mut reclaimed = 0usize;
         for execution in orphaned {
             let ctx = self.ctx.clone();
             let tc = table_config.clone();
@@ -2573,7 +2573,7 @@ impl Worker {
 
             match result {
                 Ok(()) => {
-                    failed += 1;
+                    reclaimed += 1;
                     debug!(
                         "Marked orphaned job {} as failed (was claimed by process {:?})",
                         job_id, process_id
@@ -2588,7 +2588,7 @@ impl Worker {
             }
         }
 
-        Ok(failed)
+        Ok(reclaimed)
     }
 
     /// Prune dead processes and fail their claimed executions
