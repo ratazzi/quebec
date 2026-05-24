@@ -1396,35 +1396,44 @@ impl Execution {
                     "Emergency cleanup: after_executed transaction failed after all retries",
                 )
                 .await;
-                let claimed_deleted = if let Err(e) = fail_result {
-                    // Fallback: at minimum delete the claimed record to unblock the worker
+                if let Err(e) = fail_result {
+                    // Fallback: at minimum delete the claimed record to unblock the worker.
+                    // `fail_claimed_execution` can return Err *after* the claimed
+                    // row was already deleted (the post-delete unblock/slot
+                    // release failed), so the fallback delete's row count is not
+                    // a reliable signal of whether the row still exists.
                     warn!(
                     "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
                     job_id, e
                 );
-                    query_builder::claimed_executions::delete_by_id(
+                    if let Err(e2) = query_builder::claimed_executions::delete_by_id(
                         cleanup_db.as_ref(),
                         &table_config_orig,
                         claimed_id,
                     )
                     .await
-                    .inspect_err(|e2| {
+                    {
                         error!(
                             "Emergency cleanup also failed for claimed_execution {}: {:?}",
                             claimed_id, e2
                         );
-                    })
-                    .map(|deleted| deleted > 0)
-                    .unwrap_or(false)
-                } else {
-                    // fail_claimed_execution deleted the claimed row.
-                    true
-                };
+                    }
+                }
 
-                // The job already executed. If the claimed row is gone the ledger
-                // entry can be cleared; if it is still present mark CleanupPending
-                // so the shutdown release does NOT requeue an executed job.
-                if claimed_deleted {
+                // The job already executed. Decide CleanupPending vs ledger_remove
+                // on whether the claimed row STILL EXISTS, not on a fallback
+                // delete's row count: if the row is gone the ledger entry can be
+                // cleared; if it is still present mark CleanupPending so the
+                // shutdown release does NOT requeue an executed job.
+                let claimed_gone = query_builder::claimed_executions::find_by_id(
+                    cleanup_db.as_ref(),
+                    &table_config_orig,
+                    claimed_id,
+                )
+                .await
+                .map(|row| row.is_none())
+                .unwrap_or(false);
+                if claimed_gone {
                     self.ctx.ledger_remove(self.claimed.id);
                 } else {
                     self.ctx
@@ -1787,6 +1796,25 @@ impl Worker {
     /// spinning up the full main loop and signalling SIGTERM.
     pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
         self.release_all_claimed_executions(process_id).await
+    }
+
+    /// Test-only wrapper around the private `delete_claimed_by_id` so a
+    /// regression test can assert the ledger entry is cleared after the
+    /// claimed row is dropped (the job-record-missing dispatch path).
+    pub(crate) async fn delete_claimed_by_id_for_test(&self, execution_id: i64) {
+        Self::delete_claimed_by_id(&self.ctx, execution_id).await;
+    }
+
+    /// Test-only wrapper around the private `fail_claimed_by_id` so a
+    /// regression test can assert the ledger entry is cleared after the
+    /// claimed row is failed (the unregistered-runnable dispatch path).
+    pub(crate) async fn fail_claimed_by_id_for_test(
+        &self,
+        execution_id: i64,
+        job_id: i64,
+        error_msg: &str,
+    ) {
+        Self::fail_claimed_by_id(&self.ctx, execution_id, job_id, error_msg).await;
     }
 
     /// Test-only: run exactly the dispatch-failure reconcile the maintenance
@@ -2747,6 +2775,11 @@ impl Worker {
             match result {
                 Ok(()) => {
                     released += 1;
+                    // Claim requeued + row deleted: drop the ledger entry so
+                    // close()/test-hook paths don't leak (the real
+                    // graceful_shutdown exits the process, but those paths
+                    // keep running).
+                    self.ctx.ledger_remove(execution_id);
                     debug!("Released job {} back to ready state", job_id);
                 }
                 Err(e) => {
@@ -2890,17 +2923,24 @@ impl Worker {
             return;
         };
         let table_config = ctx.table_config.clone();
-        if let Err(e) = query_builder::claimed_executions::delete_by_id(
+        match query_builder::claimed_executions::delete_by_id(
             db.as_ref(),
             &table_config,
             execution_id,
         )
         .await
         {
-            warn!(
-                "Failed to delete orphaned claimed execution {}: {:?}",
-                execution_id, e
-            );
+            Ok(_) => {
+                // Claim row gone: drop the ledger entry so it stops counting
+                // against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to delete orphaned claimed execution {}: {:?}",
+                    execution_id, e
+                );
+            }
         }
     }
 
@@ -2918,9 +2958,10 @@ impl Worker {
         };
         let table_config = ctx.table_config.clone();
         let ctx = ctx.clone();
-        if let Err(e) = db
+        match db
             .transaction::<_, (), DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 let error_msg = error_msg.to_string();
                 Box::pin(async move {
                     Self::fail_claimed_execution(
@@ -2937,10 +2978,17 @@ impl Worker {
             })
             .await
         {
-            warn!(
-                "Failed to clean up claimed execution {}: {:?}",
-                execution_id, e
-            );
+            Ok(()) => {
+                // Claim row failed + deleted: drop the ledger entry so it stops
+                // counting against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to clean up claimed execution {}: {:?}",
+                    execution_id, e
+                );
+            }
         }
     }
 
@@ -3555,6 +3603,11 @@ impl Worker {
             let Ok(processing_db) = ctx.get_db().await.inspect_err(|e| {
                 warn!("[{}] failed to get DB for processing jobs: {:?}", source, e);
             }) else {
+                // claim_jobs already committed these rows (Dispatched in the
+                // ledger). Returning without requeueing would leak them: the
+                // rows stay claimed + Dispatched forever and the reconcile has
+                // nothing to retry. Stash them so the maintenance tick requeues.
+                self.stash_dispatch_retry(claimed.clone()).await;
                 return;
             };
             // Use a single quick transaction to fetch all job data

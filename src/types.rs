@@ -1055,6 +1055,33 @@ impl PyQuebec {
         })
     }
 
+    /// Drive the private `delete_claimed_by_id` dispatch path (job record is
+    /// gone) for the given claimed_executions id. Test-only hook: asserts the
+    /// ledger entry is cleared after the claimed row is dropped.
+    fn _delete_claimed_by_id(&self, py: Python<'_>, execution_id: i64) {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.delete_claimed_by_id_for_test(execution_id).await;
+            })
+        })
+    }
+
+    /// Drive the private `fail_claimed_by_id` dispatch path (runnable
+    /// unregistered) for the given claimed_executions id. Test-only hook:
+    /// asserts the ledger entry is cleared after the claimed row is failed.
+    fn _fail_claimed_by_id(&self, py: Python<'_>, execution_id: i64, job_id: i64, error_msg: &str) {
+        let worker = self.worker.clone();
+        let error_msg = error_msg.to_string();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .fail_claimed_by_id_for_test(execution_id, job_id, &error_msg)
+                    .await;
+            })
+        })
+    }
+
     fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone();

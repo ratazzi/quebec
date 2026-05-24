@@ -268,6 +268,96 @@ def test_missing_ledger_entry_is_released_on_shutdown(qc_with_sqlalchemy, db_ass
     assert db_assert.count_ready_executions() == 1
 
 
+def test_dispatched_release_clears_ledger_on_shutdown(qc_with_sqlalchemy, db_assert):
+    """A successful shutdown release of a Dispatched claim clears its ledger entry.
+
+    ``test_dispatched_released_on_shutdown`` pins the DB outcome (row requeued);
+    this pins the ledger outcome so ``release_all_claimed_executions``' success
+    arm does not leak the entry (close()/test-hook paths keep running, so a
+    lingering entry would block ``should_drain_exit`` forever).
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    qc.register_job(_IdleJob)
+    process_id = qc.register_worker_process()
+
+    enqueued = _IdleJob.perform_later(qc)
+    qc.drain_batch(1)
+
+    session.expire_all()
+    claimed_id = _claimed_id(session, prefix, enqueued.id)
+    qc._set_ledger_state(claimed_id, 0)
+    assert qc._ledger_state(claimed_id) == 0
+
+    released = qc.release_claimed_for_shutdown(process_id)
+
+    assert released == 1
+    assert qc._ledger_state(claimed_id) is None
+
+
+def test_delete_claimed_by_id_clears_ledger(qc_with_sqlalchemy, db_assert):
+    """The job-record-missing dispatch path clears the ledger entry.
+
+    ``process_available_jobs`` calls ``delete_claimed_by_id`` when a claimed
+    row's job record is gone (FK would prevent a failed_executions insert). The
+    claimed row is dropped, so its ledger entry must be cleared too, otherwise
+    it leaks and blocks drain exit.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    process_id = qc.register_worker_process()
+    claimed_id = _seed_claimed(session, prefix, process_id)
+
+    # Stand in for the Dispatched ledger entry claim_jobs would have set.
+    qc._set_ledger_state(claimed_id, 0)
+    assert qc._ledger_state(claimed_id) == 0
+    assert db_assert.count_claimed_executions() == 1
+
+    qc._delete_claimed_by_id(claimed_id)
+
+    session.expire_all()
+    assert db_assert.count_claimed_executions() == 0
+    assert qc._ledger_state(claimed_id) is None
+
+
+def test_fail_claimed_by_id_clears_ledger(qc_with_sqlalchemy, db_assert):
+    """The unregistered-runnable dispatch path clears the ledger entry.
+
+    ``process_available_jobs`` calls ``fail_claimed_by_id`` when the job's
+    runnable is not registered: it writes a failed_executions row, deletes the
+    claimed row, and releases the semaphore in one transaction. The ledger
+    entry must be cleared so the now-gone claim stops blocking drain exit.
+    """
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    process_id = qc.register_worker_process()
+    claimed_id = _seed_claimed(session, prefix, process_id)
+    job_id = session.execute(
+        text(f"SELECT job_id FROM {prefix}_claimed_executions WHERE id = :cid"),
+        {"cid": claimed_id},
+    ).scalar()
+
+    qc._set_ledger_state(claimed_id, 0)
+    assert qc._ledger_state(claimed_id) == 0
+    assert db_assert.count_claimed_executions() == 1
+
+    qc._fail_claimed_by_id(claimed_id, job_id, "Job handler not found: CrashJob")
+
+    session.expire_all()
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 1
+    assert qc._ledger_state(claimed_id) is None
+
+
 def test_should_drain_exit_tracks_ledger_emptiness(db_url, test_prefix):
     """should_drain_exit is gated on the ledger being empty."""
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
