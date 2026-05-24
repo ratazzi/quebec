@@ -1228,6 +1228,13 @@ impl PyQuebec {
         })
     }
 
+    /// Test-only: directly set the claim-in-progress flag so a regression test
+    /// can verify should_drain_exit refuses to exit while a claim transaction
+    /// is still publishing work.
+    fn _set_claim_in_progress(&self, value: bool) {
+        self.ctx.claim_in_progress.store(value, Ordering::SeqCst);
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {

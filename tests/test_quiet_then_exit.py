@@ -54,3 +54,44 @@ def test_should_drain_exit_false_with_claimed_job(db_url, test_prefix):
         assert qc.should_drain_exit() is False
     finally:
         qc.close()
+
+
+def test_should_drain_exit_disabled_when_supervised(db_url, test_prefix):
+    """Standalone-only: under the fork supervisor (supervisor_pid set), a quiet
+    drained worker does not self-exit — it would just be reforked.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        # Records supervisor_pid from the current parent (non-zero), marking this
+        # as a fork-supervised child.
+        qc.watch_parent_pid()
+        qc.quiet()
+        # Drained, but supervised → must not self-exit.
+        assert qc.should_drain_exit() is False
+    finally:
+        qc.close()
+
+
+def test_should_drain_exit_blocked_by_claim_in_progress(db_url, test_prefix):
+    """A claim transaction in progress blocks self-exit even when otherwise idle.
+
+    Guards the race where a claim that passed the quiet gate is still publishing
+    work: should_drain_exit must wait for it rather than exit mid-claim.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        qc.quiet()
+        # Idle → would exit.
+        assert qc.should_drain_exit() is True
+        # A claim in progress must block it.
+        qc._set_claim_in_progress(True)
+        assert qc.should_drain_exit() is False
+        # Once the claim finishes, exit is allowed again.
+        qc._set_claim_in_progress(False)
+        assert qc.should_drain_exit() is True
+    finally:
+        qc.close()
