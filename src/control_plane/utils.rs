@@ -90,9 +90,6 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
 
-        // Count total jobs
-        let total_jobs = query_builder::jobs::count_all(db, table_config).await?;
-
         // Count scheduled jobs
         let scheduled_count =
             query_builder::scheduled_executions::count_all(db, table_config).await? as i64;
@@ -122,7 +119,6 @@ impl ControlPlane {
         // Count active workers
         let active_workers = query_builder::processes::count_all(db, table_config).await?;
 
-        context.insert("nav_total_jobs", &total_jobs);
         context.insert("nav_scheduled_jobs", &scheduled_count);
         context.insert("nav_in_progress_jobs", &in_progress_count);
         context.insert("nav_failed_jobs", &failed_count);
