@@ -3736,12 +3736,14 @@ impl Worker {
             return Ok(());
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
-        // Propagate failures: callers already `.await?` this helper, expecting
-        // a release failure to abort the enclosing tx. Silently swallowing the
-        // DbErr would leave the slot accounted as held in `solid_queue_semaphores`
-        // while the caller's state change (claimed deleted, ready re-inserted,
-        // scheduled inserted, etc.) commits — the exact slot-leak class of bug
-        // we already saw reintroduced through every claim/throttle path.
+        // Propagate failures: callers already `.await?` this helper. In-tx callers
+        // (claim/throttle/cleanup paths) rely on the propagation to abort the
+        // enclosing tx; the out-of-tx emergency cleanup caller relies on it to
+        // route to its delete-only fallback. Silently swallowing the DbErr would
+        // leave the slot accounted as held in `solid_queue_semaphores` while the
+        // caller's state change (claimed deleted, ready re-inserted, scheduled
+        // inserted, etc.) commits — the exact slot-leak class of bug we already
+        // saw reintroduced through every claim/throttle path.
         release_semaphore(
             db,
             table_config,
