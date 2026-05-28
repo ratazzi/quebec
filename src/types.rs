@@ -952,24 +952,51 @@ impl PyQuebec {
                 let db = ctx.get_db().await.map_err(|e| {
                     PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
                 })?;
+
+                // `claim_jobs` inserted a `Dispatched` ledger entry for every
+                // claimed row. If any post-claim lookup/build below fails we
+                // must clear those entries before returning, or the
+                // worker-local ledger leaks. Capture the claimed ids so the
+                // error path can clean up regardless of how far the loop got.
+                let claimed_ids: Vec<i64> = claimed.iter().map(|c| c.id).collect();
+                let clear_ledger = || {
+                    for id in &claimed_ids {
+                        ctx.ledger_remove(*id);
+                    }
+                };
+
                 let mut out: Vec<Execution> = Vec::with_capacity(claimed.len());
                 for c in claimed {
-                    let job = crate::query_builder::jobs::find_by_id(
+                    let job = match crate::query_builder::jobs::find_by_id(
                         db.as_ref(),
                         &ctx.table_config,
                         c.job_id,
                     )
                     .await
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-                    .ok_or_else(|| {
-                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Job record not found")
-                    })?;
-                    let runnable = Python::attach(|_py| ctx.get_runnable(&job.class_name))
-                        .map_err(|e| {
-                            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                                "Job handler not found: {e}"
-                            ))
-                        })?;
+                    {
+                        Ok(Some(job)) => job,
+                        Ok(None) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                "Job record not found",
+                            ));
+                        }
+                        Err(e) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                e.to_string(),
+                            ));
+                        }
+                    };
+                    let runnable = match Python::attach(|_py| ctx.get_runnable(&job.class_name)) {
+                        Ok(runnable) => runnable,
+                        Err(e) => {
+                            clear_ledger();
+                            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                                format!("Job handler not found: {e}"),
+                            ));
+                        }
+                    };
                     out.push(Execution::new(ctx.clone(), c, job, runnable));
                 }
                 Ok(out)
@@ -1023,6 +1050,65 @@ impl PyQuebec {
         })
     }
 
+    /// Run exactly the dispatch-failure reconcile the maintenance tick runs:
+    /// drain the dispatch-retry set, retry the requeue, drop the ledger entry
+    /// for each row that now succeeds, and re-stash the rest. Test-only hook so
+    /// a regression test can drive the reconcile without the full main loop.
+    fn _run_dispatch_reconcile_once(&self, py: Python<'_>) {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.run_dispatch_reconcile_once_for_test().await;
+            })
+        })
+    }
+
+    /// Load the persisted `claimed_executions` row by id and push it into the
+    /// dispatch-retry set, simulating a residual whose dispatch-failure requeue
+    /// also failed. Test-only hook for seeding a reconcile scenario.
+    fn _add_dispatch_retry(&self, py: Python<'_>, claimed_id: i64) -> PyResult<()> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .add_dispatch_retry_for_test(claimed_id)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "_add_dispatch_retry failed: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
+    /// Drive the private `delete_claimed_by_id` dispatch path (job record is
+    /// gone) for the given claimed_executions id. Test-only hook: asserts the
+    /// ledger entry is cleared after the claimed row is dropped.
+    fn _delete_claimed_by_id(&self, py: Python<'_>, execution_id: i64) {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.delete_claimed_by_id_for_test(execution_id).await;
+            })
+        })
+    }
+
+    /// Drive the private `fail_claimed_by_id` dispatch path (runnable
+    /// unregistered) for the given claimed_executions id. Test-only hook:
+    /// asserts the ledger entry is cleared after the claimed row is failed.
+    fn _fail_claimed_by_id(&self, py: Python<'_>, execution_id: i64, job_id: i64, error_msg: &str) {
+        let worker = self.worker.clone();
+        let error_msg = error_msg.to_string();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .fail_claimed_by_id_for_test(execution_id, job_id, &error_msg)
+                    .await;
+            })
+        })
+    }
+
     fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone();
@@ -1031,8 +1117,11 @@ impl PyQuebec {
 
         self.pyqueue_mode.store(true, Ordering::Relaxed);
 
-        // Use tokio::spawn to start async task
-        self.rt.spawn(async move {
+        // Use tokio::spawn to start async task. Track the handle so
+        // graceful_shutdown / close await the pump's unwind before exiting —
+        // otherwise the process can tear down (Python queue, held Execution, DB
+        // refs) while the pump is still mid-iteration.
+        let pump_handle = self.rt.spawn(async move {
             loop {
                 // pick_job returns Err when the dispatch channel is closed or
                 // graceful shutdown has begun. In both cases the pump stops so
@@ -1063,6 +1152,14 @@ impl PyQuebec {
                 });
             }
         });
+        self.handles
+            .lock()
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to acquire lock for handles",
+                )
+            })?
+            .push(pump_handle);
 
         let handle = self.rt.spawn(async move {
             graceful_shutdown.cancelled().await;
@@ -1178,7 +1275,17 @@ impl PyQuebec {
     /// is idle, with no time limit (Sidekiq Enterprise USR2 rolling-restart
     /// semantics). Quiet has already stopped new claims, so an empty result is
     /// terminal — no new work can arrive to make it non-empty again.
-    fn should_drain_exit(&self, py: Python<'_>) -> bool {
+    ///
+    /// Drain-exit is **ledger-authoritative**: the worker-local ledger is the
+    /// truth about *this* worker's graceful-path work (`Dispatched` = claimed
+    /// but not running, `InFlight` = performing). We deliberately do NOT consult
+    /// `count_by_process_id` here. A claimed row may linger in the DB after its
+    /// ledger entry has gone `CleanupPending` (job executed, only row cleanup
+    /// failed) or dropped entirely (crash/error residue). Those rows are owned
+    /// by the DB orphan-sweep, which can only reclaim them once this process row
+    /// is gone — so waiting on the DB count would hang quiet_then_exit forever.
+    /// Once the four guard checks below pass, the worker is drained.
+    fn should_drain_exit(&self) -> bool {
         if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
             return false;
         }
@@ -1188,17 +1295,17 @@ impl PyQuebec {
         if self.ctx.supervisor_pid.load(Ordering::Relaxed) != 0 {
             return false;
         }
-        let worker = self.worker.clone();
-        let ctx = self.ctx.clone();
-        py.detach(|| {
-            self.rt.block_on(async move {
-                let process_id = match *worker.process_id_handle().lock().await {
-                    Some(id) => id,
-                    None => return false,
-                };
-                ctx.worker_drained(process_id).await
-            })
-        })
+        // A claim that passed the quiet gate before quiet was signalled may still
+        // be publishing work; wait for it so the idle snapshot is not taken
+        // mid-claim (which could let the process exit and subject that batch to
+        // graceful_shutdown's bounded drain).
+        if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+        // CleanupPending entries don't block drain: those jobs already executed and
+        // only the DB orphan-sweep owns their leftover rows. The worker is drainable
+        // once no Dispatched/InFlight (active) work remains.
+        !self.ctx.ledger_has_active()
     }
 
     /// Test-only: directly set the claim-in-progress flag so a regression test
@@ -1206,6 +1313,56 @@ impl PyQuebec {
     /// is still publishing work.
     fn _set_claim_in_progress(&self, value: bool) {
         self.ctx.claim_in_progress.store(value, Ordering::SeqCst);
+    }
+
+    /// Test-only: read a claimed execution's ledger state
+    /// (0=Dispatched, 1=InFlight, 2=CleanupPending; None if absent).
+    fn _ledger_state(&self, id: i64) -> Option<u8> {
+        self.ctx
+            .claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .map(|s| match s {
+                crate::context::ClaimState::Dispatched => 0,
+                crate::context::ClaimState::InFlight => 1,
+                crate::context::ClaimState::CleanupPending => 2,
+            })
+    }
+
+    /// Test-only: force a ledger state (to exercise CleanupPending / Dispatched paths).
+    fn _set_ledger_state(&self, id: i64, state: u8) {
+        let s = match state {
+            0 => crate::context::ClaimState::Dispatched,
+            1 => crate::context::ClaimState::InFlight,
+            _ => crate::context::ClaimState::CleanupPending,
+        };
+        self.ctx.ledger_set(id, s);
+    }
+
+    /// Test-only: drive `InFlightGuard`'s panic-only `Drop` for the given id.
+    ///
+    /// Constructs an `InFlightGuard` against the real ledger (which inserts the
+    /// id as InFlight), then drops it. When `panicking` is true the guard is
+    /// dropped while a panic unwinds (mirroring a panic between
+    /// `InFlightGuard::new` and `after_executed` in `Execution::invoke`), so its
+    /// `Drop` must remove the InFlight entry. When `panicking` is false the
+    /// guard is dropped normally, so its `Drop` must leave the entry untouched
+    /// (the normal-path transition belongs to `after_executed`). Caller reads
+    /// `_ledger_state(id)` afterwards to assert the outcome.
+    fn _drop_in_flight_guard(&self, id: i64, panicking: bool) {
+        let ledger = self.ctx.claim_ledger.clone();
+        if panicking {
+            // Drop the guard mid-unwind: construct it inside the unwinding
+            // closure so std::thread::panicking() is true at drop time.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = crate::context::InFlightGuard::new(ledger, id);
+                panic!("forced panic to exercise InFlightGuard::drop");
+            }));
+        } else {
+            let _guard = crate::context::InFlightGuard::new(ledger, id);
+            // Normal drop at end of scope.
+        }
     }
 
     fn _request_worker_memory_recycle(&self, rss_bytes: u64) {

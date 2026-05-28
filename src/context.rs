@@ -1,5 +1,4 @@
 use crate::error::{QuebecError, Result};
-use crate::query_builder;
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
@@ -38,6 +37,17 @@ pub struct ConcurrencyConstraint {
     pub limit: i32,
     pub duration: Option<chrono::Duration>,
     pub on_conflict: ConcurrencyConflict,
+}
+
+/// Lifecycle state of a claimed execution owned by this worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimState {
+    /// Claimed; queued in the mpsc channel / Python work queue; not yet performing.
+    Dispatched,
+    /// Inside perform().
+    InFlight,
+    /// Performed, but after_executed cleanup failed — already executed, must NOT requeue.
+    CleanupPending,
 }
 
 /// Concurrency conflict strategy - what to do when concurrency limit is reached
@@ -389,49 +399,92 @@ pub struct AppContext {
     /// (non-supervised) runs, the supervisor parent itself, and the
     /// scheduler (which is always a single process).
     pub proc_slot: Option<(usize, usize)>,
-    /// claimed_execution ids that have been handed to the Python side and have
-    /// not finished yet. Inserted in `Worker::pick_job` (when a job leaves the
-    /// dispatch channel for the Python work queue) and again at the start of
-    /// `Execution::invoke` (idempotent). Removed when `perform()` finishes (the
-    /// `InFlightGuard`), and on `Execution`'s `Drop` as a backstop for a job
-    /// that is picked but never performed. `release_all_claimed_executions`
-    /// skips these during graceful shutdown and the shutdown drain waits for
-    /// the set to empty, so a running or about-to-run job is never handed back
-    /// to a neighbour worker (which would run it a second time). Plain
-    /// `Mutex<HashSet>`: the guarded section is a single
-    /// insert/remove/contains, never held across an await.
-    pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
+    /// Authoritative ledger of claimed_execution ids owned by this worker,
+    /// keyed by `claimed_executions.id` and mapped to their lifecycle
+    /// `ClaimState`. As of Task 1 the only state used is `ClaimState::InFlight`,
+    /// matching the semantics of the previous `in_flight_executions` set:
+    /// inserted in `Worker::pick_job` (when a job leaves the dispatch channel
+    /// for the Python work queue) and again at the start of `Execution::invoke`
+    /// (idempotent, via `InFlightGuard`), removed by `after_executed` once the
+    /// claimed row is deleted — or marked `CleanupPending` there if that cleanup
+    /// fails — removed on `Execution`'s `Drop` as a backstop for a job that
+    /// is picked but never performed (preserving any `CleanupPending` mark), and
+    /// marked `CleanupPending` by `InFlightGuard`'s `Drop` when `invoke` unwinds
+    /// on a panic (so a possibly-executed InFlight job is never requeued, even
+    /// if the `Execution` is kept alive by the Python runner and thus never
+    /// dropped).
+    /// `release_all_claimed_executions` skips in-flight and cleanup-pending ids
+    /// during graceful shutdown and the shutdown drain waits for the ledger to
+    /// empty, so a running or about-to-run job is never handed back to a
+    /// neighbour worker (which would run it a second time). Plain
+    /// `Mutex<HashMap>`: the guarded section is a single
+    /// insert/remove/contains/clone, never held across an await.
+    pub claim_ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
     pub worker_memory_recycle_requested: AtomicBool,
     pub worker_memory_recycle_started_at: Mutex<Option<Instant>>,
     pub worker_last_rss_bytes: AtomicU64,
 }
 
-/// RAII guard that marks a claimed_execution as in-flight for the lifetime of
-/// a `perform()` call. Inserts the id on construction and removes it on drop,
-/// so the entry is cleared on every exit path — normal completion, error, or a
-/// panic propagating out of `Execution::invoke`.
+/// Marks a claimed_execution as in-flight at the start of a `perform()` call.
+/// Construction inserts the id as `ClaimState::InFlight`. Normal-path removal is
+/// NOT done here: the ledger entry is cleared by `after_executed`, which tracks
+/// the real DB cleanup outcome (remove on success, mark `CleanupPending` on
+/// failure). The only thing `Drop` does is a panic-only backstop (see below).
 pub struct InFlightGuard {
-    set: Arc<std::sync::Mutex<HashSet<i64>>>,
+    ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
     id: i64,
 }
 
 impl InFlightGuard {
-    pub fn new(set: Arc<std::sync::Mutex<HashSet<i64>>>, id: i64) -> Self {
-        // Recover from poisoning: the set is a plain HashSet that stays
-        // consistent even if a holder panicked, and silently skipping the
-        // insert would let the shutdown release treat a running job as
-        // releasable.
-        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
-        Self { set, id }
+    pub fn new(
+        ledger: Arc<std::sync::Mutex<std::collections::HashMap<i64, ClaimState>>>,
+        id: i64,
+    ) -> Self {
+        // Recover from poisoning: the ledger stays consistent even if a holder
+        // panicked, and silently skipping the insert would let the shutdown
+        // release treat a running job as releasable.
+        ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, ClaimState::InFlight);
+        Self { ledger, id }
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.set
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.id);
+        // Panic-only backstop. On a NORMAL drop do nothing: `after_executed`
+        // owns the normal-path transition (remove on cleanup success,
+        // CleanupPending on failure), and removing here would wipe a
+        // CleanupPending mark since the guard drops right after
+        // `after_executed` returns.
+        //
+        // On a PANIC unwind, however, `after_executed` never ran, so the
+        // InFlight entry would otherwise leak forever and `ledger_has_active`
+        // would block the quiet_then_exit drain. The guard is a stack local of
+        // `Execution::invoke`, so it is reliably dropped when that frame
+        // unwinds (the owning `Execution` may be kept alive on the Python side,
+        // so its own Drop backstop may not fire). Mark the entry
+        // `CleanupPending` ONLY if it is still InFlight: the job was inside
+        // perform() and may have committed side effects, so it must NOT be
+        // requeued. CleanupPending puts the id in
+        // `release_all_claimed_executions`'s skip-set (a graceful shutdown that
+        // survives the panic will not hand the row to a neighbour → no
+        // duplicate run), counts as non-active so it does not block the drain
+        // (`ledger_has_active` treats CleanupPending as drained), and the
+        // residual claimed DB row is reclaimed by the orphan-sweep once this
+        // process exits. This mirrors `after_executed`'s "cleanup failed →
+        // CleanupPending" semantics. Note: `std::thread::panicking()` detects
+        // panic unwinding, NOT async task cancellation — a dropped future is
+        // not a panic, and that normal-drop case is already covered by
+        // `Execution::Drop`.
+        if !std::thread::panicking() {
+            return;
+        }
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(ledger.get(&self.id), Some(ClaimState::InFlight)) {
+            ledger.insert(self.id, ClaimState::CleanupPending);
+        }
     }
 }
 
@@ -527,6 +580,54 @@ pub struct RunnableDefaults {
 }
 
 impl AppContext {
+    /// Record `id` in the claim ledger with the given state. Poison-recovering;
+    /// never held across an await.
+    pub fn ledger_set(&self, id: i64, state: ClaimState) {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, state);
+    }
+
+    /// Remove `id` from the claim ledger. Poison-recovering.
+    pub fn ledger_remove(&self, id: i64) {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    /// True when the claim ledger has no tracked entries. Poison-recovering.
+    pub fn ledger_is_empty(&self) -> bool {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
+    /// True when the ledger holds any `Dispatched` or `InFlight` entry, i.e. work
+    /// that is still pending dispatch or actively executing. `CleanupPending`
+    /// entries do NOT count as active: the job already finished executing and only
+    /// the DB orphan-sweep is left to reclaim the row, so a worker carrying solely
+    /// `CleanupPending` entries (or none at all) is fully drained. Poison-recovering;
+    /// single locked pass, never held across an await.
+    pub fn ledger_has_active(&self) -> bool {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|s| matches!(s, ClaimState::Dispatched | ClaimState::InFlight))
+    }
+
+    /// Snapshot the claim ledger so callers can inspect states without holding
+    /// the lock. Poison-recovering.
+    pub fn ledger_snapshot(&self) -> std::collections::HashMap<i64, ClaimState> {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     #[cfg(feature = "python")]
     pub fn new(
         dsn: DatabaseUrl,
@@ -888,7 +989,7 @@ impl AppContext {
             supervisor_pid: AtomicI32::new(0),
             claim_in_progress: AtomicBool::new(false),
             proc_slot: None,
-            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            claim_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_memory_recycle_requested: AtomicBool::new(false),
             worker_memory_recycle_started_at: Mutex::new(None),
             worker_last_rss_bytes: AtomicU64::new(0),
@@ -928,20 +1029,28 @@ impl AppContext {
             return false;
         }
 
-        let in_flight_empty = self
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
-        if !in_flight_empty {
+        // Ledger gate: CleanupPending entries don't block drain (those jobs
+        // already executed and only the DB orphan-sweep owns their leftover
+        // rows). Active = Dispatched or InFlight.
+        if self.ledger_has_active() {
             return false;
         }
+
+        // DB gate, memory-recycle only: the ledger covers everything
+        // Worker::pick_job dispatched, but external callers (drain_one in
+        // tests, future helpers) may claim rows outside that flow without
+        // touching the ledger. This count keeps recycle from exiting while
+        // such DB rows are still owned by us. The recycle loop bounds the
+        // wait with `worker_memory_graceful_timeout` so this never blocks
+        // forever; `should_drain_exit` (quiet_then_exit) deliberately does
+        // NOT use this helper — there is no equivalent timeout there and
+        // a stuck DB-only row would hang the standalone graceful path.
 
         let Ok(db) = self.get_db().await else {
             return false;
         };
         matches!(
-            query_builder::claimed_executions::count_by_process_id(
+            crate::query_builder::claimed_executions::count_by_process_id(
                 db.as_ref(),
                 &self.table_config,
                 process_id,
@@ -1048,9 +1157,9 @@ impl AppContext {
             // keep the slot label until explicitly reset by apply_*_config.
             proc_slot: self.proc_slot,
             // Fresh per-process tracking: the child runs its own worker /
-            // dispatch channel, so in-flight ids must not be shared with the
+            // dispatch channel, so claim-ledger ids must not be shared with the
             // parent (whose claims belong to a different process record).
-            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            claim_ledger: Arc::new(std::sync::Mutex::new(HashMap::new())),
             worker_memory_recycle_requested: AtomicBool::new(false),
             worker_memory_recycle_started_at: Mutex::new(None),
             worker_last_rss_bytes: AtomicU64::new(0),

@@ -975,16 +975,32 @@ pub struct Execution {
 
 impl Drop for Execution {
     fn drop(&mut self) {
-        // Backstop for the in-flight set: pick_job marks a job in-flight when it
-        // leaves the dispatch channel and the InFlightGuard in invoke() normally
-        // clears it. If a picked Execution is dropped without ever running
-        // perform() (e.g. it failed to enqueue to the Python work queue), clear
-        // the entry here so the shutdown drain is not left waiting on it.
-        self.ctx
-            .in_flight_executions
+        // Backstop for the claim ledger, by state. `release_all_claimed_executions`
+        // is ledger-authoritative: it requeues only `Dispatched` rows.
+        //   * `InFlight` — pick_job marked it in-flight but the Execution is being
+        //     dropped without `after_executed` (e.g. it failed to enqueue to the
+        //     Python work queue). Whether perform() ran is ambiguous, so REMOVE
+        //     the entry: this unblocks the shutdown drain (which waits on InFlight)
+        //     and leaves the claimed row for the orphan-sweep rather than risking a
+        //     double-run by requeuing it.
+        //   * `Dispatched` — the Execution was pulled from the dispatch channel but
+        //     dropped BEFORE pick_job marked it InFlight (the pre-perform shutdown
+        //     race). The job never ran, so LEAVE the entry: graceful release then
+        //     requeues it, honouring the "claimed-but-not-started → released"
+        //     guarantee. (A Dispatched entry is only dropped here during shutdown;
+        //     in normal operation pick_job transitions it to InFlight.)
+        //   * `CleanupPending` — already executed; preserve so requeue stays blocked.
+        let mut ledger = self
+            .ctx
+            .claim_ledger
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.claimed.id);
+            .unwrap_or_else(|e| e.into_inner());
+        if matches!(
+            ledger.get(&self.claimed.id),
+            Some(crate::context::ClaimState::InFlight)
+        ) {
+            ledger.remove(&self.claimed.id);
+        }
     }
 }
 
@@ -1038,14 +1054,19 @@ impl Execution {
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
         // Mark this claimed_execution as in-flight for the whole perform()
         // window. `release_all_claimed_executions` (graceful shutdown) skips
-        // ids still in this set so a job actively inside perform() is never
-        // handed back to a neighbour worker. The guard clears the id when this
-        // function returns (after `after_executed` has deleted the claimed
-        // row) or unwinds, so the entry never outlives the perform.
-        let _in_flight = crate::context::InFlightGuard::new(
-            self.ctx.in_flight_executions.clone(),
-            self.claimed.id,
-        );
+        // ids still in this state so a job actively inside perform() is never
+        // handed back to a neighbour worker. Clearing model:
+        //   * normal path: `after_executed` clears the entry — removes it on
+        //     cleanup success, marks it `CleanupPending` on cleanup failure;
+        //   * `Execution::Drop` is the backstop when a picked Execution is
+        //     dropped before finishing `after_executed`;
+        //   * `InFlightGuard::Drop` marks the entry `CleanupPending` when this
+        //     frame unwinds on a panic (it does nothing on a normal drop), so a
+        //     possibly-executed InFlight job is skipped by graceful shutdown's
+        //     release (never requeued) rather than leaking, even if the owning
+        //     `Execution` is kept alive by the Python runner and never dropped.
+        let _in_flight =
+            crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 
         self.timer = Instant::now();
         let now = chrono::Utc::now().naive_utc();
@@ -1364,6 +1385,13 @@ impl Execution {
             }
         }
 
+        // Cleanup succeeded: the transaction committed and the claimed row was
+        // deleted, so the ledger entry is no longer needed. Removal lives here
+        // (not in InFlightGuard::drop) so it tracks the real DB outcome.
+        if transaction_result.is_ok() {
+            self.ctx.ledger_remove(self.claimed.id);
+        }
+
         // Emergency cleanup: if the transaction failed after all retries, mark the job
         // as failed and release the concurrency semaphore to prevent permanent deadlock.
         if transaction_result.is_err() {
@@ -1388,24 +1416,44 @@ impl Execution {
                 )
                 .await;
                 if let Err(e) = fail_result {
-                    // Fallback: at minimum delete the claimed record to unblock the worker
+                    // Fallback: at minimum delete the claimed record to unblock the worker.
+                    // `fail_claimed_execution` can return Err *after* the claimed
+                    // row was already deleted (the post-delete unblock/slot
+                    // release failed), so the fallback delete's row count is not
+                    // a reliable signal of whether the row still exists.
                     warn!(
                     "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
                     job_id, e
                 );
-                    let _ = query_builder::claimed_executions::delete_by_id(
+                    if let Err(e2) = query_builder::claimed_executions::delete_by_id(
                         cleanup_db.as_ref(),
                         &table_config_orig,
                         claimed_id,
                     )
                     .await
-                    .inspect_err(|e2| {
+                    {
                         error!(
                             "Emergency cleanup also failed for claimed_execution {}: {:?}",
                             claimed_id, e2
                         );
-                    });
+                    }
                 }
+
+                // The job already executed. Decide CleanupPending vs ledger_remove
+                // on whether the claimed row STILL EXISTS, not on a fallback
+                // delete's row count.
+                self.resolve_emergency_cleanup_ledger(
+                    cleanup_db.as_ref(),
+                    &table_config_orig,
+                    job_id,
+                    claimed_id,
+                )
+                .await;
+            } else {
+                // Could not even get a DB handle: the claimed row is still present
+                // and the job already ran. Mark CleanupPending to block requeue.
+                self.ctx
+                    .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
             }
         }
 
@@ -1440,6 +1488,48 @@ impl Execution {
             Err(e) => Err(QuebecError::Transaction(format!(
                 "Database error during job processing: {e}"
             ))),
+        }
+    }
+
+    /// Resolve the worker-local ledger after the emergency-cleanup tail of
+    /// `after_executed`. The job has already executed; the fallback delete of
+    /// the claimed row was already attempted. Three outcomes from re-checking
+    /// whether the claimed row still exists:
+    ///
+    /// * `Ok(Some)` — row confirmed present: mark `CleanupPending` so the
+    ///   shutdown release does NOT requeue an already-executed job; the DB
+    ///   orphan-sweep reclaims the lingering row.
+    /// * `Ok(None)` — row confirmed gone: clear the ledger entry.
+    /// * `Err` — verification could not be performed: do NOT mark
+    ///   `CleanupPending`. The fallback delete above may have already removed
+    ///   the row, and even if it didn't the orphan-sweep reclaims it straight
+    ///   from the DB (it never reads the ledger). Marking `CleanupPending` on
+    ///   an unverifiable result would risk a permanent zombie ledger entry that
+    ///   nothing can ever clear, so remove it and defer to the orphan-sweep.
+    async fn resolve_emergency_cleanup_ledger<C>(
+        &self,
+        db: &C,
+        table_config: &crate::context::TableConfig,
+        job_id: i64,
+        claimed_id: i64,
+    ) where
+        C: sea_orm::ConnectionTrait,
+    {
+        match query_builder::claimed_executions::find_by_id(db, table_config, claimed_id).await {
+            Ok(Some(_)) => {
+                self.ctx
+                    .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
+            }
+            Ok(None) => {
+                self.ctx.ledger_remove(self.claimed.id);
+            }
+            Err(e) => {
+                warn!(
+                    "Could not verify claimed_execution {} after emergency cleanup of job {}: {:?}; removing ledger entry and deferring to orphan-sweep",
+                    claimed_id, job_id, e
+                );
+                self.ctx.ledger_remove(self.claimed.id);
+            }
         }
     }
 }
@@ -1514,6 +1604,39 @@ impl Execution {
         }
 
         Ok(())
+    }
+
+    /// Test-only hook for `after_executed`'s emergency-cleanup verification tail.
+    /// Drives `resolve_emergency_cleanup_ledger` directly so a regression test
+    /// can pin all three decision arms (row present → CleanupPending, row gone →
+    /// remove, verification error → remove), including the `Err` arm that is
+    /// otherwise unreachable from Python without the full triple-failure path.
+    fn _resolve_emergency_cleanup_ledger(&self, py: Python<'_>) -> PyResult<()> {
+        let handle = self.ctx.get_runtime_handle().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Tokio runtime handle not initialized",
+            )
+        })?;
+        let table_config = self.ctx.table_config.clone();
+        let job_id = self.claimed.job_id;
+        let claimed_id = self.claimed.id;
+        py.detach(|| {
+            handle.block_on(async {
+                let db = self.ctx.get_db().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to get DB: {e}"
+                    ))
+                })?;
+                self.resolve_emergency_cleanup_ledger(
+                    db.as_ref(),
+                    &table_config,
+                    job_id,
+                    claimed_id,
+                )
+                .await;
+                Ok(())
+            })
+        })
     }
 
     fn post(&mut self, py: Python, exc: &Bound<'_, PyAny>, traceback: &str) {
@@ -1693,6 +1816,13 @@ pub struct Worker {
     idle_notify: Arc<tokio::sync::Notify>,
     /// Process ID for this worker (set after on_start)
     process_id: Arc<tokio::sync::Mutex<Option<i64>>>,
+    /// Claimed rows whose dispatch-failure requeue (`release_claimed_batch`)
+    /// also failed (e.g. DB transiently down). They stay claimed in the DB and
+    /// `Dispatched` in the ledger, counting against the per-process in-flight
+    /// limit and blocking `should_drain_exit`. The maintenance tick retries
+    /// these so they eventually return to ready while the process is alive,
+    /// rather than waiting for the post-death orphan sweep.
+    dispatch_retry: Arc<tokio::sync::Mutex<Vec<quebec_claimed_executions::Model>>>,
 }
 
 impl Worker {
@@ -1727,6 +1857,7 @@ impl Worker {
             sink_receiver,
             idle_notify,
             process_id: Arc::new(tokio::sync::Mutex::new(None)),
+            dispatch_retry: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1750,6 +1881,49 @@ impl Worker {
     /// spinning up the full main loop and signalling SIGTERM.
     pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
         self.release_all_claimed_executions(process_id).await
+    }
+
+    /// Test-only wrapper around the private `delete_claimed_by_id` so a
+    /// regression test can assert the ledger entry is cleared after the
+    /// claimed row is dropped (the job-record-missing dispatch path).
+    pub(crate) async fn delete_claimed_by_id_for_test(&self, execution_id: i64) {
+        Self::delete_claimed_by_id(&self.ctx, execution_id).await;
+    }
+
+    /// Test-only wrapper around the private `fail_claimed_by_id` so a
+    /// regression test can assert the ledger entry is cleared after the
+    /// claimed row is failed (the unregistered-runnable dispatch path).
+    pub(crate) async fn fail_claimed_by_id_for_test(
+        &self,
+        execution_id: i64,
+        job_id: i64,
+        error_msg: &str,
+    ) {
+        Self::fail_claimed_by_id(&self.ctx, execution_id, job_id, error_msg).await;
+    }
+
+    /// Test-only: run exactly the dispatch-failure reconcile the maintenance
+    /// tick runs (drain the retry set, retry release, drop ledger entries for
+    /// the rows that now requeue, re-stash the rest).
+    pub(crate) async fn run_dispatch_reconcile_once_for_test(&self) {
+        let ctx = self.ctx.clone();
+        self.reconcile_dispatch_retry(&ctx).await;
+    }
+
+    /// Test-only: load the persisted `claimed_executions` row by id and push it
+    /// into the dispatch-retry set so a regression test can seed a residual
+    /// deterministically.
+    pub(crate) async fn add_dispatch_retry_for_test(&self, claimed_id: i64) -> Result<()> {
+        let db = self.ctx.get_db().await?;
+        let row = query_builder::claimed_executions::find_by_id(
+            db.as_ref(),
+            &self.ctx.table_config,
+            claimed_id,
+        )
+        .await?
+        .ok_or_else(|| QuebecError::runtime(format!("claimed execution {claimed_id} not found")))?;
+        self.dispatch_retry.lock().await.push(row);
+        Ok(())
     }
 
     fn register_handler(
@@ -2304,6 +2478,13 @@ impl Worker {
             })
             .await?;
 
+        // Record each claimed row as Dispatched. It stays Dispatched until
+        // `pick_job` hands it to the Python side and flips it to InFlight.
+        for row in &jobs {
+            self.ctx
+                .ledger_set(row.id, crate::context::ClaimState::Dispatched);
+        }
+
         trace!("elpased: {:?}", timer.elapsed());
         Ok(jobs)
     }
@@ -2379,33 +2560,54 @@ impl Worker {
             count
         );
 
+        let mut reclaimed = 0usize;
         for execution in orphaned {
             let ctx = self.ctx.clone();
             let tc = table_config.clone();
             let job_id = execution.job_id;
+            let execution_id = execution.id;
+            let process_id = execution.process_id;
 
-            db.transaction::<_, (), DbErr>(|txn| {
-                Box::pin(async move {
-                    Self::fail_claimed_execution(
-                        &ctx,
-                        txn,
-                        &tc,
-                        job_id,
-                        execution.id,
-                        "Process crashed or was killed before job completion",
-                    )
-                    .await
+            // Per-row best-effort: a failure here (e.g. an experimental
+            // queue-slot release error) must not abort the sweep of the
+            // remaining orphaned rows. The crash-recovery path is the last
+            // line of defense, so one bad row is logged and skipped, left for
+            // the next sweep tick / another process to retry, instead of
+            // propagating and leaving every other orphan un-reclaimed.
+            let result = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    Box::pin(async move {
+                        Self::fail_claimed_execution(
+                            &ctx,
+                            txn,
+                            &tc,
+                            job_id,
+                            execution_id,
+                            "Process crashed or was killed before job completion",
+                        )
+                        .await
+                    })
                 })
-            })
-            .await?;
+                .await;
 
-            debug!(
-                "Marked orphaned job {} as failed (was claimed by process {:?})",
-                job_id, execution.process_id
-            );
+            match result {
+                Ok(()) => {
+                    reclaimed += 1;
+                    debug!(
+                        "Marked orphaned job {} as failed (was claimed by process {:?})",
+                        job_id, process_id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to reclaim orphaned execution {} (job {}, claimed by process {:?}): {:?}; leaving it for a later sweep",
+                        execution_id, job_id, process_id, e
+                    );
+                }
+            }
         }
 
-        Ok(count)
+        Ok(reclaimed)
     }
 
     /// Prune dead processes and fail their claimed executions
@@ -2438,8 +2640,19 @@ impl Worker {
             count, threshold
         );
 
+        // Per-row AND per-process best-effort. We deliberately trade the old
+        // single-transaction atomicity (fail-all-rows + prune as one unit) for
+        // best-effort cleanup backed by the orphan-sweep: each row's
+        // `fail_claimed_execution` runs in its OWN small transaction so a single
+        // row's failure (e.g. an experimental queue-slot release error) rolls
+        // back only that row, not its siblings or the process prune. The process
+        // row is pruned regardless of whether some rows failed — once the row is
+        // gone, `fail_orphaned_executions` (which matches claimed rows whose
+        // process row no longer exists) becomes the safety net that reclaims the
+        // leftovers. A failure pruning one process is logged and skipped so it
+        // does not block pruning the remaining stale processes.
+        let mut pruned = 0usize;
         for process in stale_processes {
-            let table_config = table_config.clone();
             let process_id = process.id;
             let process_pid = process.pid;
             let process_hostname = process.hostname.clone();
@@ -2452,44 +2665,79 @@ impl Worker {
             })
             .to_string();
 
-            let ctx = self.ctx.clone();
-            let tc = table_config.clone();
-            let deleted_count = db
-                .transaction::<_, u64, DbErr>(|txn| {
-                    let tc = tc.clone();
-                    let error_msg = error_msg.clone();
-                    Box::pin(async move {
-                        let claimed = query_builder::claimed_executions::find_by_process_id(
-                            txn, &tc, process_id,
-                        )
-                        .await?;
-                        let deleted_count = claimed.len() as u64;
+            let claimed = match query_builder::claimed_executions::find_by_process_id(
+                db.as_ref(),
+                &table_config,
+                process_id,
+            )
+            .await
+            {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    warn!(
+                        "Failed to list claimed jobs for stale process {} (pid={}, host={:?}): {:?}; skipping this process for now",
+                        process_id, process_pid, process_hostname, e
+                    );
+                    continue;
+                }
+            };
 
-                        for execution in &claimed {
+            let mut failed = 0u64;
+            for execution in &claimed {
+                let ctx = self.ctx.clone();
+                let tc = table_config.clone();
+                let error_msg = error_msg.clone();
+                let job_id = execution.job_id;
+                let execution_id = execution.id;
+                let result = db
+                    .transaction::<_, (), DbErr>(|txn| {
+                        Box::pin(async move {
                             Self::fail_claimed_execution(
                                 &ctx,
                                 txn,
                                 &tc,
-                                execution.job_id,
-                                execution.id,
+                                job_id,
+                                execution_id,
                                 &error_msg,
                             )
-                            .await?;
-                        }
-
-                        query_builder::processes::prune(txn, &tc, process_id).await?;
-                        Ok(deleted_count)
+                            .await
+                        })
                     })
-                })
-                .await?;
+                    .await;
 
+                match result {
+                    Ok(()) => failed += 1,
+                    Err(e) => warn!(
+                        "Failed to fail claimed execution {} (job {}) for stale process {}: {:?}; leaving it for the orphan-sweep",
+                        execution_id, job_id, process_id, e
+                    ),
+                }
+            }
+
+            // Prune the process row even if some rows failed: this hands the
+            // leftovers to the orphan-sweep.
+            if let Err(e) =
+                query_builder::processes::prune(db.as_ref(), &table_config, process_id).await
+            {
+                warn!(
+                    "Failed to prune stale process {} (pid={}, host={:?}): {:?}; will retry next tick",
+                    process_id, process_pid, process_hostname, e
+                );
+                continue;
+            }
+
+            pruned += 1;
             warn!(
-                "Pruned stale process {} (pid={}, host={:?}), failed {} claimed job(s)",
-                process_id, process_pid, process_hostname, deleted_count
+                "Pruned stale process {} (pid={}, host={:?}), failed {} of {} claimed job(s)",
+                process_id,
+                process_pid,
+                process_hostname,
+                failed,
+                claimed.len()
             );
         }
 
-        Ok(count)
+        Ok(pruned)
     }
 
     /// Clear finished jobs older than the configured threshold.
@@ -2560,8 +2808,12 @@ impl Worker {
     /// graceful shutdown. Releases jobs that have not started running — those
     /// still sitting in the dispatch channel — so the dispatcher can re-claim
     /// them immediately. Jobs that have been handed to the Python side (tracked
-    /// in `ctx.in_flight_executions`) are skipped: the shutdown drain waits for
-    /// that set to empty first, so in normal shutdown there are none left here.
+    /// as `ClaimState::InFlight` in `ctx.claim_ledger`) are skipped, as are jobs
+    /// that already executed but whose claimed-row cleanup failed
+    /// (`ClaimState::CleanupPending`) — releasing either would let a neighbour
+    /// run an in-flight or already-finished job a second time. The shutdown
+    /// drain waits for the ledger to empty first, so in normal shutdown there
+    /// are none left here.
     /// Any that remain (the drain hit `shutdown_timeout`) are left in
     /// `claimed_executions` rather than released, because releasing a job whose
     /// perform thread is still running would let a neighbour run it a second
@@ -2583,97 +2835,139 @@ impl Worker {
         )
         .await?;
 
-        // Skip executions that are actively running inside perform(); releasing
-        // them would create a duplicate-execution race with a neighbour worker.
-        // Recover from poisoning rather than treating it as an empty set, which
-        // would let a running job be released back to ready (double-run).
-        let in_flight: std::collections::HashSet<i64> = self
-            .ctx
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // Release is ledger-authoritative: requeue ONLY rows the ledger still
+        // records as `Dispatched` (claimed, queued, never performed). Skip
+        // everything else:
+        //   * `InFlight` — the drain above waits for it to finish;
+        //   * `CleanupPending` — already executed; requeuing would double-run it;
+        //   * no ledger entry — error / `Execution::Drop` residue, NOT a live
+        //     Dispatched claim (`claim_jobs` records every claim as `Dispatched`,
+        //     so a missing entry means some path already removed it). Requeuing a
+        //     missing-entry row is the duplicate-run hazard where an
+        //     executed-but-cleanup-failed claim lost its ledger entry. Leave it
+        //     claimed for the DB orphan-sweep, which reclaims it once `on_stop`
+        //     deletes this process's row.
+        // This mirrors `should_drain_exit`'s ledger-authoritative gate.
+        // `ledger_snapshot` recovers from poisoning rather than treating the
+        // ledger as empty (which would skip a genuine Dispatched claim).
+        let ledger = self.ctx.ledger_snapshot();
         let claimed: Vec<_> = claimed
             .into_iter()
-            .filter(|execution| !in_flight.contains(&execution.id))
+            .filter(|execution| {
+                matches!(
+                    ledger.get(&execution.id),
+                    Some(crate::context::ClaimState::Dispatched)
+                )
+            })
             .collect();
 
         if claimed.is_empty() {
             return Ok(0);
         }
 
-        let count = claimed.len();
-        info!("Releasing {} claimed job(s) back to ready state", count);
+        let total = claimed.len();
+        info!("Releasing {} claimed job(s) back to ready state", total);
 
+        let mut released = 0usize;
         for execution in claimed {
             let table_config = table_config.clone();
             let ctx = self.ctx.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
 
-            db.transaction::<_, (), DbErr>(|txn| {
-                let ctx = ctx.clone();
-                Box::pin(async move {
-                    if let Some(job) =
-                        query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                    {
-                        // Bypass class-level concurrency limits: the job
-                        // already holds the class-level semaphore slot from
-                        // when it was dispatched. Put it back to ready
-                        // directly so the dispatcher can re-claim it
-                        // without re-acquiring. Matches Solid Queue's
-                        // `dispatch_bypassing_concurrency_limits`.
-                        query_builder::ready_executions::insert(
+            let result = db
+                .transaction::<_, (), DbErr>(|txn| {
+                    let ctx = ctx.clone();
+                    Box::pin(async move {
+                        if let Some(job) =
+                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
+                        {
+                            // Bypass class-level concurrency limits: the job
+                            // already holds the class-level semaphore slot from
+                            // when it was dispatched. Put it back to ready
+                            // directly so the dispatcher can re-claim it
+                            // without re-acquiring. Matches Solid Queue's
+                            // `dispatch_bypassing_concurrency_limits`.
+                            query_builder::ready_executions::insert(
+                                txn,
+                                &table_config,
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                            )
+                            .await?;
+                            // EXPERIMENTAL queue-level slot was acquired at
+                            // claim time and must be released here — the next
+                            // worker that re-claims this job will re-acquire.
+                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
+                                .await?;
+                        } else {
+                            warn!(
+                                "Job {} not found, dropping claimed execution {}",
+                                job_id, execution_id
+                            );
+                        }
+
+                        query_builder::claimed_executions::delete_by_id(
                             txn,
                             &table_config,
-                            job.id,
-                            &job.queue_name,
-                            job.priority,
+                            execution_id,
                         )
                         .await?;
-                        // EXPERIMENTAL queue-level slot was acquired at
-                        // claim time and must be released here — the next
-                        // worker that re-claims this job will re-acquire.
-                        Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                            .await?;
-                    } else {
-                        warn!(
-                            "Job {} not found, dropping claimed execution {}",
-                            job_id, execution_id
-                        );
-                    }
 
-                    query_builder::claimed_executions::delete_by_id(
-                        txn,
-                        &table_config,
-                        execution_id,
-                    )
-                    .await?;
-
-                    Ok(())
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
+                .await;
 
-            debug!("Released job {} back to ready state", job_id);
+            // Per-row best-effort: a failure here must not abort the release of
+            // the remaining rows. A row left claimed is recovered later by the
+            // orphan sweep / restarting worker's `fail_orphaned_executions`,
+            // whereas aborting would orphan every still-claimed row once
+            // `on_stop` deletes this process's row.
+            match result {
+                Ok(()) => {
+                    released += 1;
+                    // Claim requeued + row deleted: drop the ledger entry so
+                    // close()/test-hook paths don't leak (the real
+                    // graceful_shutdown exits the process, but those paths
+                    // keep running).
+                    self.ctx.ledger_remove(execution_id);
+                    debug!("Released job {} back to ready state", job_id);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to release claimed execution {} (job {}) on shutdown: {:?}; leaving it claimed for recovery",
+                        execution_id, job_id, e
+                    );
+                }
+            }
         }
 
-        Ok(count)
+        Ok(released)
     }
 
     /// Release a batch of claimed executions back to ready state (best-effort).
-    /// Used when a transient error prevents dispatching claimed jobs to worker threads.
+    /// Used when a transient error prevents dispatching claimed jobs to worker
+    /// threads.
+    ///
+    /// For each row that requeues successfully, its ledger entry is removed
+    /// (the claim no longer exists, so it must not count against the in-flight
+    /// limit or block drain). Returns the rows that FAILED to requeue (e.g. DB
+    /// down) so the caller can stash them for a later retry; their ledger
+    /// entries are left intact (still `Dispatched`) until they succeed.
     async fn release_claimed_batch(
         ctx: &Arc<AppContext>,
         claimed: &[quebec_claimed_executions::Model],
-    ) {
+    ) -> Vec<quebec_claimed_executions::Model> {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for release_claimed_batch: {:?}", e);
         }) else {
-            return;
+            // No DB connection: nothing could be released, all rows fail.
+            return claimed.to_vec();
         };
         let table_config = ctx.table_config.clone();
-        let mut released = 0usize;
+        let mut failed: Vec<quebec_claimed_executions::Model> = Vec::new();
         for row in claimed {
             let table_config = table_config.clone();
             let ctx = ctx.clone();
@@ -2714,16 +3008,62 @@ impl Worker {
                     "Failed to release claimed execution {} back to ready: {:?}",
                     execution_id, e
                 );
+                failed.push(row.clone());
             } else {
-                released += 1;
+                // Requeued: the claim is gone, drop it from the ledger so it
+                // stops counting against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
             }
         }
-        if released > 0 || !claimed.is_empty() {
+        if !claimed.is_empty() {
             info!(
                 "Released {}/{} claimed execution(s) back to ready state",
-                released,
+                claimed.len() - failed.len(),
                 claimed.len()
             );
+        }
+        failed
+    }
+
+    /// Append rows that failed to requeue to the worker-local retry set so the
+    /// maintenance tick can retry them. No-op for an empty list.
+    async fn stash_dispatch_retry(&self, failed: Vec<quebec_claimed_executions::Model>) {
+        if failed.is_empty() {
+            return;
+        }
+        warn!(
+            "Stashing {} claimed execution(s) for dispatch-failure retry",
+            failed.len()
+        );
+        self.dispatch_retry.lock().await.extend(failed);
+    }
+
+    /// Retry requeuing the residual claimed rows that earlier failed to release
+    /// (their dispatch failed AND the requeue failed). Drains the retry set,
+    /// retries `release_claimed_batch` (which removes the ledger entry for each
+    /// row that now succeeds), and puts the still-failing rows back for the next
+    /// tick. Called from the maintenance tick of `run_main_loop` next to
+    /// `prune_dead_processes`. Only touches rows that genuinely failed to
+    /// requeue — normal in-channel `Dispatched` rows never enter this path.
+    async fn reconcile_dispatch_retry(&self, ctx: &Arc<AppContext>) {
+        let pending: Vec<quebec_claimed_executions::Model> = {
+            let mut guard = self.dispatch_retry.lock().await;
+            if guard.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *guard)
+        };
+        let count = pending.len();
+        debug!("Reconciling {} dispatch-failure residual(s)", count);
+        let still_failed = Self::release_claimed_batch(ctx, &pending).await;
+        if !still_failed.is_empty() {
+            warn!(
+                "{}/{} dispatch-failure residual(s) still could not be requeued; \
+                 will retry next maintenance tick",
+                still_failed.len(),
+                count
+            );
+            self.dispatch_retry.lock().await.extend(still_failed);
         }
     }
 
@@ -2733,20 +3073,34 @@ impl Worker {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for delete_claimed_by_id: {:?}", e);
         }) else {
+            // Terminal row: hand off the residual claim to the DB orphan-sweep
+            // and stop tracking it locally so it can't block drain forever.
+            ctx.ledger_remove(execution_id);
             return;
         };
         let table_config = ctx.table_config.clone();
-        if let Err(e) = query_builder::claimed_executions::delete_by_id(
+        match query_builder::claimed_executions::delete_by_id(
             db.as_ref(),
             &table_config,
             execution_id,
         )
         .await
         {
-            warn!(
-                "Failed to delete orphaned claimed execution {}: {:?}",
-                execution_id, e
-            );
+            Ok(_) => {
+                // Claim row gone: drop the ledger entry so it stops counting
+                // against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to delete orphaned claimed execution {}: {:?}",
+                    execution_id, e
+                );
+                // Delete failed: leave the residual claimed row for the DB
+                // orphan-sweep, but drop the ledger entry so it stops blocking
+                // drain. This row is terminal and must never be requeued.
+                ctx.ledger_remove(execution_id);
+            }
         }
     }
 
@@ -2760,13 +3114,17 @@ impl Worker {
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for fail_claimed_by_id: {:?}", e);
         }) else {
+            // Terminal row: hand off the residual claim to the DB orphan-sweep
+            // and stop tracking it locally so it can't block drain forever.
+            ctx.ledger_remove(execution_id);
             return;
         };
         let table_config = ctx.table_config.clone();
         let ctx = ctx.clone();
-        if let Err(e) = db
+        match db
             .transaction::<_, (), DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 let error_msg = error_msg.to_string();
                 Box::pin(async move {
                     Self::fail_claimed_execution(
@@ -2783,10 +3141,22 @@ impl Worker {
             })
             .await
         {
-            warn!(
-                "Failed to clean up claimed execution {}: {:?}",
-                execution_id, e
-            );
+            Ok(()) => {
+                // Claim row failed + deleted: drop the ledger entry so it stops
+                // counting against in-flight / blocking drain exit.
+                ctx.ledger_remove(execution_id);
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to clean up claimed execution {}: {:?}",
+                    execution_id, e
+                );
+                // Transaction failed: leave the residual claimed row for the DB
+                // orphan-sweep, but drop the ledger entry so it stops blocking
+                // drain. This row is terminal (unregistered runnable) and must
+                // never be requeued.
+                ctx.ledger_remove(execution_id);
+            }
         }
     }
 
@@ -2912,7 +3282,10 @@ impl Worker {
             return Ok(());
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
-        let _ = release_semaphore(
+        // Propagate failure: every caller runs inside the same transaction that
+        // deletes the claim, so a release error must roll back the whole unit
+        // rather than commit the claim deletion while leaking the queue slot.
+        release_semaphore(
             db,
             table_config,
             format!("queue:{}", queue_name),
@@ -2920,7 +3293,7 @@ impl Worker {
             duration,
         )
         .await
-        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e));
+        .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e))?;
         Ok(())
     }
 
@@ -3138,6 +3511,15 @@ impl Worker {
         process: &crate::entities::quebec_processes::Model,
         drain_budget: std::time::Duration,
     ) -> Result<()> {
+        // Ensure pick_job is stopped before we snapshot the ledger / requeue
+        // Dispatched rows. The graceful-shutdown branch already cancelled this
+        // token (the signal that brought us here), but the memory-recycle exit
+        // path enters here while only `quiet` is cancelled, which does NOT
+        // stop pick_job. Cancelling here makes "no new dispatches mid-drain"
+        // a local invariant of the helper so neither caller can race the
+        // release_all_claimed_executions snapshot below.
+        self.ctx.graceful_shutdown.cancel();
+
         // Call worker stop handlers before exiting.
         Python::attach(|py| {
             let handlers = self.stop_handlers.read().expect("Lock poisoned");
@@ -3149,25 +3531,36 @@ impl Worker {
             }
         });
 
+        // With a very small or zero shutdown_timeout the deadline is effectively
+        // now: the loop still checks the ledger once, then falls through to
+        // release rather than draining.
         let drain_deadline = tokio::time::Instant::now() + drain_budget;
         loop {
-            let in_flight_empty = self
+            // pick_job has been stopped via the cancellation above, so
+            // Dispatched rows never advance to InFlight. Drain only waits for
+            // rows already inside perform() (InFlight); the un-started
+            // Dispatched rows are requeued by release_all_claimed_executions
+            // immediately below.
+            let no_in_flight = self
                 .ctx
-                .in_flight_executions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_empty();
-            if in_flight_empty {
+                .ledger_snapshot()
+                .values()
+                .all(|s| *s != crate::context::ClaimState::InFlight);
+            if no_in_flight {
                 break;
             }
-            if drain_budget.is_zero() || tokio::time::Instant::now() >= drain_deadline {
+            let now = tokio::time::Instant::now();
+            if drain_budget.is_zero() || now >= drain_deadline {
                 warn!(
                     "Shutdown drain timed out with jobs still inside perform(); \
                      leaving them claimed to avoid a double-execution race"
                 );
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Cap the nap at the remaining budget so we never oversleep past
+            // the deadline and eat into the release + on_stop time.
+            let nap = (drain_deadline - now).min(std::time::Duration::from_millis(50));
+            tokio::time::sleep(nap).await;
         }
 
         if let Err(e) = self.release_all_claimed_executions(process.id).await {
@@ -3306,6 +3699,10 @@ impl Worker {
                     if let Err(e) = self.prune_dead_processes(Some(process.id)).await {
                         warn!("Failed to prune dead processes: {}", e);
                     }
+                    // Retry requeuing claimed rows whose dispatch-failure release
+                    // also failed. Left unhandled they stay claimed + Dispatched,
+                    // counting against in-flight and blocking should_drain_exit.
+                    self.reconcile_dispatch_retry(&ctx).await;
                 }
                 // Periodic cleanup: clear finished jobs older than threshold (if enabled)
                 _ = cleanup_interval.tick(), if cleanup_enabled => {
@@ -3358,12 +3755,17 @@ impl Worker {
                                 .instrument(tracing::info_span!("listener", consumed = total_notifies))
                                 .await;
 
-                            let process_future = self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY");
-                            let timeout_duration = tokio::time::Duration::from_secs(1);
-
-                            if tokio::time::timeout(timeout_duration, process_future).await.is_err() {
-                                warn!("NOTIFY job processing timed out after {}ms - will rely on polling", timeout_duration.as_millis());
-                            }
+                            // Run to completion: this call claims rows (committing
+                            // claimed_executions + Dispatched ledger entries) before
+                            // sending them to the channel / stashing into
+                            // dispatch_retry. Cancelling it mid-claim would leave rows
+                            // claimed in the DB and Dispatched in the ledger but absent
+                            // from both the channel and dispatch_retry, so reconcile
+                            // could never recover them — leaking ledger entries that
+                            // block should_drain_exit and burn claim capacity. The DB
+                            // ops inside already honour the pool's own timeouts, so a
+                            // slow batch should just take the time it needs.
+                            self.process_available_jobs(worker_threads, &tx, &ctx, &thread_id, "NOTIFY").await;
                         } else {
                             trace!("Ignoring NOTIFY for queue not in worker config");
                         }
@@ -3501,6 +3903,11 @@ impl Worker {
             let Ok(processing_db) = ctx.get_db().await.inspect_err(|e| {
                 warn!("[{}] failed to get DB for processing jobs: {:?}", source, e);
             }) else {
+                // claim_jobs already committed these rows (Dispatched in the
+                // ledger). Returning without requeueing would leak them: the
+                // rows stay claimed + Dispatched forever and the reconcile has
+                // nothing to retry. Stash them so the maintenance tick requeues.
+                self.stash_dispatch_retry(claimed.clone()).await;
                 return;
             };
             // Use a single quick transaction to fetch all job data
@@ -3518,8 +3925,11 @@ impl Worker {
                 Err(e) => {
                     error!("Failed to fetch job data: {:?}", e);
                     // Release all claimed executions back to ready state to avoid
-                    // leaving them permanently stuck in claimed_executions
-                    Self::release_claimed_batch(ctx, &claimed).await;
+                    // leaving them permanently stuck in claimed_executions. Rows
+                    // that fail to requeue (release itself errored) are stashed
+                    // for the maintenance tick to retry.
+                    let failed = Self::release_claimed_batch(ctx, &claimed).await;
+                    self.stash_dispatch_retry(failed).await;
                     return;
                 }
             }
@@ -3577,11 +3987,17 @@ impl Worker {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(leaked)) => {
                     warn!("Channel unexpectedly full, releasing claimed execution back to ready");
-                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                    let failed =
+                        Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed))
+                            .await;
+                    self.stash_dispatch_retry(failed).await;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(leaked)) => {
                     error!("Dispatch channel closed, releasing claimed execution");
-                    Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed)).await;
+                    let failed =
+                        Self::release_claimed_batch(ctx, std::slice::from_ref(&leaked.claimed))
+                            .await;
+                    self.stash_dispatch_retry(failed).await;
                 }
             }
         }
@@ -3610,27 +4026,33 @@ impl Worker {
         // snapshot under and re-checking the shutdown token while held. The
         // `select!` above only blocks pulls observed *before* recv() returns;
         // shutdown can still begin between recv() and this insert, and a
-        // concurrent release could snapshot in_flight without this id. The
-        // recheck under the lock closes that window: if shutdown has begun we
-        // bail out, leaving the job's claimed row in the DB and out of
-        // in_flight so the release returns it to ready instead of us handing it
-        // to Python and double-running it. Outside shutdown this is a single
-        // insert. The InFlightGuard in Execution::invoke re-inserts (idempotent)
-        // and removes the id on completion; Execution's Drop clears it too, so a
-        // picked job that never reaches perform() cannot leak its entry.
+        // concurrent release could snapshot the ledger without this id having
+        // been promoted to InFlight. The recheck under the lock closes that
+        // window: if shutdown has begun we bail out, leaving the entry as
+        // Dispatched (set by claim_jobs) so release_all_claimed_executions
+        // requeues it instead of us handing it to Python and double-running
+        // it. Outside shutdown this is a single insert. The InFlightGuard in
+        // Execution::invoke re-inserts (idempotent) and removes the id on
+        // completion; Execution's Drop clears it too, so a picked job that
+        // never reaches perform() cannot leak its entry.
+        //
+        // The insert and shutdown recheck must happen under the same lock the
+        // release snapshots under, so this takes the ledger lock directly rather
+        // than going through `ledger_set` (which would drop the lock between the
+        // recheck and the insert, reopening the race).
         {
             // Recover from poisoning rather than failing open: returning Ok here
             // would bypass the shutdown recheck and hand a possibly-released job
-            // to Python. The set stays consistent across a panic.
-            let mut set = self
+            // to Python. The ledger stays consistent across a panic.
+            let mut ledger = self
                 .ctx
-                .in_flight_executions
+                .claim_ledger
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if self.ctx.graceful_shutdown.is_cancelled() {
                 return Err(QuebecError::runtime("shutting down"));
             }
-            set.insert(execution.claimed.id);
+            ledger.insert(execution.claimed.id, crate::context::ClaimState::InFlight);
         }
         Ok(execution)
     }
