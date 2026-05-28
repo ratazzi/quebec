@@ -85,6 +85,7 @@ rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] 
 regex = "1.10"
 proctitle = "0.1.1"
 libc = "0.2"
+moka = { version = "0.12.15", features = ["future"] }
 
 [lints.rust]
 dead_code = "warn"
