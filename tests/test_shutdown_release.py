@@ -110,8 +110,14 @@ def test_claimed_but_not_started_job_is_released_on_shutdown(qc_with_sqlalchemy)
     process_id = qc.register_worker_process()
 
     IdleJob.perform_later(qc)
-    # Claim it (now in claimed_executions) but do NOT call perform().
-    qc.drain_one()
+    # Claim it via the real batch path so the worker-local ledger records it as
+    # Dispatched, then do NOT perform it. Release is ledger-authoritative, so a
+    # claimed-but-not-started job must carry its Dispatched entry to be released
+    # (drain_one bypasses the ledger and no longer represents a production
+    # claim). Keep the Execution alive so its Drop backstop doesn't clear the
+    # entry before release runs.
+    claimed = qc.drain_batch(1)
+    assert len(claimed) == 1
 
     session.expire_all()
     assert _count(session, prefix, "claimed_executions") == 1
@@ -120,6 +126,54 @@ def test_claimed_but_not_started_job_is_released_on_shutdown(qc_with_sqlalchemy)
     released = qc.release_claimed_for_shutdown(process_id)
 
     assert released == 1
+    session.expire_all()
+    assert _count(session, prefix, "claimed_executions") == 0
+    assert _count(session, prefix, "ready_executions") == 1
+    del claimed
+
+
+def test_dropped_dispatched_claim_is_still_released_on_shutdown(qc_with_sqlalchemy):
+    """A Dispatched claim whose Execution is dropped before release is requeued.
+
+    Reproduces the pre-perform shutdown race: pick_job pulls an Execution from
+    the dispatch channel (ledger = Dispatched) but is dropped before it marks
+    InFlight (e.g. shutdown observed). ``Execution::Drop`` must LEAVE a Dispatched
+    entry (only an InFlight entry is removed), so ledger-authoritative release
+    still requeues this never-performed job instead of leaving it to be marked
+    failed by the orphan-sweep. Under the old Drop (remove any non-CleanupPending)
+    the entry would be gone and release would skip it (released == 0).
+    """
+    import gc
+
+    ctx = qc_with_sqlalchemy
+    qc = ctx["qc"]
+    session = ctx["session"]
+    prefix = ctx["prefix"]
+
+    class IdleJob(quebec.ActiveJob):
+        def perform(self, *args, **kwargs):
+            return True
+
+    qc.register_job(IdleJob)
+    process_id = qc.register_worker_process()
+
+    IdleJob.perform_later(qc)
+    # Claim via the real batch path (ledger = Dispatched), then DROP the Execution
+    # before release without ever performing it.
+    claimed = qc.drain_batch(1)
+    assert len(claimed) == 1
+    del claimed
+    gc.collect()
+
+    session.expire_all()
+    assert _count(session, prefix, "claimed_executions") == 1
+    assert _count(session, prefix, "ready_executions") == 0
+
+    released = qc.release_claimed_for_shutdown(process_id)
+
+    assert released == 1, (
+        "a dropped-but-never-performed Dispatched claim must still be requeued"
+    )
     session.expire_all()
     assert _count(session, prefix, "claimed_executions") == 0
     assert _count(session, prefix, "ready_executions") == 1
