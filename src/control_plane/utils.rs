@@ -4,6 +4,7 @@ use chrono::{NaiveDateTime, Utc};
 use sea_orm::DbErr;
 use std::collections::HashMap;
 use std::error::Error;
+use std::sync::Arc;
 use tera::Context;
 use tracing::{debug, error, info};
 use url::Url;
@@ -11,7 +12,7 @@ use url::Url;
 use crate::control_plane::models::{queue_slug, QueueInfo};
 use crate::query_builder;
 
-use super::{templates, ControlPlane};
+use super::{templates, ControlPlane, FilterKind};
 
 /// Clean SQL string by removing extra whitespace and joining lines
 pub fn clean_sql(sql: &str) -> String {
@@ -66,22 +67,56 @@ impl ControlPlane {
         }
     }
 
-    /// Get queue names from database using query_builder
+    /// Get queue names (cached). Backs the filter dropdowns and the /stats
+    /// queue list.
     pub async fn get_queue_names(&self) -> Result<Vec<String>, DbErr> {
-        let db = self.ctx.get_db().await?;
-        let db = db.as_ref();
-        let table_config = &self.ctx.table_config;
-
-        query_builder::jobs::get_queue_names(db, table_config).await
+        self.cached_filter_options(FilterKind::Queues).await
     }
 
-    /// Get job class names from database using query_builder
+    /// Get job class names (cached). Backs the filter dropdowns.
     pub async fn get_job_classes(&self) -> Result<Vec<String>, DbErr> {
-        let db = self.ctx.get_db().await?;
-        let db = db.as_ref();
-        let table_config = &self.ctx.table_config;
+        self.cached_filter_options(FilterKind::Classes).await
+    }
 
-        query_builder::jobs::get_class_names(db, table_config).await
+    /// Fetch a filter-option set through the TTL cache, falling back to a
+    /// DISTINCT query against solid_queue_jobs on a miss. moka coalesces
+    /// concurrent misses so only one query runs per key per refresh window.
+    async fn cached_filter_options(&self, kind: FilterKind) -> Result<Vec<String>, DbErr> {
+        let names = self
+            .filter_options_cache
+            .try_get_with(kind, async {
+                let db = self.ctx.get_db().await?;
+                let db = db.as_ref();
+                let table_config = &self.ctx.table_config;
+                let names = match kind {
+                    FilterKind::Queues => {
+                        query_builder::jobs::get_queue_names(db, table_config).await?
+                    }
+                    FilterKind::Classes => {
+                        query_builder::jobs::get_class_names(db, table_config).await?
+                    }
+                };
+                Ok::<_, DbErr>(Arc::new(names))
+            })
+            .await
+            .map_err(|e: Arc<DbErr>| DbErr::Custom(format!("filter options query failed: {e}")))?;
+        Ok((*names).clone())
+    }
+
+    /// Get the finished-job count (cached). Backs the nav "Finished jobs" badge,
+    /// where an exact value is not important.
+    async fn cached_finished_count(&self) -> Result<i64, DbErr> {
+        self.finished_count_cache
+            .try_get_with((), async {
+                let db = self.ctx.get_db().await?;
+                let db = db.as_ref();
+                let table_config = &self.ctx.table_config;
+                let count =
+                    query_builder::jobs::count_finished(db, table_config, None, None).await? as i64;
+                Ok::<_, DbErr>(count)
+            })
+            .await
+            .map_err(|e: Arc<DbErr>| DbErr::Custom(format!("finished count query failed: {e}")))
     }
 
     /// Populate navigation statistics for templates using query_builder
@@ -89,9 +124,6 @@ impl ControlPlane {
         let db = self.ctx.get_db().await?;
         let db = db.as_ref();
         let table_config = &self.ctx.table_config;
-
-        // Count total jobs
-        let total_jobs = query_builder::jobs::count_all(db, table_config).await?;
 
         // Count scheduled jobs
         let scheduled_count =
@@ -122,7 +154,6 @@ impl ControlPlane {
         // Count active workers
         let active_workers = query_builder::processes::count_all(db, table_config).await?;
 
-        context.insert("nav_total_jobs", &total_jobs);
         context.insert("nav_scheduled_jobs", &scheduled_count);
         context.insert("nav_in_progress_jobs", &in_progress_count);
         context.insert("nav_failed_jobs", &failed_count);
@@ -136,8 +167,7 @@ impl ControlPlane {
         context.insert("scheduled_jobs_count", &scheduled_count);
 
         // Count finished jobs by finished_at to match the /finished-jobs page
-        let finished_count =
-            query_builder::jobs::count_finished(db, table_config, None, None).await? as i64;
+        let finished_count = self.cached_finished_count().await?;
         context.insert("finished_jobs_count", &finished_count);
 
         // Per-queue ready-execution counts + paused-state snapshot, so the
@@ -149,7 +179,7 @@ impl ControlPlane {
             query_builder::ready_executions::count_by_queue(db, table_config).await?;
         let paused_queue_names =
             query_builder::pauses::find_all_queue_names(db, table_config).await?;
-        let all_queue_names = query_builder::jobs::get_queue_names(db, table_config).await?;
+        let all_queue_names = self.get_queue_names().await?;
 
         let queue_counts: Vec<QueueInfo> = all_queue_names
             .into_iter()

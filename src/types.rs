@@ -1365,6 +1365,33 @@ impl PyQuebec {
         }
     }
 
+    fn _request_worker_memory_recycle(&self, rss_bytes: u64) {
+        self.ctx.request_worker_memory_recycle(rss_bytes);
+        self.ctx.quiet.cancel();
+    }
+
+    fn _should_worker_memory_recycle_exit(&self, py: Python<'_>) -> bool {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let process_id = match *worker.process_id_handle().lock().await {
+                    Some(id) => id,
+                    None => return false,
+                };
+                worker
+                    .should_exit_for_worker_memory_recycle(process_id)
+                    .await
+            })
+        })
+    }
+
+    #[getter]
+    fn is_worker_memory_recycling(&self) -> bool {
+        self.ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
+    }
+
     fn ping(&self) -> PyResult<bool> {
         self.rt.block_on(async move {
             let db = self.ctx.get_db().await.map_err(|e| {

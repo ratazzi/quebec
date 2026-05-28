@@ -1,6 +1,6 @@
 [package]
 name = "quebec"
-version = "0.3.4"
+version = "0.3.6"
 edition = "2021"
 authors = ["ratazzi"]
 description = "A simple, database-powered background task queue for Python, written in Rust"
@@ -71,6 +71,7 @@ serde_yaml = "0.9.34"
 serde = { version = "1.0.214", features = ["derive"] }
 nanoid = "0.4"
 hostname = "0.4.0"
+sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
 async-trait = "0.1.83"
 humantime = "2.1.0"
 tokio-util = "0.7.12"
@@ -85,6 +86,7 @@ rust-embed = { version = "8.7.2", features = ["include-exclude", "debug-embed"] 
 regex = "1.10"
 proctitle = "0.1.1"
 libc = "0.2"
+moka = { version = "0.12.15", features = ["future"] }
 
 [lints.rust]
 dead_code = "warn"

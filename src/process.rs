@@ -45,11 +45,19 @@ pub fn process_revision() -> Option<&'static str> {
 /// Build the JSON metadata blob written to the `processes.metadata` column
 /// each heartbeat. Includes ``revision`` whenever :func:`process_revision`
 /// returns a value, plus ``quiet:true`` when the caller passes ``quiet =
-/// true``. Returns ``None`` when both fields would be absent so the column
+/// true``. Returns ``None`` when all fields would be absent so the column
 /// stays untouched.
 pub fn build_runtime_metadata(quiet: bool) -> Option<String> {
+    build_runtime_metadata_with_memory(quiet, None, None)
+}
+
+pub fn build_runtime_metadata_with_memory(
+    quiet: bool,
+    recycle_reason: Option<&str>,
+    rss_bytes: Option<u64>,
+) -> Option<String> {
     let revision = process_revision();
-    if !quiet && revision.is_none() {
+    if !quiet && revision.is_none() && recycle_reason.is_none() && rss_bytes.is_none() {
         return None;
     }
     let mut obj = serde_json::Map::new();
@@ -61,6 +69,17 @@ pub fn build_runtime_metadata(quiet: bool) -> Option<String> {
             "revision".to_string(),
             serde_json::Value::String(s.to_string()),
         );
+    }
+    if let Some(reason) = recycle_reason {
+        obj.insert(
+            "recycle_reason".to_string(),
+            serde_json::Value::String(reason.to_string()),
+        );
+    }
+    if let Some(bytes) = rss_bytes {
+        let mb = bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024);
+        obj.insert("rss_bytes".to_string(), serde_json::Value::from(bytes));
+        obj.insert("rss_mb".to_string(), serde_json::Value::from(mb));
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
 }

@@ -161,7 +161,10 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
 
-        let queue_names = match state.get_queue_names().await {
+        // Pause-all is a mutating action that must see the current queue set,
+        // so bypass the stale-tolerant cached helper and query jobs directly —
+        // otherwise a queue created within the cache TTL would be missed.
+        let queue_names = match query_builder::jobs::get_queue_names(db, table_config).await {
             Ok(names) => names,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
