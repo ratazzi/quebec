@@ -1,12 +1,13 @@
 use crate::error::{QuebecError, Result};
+use crate::query_builder;
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::database_url::DatabaseUrl;
 
 use tracing::{debug, error, trace, warn};
+
+pub const WORKER_MEMORY_RECYCLE_EXIT_CODE: i32 = 75;
 
 #[cfg(feature = "python")]
 use pyo3::exceptions::PyException;
@@ -339,6 +342,13 @@ pub struct AppContext {
     pub dispatcher_concurrency_maintenance_interval: Duration,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
+    /// Optional worker RSS soft limit. When set, a worker that stays above the
+    /// limit for `worker_memory_recycle_confirmations` consecutive samples
+    /// enters quiet mode, drains, and exits with the planned recycle exit code.
+    pub worker_max_rss_bytes: Option<u64>,
+    pub worker_memory_check_interval: Duration,
+    pub worker_memory_graceful_timeout: Duration,
+    pub worker_memory_recycle_confirmations: u64,
     pub control_plane_sse_interval: Duration,
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
@@ -391,6 +401,9 @@ pub struct AppContext {
     /// `Mutex<HashSet>`: the guarded section is a single
     /// insert/remove/contains, never held across an await.
     pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
+    pub worker_memory_recycle_requested: AtomicBool,
+    pub worker_memory_recycle_started_at: Mutex<Option<Instant>>,
+    pub worker_last_rss_bytes: AtomicU64,
 }
 
 /// RAII guard that marks a claimed_execution as in-flight for the lifetime of
@@ -698,6 +711,27 @@ impl AppContext {
             if let Some(v) = get_u64("worker_threads") {
                 ctx.worker_threads = v;
             }
+            if let Some(v) = get_u64("worker_max_rss_mb") {
+                ctx.worker_max_rss_bytes = if v == 0 {
+                    None
+                } else {
+                    Some(v.saturating_mul(1024 * 1024))
+                };
+            }
+            if let Some(v) = get_duration("worker_memory_check_interval") {
+                ctx.worker_memory_check_interval = v;
+            }
+            if let Some(v) = get_duration("worker_memory_graceful_timeout") {
+                ctx.worker_memory_graceful_timeout = v;
+            }
+            if let Some(v) = get_u64("worker_memory_recycle_confirmations") {
+                if v == 0 {
+                    warn!("worker_memory_recycle_confirmations=0 ignored; using 1");
+                    ctx.worker_memory_recycle_confirmations = 1;
+                } else {
+                    ctx.worker_memory_recycle_confirmations = v;
+                }
+            }
             // EXPERIMENTAL: per-queue concurrency overrides via a Python dict
             // {queue_name: limit}. Invalid entries are skipped with a warning;
             // the whole field is opt-in so leaving it unset preserves prior
@@ -835,6 +869,10 @@ impl AppContext {
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
+            worker_max_rss_bytes: None,
+            worker_memory_check_interval: Duration::from_secs(5),
+            worker_memory_graceful_timeout: Duration::from_secs(300),
+            worker_memory_recycle_confirmations: 3,
             control_plane_sse_interval: Duration::from_secs(5),
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
@@ -851,7 +889,66 @@ impl AppContext {
             claim_in_progress: AtomicBool::new(false),
             proc_slot: None,
             in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            worker_memory_recycle_requested: AtomicBool::new(false),
+            worker_memory_recycle_started_at: Mutex::new(None),
+            worker_last_rss_bytes: AtomicU64::new(0),
         }
+    }
+
+    pub fn update_worker_rss(&self, rss_bytes: u64) {
+        self.worker_last_rss_bytes
+            .store(rss_bytes, Ordering::Relaxed);
+    }
+
+    pub fn request_worker_memory_recycle(&self, rss_bytes: u64) -> bool {
+        self.update_worker_rss(rss_bytes);
+        {
+            let mut started_at = self
+                .worker_memory_recycle_started_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if started_at.is_none() {
+                *started_at = Some(Instant::now());
+            }
+        }
+        !self
+            .worker_memory_recycle_requested
+            .swap(true, Ordering::SeqCst)
+    }
+
+    pub fn worker_memory_recycle_elapsed(&self) -> Option<Duration> {
+        self.worker_memory_recycle_started_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|started_at| started_at.elapsed())
+    }
+
+    pub async fn worker_drained(&self, process_id: i64) -> bool {
+        if self.claim_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let in_flight_empty = self
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !in_flight_empty {
+            return false;
+        }
+
+        let Ok(db) = self.get_db().await else {
+            return false;
+        };
+        matches!(
+            query_builder::claimed_executions::count_by_process_id(
+                db.as_ref(),
+                &self.table_config,
+                process_id,
+            )
+            .await,
+            Ok(0)
+        )
     }
 
     /// Record the current parent PID so role loops can detect supervisor death.
@@ -928,6 +1025,10 @@ impl AppContext {
                 .dispatcher_concurrency_maintenance_interval,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
+            worker_max_rss_bytes: self.worker_max_rss_bytes,
+            worker_memory_check_interval: self.worker_memory_check_interval,
+            worker_memory_graceful_timeout: self.worker_memory_graceful_timeout,
+            worker_memory_recycle_confirmations: self.worker_memory_recycle_confirmations,
             control_plane_sse_interval: self.control_plane_sse_interval,
             worker_queues: self.worker_queues.clone(),
             graceful_shutdown: CancellationToken::new(),
@@ -950,6 +1051,9 @@ impl AppContext {
             // dispatch channel, so in-flight ids must not be shared with the
             // parent (whose claims belong to a different process record).
             in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            worker_memory_recycle_requested: AtomicBool::new(false),
+            worker_memory_recycle_started_at: Mutex::new(None),
+            worker_last_rss_bytes: AtomicU64::new(0),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),

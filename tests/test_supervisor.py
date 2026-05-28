@@ -17,6 +17,16 @@ import socket
 import pytest
 from sqlalchemy import text
 
+from quebec.supervisor import (
+    RECYCLE_EXIT_CODE,
+    ROLE_WORKER,
+    Supervisor,
+    _ChildInfo,
+    _ExitStatus,
+    _SlotState,
+    _decode_status,
+)
+
 
 def _insert_claimed(session, prefix: str, process_id: int, job_class: str = "TestJob"):
     """Insert a minimal job + claimed_execution row for a given process_id.
@@ -179,6 +189,56 @@ class TestCurrentProcessIds:
         assert qc.current_worker_process_id() is None
         assert qc.current_dispatcher_process_id() is None
         assert qc.current_scheduler_process_id() is None
+
+
+class TestSupervisorExitStatus:
+    def test_decode_exited_status(self):
+        status = _decode_status(RECYCLE_EXIT_CODE << 8)
+
+        assert status.exited is True
+        assert status.exit_code == RECYCLE_EXIT_CODE
+        assert status.signaled is False
+        assert status.signal is None
+
+    def test_planned_recycle_reforks_without_crash_loop_accounting(self, qc):
+        sup = Supervisor(qc, {ROLE_WORKER: 1}, crash_loop_max=1)
+        sup._children[123] = _ChildInfo(role=ROLE_WORKER, index=0, pid=123)
+        sup._slots[(ROLE_WORKER, 0)] = _SlotState()
+        swept = []
+        spawned = []
+        sup._fail_claimed_for_pid = lambda pid, info: swept.append((pid, info.role))
+        sup._fork_child = lambda role, index: spawned.append((role, index))
+
+        sup._handle_exit(
+            123,
+            _ExitStatus(
+                exited=True,
+                exit_code=RECYCLE_EXIT_CODE,
+                signaled=False,
+                signal=None,
+            ),
+        )
+
+        assert swept == []
+        assert spawned == [(ROLE_WORKER, 0)]
+        assert sup._slots[(ROLE_WORKER, 0)].disabled is False
+        assert sup._slots[(ROLE_WORKER, 0)].crash_times == []
+
+    def test_unexpected_exit_counts_toward_crash_loop(self, qc):
+        sup = Supervisor(qc, {ROLE_WORKER: 1}, crash_loop_max=1)
+        sup._children[124] = _ChildInfo(role=ROLE_WORKER, index=0, pid=124)
+        sup._slots[(ROLE_WORKER, 0)] = _SlotState()
+        spawned = []
+        sup._fail_claimed_for_pid = lambda pid, info: None
+        sup._fork_child = lambda role, index: spawned.append((role, index))
+
+        sup._handle_exit(
+            124,
+            _ExitStatus(exited=True, exit_code=1, signaled=False, signal=None),
+        )
+
+        assert sup._slots[(ROLE_WORKER, 0)].disabled is True
+        assert spawned == []
 
 
 class TestApplyConfig:
