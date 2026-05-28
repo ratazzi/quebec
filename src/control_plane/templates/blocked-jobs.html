@@ -109,7 +109,7 @@
                 <span class="hidden sm:inline">Unblock</span>
               </button>
             </form>
-            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/cancel" method="post" class="inline" data-turbo-frame="_top">
+            <form action="{{ base_path }}/blocked-jobs/{{ job.id }}/cancel" method="post" class="inline" data-turbo-frame="_top" data-turbo-confirm="Cancel this blocked job?">
               <button type="submit" aria-label="Cancel" title="Cancel" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
                 <svg class="h-4 w-4 sm:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
                   <line x1="18" x2="6" y1="6" y2="18"></line>
