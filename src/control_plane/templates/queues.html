@@ -6,8 +6,8 @@
 <turbo-frame id="content">
 <!-- Filters -->
 <div class="flex flex-wrap items-center gap-3 mb-6" data-controller="filter">
-  <div class="relative">
-    <select data-filter-target="statusSelect" data-action="change->filter#apply" class="appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-1 focus:ring-black focus:border-black">
+  <div class="relative flex-1 min-w-0 sm:flex-none">
+    <select data-filter-target="statusSelect" data-action="change->filter#apply" class="w-full sm:w-auto appearance-none bg-white border border-gray-300 rounded-md h-8 pl-3 pr-10 text-sm focus:outline-none focus:ring-1 focus:ring-black focus:border-black">
       <option value="">Filter by status...</option>
       <option value="active">Active</option>
       <option value="paused">Paused</option>
@@ -23,16 +23,23 @@
     Clear
   </button>
 
-  <div class="flex-grow"></div>
+  <div class="flex-grow basis-full sm:basis-auto"></div>
 
   <form action="{{ base_path }}/queues/all/pause" method="post">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5 mr-2">
+      <svg class="h-4 w-4 mr-1.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+        <rect x="6" y="4" width="4" height="16"></rect>
+        <rect x="14" y="4" width="4" height="16"></rect>
+      </svg>
       Pause all
     </button>
   </form>
 
   <form action="{{ base_path }}/queues/all/resume" method="post">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
+      <svg class="h-4 w-4 mr-1.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+        <polygon points="6 4 20 12 6 20 6 4"></polygon>
+      </svg>
       Resume all
     </button>
   </form>
@@ -43,16 +50,16 @@
   <table class="min-w-full divide-y divide-gray-200">
     <thead class="bg-gray-50">
       <tr>
-        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
           Queue Name
         </th>
-        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
           Jobs Count
         </th>
-        <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
           Status
         </th>
-        <th scope="col" class="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
           Actions
         </th>
       </tr>
@@ -60,7 +67,7 @@
     <tbody class="bg-white divide-y divide-gray-200">
       {% for queue in queues %}
       <tr>
-        <td class="px-6 py-4 whitespace-nowrap">
+        <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
           <a href="{{ base_path }}/queues/{{ queue.name }}" data-turbo-action="advance" class="text-sm font-medium text-gray-900 hover:underline">{{ queue.name }}</a>
           {% if queue.concurrency_limit %}
             <span class="ml-1.5 inline-flex items-center gap-1 rounded-full border border-gray-200 px-2 py-0.5 text-xs font-mono text-gray-600" title="Experimental: global concurrency limit for this queue (experimental_queue_concurrency)">
@@ -72,30 +79,41 @@
             </span>
           {% endif %}
         </td>
-        <td class="px-6 py-4 whitespace-nowrap" id="queue-count-{{ queue.slug }}">
+        <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap" id="queue-count-{{ queue.slug }}">
           <div class="text-sm text-gray-900">{{ queue.jobs_count }}</div>
         </td>
-        <td class="px-6 py-4 whitespace-nowrap" id="queue-status-{{ queue.slug }}">
+        <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap" id="queue-status-{{ queue.slug }}">
           <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full {% if queue.status == 'active' %}bg-green-100 text-green-800{% else %}bg-yellow-100 text-yellow-800{% endif %}">
             {{ queue.status | title }}
           </span>
         </td>
-        <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+        <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-right text-sm font-medium">
           {% if queue.status == 'active' %}
           <button
             data-queue-name="{{ queue.name }}"
             data-action="pause"
             onclick="toggleQueueStatus(this)"
+            aria-label="Pause"
+            title="Pause"
             class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
-            Pause
+            <svg class="h-4 w-4 sm:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="6" y="4" width="4" height="16"></rect>
+              <rect x="14" y="4" width="4" height="16"></rect>
+            </svg>
+            <span class="hidden sm:inline">Pause</span>
           </button>
           {% else %}
           <button
             data-queue-name="{{ queue.name }}"
             data-action="resume"
             onclick="toggleQueueStatus(this)"
+            aria-label="Resume"
+            title="Resume"
             class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
-            Resume
+            <svg class="h-4 w-4 sm:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+              <polygon points="6 4 20 12 6 20 6 4"></polygon>
+            </svg>
+            <span class="hidden sm:inline">Resume</span>
           </button>
           {% endif %}
         </td>

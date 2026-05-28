@@ -8,35 +8,79 @@
     <h2 class="text-2xl font-bold">Workers</h2>
   </div>
 
-  <div class="overflow-x-auto rounded-lg border border-gray-200">
+  <div class="sm:hidden space-y-3">
+    {% for worker in workers %}
+    <div class="rounded-lg border border-gray-200 p-4 space-y-2 text-sm">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0">
+          <div class="font-medium text-gray-900">{{ worker.name }}</div>
+          <div class="text-xs text-gray-500">#{{ worker.id }} · {{ worker.kind }}</div>
+        </div>
+        <div class="flex flex-wrap justify-end gap-1 shrink-0">
+          {% if worker.status == "alive" %}
+            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Active</span>
+          {% else %}
+            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">Dead</span>
+          {% endif %}
+          {% if worker.quiet %}
+            <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="Worker is in quiet mode: no longer claiming new jobs, draining in-flight work">Quiet</span>
+          {% endif %}
+        </div>
+      </div>
+      <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        <dt class="text-gray-500">Hostname</dt>
+        <dd class="text-gray-900 truncate">{{ worker.hostname | default(value="unknown") }}</dd>
+        <dt class="text-gray-500">PID</dt>
+        <dd class="text-gray-900 flex items-center gap-1.5 min-w-0">
+          <span>{{ worker.pid }}</span>
+          {% if worker.revision %}
+            <svg class="h-3.5 w-3.5 text-gray-400 shrink-0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"></circle>
+              <line x1="3" x2="9" y1="12" y2="12"></line>
+              <line x1="15" x2="21" y1="12" y2="12"></line>
+            </svg>
+            <span class="font-mono text-gray-500 truncate" title="Process revision reported at heartbeat (git SHA when available)">{{ worker.revision }}</span>
+          {% endif %}
+        </dd>
+        <dt class="text-gray-500">Heartbeat</dt>
+        <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></dd>
+      </dl>
+    </div>
+    {% endfor %}
+    {% if workers | length == 0 %}
+    <div class="rounded-lg border border-gray-200 p-4 text-sm text-center text-gray-500">No workers found</div>
+    {% endif %}
+  </div>
+
+  <div class="hidden sm:block overflow-x-auto rounded-lg border border-gray-200">
     <table class="min-w-full divide-y divide-gray-200">
       <thead class="bg-gray-50">
         <tr>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Worker ID</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kind</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hostname</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
-          <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Worker ID</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Name</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kind</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hostname</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
         </tr>
       </thead>
       <tbody class="bg-white divide-y divide-gray-200">
         {% for worker in workers %}
         <tr>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900">{{ worker.id }}</div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900">{{ worker.name }}</div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900">{{ worker.kind }}</div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900">{{ worker.hostname | default(value="unknown") }}</div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="flex items-center gap-1.5 text-sm text-gray-900">
               <span>{{ worker.pid }}</span>
               {% if worker.revision %}
@@ -49,10 +93,10 @@
               {% endif %}
             </div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></div>
           </td>
-          <td class="px-6 py-4 whitespace-nowrap">
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             {% if worker.status == "alive" %}
               <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
                 Active

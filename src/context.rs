@@ -1,12 +1,13 @@
 use crate::error::{QuebecError, Result};
+use crate::query_builder;
 use croner::Cron;
 use english_to_cron::str_cron_syntax;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection, DbErr};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::database_url::DatabaseUrl;
 
 use tracing::{debug, error, trace, warn};
+
+pub const WORKER_MEMORY_RECYCLE_EXIT_CODE: i32 = 75;
 
 #[cfg(feature = "python")]
 use pyo3::exceptions::PyException;
@@ -361,6 +364,14 @@ pub struct AppContext {
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
+    /// When a quiet signal (SIGUSR1/SIGTSTP) is received, also exit the process
+    /// once all of this worker's in-flight and claimed jobs have drained — with
+    /// no time limit, matching Sidekiq Enterprise's USR2 rolling restart. Opt-in
+    /// (default false). Standalone-only: ignored under the fork supervisor, where
+    /// a self-exited child would just be reforked — use a supervisor-level
+    /// rolling restart there instead. Independent of `shutdown_timeout`, which
+    /// still bounds the SIGTERM graceful-shutdown path.
+    pub quiet_then_exit: bool,
     pub silence_polling: bool,
     pub preserve_finished_jobs: bool,
     pub clear_finished_jobs_after: Duration,
@@ -372,6 +383,13 @@ pub struct AppContext {
     pub dispatcher_concurrency_maintenance_interval: Duration,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
+    /// Optional worker RSS soft limit. When set, a worker that stays above the
+    /// limit for `worker_memory_recycle_confirmations` consecutive samples
+    /// enters quiet mode, drains, and exits with the planned recycle exit code.
+    pub worker_max_rss_bytes: Option<u64>,
+    pub worker_memory_check_interval: Duration,
+    pub worker_memory_graceful_timeout: Duration,
+    pub worker_memory_recycle_confirmations: u64,
     pub control_plane_sse_interval: Duration,
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
@@ -402,6 +420,64 @@ pub struct AppContext {
     /// if it no longer matches (i.e. the supervisor died and we got reparented
     /// to init/launchd). Zero means "not supervised, do not check".
     pub supervisor_pid: AtomicI32,
+    /// True while a worker claim transaction is in flight (from before the quiet
+    /// gate in `process_available_jobs` until the claimed jobs have been
+    /// dispatched). `should_drain_exit` requires this to be false so a job that
+    /// passed the quiet check just before quiet was signalled cannot be missed
+    /// by the idle snapshot, which would otherwise let the process self-exit
+    /// while that batch is still being published.
+    pub claim_in_progress: AtomicBool,
+    /// `(entry_index, within_entry)` populated by `apply_worker_config` /
+    /// `apply_dispatcher_config` after fork so `set_proc_title` can show
+    /// `[worker.<entry>.<within>:threads]` instead of all sibling processes
+    /// sharing the same `[worker:threads]` line. `None` for standalone
+    /// (non-supervised) runs, the supervisor parent itself, and the
+    /// scheduler (which is always a single process).
+    pub proc_slot: Option<(usize, usize)>,
+    /// claimed_execution ids that have been handed to the Python side and have
+    /// not finished yet. Inserted in `Worker::pick_job` (when a job leaves the
+    /// dispatch channel for the Python work queue) and again at the start of
+    /// `Execution::invoke` (idempotent). Removed when `perform()` finishes (the
+    /// `InFlightGuard`), and on `Execution`'s `Drop` as a backstop for a job
+    /// that is picked but never performed. `release_all_claimed_executions`
+    /// skips these during graceful shutdown and the shutdown drain waits for
+    /// the set to empty, so a running or about-to-run job is never handed back
+    /// to a neighbour worker (which would run it a second time). Plain
+    /// `Mutex<HashSet>`: the guarded section is a single
+    /// insert/remove/contains, never held across an await.
+    pub in_flight_executions: Arc<std::sync::Mutex<HashSet<i64>>>,
+    pub worker_memory_recycle_requested: AtomicBool,
+    pub worker_memory_recycle_started_at: Mutex<Option<Instant>>,
+    pub worker_last_rss_bytes: AtomicU64,
+}
+
+/// RAII guard that marks a claimed_execution as in-flight for the lifetime of
+/// a `perform()` call. Inserts the id on construction and removes it on drop,
+/// so the entry is cleared on every exit path — normal completion, error, or a
+/// panic propagating out of `Execution::invoke`.
+pub struct InFlightGuard {
+    set: Arc<std::sync::Mutex<HashSet<i64>>>,
+    id: i64,
+}
+
+impl InFlightGuard {
+    pub fn new(set: Arc<std::sync::Mutex<HashSet<i64>>>, id: i64) -> Self {
+        // Recover from poisoning: the set is a plain HashSet that stays
+        // consistent even if a holder panicked, and silently skipping the
+        // insert would let the shutdown release treat a running job as
+        // releasable.
+        set.lock().unwrap_or_else(|e| e.into_inner()).insert(id);
+        Self { set, id }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
@@ -420,6 +496,71 @@ pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
         .filter(|f| f.is_finite() && *f >= 0.0)
         .and_then(|f| Duration::try_from_secs_f64(f).ok())
         .or_else(|| s.parse::<u64>().ok().map(Duration::from_secs))
+}
+
+/// Build the `<basename>@<sha>` suffix appended to `set_proc_title`. Pure
+/// function (path + revision in, string out) so it can be reasoned about
+/// without spinning up an `AppContext`. Either component is dropped when
+/// absent, leaving:
+/// - "release-id@a1b2c3d" when both present
+/// - "release-id"          when no git available
+/// - "@a1b2c3d"            when path has no usable last component
+/// - None                  when neither is available
+///
+/// `cwd` is canonicalized so Capistrano-style deploys where the working
+/// dir is `<root>/current` (a symlink to `<root>/releases/<id>`) surface
+/// the release id rather than the literal "current".
+pub(crate) fn proctitle_suffix(cwd: &std::path::Path, revision: Option<&str>) -> Option<String> {
+    let resolved = std::fs::canonicalize(cwd).ok();
+    let basename = resolved
+        .as_deref()
+        .unwrap_or(cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    match (basename, revision) {
+        (Some(b), Some(s)) => Some(format!("{b}@{s}")),
+        (Some(b), None) => Some(b),
+        (None, Some(s)) => Some(format!("@{s}")),
+        (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod proctitle_suffix_tests {
+    use super::proctitle_suffix;
+    use std::path::Path;
+
+    #[test]
+    fn both_present_joins_with_at() {
+        let cwd = std::env::current_dir().unwrap();
+        let basename = cwd.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(
+            proctitle_suffix(&cwd, Some("a1b2c3d")),
+            Some(format!("{basename}@a1b2c3d"))
+        );
+    }
+
+    #[test]
+    fn only_basename_when_revision_absent() {
+        let cwd = std::env::current_dir().unwrap();
+        let basename = cwd.file_name().unwrap().to_str().unwrap().to_string();
+        assert_eq!(proctitle_suffix(&cwd, None), Some(basename));
+    }
+
+    #[test]
+    fn only_revision_when_basename_absent() {
+        assert_eq!(
+            proctitle_suffix(Path::new("/"), Some("a1b2c3d")),
+            Some("@a1b2c3d".to_string())
+        );
+    }
+
+    #[test]
+    fn none_when_both_missing() {
+        assert_eq!(proctitle_suffix(Path::new("/"), None), None);
+    }
 }
 
 /// Class-level scheduling metadata captured at `register_job_class` time.
@@ -549,6 +690,9 @@ impl AppContext {
             if let Some(v) = get_bool("silence_polling") {
                 ctx.silence_polling = v;
             }
+            if let Some(v) = get_bool("quiet_then_exit") {
+                ctx.quiet_then_exit = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -611,6 +755,27 @@ impl AppContext {
             }
             if let Some(v) = get_u64("worker_threads") {
                 ctx.worker_threads = v;
+            }
+            if let Some(v) = get_u64("worker_max_rss_mb") {
+                ctx.worker_max_rss_bytes = if v == 0 {
+                    None
+                } else {
+                    Some(v.saturating_mul(1024 * 1024))
+                };
+            }
+            if let Some(v) = get_duration("worker_memory_check_interval") {
+                ctx.worker_memory_check_interval = v;
+            }
+            if let Some(v) = get_duration("worker_memory_graceful_timeout") {
+                ctx.worker_memory_graceful_timeout = v;
+            }
+            if let Some(v) = get_u64("worker_memory_recycle_confirmations") {
+                if v == 0 {
+                    warn!("worker_memory_recycle_confirmations=0 ignored; using 1");
+                    ctx.worker_memory_recycle_confirmations = 1;
+                } else {
+                    ctx.worker_memory_recycle_confirmations = v;
+                }
             }
             // EXPERIMENTAL: per-queue concurrency overrides via a Python dict
             // {queue_name: limit}. Invalid entries are skipped with a warning;
@@ -738,6 +903,7 @@ impl AppContext {
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
             silence_polling: true,
+            quiet_then_exit: false,
             preserve_finished_jobs: true,
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
             cleanup_batch_size: 500,
@@ -748,6 +914,10 @@ impl AppContext {
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
+            worker_max_rss_bytes: None,
+            worker_memory_check_interval: Duration::from_secs(5),
+            worker_memory_graceful_timeout: Duration::from_secs(300),
+            worker_memory_recycle_confirmations: 3,
             control_plane_sse_interval: Duration::from_secs(5),
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
@@ -762,7 +932,69 @@ impl AppContext {
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
             supervisor_pid: AtomicI32::new(0),
+            claim_in_progress: AtomicBool::new(false),
+            proc_slot: None,
+            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            worker_memory_recycle_requested: AtomicBool::new(false),
+            worker_memory_recycle_started_at: Mutex::new(None),
+            worker_last_rss_bytes: AtomicU64::new(0),
         }
+    }
+
+    pub fn update_worker_rss(&self, rss_bytes: u64) {
+        self.worker_last_rss_bytes
+            .store(rss_bytes, Ordering::Relaxed);
+    }
+
+    pub fn request_worker_memory_recycle(&self, rss_bytes: u64) -> bool {
+        self.update_worker_rss(rss_bytes);
+        {
+            let mut started_at = self
+                .worker_memory_recycle_started_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if started_at.is_none() {
+                *started_at = Some(Instant::now());
+            }
+        }
+        !self
+            .worker_memory_recycle_requested
+            .swap(true, Ordering::SeqCst)
+    }
+
+    pub fn worker_memory_recycle_elapsed(&self) -> Option<Duration> {
+        self.worker_memory_recycle_started_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|started_at| started_at.elapsed())
+    }
+
+    pub async fn worker_drained(&self, process_id: i64) -> bool {
+        if self.claim_in_progress.load(Ordering::SeqCst) {
+            return false;
+        }
+
+        let in_flight_empty = self
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !in_flight_empty {
+            return false;
+        }
+
+        let Ok(db) = self.get_db().await else {
+            return false;
+        };
+        matches!(
+            query_builder::claimed_executions::count_by_process_id(
+                db.as_ref(),
+                &self.table_config,
+                process_id,
+            )
+            .await,
+            Ok(0)
+        )
     }
 
     /// Record the current parent PID so role loops can detect supervisor death.
@@ -827,6 +1059,7 @@ impl AppContext {
             process_alive_threshold: self.process_alive_threshold,
             shutdown_timeout: self.shutdown_timeout,
             silence_polling: self.silence_polling,
+            quiet_then_exit: self.quiet_then_exit,
             preserve_finished_jobs: self.preserve_finished_jobs,
             clear_finished_jobs_after: self.clear_finished_jobs_after,
             cleanup_batch_size: self.cleanup_batch_size,
@@ -838,6 +1071,10 @@ impl AppContext {
                 .dispatcher_concurrency_maintenance_interval,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
+            worker_max_rss_bytes: self.worker_max_rss_bytes,
+            worker_memory_check_interval: self.worker_memory_check_interval,
+            worker_memory_graceful_timeout: self.worker_memory_graceful_timeout,
+            worker_memory_recycle_confirmations: self.worker_memory_recycle_confirmations,
             control_plane_sse_interval: self.control_plane_sse_interval,
             worker_queues: self.worker_queues.clone(),
             graceful_shutdown: CancellationToken::new(),
@@ -853,6 +1090,17 @@ impl AppContext {
             idle_notify: Arc::new(RwLock::new(None)),
             // Fresh state; child must call `watch_parent_pid` after fork.
             supervisor_pid: AtomicI32::new(0),
+            claim_in_progress: AtomicBool::new(false),
+            // Preserve so re-forks (or apply_*_config re-using a forked ctx)
+            // keep the slot label until explicitly reset by apply_*_config.
+            proc_slot: self.proc_slot,
+            // Fresh per-process tracking: the child runs its own worker /
+            // dispatch channel, so in-flight ids must not be shared with the
+            // parent (whose claims belong to a different process record).
+            in_flight_executions: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            worker_memory_recycle_requested: AtomicBool::new(false),
+            worker_memory_recycle_started_at: Mutex::new(None),
+            worker_last_rss_bytes: AtomicU64::new(0),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),
@@ -970,16 +1218,41 @@ impl AppContext {
     }
 
     /// Set process title for better visibility in system tools (htop, ps, etc.)
-    /// Format: quebec-app_name [process_type:details]
+    /// Base format: `quebec-app_name [role:details] <cwd_basename>@<git_sha>`.
+    ///
+    /// `role` is `process_type` by default; when the context has
+    /// `proc_slot = Some((entry, within))` (set by `apply_worker_config` /
+    /// `apply_dispatcher_config` in supervisor children) it becomes
+    /// `process_type#<entry>/<within>` so sibling workers / dispatchers
+    /// can be told apart in `ps` — `#N` names the queue.yml entry, `/M`
+    /// the process index inside it.
+    ///
+    /// The suffix is computed by [`proctitle_suffix`] from the running
+    /// process's cwd (with symlinks resolved, so a Capistrano-style
+    /// `current` → `releases/<id>` deploy surfaces `<id>` instead of
+    /// `current`) and the cached `git rev-parse --short HEAD` output.
+    /// Either component is dropped when missing, so the suffix is omitted
+    /// entirely for plain checkouts without `.git` in a path with no last
+    /// component.
     /// Examples:
-    /// - quebec-myapp [worker:3]
-    /// - quebec-myapp [dispatcher]
-    /// - quebec-myapp [scheduler]
+    /// - quebec-myapp [worker:3] myapp@a1b2c3d              (standalone local)
+    /// - quebec-coms [worker:10] 20260523-1738-b5b146b@b5b146b  (Capistrano)
+    /// - quebec-coms [worker#0/1:5] release@sha             (supervised, slot 1)
+    /// - quebec-coms [dispatcher#1/0] release@sha           (supervised dispatcher)
+    /// - quebec-myapp [dispatcher] myapp                    (no git available)
     pub fn set_proc_title(&self, process_type: &str, details: Option<&str>) {
-        let title = if let Some(details) = details {
-            format!("quebec-{} [{}:{}]", self.name, process_type, details)
+        let role = match self.proc_slot {
+            Some((entry, within)) => format!("{process_type}#{entry}/{within}"),
+            None => process_type.to_string(),
+        };
+        let base = if let Some(details) = details {
+            format!("quebec-{} [{}:{}]", self.name, role, details)
         } else {
-            format!("quebec-{} [{}]", self.name, process_type)
+            format!("quebec-{} [{}]", self.name, role)
+        };
+        let title = match proctitle_suffix(&self.cwd, crate::process::process_revision()) {
+            Some(suffix) => format!("{base} {suffix}"),
+            None => base,
         };
 
         #[cfg(target_os = "macos")]

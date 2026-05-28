@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 
 use sea_orm::TransactionTrait;
 use sea_orm::*;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::Sender;
@@ -1048,6 +1049,25 @@ impl Metric {
     }
 }
 
+/// RAII flag set for the duration of a worker claim transaction so
+/// `should_drain_exit` (quiet_then_exit self-exit) cannot observe an empty idle
+/// snapshot while a batch that passed the quiet gate is still being claimed and
+/// dispatched. Set on construction, cleared on drop.
+struct ClaimInProgressGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> ClaimInProgressGuard<'a> {
+    fn new(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self(flag)
+    }
+}
+
+impl Drop for ClaimInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[pyclass(name = "Execution", subclass)]
 #[derive(Debug)]
 pub struct Execution {
@@ -1066,6 +1086,21 @@ pub struct Execution {
     pub(crate) started_at: Option<chrono::NaiveDateTime>,
     /// Direct reference to idle notifier - avoids RwLock access in async context
     idle_notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl Drop for Execution {
+    fn drop(&mut self) {
+        // Backstop for the in-flight set: pick_job marks a job in-flight when it
+        // leaves the dispatch channel and the InFlightGuard in invoke() normally
+        // clears it. If a picked Execution is dropped without ever running
+        // perform() (e.g. it failed to enqueue to the Python work queue), clear
+        // the entry here so the shutdown drain is not left waiting on it.
+        self.ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.claimed.id);
+    }
 }
 
 impl Execution {
@@ -1116,6 +1151,17 @@ impl Execution {
     }
 
     async fn invoke(&mut self) -> Result<quebec_jobs::Model> {
+        // Mark this claimed_execution as in-flight for the whole perform()
+        // window. `release_all_claimed_executions` (graceful shutdown) skips
+        // ids still in this set so a job actively inside perform() is never
+        // handed back to a neighbour worker. The guard clears the id when this
+        // function returns (after `after_executed` has deleted the claimed
+        // row) or unwinds, so the entry never outlives the perform.
+        let _in_flight = crate::context::InFlightGuard::new(
+            self.ctx.in_flight_executions.clone(),
+            self.claimed.id,
+        );
+
         self.timer = Instant::now();
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
@@ -1801,6 +1847,24 @@ impl Worker {
 
     pub fn process_id_handle(&self) -> Arc<tokio::sync::Mutex<Option<i64>>> {
         self.process_id.clone()
+    }
+
+    /// Register a worker process record and store its id, mirroring the
+    /// `on_start` step of `run_main_loop`. Test-only hook so a regression test
+    /// can claim jobs under a known process id and then exercise
+    /// `release_all_claimed_executions` deterministically.
+    pub(crate) async fn register_process_for_test(&self) -> Result<i64> {
+        let db = self.ctx.get_db().await?;
+        let process = self.on_start(&db).await?;
+        *self.process_id.lock().await = Some(process.id);
+        Ok(process.id)
+    }
+
+    /// Test-only wrapper around the private `release_all_claimed_executions`
+    /// so the graceful-shutdown release path can be driven from pytest without
+    /// spinning up the full main loop and signalling SIGTERM.
+    pub(crate) async fn release_claimed_for_test(&self, process_id: i64) -> Result<usize> {
+        self.release_all_claimed_executions(process_id).await
     }
 
     fn register_handler(
@@ -2946,8 +3010,20 @@ impl Worker {
         Ok(total_deleted)
     }
 
-    /// Release all claimed executions for a process back to ready state.
-    /// Called during graceful shutdown for jobs claimed but not yet started.
+    /// Release claimed executions for a process back to ready state during
+    /// graceful shutdown. Releases jobs that have not started running — those
+    /// still sitting in the dispatch channel — so the dispatcher can re-claim
+    /// them immediately. Jobs that have been handed to the Python side (tracked
+    /// in `ctx.in_flight_executions`) are skipped: the shutdown drain waits for
+    /// that set to empty first, so in normal shutdown there are none left here.
+    /// Any that remain (the drain hit `shutdown_timeout`) are left in
+    /// `claimed_executions` rather than released, because releasing a job whose
+    /// perform thread is still running would let a neighbour run it a second
+    /// time; those leftovers are reclaimed by the supervisor's orphan sweep or a
+    /// restarting worker's `fail_orphaned_executions` (both match claims whose
+    /// process row no longer exists — `prune_dead_processes`, which only finds
+    /// stale-but-present rows, would miss them since this process deletes its
+    /// own row right after).
     /// Unlike fail_orphaned_executions, this does NOT mark jobs as failed.
     /// Matches Solid Queue's Process::Executor#after_destroy :release_all_claimed_executions.
     async fn release_all_claimed_executions(&self, process_id: i64) -> Result<usize> {
@@ -2960,6 +3036,21 @@ impl Worker {
             process_id,
         )
         .await?;
+
+        // Skip executions that are actively running inside perform(); releasing
+        // them would create a duplicate-execution race with a neighbour worker.
+        // Recover from poisoning rather than treating it as an empty set, which
+        // would let a running job be released back to ready (double-run).
+        let in_flight: std::collections::HashSet<i64> = self
+            .ctx
+            .in_flight_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let claimed: Vec<_> = claimed
+            .into_iter()
+            .filter(|execution| !in_flight.contains(&execution.id))
+            .collect();
 
         if claimed.is_empty() {
             return Ok(0);
@@ -3413,6 +3504,142 @@ impl Worker {
         }
     }
 
+    async fn check_worker_memory_recycle(
+        &self,
+        process: &crate::entities::quebec_processes::Model,
+        over_limit_count: &mut u64,
+        rss_unsupported_logged: &mut bool,
+        quiet_announced: &mut bool,
+    ) {
+        let Some(limit_bytes) = self.ctx.worker_max_rss_bytes else {
+            return;
+        };
+
+        let Some(rss_bytes) = crate::memory::current_rss_bytes() else {
+            if !*rss_unsupported_logged {
+                warn!(
+                    "worker_max_rss_mb is configured, but current RSS is unavailable \
+                     on this platform; worker memory recycle is disabled"
+                );
+                *rss_unsupported_logged = true;
+            }
+            return;
+        };
+
+        self.ctx.update_worker_rss(rss_bytes);
+        if rss_bytes <= limit_bytes {
+            *over_limit_count = 0;
+            return;
+        }
+
+        *over_limit_count = (*over_limit_count).saturating_add(1);
+        let confirmations = self.ctx.worker_memory_recycle_confirmations.max(1);
+        if *over_limit_count < confirmations {
+            debug!(
+                "Worker RSS {} MiB exceeds configured limit {} MiB ({}/{})",
+                rss_bytes / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+                *over_limit_count,
+                confirmations
+            );
+            return;
+        }
+
+        let newly_requested = self.ctx.request_worker_memory_recycle(rss_bytes);
+        if newly_requested {
+            warn!(
+                "Worker RSS {} MiB exceeded configured limit {} MiB for {} consecutive check(s); \
+                 entering quiet mode for planned recycle",
+                rss_bytes / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+                confirmations
+            );
+        }
+
+        if !self.ctx.quiet.is_cancelled() {
+            self.ctx.quiet.cancel();
+        }
+
+        *quiet_announced = true;
+        if let Ok(db) = self.ctx.get_db().await {
+            if let Err(e) = self.heartbeat(&db, process).await {
+                warn!("Failed to flush memory recycle heartbeat: {}", e);
+            }
+        }
+    }
+
+    pub(crate) async fn should_exit_for_worker_memory_recycle(&self, process_id: i64) -> bool {
+        if !self
+            .ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
+            || !self.ctx.quiet.is_cancelled()
+        {
+            return false;
+        }
+
+        if self
+            .ctx
+            .worker_memory_recycle_elapsed()
+            .is_some_and(|elapsed| elapsed >= self.ctx.worker_memory_graceful_timeout)
+        {
+            warn!(
+                "Worker memory recycle graceful timeout {:?} reached; exiting planned recycle",
+                self.ctx.worker_memory_graceful_timeout
+            );
+            return true;
+        }
+
+        self.ctx.worker_drained(process_id).await
+    }
+
+    async fn shutdown_worker_process(
+        &self,
+        process: &crate::entities::quebec_processes::Model,
+        drain_budget: std::time::Duration,
+    ) -> Result<()> {
+        // Call worker stop handlers before exiting.
+        Python::attach(|py| {
+            let handlers = self.stop_handlers.read().expect("Lock poisoned");
+            for handler in handlers.iter() {
+                match handler.bind(py).call0() {
+                    Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
+                    Err(e) => error!("Error calling worker stop handler in main loop: {:?}", e),
+                }
+            }
+        });
+
+        let drain_deadline = tokio::time::Instant::now() + drain_budget;
+        loop {
+            let in_flight_empty = self
+                .ctx
+                .in_flight_executions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if in_flight_empty {
+                break;
+            }
+            if drain_budget.is_zero() || tokio::time::Instant::now() >= drain_deadline {
+                warn!(
+                    "Shutdown drain timed out with jobs still inside perform(); \
+                     leaving them claimed to avoid a double-execution race"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if let Err(e) = self.release_all_claimed_executions(process.id).await {
+            warn!("Failed to release claimed executions on shutdown: {}", e);
+        }
+
+        let stop_db = self.ctx.get_db().await?;
+        self.on_stop(&stop_db, process).await?;
+
+        Ok(())
+    }
+
     pub async fn run_main_loop(&self) -> Result<()> {
         // Don't acquire long-term connections here, get them when needed
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
@@ -3430,6 +3657,17 @@ impl Worker {
             std::time::Duration::from_secs(3600) // dummy interval when disabled
         };
         let mut cleanup_interval = tokio::time::interval(cleanup_duration);
+        let memory_check_enabled = self.ctx.worker_max_rss_bytes.is_some();
+        let memory_check_duration = if memory_check_enabled {
+            self.ctx
+                .worker_memory_check_interval
+                .max(std::time::Duration::from_secs(1))
+        } else {
+            std::time::Duration::from_secs(3600)
+        };
+        let mut memory_check_interval = tokio::time::interval(memory_check_duration);
+        let mut memory_over_limit_count = 0u64;
+        let mut memory_unsupported_logged = false;
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
         // Only enabled when running as a supervisor-managed child so the old
         // single-process threaded mode is unaffected.
@@ -3507,6 +3745,22 @@ impl Worker {
                         }
                     }
                 }
+                _ = memory_check_interval.tick(), if memory_check_enabled => {
+                    if self.ctx.worker_memory_recycle_requested.load(Ordering::Relaxed) {
+                        if self.should_exit_for_worker_memory_recycle(process.id).await {
+                            info!("Worker memory recycle drained or timed out; exiting with planned recycle status");
+                            self.shutdown_worker_process(&process, std::time::Duration::ZERO).await?;
+                            std::process::exit(WORKER_MEMORY_RECYCLE_EXIT_CODE);
+                        }
+                    } else {
+                        self.check_worker_memory_recycle(
+                            &process,
+                            &mut memory_over_limit_count,
+                            &mut memory_unsupported_logged,
+                            &mut quiet_announced,
+                        ).await;
+                    }
+                }
                 // Periodic maintenance: prune dead processes and fail their claimed jobs
                 _ = maintenance_interval.tick() => {
                     if let Err(e) = self.prune_dead_processes(Some(process.id)).await {
@@ -3531,30 +3785,19 @@ impl Worker {
                 _ = quit.cancelled() => {
                     info!("Graceful shutdown, stop polling");
 
-                    // Call worker stop handlers before exiting
-                    Python::attach(|py| {
-                        let handlers = self.stop_handlers.read().expect("Lock poisoned");
-                        for handler in handlers.iter() {
-                            match handler.bind(py).call0() {
-                                Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
-                                Err(e) => error!("Error calling worker stop handler in main loop: {:?}", e)
-                            }
-                        }
-                    });
-
-                    // Release remaining claimed executions back to ready state BEFORE
-                    // deleting the process record, to avoid a race where another worker's
-                    // fail_orphaned_executions sees them as orphans and marks them failed.
-                    // Python side calls t.join() first, so actively-running jobs complete
-                    // normally via after_executed(). This handles jobs that were claimed
-                    // but not yet started (sitting in the mpsc channel).
-                    if let Err(e) = self.release_all_claimed_executions(process.id).await {
-                        warn!("Failed to release claimed executions on shutdown: {}", e);
-                    }
-
-                    // Clean up process record
-                    let stop_db = self.ctx.get_db().await?;
-                    self.on_stop(&stop_db, &process).await?;
+                    // Wait for jobs already handed to the Python side to finish
+                    // before releasing anything. pick_job stops feeding the
+                    // Python work queue once shutdown begins (it returns Err on
+                    // the cancellation token), so the ThreadedRunner drains the
+                    // buffered jobs and in_flight empties as each completes via
+                    // after_executed(), which removes its claimed row. Use a
+                    // fraction of shutdown_timeout so the outer graceful_shutdown
+                    // block_on still has budget to run the release and on_stop
+                    // below before its own timeout fires.
+                    self.shutdown_worker_process(
+                        &process,
+                        self.ctx.shutdown_timeout.mul_f64(0.8),
+                    ).await?;
 
                     return Ok(());
                 }
@@ -3608,6 +3851,12 @@ impl Worker {
         thread_id: &str,
         source: &str,
     ) {
+        // Mark a claim transaction in progress for the whole body (before the
+        // quiet gate, through dispatch) so quiet_then_exit's should_drain_exit
+        // cannot see an empty idle snapshot while a batch that passed the quiet
+        // gate is still being claimed/dispatched.
+        let _claim_guard = ClaimInProgressGuard::new(&ctx.claim_in_progress);
+
         // Sidekiq-style quiet mode: keep running but stop claiming new work
         // so in-flight jobs can drain. Used for seamless restarts.
         if ctx.quiet.is_cancelled() {
@@ -3801,11 +4050,48 @@ impl Worker {
     pub async fn pick_job(&self) -> Result<Execution> {
         let rx = self.dispatch_receiver.clone();
         let mut receiver = rx.lock().await;
-        let execution = receiver.recv().await;
-        if execution.is_none() {
-            return Err(QuebecError::runtime("No job found"));
-        }
+        // Stop handing channel jobs to the Python side once graceful shutdown
+        // begins. The shutdown release path runs concurrently; if we kept
+        // picking here we could mark a job in-flight and enqueue it to Python
+        // *after* release has snapshotted it as releasable, double-running it.
+        // Cancelling the recv leaves the job in the channel so the release
+        // returns it to ready (it never started). `biased` checks shutdown
+        // first so a job is never pulled after cancellation.
+        let execution = tokio::select! {
+            biased;
+            _ = self.ctx.graceful_shutdown.cancelled() => {
+                return Err(QuebecError::runtime("shutting down"));
+            }
+            execution = receiver.recv() => execution,
+        };
         let execution = execution.ok_or_else(|| QuebecError::runtime("No job found"))?;
+        // Mark in-flight the moment a job leaves the dispatch channel for the
+        // Python side, holding the same lock the shutdown release takes its
+        // snapshot under and re-checking the shutdown token while held. The
+        // `select!` above only blocks pulls observed *before* recv() returns;
+        // shutdown can still begin between recv() and this insert, and a
+        // concurrent release could snapshot in_flight without this id. The
+        // recheck under the lock closes that window: if shutdown has begun we
+        // bail out, leaving the job's claimed row in the DB and out of
+        // in_flight so the release returns it to ready instead of us handing it
+        // to Python and double-running it. Outside shutdown this is a single
+        // insert. The InFlightGuard in Execution::invoke re-inserts (idempotent)
+        // and removes the id on completion; Execution's Drop clears it too, so a
+        // picked job that never reaches perform() cannot leak its entry.
+        {
+            // Recover from poisoning rather than failing open: returning Ok here
+            // would bypass the shutdown recheck and hand a possibly-released job
+            // to Python. The set stays consistent across a panic.
+            let mut set = self
+                .ctx
+                .in_flight_executions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.ctx.graceful_shutdown.is_cancelled() {
+                return Err(QuebecError::runtime("shutting down"));
+            }
+            set.insert(execution.claimed.id);
+        }
         Ok(execution)
     }
 
@@ -3836,6 +4122,14 @@ impl ProcessTrait for Worker {
     }
 
     fn runtime_metadata(&self) -> Option<String> {
-        crate::process::build_runtime_metadata(self.ctx.quiet.is_cancelled())
+        let rss_bytes = self.ctx.worker_last_rss_bytes.load(Ordering::Relaxed);
+        crate::process::build_runtime_metadata_with_memory(
+            self.ctx.quiet.is_cancelled(),
+            self.ctx
+                .worker_memory_recycle_requested
+                .load(Ordering::Relaxed)
+                .then_some("rss_limit"),
+            (rss_bytes > 0).then_some(rss_bytes),
+        )
     }
 }

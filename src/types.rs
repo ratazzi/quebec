@@ -89,17 +89,27 @@ use crate::worker::{Execution, Worker};
 use tracing::{debug, error, info, trace, warn};
 
 /// Map a supervisor slot index (0..total_processes) to the config entry that
-/// should drive that slot's configuration. Entries with `processes == 0` are
-/// skipped entirely to match the counting done in `supervisor_plan_from_config`.
-fn slot_to_entry<T>(slot: usize, entries: &[T], processes: impl Fn(&T) -> u32) -> Option<&T> {
+/// should drive that slot's configuration. Entries with `processes == 0`
+/// contribute zero slots (matching `supervisor_plan_from_config`).
+///
+/// Returns `(entry_index, within_entry, &entry)` where `entry_index` is the
+/// raw position of the entry in the input slice (including any
+/// `processes == 0` siblings that were skipped while counting), so it
+/// lines up 1:1 with the order users see in their `queue.yml`. `within_entry`
+/// is 0-based among that entry's siblings.
+fn slot_to_entry<T>(
+    slot: usize,
+    entries: &[T],
+    processes: impl Fn(&T) -> u32,
+) -> Option<(usize, usize, &T)> {
     let mut acc = 0usize;
-    for entry in entries {
+    for (entry_idx, entry) in entries.iter().enumerate() {
         let n = processes(entry) as usize;
         if n == 0 {
             continue;
         }
         if slot < acc + n {
-            return Some(entry);
+            return Some((entry_idx, slot - acc, entry));
         }
         acc += n;
     }
@@ -975,6 +985,44 @@ impl PyQuebec {
         Ok(())
     }
 
+    /// Register a worker process record and store its id on the worker, the
+    /// same `on_start` step the real main loop performs. Returns the process
+    /// id. Test-only: lets a regression test claim jobs under a known process
+    /// id and then drive `release_claimed_for_shutdown` deterministically.
+    fn register_worker_process(&self, py: Python<'_>) -> PyResult<i64> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker.register_process_for_test().await.map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "register_worker_process failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Run the graceful-shutdown release path (`release_all_claimed_executions`)
+    /// for the given process id and return how many claimed jobs were released
+    /// back to ready. Test-only hook: exercises the shutdown release without
+    /// the full main loop / SIGTERM dance so a regression test can assert that
+    /// a job currently inside perform() is NOT released.
+    fn release_claimed_for_shutdown(&self, py: Python<'_>, process_id: i64) -> PyResult<usize> {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                worker
+                    .release_claimed_for_test(process_id)
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "release_claimed_for_shutdown failed: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
     fn bind_queue(&self, _py: Python<'_>, queue: Py<PyAny>) -> PyResult<()> {
         let worker = self.worker.clone();
         let queue = queue.clone();
@@ -986,16 +1034,18 @@ impl PyQuebec {
         // Use tokio::spawn to start async task
         self.rt.spawn(async move {
             loop {
-                let result = worker.pick_job().await;
+                // pick_job returns Err when the dispatch channel is closed or
+                // graceful shutdown has begun. In both cases the pump stops so
+                // it cannot hand a job to Python concurrently with the shutdown
+                // release path (which would race a double-run).
+                let res = match worker.pick_job().await {
+                    Ok(res) => res,
+                    Err(_) => break,
+                };
 
                 // Get GIL and send result to Python queue
                 Python::attach(|py| {
                     let queue = queue.bind(py);
-
-                    let Ok(res) = result else {
-                        debug!("No job available");
-                        return;
-                    };
 
                     // Determine which method to use based on queue type
                     let method_name = if queue.hasattr("put_nowait").unwrap_or(false) {
@@ -1119,6 +1169,70 @@ impl PyQuebec {
     #[getter]
     fn worker_threads(&self) -> u64 {
         self.ctx.worker_threads
+    }
+
+    /// Whether the process should now exit because a quiet signal was received
+    /// with `quiet_then_exit` enabled and this worker has fully drained: no jobs
+    /// in flight (being performed) and none claimed-but-not-yet-running. The
+    /// Python wait loop polls this to trigger graceful_shutdown once the worker
+    /// is idle, with no time limit (Sidekiq Enterprise USR2 rolling-restart
+    /// semantics). Quiet has already stopped new claims, so an empty result is
+    /// terminal — no new work can arrive to make it non-empty again.
+    fn should_drain_exit(&self, py: Python<'_>) -> bool {
+        if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
+            return false;
+        }
+        // Standalone-only: under the fork supervisor a self-exited worker child
+        // would just be reforked, so quiet_then_exit is a no-op there. Supervised
+        // deployments should use a supervisor-level rolling restart instead.
+        if self.ctx.supervisor_pid.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        let worker = self.worker.clone();
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let process_id = match *worker.process_id_handle().lock().await {
+                    Some(id) => id,
+                    None => return false,
+                };
+                ctx.worker_drained(process_id).await
+            })
+        })
+    }
+
+    /// Test-only: directly set the claim-in-progress flag so a regression test
+    /// can verify should_drain_exit refuses to exit while a claim transaction
+    /// is still publishing work.
+    fn _set_claim_in_progress(&self, value: bool) {
+        self.ctx.claim_in_progress.store(value, Ordering::SeqCst);
+    }
+
+    fn _request_worker_memory_recycle(&self, rss_bytes: u64) {
+        self.ctx.request_worker_memory_recycle(rss_bytes);
+        self.ctx.quiet.cancel();
+    }
+
+    fn _should_worker_memory_recycle_exit(&self, py: Python<'_>) -> bool {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let process_id = match *worker.process_id_handle().lock().await {
+                    Some(id) => id,
+                    None => return false,
+                };
+                worker
+                    .should_exit_for_worker_memory_recycle(process_id)
+                    .await
+            })
+        })
+    }
+
+    #[getter]
+    fn is_worker_memory_recycling(&self) -> bool {
+        self.ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
     }
 
     fn ping(&self) -> PyResult<bool> {
@@ -1457,6 +1571,14 @@ impl PyQuebec {
         py.detach(|| Ok(self.rt.block_on(async move { *handle.lock().await })))
     }
 
+    /// Debug accessor — returns the current `(entry_index, within_entry)`
+    /// proctitle slot if set by a prior `apply_worker_config` /
+    /// `apply_dispatcher_config`, otherwise `None`.
+    #[pyo3(name = "_proc_slot")]
+    fn proc_slot(&self) -> Option<(usize, usize)> {
+        self.ctx.proc_slot
+    }
+
     /// Read `workers`/`dispatchers` from the loaded queue.yml and return a plan
     /// dict suitable for `Supervisor(plan=...)`, or `None` if the config file
     /// is absent or specifies fewer than 2 total child processes.
@@ -1507,25 +1629,39 @@ impl PyQuebec {
     /// No-op if no config file is loaded or the `workers` section is missing.
     fn apply_worker_config(&mut self, py: Python<'_>, slot_index: usize) -> PyResult<()> {
         let env = std::env::var("QUEBEC_ENV").ok();
-        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
-            return Ok(());
-        };
-        let Some(workers) = config.workers else {
-            return Ok(());
-        };
-        let Some(worker_cfg) = slot_to_entry(slot_index, &workers, |w| w.processes.unwrap_or(1))
-        else {
-            let total: u32 = workers.iter().map(|w| w.processes.unwrap_or(1)).sum();
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "apply_worker_config: slot {} out of range (have {} total worker processes across {} entries)",
-                slot_index, total, workers.len()
-            )));
+        let workers_opt = crate::config::QueueConfig::find(env.as_deref())
+            .ok()
+            .and_then(|c| c.workers);
+
+        // Determine (entry_idx, within_entry, optional config override).
+        // Falling back to (0, slot_index) when no queue.yml / no workers
+        // section means supervised processes still get distinguishable
+        // proctitles (`worker#0/0`, `worker#0/1`, ...) — without this the
+        // documented "embedded services without a yml" path leaves
+        // `proc_slot = None` for every child and they all share
+        // `[worker:threads]`.
+        let (entry_idx, within_entry, worker_cfg) = match workers_opt.as_ref() {
+            Some(workers) => match slot_to_entry(slot_index, workers, |w| w.processes.unwrap_or(1))
+            {
+                Some((e, w, cfg)) => (e, w, Some(cfg)),
+                None => {
+                    let total: u32 = workers.iter().map(|w| w.processes.unwrap_or(1)).sum();
+                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                        "apply_worker_config: slot {} out of range (have {} total worker processes across {} entries)",
+                        slot_index, total, workers.len()
+                    )));
+                }
+            },
+            None => (0usize, slot_index, None),
         };
 
         let mut new_inner = self
             .ctx
             .fork_clone(self.ctx.db.clone(), self.rt.handle().clone());
-        apply_worker_cfg_to(&mut new_inner, worker_cfg)?;
+        if let Some(cfg) = worker_cfg {
+            apply_worker_cfg_to(&mut new_inner, cfg)?;
+        }
+        new_inner.proc_slot = Some((entry_idx, within_entry));
         let new_ctx = Arc::new(new_inner);
         self.rebuild_wrappers_with_ctx(py, new_ctx);
         Ok(())
@@ -1535,26 +1671,33 @@ impl PyQuebec {
     /// apply_worker_config.
     fn apply_dispatcher_config(&mut self, py: Python<'_>, slot_index: usize) -> PyResult<()> {
         let env = std::env::var("QUEBEC_ENV").ok();
-        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
-            return Ok(());
-        };
-        let Some(dispatchers) = config.dispatchers else {
-            return Ok(());
-        };
-        let Some(dispatcher_cfg) =
-            slot_to_entry(slot_index, &dispatchers, |d| d.processes.unwrap_or(1))
-        else {
-            let total: u32 = dispatchers.iter().map(|d| d.processes.unwrap_or(1)).sum();
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "apply_dispatcher_config: slot {} out of range (have {} total dispatcher processes across {} entries)",
-                slot_index, total, dispatchers.len()
-            )));
+        let dispatchers_opt = crate::config::QueueConfig::find(env.as_deref())
+            .ok()
+            .and_then(|c| c.dispatchers);
+
+        let (entry_idx, within_entry, dispatcher_cfg) = match dispatchers_opt.as_ref() {
+            Some(dispatchers) => {
+                match slot_to_entry(slot_index, dispatchers, |d| d.processes.unwrap_or(1)) {
+                    Some((e, w, cfg)) => (e, w, Some(cfg)),
+                    None => {
+                        let total: u32 = dispatchers.iter().map(|d| d.processes.unwrap_or(1)).sum();
+                        return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                            "apply_dispatcher_config: slot {} out of range (have {} total dispatcher processes across {} entries)",
+                            slot_index, total, dispatchers.len()
+                        )));
+                    }
+                }
+            }
+            None => (0usize, slot_index, None),
         };
 
         let mut new_inner = self
             .ctx
             .fork_clone(self.ctx.db.clone(), self.rt.handle().clone());
-        apply_dispatcher_cfg_to(&mut new_inner, dispatcher_cfg)?;
+        if let Some(cfg) = dispatcher_cfg {
+            apply_dispatcher_cfg_to(&mut new_inner, cfg)?;
+        }
+        new_inner.proc_slot = Some((entry_idx, within_entry));
         let new_ctx = Arc::new(new_inner);
         self.rebuild_wrappers_with_ctx(py, new_ctx);
         Ok(())

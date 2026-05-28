@@ -23,12 +23,28 @@ pub mod utils;
 
 pub use ext::ControlPlaneExt;
 
+/// Identifies which cached filter-option set to fetch.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FilterKind {
+    Queues,
+    Classes,
+}
+
 pub struct ControlPlane {
     pub(crate) ctx: Arc<AppContext>,
     pub(crate) tera: RwLock<Tera>,
     pub(crate) page_size: u64,
     pub(crate) base_path: String,
     pub(crate) sse_interval: Duration,
+    /// Cache for the queue-name / class-name DISTINCT lookups behind the filter
+    /// dropdowns and the /stats queue list. These sets change only when a new
+    /// queue or job class first appears, so a short TTL avoids repeated
+    /// full-table DISTINCT scans on solid_queue_jobs.
+    pub(crate) filter_options_cache: moka::future::Cache<FilterKind, Arc<Vec<String>>>,
+    /// Cache for the finished-job COUNT behind the nav "Finished jobs" badge.
+    /// The count only grows and is a coarse overview number, so a short TTL
+    /// avoids re-running the index-only scan on every render / SSE tick.
+    pub(crate) finished_count_cache: moka::future::Cache<(), i64>,
 }
 
 impl ControlPlane {
@@ -62,6 +78,12 @@ impl ControlPlane {
             page_size: 10,
             base_path: String::new(),
             sse_interval,
+            filter_options_cache: moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+            finished_count_cache: moka::future::Cache::builder()
+                .time_to_live(Duration::from_secs(60))
+                .build(),
         }
     }
 

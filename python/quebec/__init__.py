@@ -475,6 +475,14 @@ def _quebec_wait(self):
                 state["shutdown_event"].set()
                 self.graceful_shutdown()
                 break
+            # quiet_then_exit: once a quiet signal has drained all in-flight and
+            # claimed jobs, exit on our own (no timeout) instead of waiting for a
+            # later SIGTERM. Mirrors Sidekiq Enterprise's USR2 rolling restart.
+            if self.should_drain_exit():
+                logger.info("quiet_then_exit: worker drained, shutting down")
+                state["shutdown_event"].set()
+                self.graceful_shutdown()
+                break
             time.sleep(0.5)
     except KeyboardInterrupt:
         logger.debug("KeyboardInterrupt, shutting down...")

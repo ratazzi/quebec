@@ -3,10 +3,6 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
 };
-use sea_orm::sea_query::{
-    Alias, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
-};
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -165,7 +161,10 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
 
-        let queue_names = match state.get_queue_names().await {
+        // Pause-all is a mutating action that must see the current queue set,
+        // so bypass the stale-tolerant cached helper and query jobs directly —
+        // otherwise a queue created within the cache TTL would be missed.
+        let queue_names = match query_builder::jobs::get_queue_names(db, table_config).await {
             Ok(names) => names,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
@@ -229,14 +228,18 @@ impl ControlPlane {
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get total job count for this queue using query_builder
+        // Count and fetch ready executions for this queue. This matches the
+        // /queues list size (and Mission Control's Queue#size + Queue#jobs):
+        // only ready/pending jobs belong to a queue's listing. Blocked /
+        // scheduled / claimed / failed jobs are surfaced through their own
+        // top-nav tabs to avoid the "list shows 0 but detail shows blocked"
+        // double-counting confusion.
         let total_jobs =
-            query_builder::jobs::count_by_queue_unfinished(db, table_config, &queue_name)
+            query_builder::ready_executions::count_by_queue_name(db, table_config, &queue_name)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get jobs for this queue with pagination using query_builder
-        let jobs = query_builder::jobs::find_by_queue_unfinished_paginated(
+        let ready_rows = query_builder::ready_executions::find_by_queue_paginated(
             db,
             table_config,
             &queue_name,
@@ -246,156 +249,22 @@ impl ControlPlane {
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-        // Get execution status for each job
-        let job_ids: Vec<i64> = jobs.iter().map(|j| j.id).collect();
-
-        // Check for failed executions
-        let failed_table = Alias::new(&state.ctx.table_config.failed_executions);
-
-        let failed_query = SeaQuery::select()
-            .column(Alias::new("job_id"))
-            .from(failed_table)
-            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
-            .to_owned();
-
-        let (failed_sql, failed_values) = match db.get_database_backend() {
-            DbBackend::Postgres => failed_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => failed_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => failed_query.build(MysqlQueryBuilder),
-        };
-
-        let failed_executions_stmt =
-            Statement::from_sql_and_values(db.get_database_backend(), &failed_sql, failed_values);
-
-        let failed_job_ids: Vec<i64> = db
-            .query_all(failed_executions_stmt)
+        let job_ids: Vec<i64> = ready_rows.iter().map(|r| r.job_id).collect();
+        let jobs = query_builder::jobs::find_by_ids(db, table_config, job_ids)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let jobs_by_id: HashMap<i64, _> = jobs.into_iter().map(|j| (j.id, j)).collect();
+
+        let queue_jobs: Vec<crate::control_plane::models::QueueJobInfo> = ready_rows
             .iter()
-            .map(|row| row.try_get::<i64>("", "job_id").unwrap_or(0))
-            .collect();
-
-        // Check for claimed executions (in progress)
-        let claimed_table = Alias::new(&state.ctx.table_config.claimed_executions);
-
-        let claimed_query = SeaQuery::select()
-            .columns([Alias::new("id"), Alias::new("job_id")])
-            .from(claimed_table)
-            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
-            .to_owned();
-
-        let (claimed_sql, claimed_values) = match db.get_database_backend() {
-            DbBackend::Postgres => claimed_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => claimed_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => claimed_query.build(MysqlQueryBuilder),
-        };
-
-        let claimed_executions_stmt =
-            Statement::from_sql_and_values(db.get_database_backend(), &claimed_sql, claimed_values);
-
-        let claimed_map: HashMap<i64, i64> = db
-            .query_all(claimed_executions_stmt)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .iter()
-            .map(|row| {
-                let job_id: i64 = row.try_get("", "job_id").unwrap_or(0);
-                let execution_id: i64 = row.try_get("", "id").unwrap_or(0);
-                (job_id, execution_id)
-            })
-            .collect();
-
-        // Check for scheduled executions
-        let scheduled_table = Alias::new(&state.ctx.table_config.scheduled_executions);
-
-        let scheduled_query = SeaQuery::select()
-            .columns([Alias::new("id"), Alias::new("job_id")])
-            .from(scheduled_table)
-            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids.clone()))
-            .to_owned();
-
-        let (scheduled_sql, scheduled_values) = match db.get_database_backend() {
-            DbBackend::Postgres => scheduled_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => scheduled_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => scheduled_query.build(MysqlQueryBuilder),
-        };
-
-        let scheduled_executions_stmt = Statement::from_sql_and_values(
-            db.get_database_backend(),
-            &scheduled_sql,
-            scheduled_values,
-        );
-
-        let scheduled_map: HashMap<i64, i64> = db
-            .query_all(scheduled_executions_stmt)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .iter()
-            .map(|row| {
-                let job_id: i64 = row.try_get("", "job_id").unwrap_or(0);
-                let execution_id: i64 = row.try_get("", "id").unwrap_or(0);
-                (job_id, execution_id)
-            })
-            .collect();
-
-        // Check for blocked executions
-        let blocked_table = Alias::new(&state.ctx.table_config.blocked_executions);
-
-        let blocked_query = SeaQuery::select()
-            .columns([Alias::new("id"), Alias::new("job_id")])
-            .from(blocked_table)
-            .and_where(Expr::col(Alias::new("job_id")).is_in(job_ids))
-            .to_owned();
-
-        let (blocked_sql, blocked_values) = match db.get_database_backend() {
-            DbBackend::Postgres => blocked_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => blocked_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => blocked_query.build(MysqlQueryBuilder),
-        };
-
-        let blocked_executions_stmt =
-            Statement::from_sql_and_values(db.get_database_backend(), &blocked_sql, blocked_values);
-
-        let blocked_map: HashMap<i64, i64> = db
-            .query_all(blocked_executions_stmt)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .iter()
-            .map(|row| {
-                let job_id: i64 = row.try_get("", "job_id").unwrap_or(0);
-                let execution_id: i64 = row.try_get("", "id").unwrap_or(0);
-                (job_id, execution_id)
-            })
-            .collect();
-
-        let queue_jobs: Vec<crate::control_plane::models::QueueJobInfo> = jobs
-            .into_iter()
-            .map(|job| {
-                let status = if failed_job_ids.contains(&job.id) {
-                    "failed"
-                } else if claimed_map.contains_key(&job.id) {
-                    "in_progress"
-                } else if scheduled_map.contains_key(&job.id) {
-                    "scheduled"
-                } else if blocked_map.contains_key(&job.id) {
-                    "blocked"
-                } else {
-                    "ready"
-                };
-
-                let execution_id = claimed_map
-                    .get(&job.id)
-                    .or_else(|| scheduled_map.get(&job.id))
-                    .or_else(|| blocked_map.get(&job.id))
-                    .copied();
-
-                crate::control_plane::models::QueueJobInfo {
-                    id: job.id,
-                    class_name: job.class_name.clone(),
-                    status: status.to_string(),
-                    created_at: Self::format_naive_datetime(job.created_at),
-                    execution_id,
-                }
+            .filter_map(|ready| {
+                jobs_by_id.get(&ready.job_id).map(|job| {
+                    crate::control_plane::models::QueueJobInfo {
+                        id: job.id,
+                        class_name: job.class_name.clone(),
+                        created_at: Self::format_naive_datetime(job.created_at),
+                    }
+                })
             })
             .collect();
 

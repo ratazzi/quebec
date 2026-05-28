@@ -24,6 +24,7 @@ ROLE_WORKER = "worker"
 ROLE_DISPATCHER = "dispatcher"
 ROLE_SCHEDULER = "scheduler"
 VALID_ROLES = {ROLE_WORKER, ROLE_DISPATCHER, ROLE_SCHEDULER}
+RECYCLE_EXIT_CODE = 75
 
 Plan = Dict[str, Union[int, List]]
 
@@ -35,12 +36,47 @@ class _ChildInfo:
     pid: int
 
 
+@dataclass(frozen=True)
+class _ExitStatus:
+    exited: bool
+    exit_code: Optional[int]
+    signaled: bool
+    signal: Optional[int]
+
+
 @dataclass
 class _SlotState:
     """Restart history for a (role, index) slot."""
 
     spawn_times: List[float] = field(default_factory=list)
+    crash_times: List[float] = field(default_factory=list)
     disabled: bool = False
+
+
+def _decode_status(status: int) -> _ExitStatus:
+    if os.WIFEXITED(status):
+        return _ExitStatus(
+            exited=True,
+            exit_code=os.WEXITSTATUS(status),
+            signaled=False,
+            signal=None,
+        )
+    if os.WIFSIGNALED(status):
+        return _ExitStatus(
+            exited=False,
+            exit_code=None,
+            signaled=True,
+            signal=os.WTERMSIG(status),
+        )
+    return _ExitStatus(exited=False, exit_code=None, signaled=False, signal=None)
+
+
+def _status_description(status: _ExitStatus) -> str:
+    if status.exited:
+        return f"exit_code={status.exit_code}"
+    if status.signaled:
+        return f"signal={status.signal}"
+    return "status=unknown"
 
 
 class Supervisor:
@@ -332,20 +368,22 @@ class Supervisor:
 
     def _supervise(self) -> None:
         while not self._stopping:
-            pid = self._reap_one(block=False)
+            pid, status = self._reap_one(block=False)
             if pid == 0:
                 self._interruptible_sleep(1.0)
                 continue
-            self._handle_exit(pid)
+            self._handle_exit(pid, status)
 
-    def _reap_one(self, *, block: bool) -> int:
-        """Return a reaped child pid, or 0 if none (when non-blocking)."""
+    def _reap_one(self, *, block: bool) -> Tuple[int, Optional[_ExitStatus]]:
+        """Return a reaped child pid/status, or ``(0, None)`` if none."""
         flags = 0 if block else os.WNOHANG
         try:
-            pid, _status = os.waitpid(-1, flags)
-            return pid
+            pid, status = os.waitpid(-1, flags)
+            if pid == 0:
+                return 0, None
+            return pid, _decode_status(status)
         except ChildProcessError:
-            return 0
+            return 0, None
 
     def _fail_claimed_for_pid(self, pid: int, info: Optional[_ChildInfo]) -> None:
         """Best-effort: mark any claimed jobs owned by a dead child as failed.
@@ -381,31 +419,59 @@ class Supervisor:
             else:
                 logger.exception("Failed to mark claimed jobs for pid=%d", pid)
 
-    def _handle_exit(self, pid: int) -> None:
+    def _handle_exit(self, pid: int, status: Optional[_ExitStatus]) -> None:
+        status = status or _ExitStatus(
+            exited=False, exit_code=None, signaled=False, signal=None
+        )
         info = self._children.pop(pid, None)
         if info is None:
             logger.warning("Reaped unknown pid=%d", pid)
             return
-        logger.warning(
-            "Child %s[%d] (pid=%d) exited unexpectedly", info.role, info.index, pid
+
+        planned_recycle = (
+            info.role == ROLE_WORKER
+            and status.exited
+            and status.exit_code == RECYCLE_EXIT_CODE
         )
+        if planned_recycle:
+            if self._stopping:
+                return
+            logger.info(
+                "Child %s[%d] (pid=%d) exited for planned memory recycle; reforking",
+                info.role,
+                info.index,
+                pid,
+            )
+            self._fork_child(info.role, info.index)
+            return
 
         self._fail_claimed_for_pid(pid, info)
 
         if self._stopping:
             return
 
+        logger.warning(
+            "Child %s[%d] (pid=%d) exited unexpectedly (%s)",
+            info.role,
+            info.index,
+            pid,
+            _status_description(status),
+        )
+
         slot = self._slots.get((info.role, info.index))
         if slot is not None:
             now = time.monotonic()
-            recent = [t for t in slot.spawn_times if now - t <= self.crash_loop_window]
-            if len(recent) >= self.crash_loop_max:
+            slot.crash_times = [
+                t for t in slot.crash_times if now - t <= self.crash_loop_window
+            ]
+            slot.crash_times.append(now)
+            if len(slot.crash_times) >= self.crash_loop_max:
                 slot.disabled = True
                 logger.error(
                     "Slot (%s, %d) crashed %d times in %.0fs; disabling auto-restart",
                     info.role,
                     info.index,
-                    len(recent),
+                    len(slot.crash_times),
                     self.crash_loop_window,
                 )
                 return
@@ -458,7 +524,7 @@ class Supervisor:
                 pass
 
         while self._children:
-            pid = self._reap_one(block=True)
+            pid, _status = self._reap_one(block=True)
             if pid == 0:
                 break
             info = self._children.pop(pid, None)
@@ -474,7 +540,7 @@ class Supervisor:
 
     def _reap_until(self, *, deadline: float) -> None:
         while self._children and time.monotonic() < deadline:
-            pid = self._reap_one(block=False)
+            pid, _status = self._reap_one(block=False)
             if pid == 0:
                 time.sleep(0.1)
                 continue

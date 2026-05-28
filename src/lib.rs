@@ -8,6 +8,7 @@ pub mod database_url;
 mod dispatcher;
 pub mod entities;
 mod error;
+mod memory;
 mod notify;
 mod process;
 #[cfg(target_os = "macos")]
