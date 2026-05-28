@@ -72,6 +72,17 @@ pub struct HookFlags {
     pub after_discard: bool,
 }
 
+/// Outcome of `Worker::try_consume_rate_for_candidate`.
+#[derive(Debug, Clone, Copy)]
+enum RateGateResult {
+    /// The candidate may proceed to claim.
+    Granted,
+    /// The candidate has been removed from `ready_executions` and routed
+    /// (rescheduled or marked finished). The caller must skip to the next
+    /// candidate.
+    Routed,
+}
+
 #[pyclass(name = "Runnable", subclass)]
 #[derive(Debug)]
 pub struct Runnable {
@@ -87,6 +98,12 @@ pub struct Runnable {
     /// Continuation info for interrupted jobs (step name, cursor, original args)
     pub(crate) continuation_info: Option<ContinuationInfo>,
     pub hooks: HookFlags,
+    /// Experimental sliding-window rate limit. `rate_limit_max.is_some()` is
+    /// the discriminator — when None, the claim path's `rate_limit_enabled`
+    /// gate short-circuits without ever calling into this struct.
+    pub rate_limit_max: Option<i32>,
+    pub rate_limit_window_seconds: Option<i32>,
+    pub rate_limit_on_throttle: crate::context::RateLimitConflict,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +133,9 @@ impl Runnable {
             concurrency_on_conflict: ConcurrencyConflict::default(),
             continuation_info: None,
             hooks: HookFlags::default(),
+            rate_limit_max: None,
+            rate_limit_window_seconds: None,
+            rate_limit_on_throttle: crate::context::RateLimitConflict::default(),
         }
     }
 
@@ -133,6 +153,9 @@ impl Runnable {
             concurrency_on_conflict: self.concurrency_on_conflict,
             continuation_info: self.continuation_info.clone(),
             hooks: self.hooks.clone(),
+            rate_limit_max: self.rate_limit_max,
+            rate_limit_window_seconds: self.rate_limit_window_seconds,
+            rate_limit_on_throttle: self.rate_limit_on_throttle,
         }
     }
 
@@ -253,6 +276,98 @@ impl Runnable {
             }))
         })
         .map_err(|e: PyErr| QuebecError::Python(format!("get_concurrency_constraint: {e}")))
+    }
+
+    /// Call the Python instance's `rate_limit_key(*args, **kwargs)` method.
+    /// `arguments_json` is the raw `jobs.arguments` column (a Solid-Queue-style
+    /// envelope `{ "arguments": [...], ... }`). Falls back to the class name
+    /// if the method is missing for any reason — defensive only, since
+    /// `BaseClass` always provides a default.
+    pub fn compute_rate_limit_key(&self, arguments_json: &str) -> Result<String> {
+        Python::attach(|py| -> PyResult<String> {
+            let bound = self.handler.bind(py);
+            let instance = bound.call0()?;
+
+            if !instance.hasattr("rate_limit_key")? {
+                return Ok(self.class_name.clone());
+            }
+            let attr = instance.getattr("rate_limit_key")?;
+            if !attr.is_callable() {
+                return Ok(self.class_name.clone());
+            }
+
+            // Decode the args envelope. Tolerate any shape — bad JSON or
+            // missing "arguments" just means call with empty args.
+            //
+            // Solid Queue / Quebec wraps the args dict more than once
+            // depending on the enqueue path (perform_later vs scheduler);
+            // mirror Execution::parse_job_arguments_from_json (worker.rs:634)
+            // and walk nested `arguments` keys until we reach the Array.
+            let mut v = serde_json::from_str::<serde_json::Value>(arguments_json)
+                .unwrap_or(serde_json::Value::Null);
+            while let serde_json::Value::Object(ref o) = v {
+                match o.get("arguments") {
+                    Some(serde_json::Value::Array(_)) => {
+                        v = o["arguments"].clone();
+                        break;
+                    }
+                    Some(serde_json::Value::Object(_)) => v = o["arguments"].clone(),
+                    _ => break,
+                }
+            }
+            let args_array = match v {
+                serde_json::Value::Array(arr) => arr,
+                _ => Vec::new(),
+            };
+
+            // Split off `_quebec_kwargs` marker dict at tail (mirrors
+            // parse_job_arguments_from_json on the Execution side).
+            let (positional, kwargs_map): (Vec<serde_json::Value>, Option<serde_json::Map<_, _>>) =
+                match args_array.last() {
+                    Some(serde_json::Value::Object(obj)) if obj.contains_key("_quebec_kwargs") => {
+                        let mut p = args_array.clone();
+                        p.pop();
+                        let mut kw = obj.clone();
+                        kw.remove("_quebec_kwargs");
+                        kw.remove("_aj_symbol_keys");
+                        (p, Some(kw))
+                    }
+                    _ => (args_array, None),
+                };
+
+            let py_list = pyo3::types::PyList::empty(py);
+            for v in &positional {
+                py_list.append(json_to_py(py, v)?)?;
+            }
+            let py_args = pyo3::types::PyTuple::new(py, py_list.iter())?;
+
+            let py_kwargs = pyo3::types::PyDict::new(py);
+            if let Some(kw) = kwargs_map {
+                for (k, v) in kw {
+                    py_kwargs.set_item(k, json_to_py(py, &v)?)?;
+                }
+            }
+
+            // Fall back to class name on any user-side failure (raise,
+            // non-str, None). Surfacing PyErr would bounce the claim_job tx
+            // and leave the candidate spinning in ready until the user fixes
+            // their code.
+            match attr
+                .call(py_args, Some(&py_kwargs))
+                .and_then(|r| r.extract::<String>())
+            {
+                Ok(s) if !s.is_empty() => Ok(s),
+                Ok(_) => Ok(self.class_name.clone()),
+                Err(e) => {
+                    warn!(
+                        class = self.class_name,
+                        "rate_limit_key failed ({e}); using class name as bucket"
+                    );
+                    Ok(self.class_name.clone())
+                }
+            }
+        })
+        .map_err(|e: PyErr| QuebecError::Python(format!("compute_rate_limit_key: {e}")))
     }
 
     /// Check if should retry, return matching retry strategy and its exception key.
@@ -2076,6 +2191,87 @@ impl Worker {
                 )));
             }
 
+            // Extract rate_limit_* declarations (optional). `rate_limit_max`
+            // is the discriminator — when None, the entire feature is off
+            // for this class.
+            let mut rate_limit_max: Option<i32> = None;
+            let mut rate_limit_window_seconds: Option<i32> = None;
+            let mut rate_limit_on_throttle = crate::context::RateLimitConflict::default();
+
+            if bound.hasattr("rate_limit_max")? {
+                let attr = bound.getattr("rate_limit_max")?;
+                if !attr.is_none() {
+                    let max = attr.extract::<i32>()?;
+                    if max <= 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "{class_name}: rate_limit_max must be positive, got {max}"
+                        )));
+                    }
+                    rate_limit_max = Some(max);
+                }
+            }
+
+            if rate_limit_max.is_some() {
+                if !bound.hasattr("rate_limit_window")? {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_max is set but \
+                         `rate_limit_window` is missing — declare \
+                         `rate_limit_window = timedelta(seconds=N)` (N >= 1) \
+                         on the class."
+                    )));
+                }
+                let td = bound.getattr("rate_limit_window")?;
+                // Type-check upfront so users get a clear error instead of
+                // the cryptic `AttributeError: 'int' object has no attribute
+                // 'total_seconds'` that surfaces if any non-timedelta is set.
+                if !td.is_instance_of::<pyo3::types::PyDelta>() {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                        "{class_name}: rate_limit_window must be a datetime.timedelta, got {}",
+                        td.get_type().qualname()?
+                    )));
+                }
+                let total: f64 = td.call_method0("total_seconds")?.extract()?;
+                if total < 1.0 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window must be >= 1 second, \
+                         got {total}s. Sub-second windows make jitter and \
+                         retry_at solver precision insufficient."
+                    )));
+                }
+                if total > i32::MAX as f64 {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window too large, got {total}s"
+                    )));
+                }
+                // The sliding-window math operates in integer seconds (window
+                // bucket index = floor(epoch / window_secs)). Silently truncating
+                // 1.9s → 1s would loosen the limit by ~50%, so refuse instead of
+                // guessing whether the user wanted floor/ceil/round.
+                if total.fract().abs() > f64::EPSILON {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "{class_name}: rate_limit_window must be a whole number \
+                         of seconds, got {total}s. The sliding-window algorithm \
+                         operates in 1-second buckets — fractional windows would \
+                         be silently rounded."
+                    )));
+                }
+                rate_limit_window_seconds = Some(total as i32);
+
+                if bound.hasattr("rate_limit_on_throttle")? {
+                    let attr = bound.getattr("rate_limit_on_throttle")?;
+                    let is_descriptor = attr
+                        .get_type()
+                        .qualname()
+                        .map(|n| n.contains("descriptor"))
+                        .unwrap_or(Ok(false))
+                        .unwrap_or(false);
+                    if !is_descriptor {
+                        rate_limit_on_throttle =
+                            attr.extract::<crate::context::RateLimitConflict>()?;
+                    }
+                }
+            }
+
             let module_path = bound
                 .getattr("__module__")
                 .and_then(|m| m.extract::<String>())
@@ -2114,6 +2310,9 @@ impl Worker {
                 concurrency_on_conflict,
                 continuation_info: None,
                 hooks,
+                rate_limit_max,
+                rate_limit_window_seconds,
+                rate_limit_on_throttle,
             };
             info!("Registered job: {:?}", runnable);
 
@@ -2125,8 +2324,173 @@ impl Worker {
             if has_concurrency_control {
                 self.ctx.enable_concurrency_control(class_name.to_string());
             }
+
+            // Mirror rate limit config into the AppContext registry so the
+            // worker claim path can `.is_empty()` short-circuit when no
+            // class uses the feature.
+            //
+            // Re-registration of the same class without `rate_limit_max` must
+            // also clear any stale config — otherwise the prior config keeps
+            // throttling silently in long-lived processes / test reuse.
+            if let Ok(mut reg) = self.ctx.rate_limited_classes.write() {
+                match (rate_limit_max, rate_limit_window_seconds) {
+                    (Some(max), Some(win_secs)) => {
+                        reg.insert(
+                            class_name.to_string(),
+                            crate::context::RateLimitConfig {
+                                max,
+                                window: chrono::Duration::seconds(win_secs as i64),
+                                on_throttle: rate_limit_on_throttle,
+                            },
+                        );
+                    }
+                    _ => {
+                        reg.remove(&class_name.to_string());
+                    }
+                }
+            }
             Ok(())
         })
+    }
+
+    /// EXPERIMENTAL: sliding-window rate-limit gate.
+    /// Called between picking a ready row and inserting claimed_executions
+    /// (only when at least one class has declared `rate_limit_max`).
+    ///
+    /// Returns `Granted` when the candidate may proceed to claim, or `Routed`
+    /// when the candidate has been removed from `ready_executions` and either
+    /// rescheduled (default) or marked finished (Discard mode). The caller
+    /// should `continue` on `Routed` and re-find the next candidate.
+    async fn try_consume_rate_for_candidate<C: ConnectionTrait>(
+        ctx: &Arc<crate::context::AppContext>,
+        txn: &C,
+        table_config: &crate::context::TableConfig,
+        execution: &quebec_ready_executions::Model,
+    ) -> std::result::Result<RateGateResult, DbErr> {
+        let job = query_builder::jobs::find_by_id(txn, table_config, execution.job_id).await?;
+        let Some(job) = job else {
+            // Ready row pointing at a vanished job — let the normal claim
+            // flow handle it (it will fail downstream and surface the bug).
+            return Ok(RateGateResult::Granted);
+        };
+
+        let cfg = {
+            let reg = ctx
+                .rate_limited_classes
+                .read()
+                .map_err(|_| DbErr::Custom("rate_limited_classes RwLock poisoned".into()))?;
+            reg.get(&job.class_name).cloned()
+        };
+        let Some(cfg) = cfg else {
+            return Ok(RateGateResult::Granted);
+        };
+
+        let runnable = ctx.get_runnable(&job.class_name).map_err(|e| {
+            DbErr::Custom(format!(
+                "rate-limit: get_runnable({}) failed: {e}",
+                job.class_name
+            ))
+        })?;
+        let arguments = job.arguments.clone().unwrap_or_default();
+        let user_key = runnable
+            .compute_rate_limit_key(&arguments)
+            .map_err(|e| DbErr::Custom(format!("rate-limit: {e}")))?;
+
+        let result = crate::semaphore::try_consume_rate_token(
+            txn,
+            table_config,
+            &job.class_name,
+            &user_key,
+            cfg.window,
+            cfg.max,
+            job.id,
+        )
+        .await?;
+
+        match result {
+            crate::semaphore::ConsumeResult::Granted => Ok(RateGateResult::Granted),
+            crate::semaphore::ConsumeResult::Throttled { retry_at } => {
+                query_builder::ready_executions::delete_by_id(txn, table_config, execution.id)
+                    .await?;
+                match cfg.on_throttle {
+                    crate::context::RateLimitConflict::Reschedule => {
+                        debug!(
+                            jid = job.active_job_id.as_deref(),
+                            class = job.class_name,
+                            user_key = user_key,
+                            retry_at = ?retry_at,
+                            "rate-limit: throttled, rescheduling"
+                        );
+                        query_builder::scheduled_executions::insert(
+                            txn,
+                            table_config,
+                            job.id,
+                            &job.queue_name,
+                            job.priority,
+                            retry_at,
+                        )
+                        .await?;
+                    }
+                    crate::context::RateLimitConflict::Discard => {
+                        debug!(
+                            jid = job.active_job_id.as_deref(),
+                            class = job.class_name,
+                            user_key = user_key,
+                            "rate-limit: throttled, discarding"
+                        );
+                        query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
+                    }
+                }
+                // Release the class-level concurrency_key semaphore (if any).
+                // Without this, a rate-rescheduled job stays "in flight" from
+                // concurrency_key's perspective even though it's no longer in
+                // ready_executions — the next scheduled→ready promotion would
+                // try to re-acquire the slot the job already holds and route
+                // it to blocked_executions until concurrency_duration TTL.
+                // For Discard, the slot would stay held for a finished job
+                // until TTL. Mirrors after_executed (worker.rs around the
+                // release_semaphore call) so concurrency accounting stays
+                // consistent across both code paths.
+                if let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) {
+                    let limit = runnable.concurrency_limit.unwrap_or(1);
+                    let duration = runnable
+                        .concurrency_duration
+                        .map(|s| chrono::Duration::seconds(s as i64));
+                    // Propagate release errors (lock timeout, conn drop, ...)
+                    // so the whole rate-routed transaction rolls back. The
+                    // ready-delete + scheduled-insert / mark_finished writes
+                    // above MUST stay consistent with the semaphore state —
+                    // a silently-failed release would re-create the very slot
+                    // leak this code path was added to prevent.
+                    let released = crate::semaphore::release_semaphore(
+                        txn,
+                        table_config,
+                        key.to_string(),
+                        limit,
+                        duration,
+                    )
+                    .await?;
+
+                    if released {
+                        // Promoting one blocked job is an optimization (dispatcher's
+                        // periodic sweep also handles blocked→ready); keep it
+                        // best-effort so it can't poison the rate-route txn.
+                        Self::release_next_blocked_job(ctx, txn, key, limit)
+                            .await
+                            .inspect_err(|e| {
+                                warn!(
+                                    jid = job.active_job_id.as_deref(),
+                                    concurrency_key = key,
+                                    "rate-limit: failed to release next blocked: {:?}",
+                                    e
+                                )
+                            })
+                            .ok();
+                    }
+                }
+                Ok(RateGateResult::Routed)
+            }
+        }
     }
 
     /// Helper: claim a single execution (insert claimed, delete ready, return model)
@@ -2165,8 +2529,13 @@ impl Worker {
         // `after_executed` (or the cleanup paths) via `release_queue_slot`.
         let ctx = self.ctx.clone();
 
+        // Return Option here (not Err) so any rate-throttle side-effects
+        // (DELETE ready + INSERT scheduled / mark_finished) inside the tx
+        // commit even when no candidate was successfully claimed. The
+        // pre-existing "No ready job to claim" error is re-raised at the
+        // outer level.
         let job = db
-            .transaction::<_, quebec_claimed_executions::Model, DbErr>(|txn| {
+            .transaction::<_, Option<quebec_claimed_executions::Model>, DbErr>(|txn| {
                 let table_config = table_config.clone();
                 let ctx = ctx.clone();
                 Box::pin(async move {
@@ -2187,6 +2556,15 @@ impl Worker {
                     // entirely so feature-off workers pay zero overhead
                     // beyond a single `is_empty()` check per claim.
                     let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+                    // EXPERIMENTAL: per-class sliding-window rate limit.
+                    // Same zero-overhead pattern: when no class declared
+                    // `rate_limit_max`, the entire rate gate is skipped
+                    // (one `is_empty()` check per claim).
+                    let rate_limit_enabled = ctx
+                        .rate_limited_classes
+                        .read()
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
 
                     // For queues listed in `experimental_queue_concurrency`,
                     // attempt the `queue:<name>` semaphore between find and
@@ -2213,6 +2591,7 @@ impl Worker {
                                 .await?;
                                 let Some(ref execution) = record else { break };
 
+                                let mut queue_slot_held = false;
                                 if queue_concurrency_enabled {
                                     let acquired = Self::try_acquire_queue_slot(
                                         &ctx,
@@ -2225,13 +2604,46 @@ impl Worker {
                                         local_throttled.push(execution.queue_name.clone());
                                         continue;
                                     }
+                                    queue_slot_held = true;
+                                }
+
+                                if rate_limit_enabled {
+                                    match Self::try_consume_rate_for_candidate(
+                                        &ctx,
+                                        txn,
+                                        &table_config,
+                                        execution,
+                                    )
+                                    .await?
+                                    {
+                                        RateGateResult::Granted => {}
+                                        RateGateResult::Routed => {
+                                            // Job left ready_executions (moved
+                                            // to scheduled / mark_finished),
+                                            // so it will never reach
+                                            // `after_executed` to release the
+                                            // queue slot we just took.
+                                            // Release here, otherwise the
+                                            // slot leaks until the TTL sweep.
+                                            if queue_slot_held {
+                                                Self::release_queue_slot(
+                                                    &ctx,
+                                                    txn,
+                                                    &table_config,
+                                                    &execution.queue_name,
+                                                )
+                                                .await?;
+                                            }
+                                            continue;
+                                        }
+                                    }
                                 }
 
                                 if let Some(claimed) =
                                     Self::claim_execution(txn, &table_config, execution, process_id)
                                         .await?
                                 {
-                                    return Ok(claimed);
+                                    return Ok(Some(claimed));
                                 }
                                 break;
                             }
@@ -2266,10 +2678,11 @@ impl Worker {
                         }
                     }
 
-                    Err(DbErr::Custom("No job found".into()))
+                    Ok(None)
                 })
             })
-            .await?;
+            .await?
+            .ok_or_else(|| QuebecError::Database(DbErr::Custom("No job found".into())))?;
 
         Ok(job)
     }
@@ -2314,6 +2727,13 @@ impl Worker {
                     // acquire path entirely so feature-off workers pay zero
                     // overhead beyond a single `is_empty()` check per claim.
                     let queue_concurrency_enabled = !ctx.experimental_queue_concurrency.is_empty();
+                    // EXPERIMENTAL: same zero-overhead pattern for the
+                    // sliding-window rate gate.
+                    let rate_limit_enabled = ctx
+                        .rate_limited_classes
+                        .read()
+                        .map(|r| !r.is_empty())
+                        .unwrap_or(false);
 
                     // Helper macro to claim jobs from a queue (batch insert + batch delete).
                     // EXPERIMENTAL: when `experimental_queue_concurrency` is
@@ -2363,26 +2783,60 @@ impl Worker {
                                 let exhausted = (records.len() as u64) < requested;
 
                                 let mut accepted: Vec<&quebec_ready_executions::Model> = Vec::new();
-                                if !queue_concurrency_enabled {
-                                    // Feature disabled: accept every found
-                                    // record verbatim — no per-record
+                                if !queue_concurrency_enabled && !rate_limit_enabled {
+                                    // Both feature flags off: accept every
+                                    // found record verbatim — no per-record
                                     // HashMap lookup, no async helper call.
                                     accepted.extend(records.iter());
                                 } else {
                                     for record in &records {
-                                        if local_throttled.contains(&record.queue_name) {
-                                            continue;
+                                        let mut queue_slot_held = false;
+                                        if queue_concurrency_enabled {
+                                            if local_throttled.contains(&record.queue_name) {
+                                                continue;
+                                            }
+                                            let acquired = Self::try_acquire_queue_slot(
+                                                &ctx,
+                                                txn,
+                                                &table_config,
+                                                &record.queue_name,
+                                            )
+                                            .await?;
+                                            if !acquired {
+                                                local_throttled.insert(record.queue_name.clone());
+                                                continue;
+                                            }
+                                            queue_slot_held = true;
                                         }
-                                        let acquired = Self::try_acquire_queue_slot(
-                                            &ctx,
-                                            txn,
-                                            &table_config,
-                                            &record.queue_name,
-                                        )
-                                        .await?;
-                                        if !acquired {
-                                            local_throttled.insert(record.queue_name.clone());
-                                            continue;
+                                        if rate_limit_enabled {
+                                            match Self::try_consume_rate_for_candidate(
+                                                &ctx,
+                                                txn,
+                                                &table_config,
+                                                record,
+                                            )
+                                            .await?
+                                            {
+                                                RateGateResult::Granted => {}
+                                                RateGateResult::Routed => {
+                                                    // Release the queue slot
+                                                    // taken just above — the
+                                                    // job moved out of
+                                                    // ready_executions so
+                                                    // `after_executed` never
+                                                    // fires for it.
+                                                    if queue_slot_held {
+                                                        Self::release_queue_slot(
+                                                            &ctx,
+                                                            txn,
+                                                            &table_config,
+                                                            &record.queue_name,
+                                                        )
+                                                        .await?;
+                                                    }
+                                                    continue;
+                                                }
+                                            }
                                         }
                                         accepted.push(record);
                                     }
@@ -3282,9 +3736,14 @@ impl Worker {
             return Ok(());
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
-        // Propagate failure: every caller runs inside the same transaction that
-        // deletes the claim, so a release error must roll back the whole unit
-        // rather than commit the claim deletion while leaking the queue slot.
+        // Propagate failures: callers already `.await?` this helper. In-tx callers
+        // (claim/throttle/cleanup paths) rely on the propagation to abort the
+        // enclosing tx; the out-of-tx emergency cleanup caller relies on it to
+        // route to its delete-only fallback. Silently swallowing the DbErr would
+        // leave the slot accounted as held in `solid_queue_semaphores` while the
+        // caller's state change (claimed deleted, ready re-inserted, scheduled
+        // inserted, etc.) commits — the exact slot-leak class of bug we already
+        // saw reintroduced through every claim/throttle path.
         release_semaphore(
             db,
             table_config,

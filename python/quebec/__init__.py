@@ -248,6 +248,22 @@ class NoNewOverrideMeta(type):
 
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
+    def rate_limit_key(self, *args, **kwargs) -> str:
+        """Bucket key for the experimental sliding-window rate limit.
+
+        Default returns the class name (one bucket per class). Override on
+        the subclass to partition by dimension (region, tenant, etc.):
+
+            def rate_limit_key(self, *args, region="us", **kwargs):
+                return f"stripe:{region}"
+
+        Called at claim time on a fresh ActiveJob instance, with the
+        original perform args/kwargs. Unlike ``concurrency_key`` the
+        result is NOT snapshotted into the jobs row — changing this method
+        reroutes in-flight jobs immediately.
+        """
+        return type(self).__name__
+
     @classmethod
     def build(cls, *args, **kwargs) -> "JobDescriptor":
         """Create a JobDescriptor for bulk enqueue via perform_all_later.

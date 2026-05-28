@@ -83,6 +83,47 @@ impl ConcurrencyConflict {
     }
 }
 
+/// Rate limit conflict strategy — what to do when the sliding window is exhausted.
+#[cfg_attr(feature = "python", pyclass(eq, eq_int, from_py_object))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateLimitConflict {
+    /// Reschedule the throttled job to a future scheduled_executions row (default).
+    #[default]
+    Reschedule = 0,
+    /// Mark the throttled job as finished without executing (dedup-style).
+    Discard = 1,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl RateLimitConflict {
+    #[staticmethod]
+    fn reschedule() -> Self {
+        RateLimitConflict::Reschedule
+    }
+
+    #[staticmethod]
+    fn discard() -> Self {
+        RateLimitConflict::Discard
+    }
+
+    fn __repr__(&self) -> String {
+        match self {
+            RateLimitConflict::Reschedule => "RateLimitConflict.Reschedule".to_string(),
+            RateLimitConflict::Discard => "RateLimitConflict.Discard".to_string(),
+        }
+    }
+}
+
+/// Per-class sliding-window rate limit configuration captured at
+/// `register_job_class` time. Stored in `AppContext.rate_limited_classes`.
+#[derive(Debug, Clone)]
+pub struct RateLimitConfig {
+    pub max: i32,
+    pub window: chrono::Duration,
+    pub on_throttle: RateLimitConflict,
+}
+
 #[derive(Debug, Clone)]
 pub struct TableConfig {
     pub jobs: String,
@@ -376,6 +417,10 @@ pub struct AppContext {
     /// semantics may change. Use to isolate misbehaving queues during
     /// remediation. Queues not present here are unlimited.
     pub experimental_queue_concurrency: HashMap<String, i32>,
+    /// EXPERIMENTAL: per-class sliding-window rate limits. Empty means
+    /// no class declared `rate_limit_max`; the worker claim path uses
+    /// `.is_empty()` to skip the rate check path with zero overhead.
+    pub rate_limited_classes: Arc<RwLock<HashMap<String, RateLimitConfig>>>,
     pub runtime_handle: Option<Handle>,
     pub table_config: TableConfig, // Dynamic table name configuration
     /// Optional notifier for idle worker threads - when set, signals main loop to poll for new jobs
@@ -983,6 +1028,7 @@ impl AppContext {
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
             experimental_queue_concurrency: HashMap::new(),
+            rate_limited_classes: Arc::new(RwLock::new(HashMap::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
             idle_notify: Arc::new(RwLock::new(None)),
@@ -1147,6 +1193,7 @@ impl AppContext {
             runnables: self.runnables.clone(),
             concurrency_enabled: self.concurrency_enabled.clone(),
             experimental_queue_concurrency: self.experimental_queue_concurrency.clone(),
+            rate_limited_classes: self.rate_limited_classes.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
             idle_notify: Arc::new(RwLock::new(None)),
