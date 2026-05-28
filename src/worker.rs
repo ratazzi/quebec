@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 
 use sea_orm::TransactionTrait;
 use sea_orm::*;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::Sender;
@@ -3043,6 +3044,142 @@ impl Worker {
         }
     }
 
+    async fn check_worker_memory_recycle(
+        &self,
+        process: &crate::entities::quebec_processes::Model,
+        over_limit_count: &mut u64,
+        rss_unsupported_logged: &mut bool,
+        quiet_announced: &mut bool,
+    ) {
+        let Some(limit_bytes) = self.ctx.worker_max_rss_bytes else {
+            return;
+        };
+
+        let Some(rss_bytes) = crate::memory::current_rss_bytes() else {
+            if !*rss_unsupported_logged {
+                warn!(
+                    "worker_max_rss_mb is configured, but current RSS is unavailable \
+                     on this platform; worker memory recycle is disabled"
+                );
+                *rss_unsupported_logged = true;
+            }
+            return;
+        };
+
+        self.ctx.update_worker_rss(rss_bytes);
+        if rss_bytes <= limit_bytes {
+            *over_limit_count = 0;
+            return;
+        }
+
+        *over_limit_count = (*over_limit_count).saturating_add(1);
+        let confirmations = self.ctx.worker_memory_recycle_confirmations.max(1);
+        if *over_limit_count < confirmations {
+            debug!(
+                "Worker RSS {} MiB exceeds configured limit {} MiB ({}/{})",
+                rss_bytes / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+                *over_limit_count,
+                confirmations
+            );
+            return;
+        }
+
+        let newly_requested = self.ctx.request_worker_memory_recycle(rss_bytes);
+        if newly_requested {
+            warn!(
+                "Worker RSS {} MiB exceeded configured limit {} MiB for {} consecutive check(s); \
+                 entering quiet mode for planned recycle",
+                rss_bytes / (1024 * 1024),
+                limit_bytes / (1024 * 1024),
+                confirmations
+            );
+        }
+
+        if !self.ctx.quiet.is_cancelled() {
+            self.ctx.quiet.cancel();
+        }
+
+        *quiet_announced = true;
+        if let Ok(db) = self.ctx.get_db().await {
+            if let Err(e) = self.heartbeat(&db, process).await {
+                warn!("Failed to flush memory recycle heartbeat: {}", e);
+            }
+        }
+    }
+
+    pub(crate) async fn should_exit_for_worker_memory_recycle(&self, process_id: i64) -> bool {
+        if !self
+            .ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
+            || !self.ctx.quiet.is_cancelled()
+        {
+            return false;
+        }
+
+        if self
+            .ctx
+            .worker_memory_recycle_elapsed()
+            .is_some_and(|elapsed| elapsed >= self.ctx.worker_memory_graceful_timeout)
+        {
+            warn!(
+                "Worker memory recycle graceful timeout {:?} reached; exiting planned recycle",
+                self.ctx.worker_memory_graceful_timeout
+            );
+            return true;
+        }
+
+        self.ctx.worker_drained(process_id).await
+    }
+
+    async fn shutdown_worker_process(
+        &self,
+        process: &crate::entities::quebec_processes::Model,
+        drain_budget: std::time::Duration,
+    ) -> Result<()> {
+        // Call worker stop handlers before exiting.
+        Python::attach(|py| {
+            let handlers = self.stop_handlers.read().expect("Lock poisoned");
+            for handler in handlers.iter() {
+                match handler.bind(py).call0() {
+                    Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
+                    Err(e) => error!("Error calling worker stop handler in main loop: {:?}", e),
+                }
+            }
+        });
+
+        let drain_deadline = tokio::time::Instant::now() + drain_budget;
+        loop {
+            let in_flight_empty = self
+                .ctx
+                .in_flight_executions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+            if in_flight_empty {
+                break;
+            }
+            if drain_budget.is_zero() || tokio::time::Instant::now() >= drain_deadline {
+                warn!(
+                    "Shutdown drain timed out with jobs still inside perform(); \
+                     leaving them claimed to avoid a double-execution race"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        if let Err(e) = self.release_all_claimed_executions(process.id).await {
+            warn!("Failed to release claimed executions on shutdown: {}", e);
+        }
+
+        let stop_db = self.ctx.get_db().await?;
+        self.on_stop(&stop_db, process).await?;
+
+        Ok(())
+    }
+
     pub async fn run_main_loop(&self) -> Result<()> {
         // Don't acquire long-term connections here, get them when needed
         let mut polling_interval = tokio::time::interval(self.ctx.worker_polling_interval);
@@ -3060,6 +3197,17 @@ impl Worker {
             std::time::Duration::from_secs(3600) // dummy interval when disabled
         };
         let mut cleanup_interval = tokio::time::interval(cleanup_duration);
+        let memory_check_enabled = self.ctx.worker_max_rss_bytes.is_some();
+        let memory_check_duration = if memory_check_enabled {
+            self.ctx
+                .worker_memory_check_interval
+                .max(std::time::Duration::from_secs(1))
+        } else {
+            std::time::Duration::from_secs(3600)
+        };
+        let mut memory_check_interval = tokio::time::interval(memory_check_duration);
+        let mut memory_over_limit_count = 0u64;
+        let mut memory_unsupported_logged = false;
         // Orphan check: detect supervisor death via ppid change (Solid Queue parity).
         // Only enabled when running as a supervisor-managed child so the old
         // single-process threaded mode is unaffected.
@@ -3137,6 +3285,22 @@ impl Worker {
                         }
                     }
                 }
+                _ = memory_check_interval.tick(), if memory_check_enabled => {
+                    if self.ctx.worker_memory_recycle_requested.load(Ordering::Relaxed) {
+                        if self.should_exit_for_worker_memory_recycle(process.id).await {
+                            info!("Worker memory recycle drained or timed out; exiting with planned recycle status");
+                            self.shutdown_worker_process(&process, std::time::Duration::ZERO).await?;
+                            std::process::exit(WORKER_MEMORY_RECYCLE_EXIT_CODE);
+                        }
+                    } else {
+                        self.check_worker_memory_recycle(
+                            &process,
+                            &mut memory_over_limit_count,
+                            &mut memory_unsupported_logged,
+                            &mut quiet_announced,
+                        ).await;
+                    }
+                }
                 // Periodic maintenance: prune dead processes and fail their claimed jobs
                 _ = maintenance_interval.tick() => {
                     if let Err(e) = self.prune_dead_processes(Some(process.id)).await {
@@ -3161,17 +3325,6 @@ impl Worker {
                 _ = quit.cancelled() => {
                     info!("Graceful shutdown, stop polling");
 
-                    // Call worker stop handlers before exiting
-                    Python::attach(|py| {
-                        let handlers = self.stop_handlers.read().expect("Lock poisoned");
-                        for handler in handlers.iter() {
-                            match handler.bind(py).call0() {
-                                Ok(_) => debug!("Worker stop handler executed successfully in main loop"),
-                                Err(e) => error!("Error calling worker stop handler in main loop: {:?}", e)
-                            }
-                        }
-                    });
-
                     // Wait for jobs already handed to the Python side to finish
                     // before releasing anything. pick_job stops feeding the
                     // Python work queue once shutdown begins (it returns Err on
@@ -3181,44 +3334,10 @@ impl Worker {
                     // fraction of shutdown_timeout so the outer graceful_shutdown
                     // block_on still has budget to run the release and on_stop
                     // below before its own timeout fires.
-                    let drain_deadline = tokio::time::Instant::now()
-                        + self.ctx.shutdown_timeout.mul_f64(0.8);
-                    loop {
-                        let in_flight_empty = self
-                            .ctx
-                            .in_flight_executions
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .is_empty();
-                        if in_flight_empty {
-                            break;
-                        }
-                        if tokio::time::Instant::now() >= drain_deadline {
-                            warn!(
-                                "Shutdown drain timed out with jobs still inside perform(); \
-                                 leaving them claimed to avoid a double-execution race"
-                            );
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-
-                    // Release jobs that never started running (still queued in the
-                    // mpsc channel or the Python work queue) back to ready so the
-                    // dispatcher can re-claim them. Jobs that finished perform()
-                    // during the drain above are already gone from
-                    // claimed_executions. If the drain timed out, rows still
-                    // in_flight are skipped (release_all_claimed_executions filters
-                    // them) to avoid handing a running job to a neighbour; those are
-                    // reaped later by the supervisor's orphan sweep or a restarting
-                    // worker's fail_orphaned_executions.
-                    if let Err(e) = self.release_all_claimed_executions(process.id).await {
-                        warn!("Failed to release claimed executions on shutdown: {}", e);
-                    }
-
-                    // Clean up process record
-                    let stop_db = self.ctx.get_db().await?;
-                    self.on_stop(&stop_db, &process).await?;
+                    self.shutdown_worker_process(
+                        &process,
+                        self.ctx.shutdown_timeout.mul_f64(0.8),
+                    ).await?;
 
                     return Ok(());
                 }
@@ -3543,6 +3662,14 @@ impl ProcessTrait for Worker {
     }
 
     fn runtime_metadata(&self) -> Option<String> {
-        crate::process::build_runtime_metadata(self.ctx.quiet.is_cancelled())
+        let rss_bytes = self.ctx.worker_last_rss_bytes.load(Ordering::Relaxed);
+        crate::process::build_runtime_metadata_with_memory(
+            self.ctx.quiet.is_cancelled(),
+            self.ctx
+                .worker_memory_recycle_requested
+                .load(Ordering::Relaxed)
+                .then_some("rss_limit"),
+            (rss_bytes > 0).then_some(rss_bytes),
+        )
     }
 }

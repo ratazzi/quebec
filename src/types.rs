@@ -1188,22 +1188,6 @@ impl PyQuebec {
         if self.ctx.supervisor_pid.load(Ordering::Relaxed) != 0 {
             return false;
         }
-        // A claim that passed the quiet gate before quiet was signalled may still
-        // be publishing work; wait for it so the idle snapshot below is not taken
-        // mid-claim (which could let the process exit and subject that batch to
-        // graceful_shutdown's bounded drain).
-        if self.ctx.claim_in_progress.load(Ordering::SeqCst) {
-            return false;
-        }
-        let in_flight_empty = self
-            .ctx
-            .in_flight_executions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
-        if !in_flight_empty {
-            return false;
-        }
         let worker = self.worker.clone();
         let ctx = self.ctx.clone();
         py.detach(|| {
@@ -1212,18 +1196,7 @@ impl PyQuebec {
                     Some(id) => id,
                     None => return false,
                 };
-                let Ok(db) = ctx.get_db().await else {
-                    return false;
-                };
-                matches!(
-                    crate::query_builder::claimed_executions::count_by_process_id(
-                        db.as_ref(),
-                        &ctx.table_config,
-                        process_id,
-                    )
-                    .await,
-                    Ok(0)
-                )
+                ctx.worker_drained(process_id).await
             })
         })
     }
@@ -1233,6 +1206,33 @@ impl PyQuebec {
     /// is still publishing work.
     fn _set_claim_in_progress(&self, value: bool) {
         self.ctx.claim_in_progress.store(value, Ordering::SeqCst);
+    }
+
+    fn _request_worker_memory_recycle(&self, rss_bytes: u64) {
+        self.ctx.request_worker_memory_recycle(rss_bytes);
+        self.ctx.quiet.cancel();
+    }
+
+    fn _should_worker_memory_recycle_exit(&self, py: Python<'_>) -> bool {
+        let worker = self.worker.clone();
+        py.detach(|| {
+            self.rt.block_on(async move {
+                let process_id = match *worker.process_id_handle().lock().await {
+                    Some(id) => id,
+                    None => return false,
+                };
+                worker
+                    .should_exit_for_worker_memory_recycle(process_id)
+                    .await
+            })
+        })
+    }
+
+    #[getter]
+    fn is_worker_memory_recycling(&self) -> bool {
+        self.ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
     }
 
     fn ping(&self) -> PyResult<bool> {
