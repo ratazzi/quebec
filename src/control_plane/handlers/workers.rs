@@ -59,6 +59,10 @@ impl ControlPlane {
                     .as_ref()
                     .and_then(|v| v.get("revision").and_then(|s| s.as_str()))
                     .map(|s| s.to_string());
+                let memory = metadata
+                    .as_ref()
+                    .and_then(|v| v.get("rss_bytes").and_then(|b| b.as_u64()))
+                    .map(Self::format_rss_bytes);
 
                 WorkerInfo {
                     id: worker.id,
@@ -66,11 +70,13 @@ impl ControlPlane {
                     kind: worker.kind,
                     hostname: worker.hostname.unwrap_or_else(|| "unknown".to_string()),
                     pid: worker.pid,
+                    created_at: Self::format_naive_datetime(worker.created_at),
                     last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
                     seconds_since_heartbeat,
                     status: status.to_string(),
                     quiet,
                     revision,
+                    memory,
                 }
             })
             .collect();

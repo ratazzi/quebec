@@ -57,6 +57,9 @@
           Queue
         </th>
         <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+          Priority
+        </th>
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
           Scheduled At
         </th>
         <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -81,6 +84,9 @@
             <div class="text-sm text-gray-900">{{ job.queue_name }}</div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
+            <div class="text-sm {% if job.priority == 0 %}text-gray-400{% else %}text-gray-900{% endif %}">{{ job.priority }}</div>
+          </td>
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900"><span data-controller="localtime" data-localtime-datetime-value="{{ job.scheduled_at }}">{{ job.scheduled_at }}</span></div>
             <div class="text-xs text-gray-400">{{ job.scheduled_in }}</div>
           </td>
@@ -102,7 +108,7 @@
         {% endfor %}
       {% else %}
         <tr>
-          <td colspan="5" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
+          <td colspan="6" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
             No scheduled jobs found
           </td>
         </tr>

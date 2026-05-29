@@ -44,6 +44,10 @@
         </dd>
         <dt class="text-gray-500">Heartbeat</dt>
         <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></dd>
+        <dt class="text-gray-500">Uptime</dt>
+        <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span></dd>
+        <dt class="text-gray-500">Memory</dt>
+        <dd class="{% if worker.memory %}text-gray-900{% else %}text-gray-400{% endif %}">{% if worker.memory %}{{ worker.memory }}{% else %}N/A{% endif %}</dd>
       </dl>
     </div>
     {% endfor %}
@@ -62,6 +66,7 @@
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hostname</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
         </tr>
       </thead>
@@ -97,6 +102,13 @@
             <div class="text-sm text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
+            {% if worker.memory %}
+            <div class="text-sm text-gray-900">{{ worker.memory }}</div>
+            {% else %}
+            <div class="text-sm text-gray-400">N/A</div>
+            {% endif %}
+          </td>
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             {% if worker.status == "alive" %}
               <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
                 Active
@@ -111,13 +123,16 @@
                 Quiet
               </span>
             {% endif %}
+            <div class="mt-1 text-xs text-gray-500">
+              <span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span>
+            </div>
           </td>
         </tr>
         {% endfor %}
 
         {% if workers | length == 0 %}
         <tr>
-          <td colspan="7" class="px-4 py-3 text-sm text-center text-gray-500">No workers found</td>
+          <td colspan="8" class="px-4 py-3 text-sm text-center text-gray-500">No workers found</td>
         </tr>
         {% endif %}
       </tbody>

@@ -80,6 +80,7 @@ impl ControlPlane {
                     job_id: execution.job_id,
                     queue_name: execution.queue_name.clone(),
                     class_name: job.class_name.clone(),
+                    priority: job.priority,
                     concurrency_key: execution.concurrency_key.clone(),
                     created_at: Self::format_naive_datetime(execution.created_at),
                     waiting_time,

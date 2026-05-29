@@ -57,6 +57,10 @@
         <div class="text-xs text-gray-500">id {{ job.id }} · {{ job.queue_name }}</div>
       </div>
       <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+        {% if job.priority != 0 %}
+        <dt class="text-gray-500">Priority</dt>
+        <dd class="text-gray-900">{{ job.priority }}</dd>
+        {% endif %}
         <dt class="text-gray-500">Created</dt>
         <dd class="text-gray-900"><span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span></dd>
         <dt class="text-gray-500">Finished</dt>
@@ -83,6 +87,9 @@
           Queue
         </th>
         <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+          Priority
+        </th>
+        <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
           Created At
         </th>
         <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -107,6 +114,9 @@
             <div class="text-sm text-gray-900">{{ job.queue_name }}</div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
+            <div class="text-sm {% if job.priority == 0 %}text-gray-400{% else %}text-gray-900{% endif %}">{{ job.priority }}</div>
+          </td>
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900"><span data-controller="localtime" data-localtime-datetime-value="{{ job.created_at }}">{{ job.created_at }}</span></div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
@@ -119,7 +129,7 @@
         {% endfor %}
       {% else %}
         <tr>
-          <td colspan="5" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
+          <td colspan="6" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
             No finished jobs found
           </td>
         </tr>
