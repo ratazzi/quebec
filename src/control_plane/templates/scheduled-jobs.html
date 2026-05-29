@@ -84,7 +84,7 @@
             <div class="text-sm text-gray-900">{{ job.queue_name }}</div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
-            <div class="text-sm text-gray-900">{% if job.priority != 0 %}{{ job.priority }}{% else %}—{% endif %}</div>
+            <div class="text-sm {% if job.priority == 0 %}text-gray-400{% else %}text-gray-900{% endif %}">{{ job.priority }}</div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-gray-900"><span data-controller="localtime" data-localtime-datetime-value="{{ job.scheduled_at }}">{{ job.scheduled_at }}</span></div>
