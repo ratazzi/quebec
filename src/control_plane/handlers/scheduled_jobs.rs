@@ -85,7 +85,7 @@ impl ControlPlane {
         FROM {} s
         JOIN {} j ON s.job_id = j.id
         WHERE {}
-        ORDER BY s.scheduled_at ASC
+        ORDER BY s.scheduled_at ASC, j.priority ASC, s.job_id ASC
         LIMIT {} OFFSET {}",
             table_config.scheduled_executions, table_config.jobs, where_clause, p1, p2
         ));
