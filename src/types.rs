@@ -1289,6 +1289,18 @@ impl PyQuebec {
         if !self.ctx.quiet_then_exit || !self.ctx.quiet.is_cancelled() {
             return false;
         }
+        // Memory recycle enters quiet through the same token, but it must exit via
+        // the worker's planned-recycle path (exit code 75) so a supervisor/systemd
+        // relaunches the process. quiet_then_exit's graceful exit (code 0) would
+        // mask that intent and leave a Restart=on-failure deployment without a new
+        // worker, so defer to the recycle path here.
+        if self
+            .ctx
+            .worker_memory_recycle_requested
+            .load(Ordering::Relaxed)
+        {
+            return false;
+        }
         // Standalone-only: under the fork supervisor a self-exited worker child
         // would just be reforked, so quiet_then_exit is a no-op there. Supervised
         // deployments should use a supervisor-level rolling restart instead.

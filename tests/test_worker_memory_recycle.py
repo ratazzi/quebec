@@ -23,6 +23,31 @@ def test_memory_recycle_exits_when_drained_under_supervisor(db_url, test_prefix)
         qc.close()
 
 
+def test_memory_recycle_does_not_self_exit_via_quiet_then_exit(db_url, test_prefix):
+    """Standalone (non-supervisor) + quiet_then_exit + memory recycle.
+
+    Memory recycle enters quiet through the shared quiet token, but it must exit
+    via the planned-recycle path (exit code 75) so a supervisor/systemd with
+    Restart=on-failure relaunches the worker. quiet_then_exit's graceful exit
+    (code 0) would hijack that and leave the deployment without a new worker, so
+    should_drain_exit() must refuse while a recycle is requested.
+    """
+    qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
+    assert qc.create_tables() is True
+    try:
+        qc.register_worker_process()
+        qc._request_worker_memory_recycle(256 * 1024 * 1024)
+
+        assert qc.is_quiet is True
+        assert qc.is_worker_memory_recycling is True
+        # quiet_then_exit must NOT claim the exit — the recycle path (exit 75) owns it.
+        assert qc.should_drain_exit() is False
+        # The recycle predicate is the one that should fire.
+        assert qc._should_worker_memory_recycle_exit() is True
+    finally:
+        qc.close()
+
+
 def test_memory_recycle_waits_for_claimed_job_before_timeout(db_url, test_prefix):
     qc = quebec.Quebec(
         db_url,
