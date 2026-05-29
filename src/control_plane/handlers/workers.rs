@@ -59,6 +59,10 @@ impl ControlPlane {
                     .as_ref()
                     .and_then(|v| v.get("revision").and_then(|s| s.as_str()))
                     .map(|s| s.to_string());
+                let memory = metadata
+                    .as_ref()
+                    .and_then(|v| v.get("rss_bytes").and_then(|b| b.as_u64()))
+                    .map(Self::format_rss_bytes);
 
                 WorkerInfo {
                     id: worker.id,
@@ -72,6 +76,7 @@ impl ControlPlane {
                     status: status.to_string(),
                     quiet,
                     revision,
+                    memory,
                 }
             })
             .collect();

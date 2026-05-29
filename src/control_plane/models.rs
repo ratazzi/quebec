@@ -60,6 +60,7 @@ pub struct WorkerInfo {
     pub status: String,
     pub quiet: bool,
     pub revision: Option<String>,
+    pub memory: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

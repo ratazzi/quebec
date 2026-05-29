@@ -43,6 +43,18 @@ impl ControlPlane {
         datetime.format("%Y-%m-%d %H:%M:%S").to_string()
     }
 
+    /// Format an RSS byte count as a human-readable binary size, e.g. "3.1 GiB" / "298 MiB".
+    /// Picks the unit by magnitude via log-1024 (the classic StackOverflow approach).
+    pub fn format_rss_bytes(bytes: u64) -> String {
+        if bytes == 0 {
+            return "0 B".to_string();
+        }
+        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+        let exp = ((bytes as f64).log(1024.0).floor() as usize).min(UNITS.len() - 1);
+        let value = bytes as f64 / 1024_f64.powi(exp as i32);
+        format!("{:.1} {}", value, UNITS[exp])
+    }
+
     /// Calculate runtime from start time to now
     #[allow(dead_code)]
     pub fn calculate_runtime(started_at: NaiveDateTime) -> String {
