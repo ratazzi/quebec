@@ -54,6 +54,7 @@ pub struct WorkerInfo {
     pub kind: String,
     pub hostname: String,
     pub pid: i32,
+    pub created_at: String,
     pub last_heartbeat_at: String,
     pub seconds_since_heartbeat: i64,
     pub status: String,

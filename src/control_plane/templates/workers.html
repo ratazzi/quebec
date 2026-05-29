@@ -44,6 +44,8 @@
         </dd>
         <dt class="text-gray-500">Heartbeat</dt>
         <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></dd>
+        <dt class="text-gray-500">Uptime</dt>
+        <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span></dd>
       </dl>
     </div>
     {% endfor %}
@@ -111,6 +113,9 @@
                 Quiet
               </span>
             {% endif %}
+            <div class="mt-1 text-xs text-gray-500">
+              <span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span>
+            </div>
           </td>
         </tr>
         {% endfor %}

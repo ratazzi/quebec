@@ -66,6 +66,7 @@ impl ControlPlane {
                     kind: worker.kind,
                     hostname: worker.hostname.unwrap_or_else(|| "unknown".to_string()),
                     pid: worker.pid,
+                    created_at: Self::format_naive_datetime(worker.created_at),
                     last_heartbeat_at: Self::format_naive_datetime(last_heartbeat),
                     seconds_since_heartbeat,
                     status: status.to_string(),
