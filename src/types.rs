@@ -954,14 +954,17 @@ impl PyQuebec {
                 })?;
 
                 // `claim_jobs` inserted a `Dispatched` ledger entry for every
-                // claimed row. If any post-claim lookup/build below fails we
-                // must clear those entries before returning, or the
-                // worker-local ledger leaks. Capture the claimed ids so the
-                // error path can clean up regardless of how far the loop got.
+                // claimed row, and the exclusive sieve may have stored one of
+                // those ids as `exclusive_owner`. If any post-claim lookup
+                // below fails we must clear both, or the worker-local state
+                // leaks. Capture the ids so the error path can clean up
+                // regardless of how far the loop got. CAS-based exclusive
+                // clear is a no-op for non-owning ids.
                 let claimed_ids: Vec<i64> = claimed.iter().map(|c| c.id).collect();
                 let clear_ledger = || {
                     for id in &claimed_ids {
                         ctx.ledger_remove(*id);
+                        ctx.clear_exclusive_owner_if(*id);
                     }
                 };
 
@@ -1390,6 +1393,26 @@ impl PyQuebec {
         self.ctx
             .worker_memory_recycle_requested
             .load(Ordering::Relaxed)
+    }
+
+    /// Test-only: true when a `exclusive = True` job currently owns this
+    /// worker's exclusive seat. Internally the worker stores the owning
+    /// `claimed_executions.id` (or `0` when no exclusive owns), so this is
+    /// `exclusive_owner != 0`. Underscore prefix marks this as test-only.
+    fn _is_exclusive_active(&self) -> bool {
+        self.ctx.exclusive_owner.load(Ordering::SeqCst) != 0
+    }
+
+    /// Test-only: returns the `claimed_executions.id` currently owning the
+    /// exclusive seat, or `None` if no exclusive owns it. Used by regression
+    /// tests for the ownership-aware clear semantics.
+    fn _exclusive_owner(&self) -> Option<i64> {
+        let owner = self.ctx.exclusive_owner.load(Ordering::SeqCst);
+        if owner == 0 {
+            None
+        } else {
+            Some(owner)
+        }
     }
 
     fn ping(&self) -> PyResult<bool> {

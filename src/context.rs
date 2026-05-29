@@ -468,6 +468,30 @@ pub struct AppContext {
     pub worker_memory_recycle_requested: AtomicBool,
     pub worker_memory_recycle_started_at: Mutex<Option<Instant>>,
     pub worker_last_rss_bytes: AtomicU64,
+    /// Worker-local stop-the-world ownership for exclusive jobs
+    /// (`Runnable.exclusive`). `0` means no exclusive owns the worker; any other
+    /// value is the `claimed_executions.id` of the currently-owning exclusive.
+    /// Set by `claim_jobs`' exclusive sieve via a plain `store`: production
+    /// claim dispatch is single-loop (the dispatcher's main `select!`), so
+    /// no concurrent setters can race; the gate observers use SeqCst loads
+    /// and CAS, which serialise correctly against the store.
+    /// Cleared by the owner's `after_executed` (success and emergency
+    /// branches) and `Execution::Drop`, all via CAS (id → 0). All
+    /// abandonment helpers (`release_claimed_batch`, `delete_claimed_by_id`,
+    /// `fail_claimed_by_id`, `release_all_claimed_executions`) also CAS-
+    /// clear, so a exclusive sieved but never executed (find_by_ids failure,
+    /// runnable lookup failure, channel-full, etc.) doesn't leave the
+    /// worker stuck. CAS ensures a stale Execution dropping LATE cannot
+    /// clear a freshly-set ownership belonging to a newer exclusive.
+    /// Process-local — does not coordinate across forked siblings or other
+    /// worker processes.
+    pub exclusive_owner: std::sync::atomic::AtomicI64,
+    /// True when at least one registered class declares `exclusive = True`.
+    /// Cached at registration so the `claim_jobs` fast-path can short-circuit
+    /// the exclusive sieve with a single atomic load instead of acquiring the
+    /// GIL and scanning the `runnables` registry on every claim batch. Set by
+    /// `register_job_class`; inherited across fork (the registry is shared).
+    pub any_exclusive_class: AtomicBool,
 }
 
 /// Marks a claimed_execution as in-flight at the start of a `perform()` call.
@@ -1039,7 +1063,24 @@ impl AppContext {
             worker_memory_recycle_requested: AtomicBool::new(false),
             worker_memory_recycle_started_at: Mutex::new(None),
             worker_last_rss_bytes: AtomicU64::new(0),
+            exclusive_owner: std::sync::atomic::AtomicI64::new(0),
+            any_exclusive_class: AtomicBool::new(false),
         }
+    }
+
+    /// Helper for callers that abandon a claimed row (release / delete /
+    /// fail) before it becomes an `Execution`. Compare-exchanges `id → 0`
+    /// so only the row that actually owns the exclusive seat can clear it —
+    /// preventing a stale Execution drop or an unrelated release from
+    /// stomping a newer exclusive's ownership. No-op when the row does not
+    /// own the exclusive (the common case).
+    pub fn clear_exclusive_owner_if(&self, claimed_id: i64) {
+        let _ = self.exclusive_owner.compare_exchange(
+            claimed_id,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn update_worker_rss(&self, rss_bytes: u64) {
@@ -1210,6 +1251,15 @@ impl AppContext {
             worker_memory_recycle_requested: AtomicBool::new(false),
             worker_memory_recycle_started_at: Mutex::new(None),
             worker_last_rss_bytes: AtomicU64::new(0),
+            // Fresh per-process exclusive ownership — exclusive ownership does
+            // not cross fork; the child has its own ledger lifecycle.
+            exclusive_owner: std::sync::atomic::AtomicI64::new(0),
+            // The runnables registry is shared across fork, so the
+            // exclusive-class presence flag carries over unchanged.
+            any_exclusive_class: AtomicBool::new(
+                self.any_exclusive_class
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
             use_listen_notify: self.use_listen_notify,
             notify_throttle_interval: self.notify_throttle_interval,
             force_override_queue: self.force_override_queue.clone(),

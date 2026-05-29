@@ -104,6 +104,13 @@ pub struct Runnable {
     pub rate_limit_max: Option<i32>,
     pub rate_limit_window_seconds: Option<i32>,
     pub rate_limit_on_throttle: crate::context::RateLimitConflict,
+    /// Worker-local stop-the-world flag. When true, claiming this class flips
+    /// `AppContext.exclusive_active`: the dispatcher stops claiming new work, the
+    /// exclusive picker waits for other in-flight jobs on this worker to drain,
+    /// then runs alone. Scope is the current worker process — combine with
+    /// `concurrency_limit = 1` + a `concurrency_key` for cluster-wide
+    /// single-instance. Default false.
+    pub exclusive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +143,7 @@ impl Runnable {
             rate_limit_max: None,
             rate_limit_window_seconds: None,
             rate_limit_on_throttle: crate::context::RateLimitConflict::default(),
+            exclusive: false,
         }
     }
 
@@ -156,6 +164,7 @@ impl Runnable {
             rate_limit_max: self.rate_limit_max,
             rate_limit_window_seconds: self.rate_limit_window_seconds,
             rate_limit_on_throttle: self.rate_limit_on_throttle,
+            exclusive: self.exclusive,
         }
     }
 
@@ -1116,6 +1125,19 @@ impl Drop for Execution {
         ) {
             ledger.remove(&self.claimed.id);
         }
+        drop(ledger);
+
+        // Exclusive backstop: if this Execution owns the exclusive seat and is
+        // being dropped without after_executed having cleared it (e.g.
+        // dispatch-channel enqueue failure before perform(), or pick_job
+        // returning Err from the exclusive wait on shutdown), release
+        // ownership so the next claim cycle can resume. CAS-gated by
+        // claimed_id: only the actual owner can clear, so a late drop of a
+        // previous-exclusive's Execution after a NEW exclusive has taken the
+        // seat will fail the CAS and leave the new owner intact.
+        if self.runnable.exclusive {
+            self.ctx.clear_exclusive_owner_if(self.claimed.id);
+        }
     }
 }
 
@@ -1505,6 +1527,13 @@ impl Execution {
         // (not in InFlightGuard::drop) so it tracks the real DB outcome.
         if transaction_result.is_ok() {
             self.ctx.ledger_remove(self.claimed.id);
+            // Clear exclusive ownership for this row so the dispatcher can
+            // resume claiming. CAS gate: only the row that actually owns
+            // the seat can clear it, so a stale Execution drop arriving
+            // late cannot wipe a newer exclusive's ownership.
+            if self.runnable.exclusive {
+                self.ctx.clear_exclusive_owner_if(self.claimed.id);
+            }
         }
 
         // Emergency cleanup: if the transaction failed after all retries, mark the job
@@ -1569,6 +1598,16 @@ impl Execution {
                 // and the job already ran. Mark CleanupPending to block requeue.
                 self.ctx
                     .ledger_set(self.claimed.id, crate::context::ClaimState::CleanupPending);
+            }
+
+            // Release exclusive ownership here as well: perform() already ran
+            // (only the post-perform DB cleanup failed), so the worker must
+            // be allowed to resume claiming. Leaving ownership stuck would
+            // block every subsequent claim cycle on this worker for no
+            // benefit. CAS-gated by claimed_id for the same stale-Execution
+            // safety reason as the success path above.
+            if self.runnable.exclusive {
+                self.ctx.clear_exclusive_owner_if(self.claimed.id);
             }
         }
 
@@ -2272,6 +2311,34 @@ impl Worker {
                 }
             }
 
+            // Per-class exclusive flag. When true, the worker stops claiming new
+            // jobs once a exclusive is dispatched, drains sibling in-flight jobs,
+            // then runs the exclusive alone. Worker-process scope only — does NOT
+            // coordinate across separate worker processes; combine with
+            // `concurrency_limit = 1` + `concurrency_key` for global
+            // single-instance.
+            let mut exclusive = false;
+            if bound.hasattr("exclusive")? {
+                let attr = bound.getattr("exclusive")?;
+                let is_descriptor = attr
+                    .get_type()
+                    .qualname()
+                    .map(|n| n.contains("descriptor"))
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(false);
+                if !is_descriptor && !attr.is_none() {
+                    exclusive = attr.extract::<bool>().map_err(|_| {
+                        pyo3::exceptions::PyTypeError::new_err(format!(
+                            "{class_name}: exclusive must be a bool, got {}",
+                            attr.get_type()
+                                .qualname()
+                                .map(|q| q.to_string())
+                                .unwrap_or_default()
+                        ))
+                    })?;
+                }
+            }
+
             let module_path = bound
                 .getattr("__module__")
                 .and_then(|m| m.extract::<String>())
@@ -2313,11 +2380,21 @@ impl Worker {
                 rate_limit_max,
                 rate_limit_window_seconds,
                 rate_limit_on_throttle,
+                exclusive,
             };
             info!("Registered job: {:?}", runnable);
 
             if let Ok(mut runnables) = self.ctx.runnables.write() {
                 runnables.insert(class_name.to_string(), runnable);
+            }
+
+            // Cache exclusive-class presence so the claim_jobs fast-path can
+            // skip the GIL + registry scan. Sticky: never cleared (classes are
+            // only ever added during startup registration).
+            if exclusive {
+                self.ctx
+                    .any_exclusive_class
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
 
             // Only store concurrency info if concurrency control is actually enabled
@@ -2939,8 +3016,116 @@ impl Worker {
                 .ledger_set(row.id, crate::context::ClaimState::Dispatched);
         }
 
+        // Exclusive sieve. When the batch contains a `exclusive = True` job, keep
+        // only the FIRST one (batch order) and release every other claimed row
+        // (exclusive or not) back to ready. This guarantees:
+        //
+        //   1. The dispatcher will not start any more non-exclusive work on
+        //      this worker (we set `exclusive_active` here so the next
+        //      `process_available_jobs` short-circuits at its gate).
+        //   2. Exactly one exclusive is ever in flight on this worker at a
+        //      time, so the exclusive's pick_job wait loop has a deterministic
+        //      exit condition (zero non-self InFlight/Dispatched entries).
+        //   3. Both production (`process_available_jobs` → `claim_jobs`) and
+        //      the test helper (`drain_batch` → `claim_jobs`) see the same
+        //      sieve, so tests can drive the exclusive behavior end-to-end
+        //      without an extra hook.
+        //
+        // Fast-path: short-circuit when no class has declared `exclusive = True`
+        // (the common case). A single atomic load — no GIL, no registry scan —
+        // off the cached flag set at registration time. Avoids both the
+        // find_by_ids lookup and the class_name scan.
+        let any_exclusive_class = self
+            .ctx
+            .any_exclusive_class
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let jobs = if any_exclusive_class && !jobs.is_empty() {
+            self.apply_exclusive_sieve(jobs).await
+        } else {
+            jobs
+        };
+
         trace!("elpased: {:?}", timer.elapsed());
         Ok(jobs)
+    }
+
+    /// Detect the first exclusive-flagged claimed row in `batch`, set
+    /// `exclusive_active`, and release every other row back to ready. Returns
+    /// either the unchanged `batch` (no exclusive found) or a single-row
+    /// vector containing just the exclusive.
+    ///
+    /// `release_claimed_batch` handles the per-row tx and removes the released
+    /// rows' ledger entries; failures are stashed for the maintenance
+    /// reconcile, mirroring how channel-full and post-claim DB errors are
+    /// handled.
+    async fn apply_exclusive_sieve(
+        &self,
+        batch: Vec<quebec_claimed_executions::Model>,
+    ) -> Vec<quebec_claimed_executions::Model> {
+        // Look up class_name for each claimed row. Cheap one-shot batch read.
+        let job_ids: Vec<i64> = batch.iter().map(|r| r.job_id).collect();
+        let table_config = self.ctx.table_config.clone();
+        let Ok(db) = self.ctx.get_db().await else {
+            // No DB connection: cannot inspect class_names, so cannot apply
+            // the sieve. Return the unchanged batch — worst case is a exclusive
+            // job running concurrently with siblings, which is at most the
+            // pre-feature behavior. Logged via the outer claim_jobs path.
+            return batch;
+        };
+        let jobs_lookup = query_builder::jobs::find_by_ids(db.as_ref(), &table_config, job_ids)
+            .await
+            .ok();
+        let job_map: std::collections::HashMap<i64, String> = match jobs_lookup {
+            Some(jobs) => jobs.into_iter().map(|j| (j.id, j.class_name)).collect(),
+            None => return batch,
+        };
+
+        let exclusive_idx = batch.iter().position(|row| {
+            job_map
+                .get(&row.job_id)
+                .and_then(|class_name| {
+                    Python::attach(|_py| {
+                        self.ctx.get_runnable(class_name).ok().map(|r| r.exclusive)
+                    })
+                })
+                .unwrap_or(false)
+        });
+
+        let Some(idx) = exclusive_idx else {
+            return batch;
+        };
+
+        let mut kept: Vec<quebec_claimed_executions::Model> = Vec::with_capacity(1);
+        let mut to_release: Vec<quebec_claimed_executions::Model> = Vec::new();
+        for (i, row) in batch.into_iter().enumerate() {
+            if i == idx {
+                kept.push(row);
+            } else {
+                to_release.push(row);
+            }
+        }
+
+        // Take ownership BEFORE releasing siblings so a concurrent
+        // process_available_jobs poll sees the gate even if it interleaves
+        // with the release calls. The owner is the exclusive's claimed id;
+        // any later clear is a CAS that only succeeds for that same id, so
+        // a stale Execution drop cannot wipe out a newer exclusive.
+        let exclusive_id = kept
+            .first()
+            .map(|row| row.id)
+            .expect("kept contains exactly one exclusive row");
+        self.ctx
+            .exclusive_owner
+            .store(exclusive_id, std::sync::atomic::Ordering::SeqCst);
+
+        if !to_release.is_empty() {
+            let failed = Self::release_claimed_batch(&self.ctx, &to_release).await;
+            if !failed.is_empty() {
+                self.stash_dispatch_retry(failed).await;
+            }
+        }
+
+        kept
     }
 
     /// Check if this worker should handle the notify message for the given queue.
@@ -3385,8 +3570,10 @@ impl Worker {
                     // Claim requeued + row deleted: drop the ledger entry so
                     // close()/test-hook paths don't leak (the real
                     // graceful_shutdown exits the process, but those paths
-                    // keep running).
+                    // keep running). Also CAS-clear exclusive ownership in case
+                    // the released row was an unowned exclusive sieve leftover.
                     self.ctx.ledger_remove(execution_id);
+                    self.ctx.clear_exclusive_owner_if(execution_id);
                     debug!("Released job {} back to ready state", job_id);
                 }
                 Err(e) => {
@@ -3467,6 +3654,11 @@ impl Worker {
                 // Requeued: the claim is gone, drop it from the ledger so it
                 // stops counting against in-flight / blocking drain exit.
                 ctx.ledger_remove(execution_id);
+                // CAS-clear exclusive ownership: if this row was the exclusive
+                // sieve's kept row (e.g. find_by_ids failure released it
+                // pre-dispatch), release the seat. CAS so non-exclusive rows
+                // and rows from older exclusives are no-ops.
+                ctx.clear_exclusive_owner_if(execution_id);
             }
         }
         if !claimed.is_empty() {
@@ -3524,6 +3716,10 @@ impl Worker {
     /// Delete a claimed execution record without writing to failed_executions.
     /// Used when the job record itself is already gone (FK would prevent insert).
     async fn delete_claimed_by_id(ctx: &Arc<AppContext>, execution_id: i64) {
+        // CAS-clear exclusive ownership on any path that abandons the row.
+        // Idempotent and free for non-exclusive rows (compare fails). Done up
+        // front so even the "no DB" early-return path frees the seat.
+        ctx.clear_exclusive_owner_if(execution_id);
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for delete_claimed_by_id: {:?}", e);
         }) else {
@@ -3565,6 +3761,11 @@ impl Worker {
         job_id: i64,
         error_msg: &str,
     ) {
+        // CAS-clear exclusive ownership: covers the runnable-lookup-failure
+        // path in process_available_jobs (which calls this on the
+        // sieved-but-undispatchable kept exclusive). No-op for non-exclusive
+        // rows.
+        ctx.clear_exclusive_owner_if(execution_id);
         let Ok(db) = ctx.get_db().await.inspect_err(|e| {
             warn!("Failed to get DB for fail_claimed_by_id: {:?}", e);
         }) else {
@@ -4265,6 +4466,22 @@ impl Worker {
             return;
         }
 
+        // Exclusive gate: a exclusive-flagged job has been claimed on this worker
+        // and is either waiting for siblings to drain or executing. Stop
+        // claiming new work until the owner clears `exclusive_owner` (success
+        // path, emergency-cleanup path, Execution::Drop backstop, or any
+        // abandonment helper for a exclusive sieved-but-never-executed). Zero
+        // overhead when no exclusive is in flight: a single SeqCst load
+        // compared against 0.
+        if ctx
+            .exclusive_owner
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            trace!("[{}] exclusive active, skipping claim", source);
+            return;
+        }
+
         // Only claim as many jobs as the channel can accept to prevent
         // claimed execution leaks when the channel is full.
         let available = tx.lock().await.capacity();
@@ -4513,6 +4730,45 @@ impl Worker {
             }
             ledger.insert(execution.claimed.id, crate::context::ClaimState::InFlight);
         }
+
+        // Exclusive serialization: if this execution is a exclusive job, do not
+        // hand it to the Python work queue until every OTHER claim on this
+        // worker has drained. Siblings from earlier batches still in the
+        // dispatch channel will be picked by other threads and run to
+        // completion; new batches won't be claimed because
+        // `process_available_jobs` short-circuits on `exclusive_active`.
+        //
+        // CleanupPending entries don't count — the job already finished.
+        // Dispatched and InFlight do — they are jobs still in flight or
+        // about to be picked. Wait for them to clear.
+        //
+        // Honour `graceful_shutdown` mid-wait so a SIGTERM during a exclusive
+        // wait doesn't keep the worker pinned. The exclusive's claimed row
+        // stays in `claimed_executions` as InFlight in the ledger; shutdown
+        // release skips InFlight, and the orphan-sweep / restarting worker
+        // reclaims it (same semantics any InFlight-during-shutdown row gets).
+        if execution.runnable.exclusive {
+            let self_id = execution.claimed.id;
+            loop {
+                let snapshot = self.ctx.ledger_snapshot();
+                let others_active = snapshot.iter().any(|(id, state)| {
+                    *id != self_id
+                        && matches!(
+                            state,
+                            crate::context::ClaimState::Dispatched
+                                | crate::context::ClaimState::InFlight
+                        )
+                });
+                if !others_active {
+                    break;
+                }
+                if self.ctx.graceful_shutdown.is_cancelled() {
+                    return Err(QuebecError::runtime("shutting down during exclusive wait"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
         Ok(execution)
     }
 
