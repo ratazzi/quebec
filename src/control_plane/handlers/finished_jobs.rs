@@ -74,6 +74,7 @@ impl ControlPlane {
                     id: job.id,
                     queue_name: job.queue_name,
                     class_name: job.class_name,
+                    priority: job.priority,
                     created_at: Self::format_naive_datetime(job.created_at),
                     finished_at: Self::format_naive_datetime(finished_at),
                     runtime,

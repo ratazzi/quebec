@@ -108,6 +108,7 @@ pub struct FailedJobInfo {
     pub id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub error: String,
     pub failed_at: String,
 }
@@ -118,6 +119,7 @@ pub struct InProgressJobInfo {
     pub job_id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub worker_info: String,
     pub started_at: String,
     pub runtime: String,
@@ -127,6 +129,7 @@ pub struct InProgressJobInfo {
 pub struct QueueJobInfo {
     pub id: i64,
     pub class_name: String,
+    pub priority: i32,
     pub created_at: String,
 }
 
@@ -136,6 +139,7 @@ pub struct ScheduledJobInfo {
     pub job_id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub created_at: String,
     pub scheduled_at: String,
     pub scheduled_in: String,
@@ -147,6 +151,7 @@ pub struct BlockedJobInfo {
     pub job_id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub concurrency_key: String,
     pub created_at: String,
     pub waiting_time: String,
@@ -158,6 +163,7 @@ pub struct FinishedJobInfo {
     pub id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub created_at: String,
     pub finished_at: String,
     pub runtime: String,

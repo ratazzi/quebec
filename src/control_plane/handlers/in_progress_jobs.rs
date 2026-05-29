@@ -99,6 +99,7 @@ impl ControlPlane {
                     job_id: execution.job_id,
                     queue_name: job.queue_name.clone(),
                     class_name: job.class_name.clone(),
+                    priority: job.priority,
                     worker_info,
                     started_at: Self::format_naive_datetime(execution.created_at),
                     runtime,

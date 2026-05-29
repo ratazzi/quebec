@@ -79,6 +79,9 @@
             Job
           </th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+            Priority
+          </th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
             Error
           </th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
@@ -96,6 +99,9 @@
             </div>
             <div class="text-sm text-gray-500">ID: {{ job.id }}</div>
             <div class="text-xs text-gray-400">Queue: {{ job.queue_name }}</div>
+          </td>
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
+            <div class="text-sm text-gray-900">{% if job.priority != 0 %}{{ job.priority }}{% else %}—{% endif %}</div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             <div class="text-sm text-red-600">
@@ -133,7 +139,7 @@
         {% endfor %}
         {% else %}
         <tr>
-          <td colspan="3" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
+          <td colspan="4" class="px-3 py-3 sm:px-6 sm:py-4 text-center text-sm text-gray-500">
             No failed jobs found.
           </td>
         </tr>

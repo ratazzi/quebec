@@ -80,6 +80,7 @@ impl ControlPlane {
             s.scheduled_at,
             j.class_name,
             j.queue_name,
+            j.priority,
             j.created_at
         FROM {} s
         JOIN {} j ON s.job_id = j.id
@@ -110,6 +111,7 @@ impl ControlPlane {
             let job_id: i64 = row.try_get("", "job_id").unwrap_or_default();
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
+            let priority: i32 = row.try_get("", "priority").unwrap_or(0);
 
             // Parse creation time
             let created_at_str =
@@ -151,6 +153,7 @@ impl ControlPlane {
                 job_id,
                 queue_name,
                 class_name,
+                priority,
                 created_at: created_at_str,
                 scheduled_at: scheduled_at_str,
                 scheduled_in,

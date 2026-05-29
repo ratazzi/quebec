@@ -262,6 +262,7 @@ impl ControlPlane {
                     crate::control_plane::models::QueueJobInfo {
                         id: job.id,
                         class_name: job.class_name.clone(),
+                        priority: job.priority,
                         created_at: Self::format_naive_datetime(job.created_at),
                     }
                 })

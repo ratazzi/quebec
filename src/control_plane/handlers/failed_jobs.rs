@@ -62,6 +62,7 @@ impl ControlPlane {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
                     class_name: job.class_name.clone(),
+                    priority: job.priority,
                     error: execution.error.unwrap_or_default(),
                     failed_at: Self::format_naive_datetime(execution.created_at),
                 });
