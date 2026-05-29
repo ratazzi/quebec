@@ -18,9 +18,14 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Scheduled tasks
 - Recurring tasks
 - Concurrency control
+- Per-queue concurrency limits
+- Rate limiting
+- Exclusive (stop-the-world) jobs
+- Multi-process (fork) mode
+- Memory-based worker recycling
 - Web dashboard
 - Automatic retries
-- Signal handling
+- Signal handling & graceful restart
 - Lifecycle hooks
 
 ### Control Plane
@@ -167,6 +172,37 @@ MyJob.set(queue='critical').perform_later(qc2, arg1)
 Recommended: configure worker thread count in `queue.yml` via `workers.threads`.
 If you need a one-off override, `Quebec(..., worker_threads=3)` is also supported.
 
+### Multi-Process Mode (fork supervisor)
+
+By default `qc.run()` runs all components as threads in a single process. To scale across CPU cores, set `QUEBEC_SUPERVISOR=1` to fork a pool of child processes instead:
+
+```bash
+QUEBEC_SUPERVISOR=1 python -m quebec your.jobs
+```
+
+```yaml
+# queue.yml (under your environment, e.g. production:)
+workers:
+  - queues: "*"
+    threads: 5
+    processes: 4        # fork 4 worker processes
+dispatchers:
+  - polling_interval: 1
+    processes: 1        # fork 1 dispatcher process
+```
+
+The supervisor forks `workers[].processes` worker children and `dispatchers[].processes` dispatcher children, each taking its config from the matching yml entry, and reforks any child that dies (matching Solid Queue's process model). Fork mode is opt-in via the env var so an existing config with `processes` set doesn't silently switch process model on upgrade; `spawn` is ignored in this mode. Outside supervisor mode the `processes` keys are ignored and Quebec uses the single-process threaded runtime.
+
+### Force Queue Override (multi-branch development)
+
+Set `QUEBEC_FORCE_OVERRIDE_QUEUE` to pin every enqueue and consumption to one queue — handy when several development branches share a single database:
+
+```bash
+QUEBEC_FORCE_OVERRIDE_QUEUE=branch_x python -m quebec your.jobs
+```
+
+Every enqueue path rewrites `queue_name` to this value (ignoring whatever the class, call site, or scheduler specified), and the worker only consumes that queue — so jobs enqueued by one branch are never picked up by another. URL-hostile characters in the name are sanitized to `-`.
+
 ### Delayed Jobs
 
 ```python
@@ -225,6 +261,92 @@ class ReportJob(quebec.BaseClass):
 ```
 
 The actual concurrency key is `"ClassName/key"` (e.g. `"ReportJob/123"`), so different job classes never conflict. When the limit is reached, new jobs are blocked until a slot becomes available. The `concurrency_duration` acts as a safety TTL — the semaphore is released automatically if a worker crashes.
+
+### Rate Limiting (experimental)
+
+Cap how many jobs run within a sliding time window, scoped per key:
+
+```python
+from datetime import timedelta
+
+class ApiCallJob(quebec.BaseClass):
+    rate_limit_max = 5                          # at most 5 runs...
+    rate_limit_duration = timedelta(seconds=2)  # ...per rolling 2-second window
+    rate_limit_on_throttle = quebec.RateLimitConflict.Reschedule  # default
+
+    def rate_limit_key(self, region="us", **kwargs):
+        return region                           # bucket key: "ApiCallJob/us"
+
+    def perform(self, region="us"):
+        call_external_api(region)
+```
+
+Like concurrency control, the bucket is `"ClassName/key"`, and `rate_limit_key` defaults to the class name when not overridden. `rate_limit_duration` must be a `datetime.timedelta` of at least one second. When the window is exhausted, `rate_limit_on_throttle` decides what happens: `Reschedule` (the default) pushes the job to a later run, while `Discard` drops it.
+
+### Exclusive Jobs
+
+Let an occasional memory-heavy job own the whole worker process while it runs:
+
+```python
+class RebuildSearchIndexJob(quebec.BaseClass):
+    exclusive = True
+
+    def perform(self):
+        rebuild_index()                         # runs alone on this worker
+```
+
+When an `exclusive` job is claimed, the worker stops claiming new jobs, waits for any in-flight siblings to finish, then runs the exclusive job by itself before resuming normal claiming. The scope is the **current worker process** — it does not coordinate across separate worker processes; pair it with `concurrency_limit = 1` and a `concurrency_key` if you also need cluster-wide single-instance execution.
+
+### Graceful Restart (quiet-then-exit)
+
+Drain in-flight work and exit on a quiet signal, for zero-downtime rolling restarts:
+
+```python
+qc = quebec.Quebec(database_url="...", quiet_then_exit=True)
+qc.run()
+```
+
+Sending `SIGUSR1` (or `SIGTSTP`) puts the worker into quiet mode: it stops claiming new jobs but keeps running until every in-flight job finishes, then exits cleanly — with no time limit (unlike the `SIGTERM` path, which is bounded by `shutdown_timeout`). The usual flow is: signal the old instance quiet, start a new instance, and the old one exits once drained. Opt-in (default off), and standalone-only — under the fork supervisor a self-exited child would just be reforked, so use a supervisor-level rolling restart there instead. Also settable via `QUEBEC_QUIET_THEN_EXIT=1`.
+
+### Memory-Based Worker Recycling
+
+Long-lived Python workers tend to hold onto RSS the interpreter never returns to the OS. Quebec can recycle a bloated worker by draining it and exiting with a dedicated code, leaving the actual restart to your process supervisor. It is configured by environment variables — there is no in-process restart:
+
+```bash
+QUEBEC_WORKER_MAX_RSS_MB=512                  # soft limit; unset = disabled
+QUEBEC_WORKER_MEMORY_RECYCLE_CONFIRMATIONS=3  # consecutive over-limit samples before recycling (default)
+QUEBEC_WORKER_MEMORY_CHECK_INTERVAL=5s        # how often RSS is sampled (default)
+```
+
+When a worker's RSS stays above the limit for that many consecutive samples, it enters quiet mode, stops claiming, drains its in-flight jobs (no time limit), and exits with code **75** — the planned-recycle code. The supervisor then relaunches a fresh process. Under the built-in fork supervisor (`QUEBEC_SUPERVISOR=1`) this refork is automatic; under systemd, `Restart=on-failure` relaunches the worker after the non-zero recycle exit:
+
+```ini
+# /etc/systemd/system/quebec-worker.service
+[Service]
+ExecStart=/usr/bin/python -m quebec your.jobs
+Environment=QUEBEC_DATABASE_URL=postgresql://localhost/myapp
+Environment=QUEBEC_WORKER_MAX_RSS_MB=512
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker.
+
+### Per-Queue Concurrency (experimental)
+
+Cap how many jobs run concurrently across the cluster for specific queues, independent of per-class `concurrency_key`:
+
+```python
+qc = quebec.Quebec(
+    database_url="...",
+    experimental_queue_concurrency={"reports": 2, "exports": 1},
+)
+qc.run()
+```
+
+Each listed queue acquires a `queue:<name>` semaphore at claim time; queues not present are unlimited. Useful for isolating a misbehaving queue during remediation. Naming and semantics are experimental and may change.
 
 ### TLS Configuration (PostgreSQL)
 
