@@ -20,17 +20,17 @@ import quebec
 class ThrottleJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 3
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     calls: list[int] = []
 
     def perform(self, value: int) -> None:
         type(self).calls.append(value)
 
 
-class SmallWindowJob(quebec.BaseClass):
+class SmallDurationJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 2
-    rate_limit_window = timedelta(seconds=1)
+    rate_limit_duration = timedelta(seconds=1)
     calls: list[int] = []
 
     def perform(self, value: int = 0) -> None:
@@ -40,7 +40,7 @@ class SmallWindowJob(quebec.BaseClass):
 class DiscardJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     rate_limit_on_throttle = quebec.RateLimitConflict.Discard
     calls: list[int] = []
 
@@ -51,7 +51,7 @@ class DiscardJob(quebec.BaseClass):
 class StripeJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     calls: list[tuple] = []
 
     def rate_limit_key(self, region: str = "us") -> str:
@@ -83,7 +83,7 @@ def test_register_job_extracts_rate_limit_config(qc_with_sqlalchemy):
 
     class ApiCall(quebec.BaseClass):
         rate_limit_max = 5
-        rate_limit_window = timedelta(seconds=2)
+        rate_limit_duration = timedelta(seconds=2)
         rate_limit_on_throttle = quebec.RateLimitConflict.Discard
 
         def perform(self, *args, **kwargs):
@@ -94,7 +94,7 @@ def test_register_job_extracts_rate_limit_config(qc_with_sqlalchemy):
     cfg = qc._rate_limit_config_for(ApiCall.__qualname__)
     assert cfg is not None
     assert cfg["max"] == 5
-    assert cfg["window_seconds"] == 2
+    assert cfg["duration_seconds"] == 2
     assert cfg["on_throttle"] == quebec.RateLimitConflict.Discard
 
 
@@ -114,7 +114,7 @@ def test_register_job_defaults_to_reschedule(qc_with_sqlalchemy):
 
     class DefaultThrottle(quebec.BaseClass):
         rate_limit_max = 10
-        rate_limit_window = timedelta(seconds=1)
+        rate_limit_duration = timedelta(seconds=1)
 
         def perform(self, *args, **kwargs):
             pass
@@ -124,54 +124,68 @@ def test_register_job_defaults_to_reschedule(qc_with_sqlalchemy):
     assert cfg["on_throttle"] == quebec.RateLimitConflict.Reschedule
 
 
-def test_register_job_rejects_subsecond_window(qc_with_sqlalchemy):
+def test_register_job_rejects_subsecond_duration(qc_with_sqlalchemy):
     qc = qc_with_sqlalchemy["qc"]
 
     class TooFast(quebec.BaseClass):
         rate_limit_max = 5
-        rate_limit_window = timedelta(milliseconds=500)
+        rate_limit_duration = timedelta(milliseconds=500)
 
         def perform(self, *args, **kwargs):
             pass
 
-    with pytest.raises(ValueError, match="rate_limit_window must be >= 1 second"):
+    with pytest.raises(ValueError, match="rate_limit_duration must be >= 1 second"):
         qc.register_job(TooFast)
 
 
-def test_register_job_rejects_fractional_window(qc_with_sqlalchemy):
+def test_register_job_rejects_fractional_duration(qc_with_sqlalchemy):
     """1.9s would silently truncate to 1s under `as i32`, loosening the
     declared limit by ~50%. Refuse rather than guess floor/ceil/round.
     """
     qc = qc_with_sqlalchemy["qc"]
 
-    class FractionalWindow(quebec.BaseClass):
+    class FractionalDuration(quebec.BaseClass):
         rate_limit_max = 5
-        rate_limit_window = timedelta(seconds=1, milliseconds=900)
+        rate_limit_duration = timedelta(seconds=1, milliseconds=900)
 
         def perform(self, *args, **kwargs):
             pass
 
     with pytest.raises(ValueError, match="whole number of seconds"):
-        qc.register_job(FractionalWindow)
+        qc.register_job(FractionalDuration)
 
 
-def test_register_job_rejects_max_without_window(qc_with_sqlalchemy):
+def test_register_job_rejects_max_without_duration(qc_with_sqlalchemy):
     qc = qc_with_sqlalchemy["qc"]
 
-    class MissingWindow(quebec.BaseClass):
+    class MissingDuration(quebec.BaseClass):
         rate_limit_max = 5
 
         def perform(self, *args, **kwargs):
             pass
 
-    with pytest.raises(ValueError, match="rate_limit_window"):
-        qc.register_job(MissingWindow)
+    with pytest.raises(ValueError, match="rate_limit_duration"):
+        qc.register_job(MissingDuration)
+
+
+def test_register_job_rejects_old_rate_limit_window_name(qc_with_sqlalchemy):
+    qc = qc_with_sqlalchemy["qc"]
+
+    class OldName(quebec.BaseClass):
+        rate_limit_max = 5
+        rate_limit_window = timedelta(seconds=1)
+
+        def perform(self, *args, **kwargs):
+            pass
+
+    with pytest.raises(ValueError, match="rate_limit_duration"):
+        qc.register_job(OldName)
 
 
 def test_default_rate_limit_key_is_class_name():
     class Foo(quebec.BaseClass):
         rate_limit_max = 5
-        rate_limit_window = timedelta(seconds=1)
+        rate_limit_duration = timedelta(seconds=1)
 
         def perform(self, *args, **kwargs):
             pass
@@ -182,7 +196,7 @@ def test_default_rate_limit_key_is_class_name():
 def test_rate_limit_key_can_be_overridden():
     class Bar(quebec.BaseClass):
         rate_limit_max = 5
-        rate_limit_window = timedelta(seconds=1)
+        rate_limit_duration = timedelta(seconds=1)
 
         def rate_limit_key(self, region="us"):
             return f"bar:{region}"
@@ -216,7 +230,7 @@ def _drain_silently(qc) -> object | None:
 def _reset_call_state():
     """Reset module-level class state between tests."""
     ThrottleJob.calls = []
-    SmallWindowJob.calls = []
+    SmallDurationJob.calls = []
     DiscardJob.calls = []
     StripeJob.calls = []
     PlainJob.calls = []
@@ -258,9 +272,9 @@ def test_recovers_after_window_elapses(qc_with_sqlalchemy):
     session = qc_with_sqlalchemy["session"]
     prefix = qc_with_sqlalchemy["prefix"]
 
-    qc.register_job(SmallWindowJob)
+    qc.register_job(SmallDurationJob)
     for i in range(2):
-        SmallWindowJob.perform_later(qc, i)
+        SmallDurationJob.perform_later(qc, i)
 
     # Two grants in first window.
     e1 = _drain_silently(qc)
@@ -270,7 +284,7 @@ def test_recovers_after_window_elapses(qc_with_sqlalchemy):
     e2.perform()
 
     # Third enqueue in same window → throttled into scheduled.
-    SmallWindowJob.perform_later(qc, 99)
+    SmallDurationJob.perform_later(qc, 99)
     assert _drain_silently(qc) is None
     scheduled = session.execute(
         text(f"SELECT count(*) FROM {prefix}_scheduled_executions")
@@ -298,7 +312,7 @@ def test_recovers_after_window_elapses(qc_with_sqlalchemy):
     e3 = _drain_silently(qc)
     assert e3 is not None
     e3.perform()
-    assert SmallWindowJob.calls == [0, 1, 99]
+    assert SmallDurationJob.calls == [0, 1, 99]
 
 
 def test_discard_mode_finishes_throttled_jobs(qc_with_sqlalchemy):
@@ -377,7 +391,7 @@ def test_zero_overhead_plain_job_still_claims(qc_with_sqlalchemy):
 class BurstJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 5
-    rate_limit_window = timedelta(seconds=5)
+    rate_limit_duration = timedelta(seconds=5)
     calls: list[int] = []
 
     def perform(self, value: int = 0) -> None:
@@ -429,7 +443,7 @@ class QueueRateJob(quebec.BaseClass):
 
     queue_as = "default"
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     calls: list[int] = []
 
     def perform(self, value: int = 0) -> None:
@@ -494,7 +508,7 @@ def test_reregister_without_rate_limit_clears_stale_config(qc_with_sqlalchemy):
 
     class Reused(quebec.BaseClass):
         rate_limit_max = 1
-        rate_limit_window = timedelta(seconds=2)
+        rate_limit_duration = timedelta(seconds=2)
 
         def perform(self, *args, **kwargs):
             pass
@@ -512,7 +526,7 @@ def test_reregister_without_rate_limit_clears_stale_config(qc_with_sqlalchemy):
 
 
 class CombinedClassRateJob(quebec.BaseClass):
-    """concurrency_limit=1 + rate_limit_max=1 + rate_limit_window=2s.
+    """concurrency_limit=1 + rate_limit_max=1 + rate_limit_duration=2s.
 
     Used by test_rate_throttle_releases_concurrency_key_slot to exercise
     the interaction between class-level concurrency_key (acquired at
@@ -522,7 +536,7 @@ class CombinedClassRateJob(quebec.BaseClass):
     queue_as = "default"
     concurrency_limit = 1
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     calls: list[int] = []
 
     @staticmethod
@@ -603,7 +617,7 @@ class CombinedDiscardJob(quebec.BaseClass):
     queue_as = "default"
     concurrency_limit = 1
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=2)
+    rate_limit_duration = timedelta(seconds=2)
     rate_limit_on_throttle = quebec.RateLimitConflict.Discard
     calls: list[int] = []
 
@@ -661,7 +675,7 @@ def test_rate_discard_releases_concurrency_key_slot(qc_with_sqlalchemy):
 class JitterSpreadJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 1
-    rate_limit_window = timedelta(seconds=1)
+    rate_limit_duration = timedelta(seconds=1)
     calls: list[int] = []
 
     def perform(self, value: int = 0) -> None:
@@ -727,7 +741,7 @@ class LargeWindowJob(quebec.BaseClass):
     queue_as = "default"
     rate_limit_max = 1
     # i32::MAX seconds — the upper bound accepted by register_job_class.
-    rate_limit_window = timedelta(seconds=2_147_483_647)
+    rate_limit_duration = timedelta(seconds=2_147_483_647)
     calls: list[int] = []
 
     def perform(self, value: int = 0) -> None:
@@ -780,7 +794,7 @@ def test_large_window_jitter_no_overflow(qc_with_sqlalchemy):
     now = datetime.now(timezone.utc)
     # base scheduled_at is now + ~window_secs (since prev=0, retry_at jumps
     # to window_end). Plus jitter (0..window). Allow up to 2x window slack.
-    upper = now + td(seconds=LargeWindowJob.rate_limit_window.total_seconds() * 2)
+    upper = now + td(seconds=LargeWindowJob.rate_limit_duration.total_seconds() * 2)
     for scheduled_at, jid in rows:
         if isinstance(scheduled_at, str):
             scheduled_at = datetime.fromisoformat(scheduled_at)
@@ -793,32 +807,32 @@ def test_large_window_jitter_no_overflow(qc_with_sqlalchemy):
         )
 
 
-def test_register_job_rejects_non_timedelta_window(qc_with_sqlalchemy):
-    """Non-timedelta `rate_limit_window` used to surface as a cryptic
+def test_register_job_rejects_non_timedelta_duration(qc_with_sqlalchemy):
+    """Non-timedelta `rate_limit_duration` used to surface as a cryptic
     `AttributeError: 'int' object has no attribute 'total_seconds'`.
     The upfront is_instance check now reports the actual problem.
     """
     qc = qc_with_sqlalchemy["qc"]
 
-    class BadWindowInt(quebec.BaseClass):
+    class BadDurationInt(quebec.BaseClass):
         rate_limit_max = 1
-        rate_limit_window = 2  # int, not timedelta
+        rate_limit_duration = 2  # int, not timedelta
 
         def perform(self, *args, **kwargs):
             pass
 
     with pytest.raises(TypeError, match="must be a datetime.timedelta"):
-        qc.register_job(BadWindowInt)
+        qc.register_job(BadDurationInt)
 
-    class BadWindowStr(quebec.BaseClass):
+    class BadDurationStr(quebec.BaseClass):
         rate_limit_max = 1
-        rate_limit_window = "2 seconds"  # str
+        rate_limit_duration = "2 seconds"  # str
 
         def perform(self, *args, **kwargs):
             pass
 
     with pytest.raises(TypeError, match="must be a datetime.timedelta"):
-        qc.register_job(BadWindowStr)
+        qc.register_job(BadDurationStr)
 
 
 @pytest.mark.parametrize(
@@ -840,7 +854,7 @@ def test_rate_limit_key_failure_falls_back_to_class_name(
 
     class Job(quebec.BaseClass):
         rate_limit_max = 1
-        rate_limit_window = timedelta(seconds=2)
+        rate_limit_duration = timedelta(seconds=2)
 
         def rate_limit_key(self, *args, **kwargs):
             if bad_return == "raise":

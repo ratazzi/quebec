@@ -213,9 +213,11 @@ Multiple `RetryStrategy` entries can target different exception types with indep
 Limit how many jobs with the same key can run simultaneously:
 
 ```python
+from datetime import timedelta
+
 class ReportJob(quebec.BaseClass):
     concurrency_limit = 3          # max 3 concurrent executions per key
-    concurrency_duration = 120     # semaphore TTL in seconds
+    concurrency_duration = timedelta(seconds=120)  # semaphore crash-safety TTL
 
     def concurrency_key(self, account_id, **kwargs):
         return str(account_id)     # final key: "ReportJob/123"
