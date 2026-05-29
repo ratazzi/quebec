@@ -248,6 +248,26 @@ class NoNewOverrideMeta(type):
 
 
 class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
+    """Recommended base for application jobs.
+
+    Per-class attributes recognized by the worker registration step:
+
+    * ``concurrency_limit`` / ``concurrency_duration`` / ``concurrency_key``
+      — cluster-wide concurrency control backed by ``solid_queue_semaphores``.
+    * ``rate_limit_max`` / ``rate_limit_window`` / ``rate_limit_on_throttle``
+      — experimental sliding-window rate limit (see ``rate_limit_key``).
+    * ``exclusive`` (bool, default ``False``) — worker-local stop-the-world flag.
+      When ``True``, claiming this class on a worker process flips an
+      in-process flag that (a) makes the dispatcher stop claiming new
+      work, (b) causes ``pick_job`` to wait until every other claim on
+      that worker has drained, and (c) clears the flag once the exclusive
+      job finishes. Scope is the **current worker process** — it does NOT
+      coordinate across separate worker processes. Pair with
+      ``concurrency_limit = 1`` + ``concurrency_key`` if you also need
+      cluster-wide single-instance execution. The drain wait is
+      unbounded — slow siblings hold the exclusive job until they finish.
+    """
+
     def rate_limit_key(self, *args, **kwargs) -> str:
         """Bucket key for the experimental sliding-window rate limit.
 
