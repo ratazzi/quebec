@@ -1187,7 +1187,7 @@ impl Execution {
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
         let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
-        let delay_ms = (now - target).num_milliseconds().max(0);
+        let delay_ms = (now - target).to_std().unwrap_or_default().as_secs_f64() * 1000.0;
         let mut job = self.job.clone();
         let jid = job.active_job_id.clone().unwrap_or_default();
         let supervised = self
@@ -1212,10 +1212,18 @@ impl Execution {
         let result = async {
             let class_name = &self.runnable.class_name;
             if job.priority == 0 {
-                info!(id = job.id, delay_ms, "Job `{class_name}' started");
+                info!(
+                    event = "job.started",
+                    id = job.id,
+                    class_name = %class_name,
+                    delay_ms,
+                    "Job `{class_name}' started"
+                );
             } else {
                 info!(
+                    event = "job.started",
                     id = job.id,
+                    class_name = %class_name,
                     priority = job.priority,
                     delay_ms,
                     "Job `{class_name}' started"
@@ -1295,32 +1303,46 @@ impl Execution {
         let job_id = self.claimed.job_id;
         let job = self.job.clone();
 
-        let eplased = self.timer.elapsed();
+        let elapsed = self.timer.elapsed();
+        let duration_ms = elapsed.as_secs_f64() * 1000.0;
+        let delay = self
+            .started_at
+            .map(|started| {
+                let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
+                (started - target).to_std().unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let delay_ms = delay.as_secs_f64() * 1000.0;
         async {
             if result.is_ok() {
                 info!(
+                    event = "job.completed",
+                    status = "executed",
+                    id = job_id,
+                    class_name = %self.runnable.class_name,
+                    duration_ms,
+                    delay_ms,
                     "Job `{}' executed in: {}",
                     self.runnable.class_name,
-                    format!("{eplased:?}").bright_purple(),
+                    format!("{elapsed:?}").bright_purple(),
                 );
             } else {
                 error!(
+                    event = "job.completed",
+                    status = "failed",
+                    id = job_id,
+                    class_name = %self.runnable.class_name,
+                    duration_ms,
+                    delay_ms,
                     "Job `{}' failed in: {:?}",
-                    self.runnable.class_name, eplased
+                    self.runnable.class_name, elapsed
                 );
             }
 
-            let delay = self
-                .started_at
-                .map(|started| {
-                    let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
-                    (started - target).to_std().unwrap_or_default()
-                })
-                .unwrap_or_default();
             let metric = Metric {
                 id: job_id,
                 success: result.is_ok(),
-                duration: eplased,
+                duration: elapsed,
                 delay,
             };
             self.metric = Some(metric);
