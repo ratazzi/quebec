@@ -102,7 +102,7 @@ pub struct Runnable {
     /// the discriminator — when None, the claim path's `rate_limit_enabled`
     /// gate short-circuits without ever calling into this struct.
     pub rate_limit_max: Option<i32>,
-    pub rate_limit_window_seconds: Option<i32>,
+    pub rate_limit_duration_seconds: Option<i32>,
     pub rate_limit_on_throttle: crate::context::RateLimitConflict,
     /// Worker-local stop-the-world flag. When true, claiming this class flips
     /// `AppContext.exclusive_active`: the dispatcher stops claiming new work, the
@@ -141,7 +141,7 @@ impl Runnable {
             continuation_info: None,
             hooks: HookFlags::default(),
             rate_limit_max: None,
-            rate_limit_window_seconds: None,
+            rate_limit_duration_seconds: None,
             rate_limit_on_throttle: crate::context::RateLimitConflict::default(),
             exclusive: false,
         }
@@ -162,7 +162,7 @@ impl Runnable {
             continuation_info: self.continuation_info.clone(),
             hooks: self.hooks.clone(),
             rate_limit_max: self.rate_limit_max,
-            rate_limit_window_seconds: self.rate_limit_window_seconds,
+            rate_limit_duration_seconds: self.rate_limit_duration_seconds,
             rate_limit_on_throttle: self.rate_limit_on_throttle,
             exclusive: self.exclusive,
         }
@@ -2234,7 +2234,7 @@ impl Worker {
             // is the discriminator — when None, the entire feature is off
             // for this class.
             let mut rate_limit_max: Option<i32> = None;
-            let mut rate_limit_window_seconds: Option<i32> = None;
+            let mut rate_limit_duration_seconds: Option<i32> = None;
             let mut rate_limit_on_throttle = crate::context::RateLimitConflict::default();
 
             if bound.hasattr("rate_limit_max")? {
@@ -2251,50 +2251,51 @@ impl Worker {
             }
 
             if rate_limit_max.is_some() {
-                if !bound.hasattr("rate_limit_window")? {
+                if !bound.hasattr("rate_limit_duration")? {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "{class_name}: rate_limit_max is set but \
-                         `rate_limit_window` is missing — declare \
-                         `rate_limit_window = timedelta(seconds=N)` (N >= 1) \
+                         `rate_limit_duration` is missing — declare \
+                         `rate_limit_duration = timedelta(seconds=N)` (N >= 1) \
                          on the class."
                     )));
                 }
-                let td = bound.getattr("rate_limit_window")?;
+
+                let td = bound.getattr("rate_limit_duration")?;
                 // Type-check upfront so users get a clear error instead of
                 // the cryptic `AttributeError: 'int' object has no attribute
                 // 'total_seconds'` that surfaces if any non-timedelta is set.
                 if !td.is_instance_of::<pyo3::types::PyDelta>() {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                        "{class_name}: rate_limit_window must be a datetime.timedelta, got {}",
+                        "{class_name}: rate_limit_duration must be a datetime.timedelta, got {}",
                         td.get_type().qualname()?
                     )));
                 }
                 let total: f64 = td.call_method0("total_seconds")?.extract()?;
                 if total < 1.0 {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "{class_name}: rate_limit_window must be >= 1 second, \
+                        "{class_name}: rate_limit_duration must be >= 1 second, \
                          got {total}s. Sub-second windows make jitter and \
                          retry_at solver precision insufficient."
                     )));
                 }
                 if total > i32::MAX as f64 {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "{class_name}: rate_limit_window too large, got {total}s"
+                        "{class_name}: rate_limit_duration too large, got {total}s"
                     )));
                 }
                 // The sliding-window math operates in integer seconds (window
                 // bucket index = floor(epoch / window_secs)). Silently truncating
-                // 1.9s → 1s would loosen the limit by ~50%, so refuse instead of
+                // 1.9s -> 1s would loosen the limit by ~50%, so refuse instead of
                 // guessing whether the user wanted floor/ceil/round.
                 if total.fract().abs() > f64::EPSILON {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "{class_name}: rate_limit_window must be a whole number \
+                        "{class_name}: rate_limit_duration must be a whole number \
                          of seconds, got {total}s. The sliding-window algorithm \
-                         operates in 1-second buckets — fractional windows would \
+                         operates in 1-second buckets; fractional durations would \
                          be silently rounded."
                     )));
                 }
-                rate_limit_window_seconds = Some(total as i32);
+                rate_limit_duration_seconds = Some(total as i32);
 
                 if bound.hasattr("rate_limit_on_throttle")? {
                     let attr = bound.getattr("rate_limit_on_throttle")?;
@@ -2378,7 +2379,7 @@ impl Worker {
                 continuation_info: None,
                 hooks,
                 rate_limit_max,
-                rate_limit_window_seconds,
+                rate_limit_duration_seconds,
                 rate_limit_on_throttle,
                 exclusive,
             };
@@ -2410,13 +2411,13 @@ impl Worker {
             // also clear any stale config — otherwise the prior config keeps
             // throttling silently in long-lived processes / test reuse.
             if let Ok(mut reg) = self.ctx.rate_limited_classes.write() {
-                match (rate_limit_max, rate_limit_window_seconds) {
-                    (Some(max), Some(win_secs)) => {
+                match (rate_limit_max, rate_limit_duration_seconds) {
+                    (Some(max), Some(duration_secs)) => {
                         reg.insert(
                             class_name.to_string(),
                             crate::context::RateLimitConfig {
                                 max,
-                                window: chrono::Duration::seconds(win_secs as i64),
+                                window: chrono::Duration::seconds(duration_secs as i64),
                                 on_throttle: rate_limit_on_throttle,
                             },
                         );
@@ -4731,39 +4732,61 @@ impl Worker {
             ledger.insert(execution.claimed.id, crate::context::ClaimState::InFlight);
         }
 
-        // Exclusive serialization: if this execution is a exclusive job, do not
+        // Exclusive serialization: if this execution is an exclusive job, do not
         // hand it to the Python work queue until every OTHER claim on this
         // worker has drained. Siblings from earlier batches still in the
         // dispatch channel will be picked by other threads and run to
         // completion; new batches won't be claimed because
-        // `process_available_jobs` short-circuits on `exclusive_active`.
+        // `process_available_jobs` short-circuits on `exclusive_owner`.
         //
         // CleanupPending entries don't count — the job already finished.
         // Dispatched and InFlight do — they are jobs still in flight or
         // about to be picked. Wait for them to clear.
         //
-        // Honour `graceful_shutdown` mid-wait so a SIGTERM during a exclusive
+        // The drain wait is unbounded by design (see issue tracking a possible
+        // timeout): a slow sibling holds the exclusive job until it finishes.
+        // To keep that visible, log a warning once the wait crosses a threshold
+        // and periodically thereafter — no behavioral change, observability only.
+        //
+        // Honour `graceful_shutdown` mid-wait so a SIGTERM during an exclusive
         // wait doesn't keep the worker pinned. The exclusive's claimed row
         // stays in `claimed_executions` as InFlight in the ledger; shutdown
         // release skips InFlight, and the orphan-sweep / restarting worker
         // reclaims it (same semantics any InFlight-during-shutdown row gets).
         if execution.runnable.exclusive {
             let self_id = execution.claimed.id;
+            const WARN_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+            let wait_started = std::time::Instant::now();
+            let mut next_warn = WARN_EVERY;
             loop {
                 let snapshot = self.ctx.ledger_snapshot();
-                let others_active = snapshot.iter().any(|(id, state)| {
-                    *id != self_id
-                        && matches!(
-                            state,
-                            crate::context::ClaimState::Dispatched
-                                | crate::context::ClaimState::InFlight
-                        )
-                });
-                if !others_active {
+                let others_active = snapshot
+                    .iter()
+                    .filter(|(id, state)| {
+                        **id != self_id
+                            && matches!(
+                                state,
+                                crate::context::ClaimState::Dispatched
+                                    | crate::context::ClaimState::InFlight
+                            )
+                    })
+                    .count();
+                if others_active == 0 {
                     break;
                 }
                 if self.ctx.graceful_shutdown.is_cancelled() {
                     return Err(QuebecError::runtime("shutting down during exclusive wait"));
+                }
+                let waited = wait_started.elapsed();
+                if waited >= next_warn {
+                    warn!(
+                        jid = %execution.job.active_job_id.clone().unwrap_or_default(),
+                        class_name = %execution.runnable.class_name,
+                        waited_secs = waited.as_secs(),
+                        siblings = others_active,
+                        "Exclusive job still waiting for sibling claims to drain"
+                    );
+                    next_warn += WARN_EVERY;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
