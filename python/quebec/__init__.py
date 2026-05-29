@@ -254,7 +254,7 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
 
     * ``concurrency_limit`` / ``concurrency_duration`` / ``concurrency_key``
       — cluster-wide concurrency control backed by ``solid_queue_semaphores``.
-    * ``rate_limit_max`` / ``rate_limit_window`` / ``rate_limit_on_throttle``
+    * ``rate_limit_max`` / ``rate_limit_duration`` / ``rate_limit_on_throttle``
       — experimental sliding-window rate limit (see ``rate_limit_key``).
     * ``exclusive`` (bool, default ``False``) — worker-local stop-the-world flag.
       When ``True``, claiming this class on a worker process flips an

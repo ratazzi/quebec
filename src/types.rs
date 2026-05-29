@@ -2551,7 +2551,7 @@ impl PyQuebec {
             Some(cfg) => {
                 let dict = PyDict::new(py);
                 dict.set_item("max", cfg.max)?;
-                dict.set_item("window_seconds", cfg.window.num_seconds())?;
+                dict.set_item("duration_seconds", cfg.window.num_seconds())?;
                 dict.set_item("on_throttle", cfg.on_throttle)?;
                 Ok(Some(dict))
             }
