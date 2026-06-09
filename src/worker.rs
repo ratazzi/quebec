@@ -126,6 +126,19 @@ pub(crate) struct RetryInfo {
     pub(crate) arguments: String,
 }
 
+/// Outcome of matching a job error against its `retry_on` declarations.
+enum RetryDecision {
+    /// Attempts remain — re-enqueue with the strategy's wait.
+    Retry {
+        strategy: RetryStrategy,
+        exception_key: String,
+    },
+    /// The matching declaration is out of attempts. Carries the strategy so the
+    /// caller can run its handler (mirrors ActiveJob's `retry_on ... do` block,
+    /// which fires once attempts are exhausted).
+    Exhausted { strategy: RetryStrategy },
+}
+
 impl Runnable {
     pub fn new(class_name: String, handler: Py<PyAny>, queue_as: String, priority: i64) -> Self {
         Self {
@@ -388,7 +401,7 @@ impl Runnable {
         bound: &Bound<PyAny>,
         error: &PyErr,
         job_arguments: Option<&str>,
-    ) -> PyResult<Option<(RetryStrategy, String)>> {
+    ) -> PyResult<Option<RetryDecision>> {
         if !bound.hasattr("retry_on")? {
             return Ok(None);
         }
@@ -406,10 +419,13 @@ impl Runnable {
             if i64::from(count) + 1 >= strategy.attempts {
                 // Exhausted for this declaration — don't try other strategies
                 // (matches ActiveJob's rescue_from: first match wins)
-                return Ok(None);
+                return Ok(Some(RetryDecision::Exhausted { strategy }));
             }
 
-            return Ok(Some((strategy, key)));
+            return Ok(Some(RetryDecision::Retry {
+                strategy,
+                exception_key: key,
+            }));
         }
 
         Ok(None)
@@ -518,9 +534,7 @@ impl Runnable {
     ) -> Result<quebec_jobs::Model> {
         // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
-            if let Err(handler_error) = handler.call1(py, (error.value(py),)) {
-                warn!("Error in discard handler: {}", handler_error);
-            }
+            self.call_strategy_handler(py, handler, &job, error, "discard");
         }
 
         let error_name = error
@@ -542,6 +556,29 @@ impl Runnable {
         }
 
         // Return success directly, indicating task was discarded and marked as completed
+        Ok(job)
+    }
+
+    /// Handle retry exhaustion — run the strategy's handler and mark the job
+    /// completed without recording a failure. Mirrors ActiveJob's
+    /// `retry_on ... do |job, error|` block, which fires once attempts are used up.
+    fn handle_retry_exhausted(
+        &self,
+        py: Python,
+        strategy: &RetryStrategy,
+        error: &PyErr,
+        job: quebec_jobs::Model,
+    ) -> Result<quebec_jobs::Model> {
+        if let Some(handler) = &strategy.handler {
+            self.call_strategy_handler(py, handler, &job, error, "retry");
+        }
+
+        let error_name = error
+            .get_type(py)
+            .name()
+            .map_or_else(|_| "unknown error".to_string(), |s| s.to_string());
+        info!("Job retries exhausted for {error_name}, handled by retry handler");
+
         Ok(job)
     }
 
@@ -871,10 +908,21 @@ impl Runnable {
         // Check error handling strategies by priority
 
         // 1. Check if should retry
-        if let Some((retry_strategy, exception_key)) =
-            self.should_retry(py, &bound, error, job.arguments.as_deref())?
-        {
-            return self.apply_retry_strategy(job, retry_strategy, &exception_key);
+        match self.should_retry(py, &bound, error, job.arguments.as_deref())? {
+            Some(RetryDecision::Retry {
+                strategy,
+                exception_key,
+            }) => {
+                return self.apply_retry_strategy(job, strategy, &exception_key);
+            }
+            // Attempts exhausted with a handler — run it and complete the job,
+            // matching ActiveJob's `retry_on ... do |job, error|` block.
+            Some(RetryDecision::Exhausted { strategy }) if strategy.handler.is_some() => {
+                return self.handle_retry_exhausted(py, &strategy, error, job.clone());
+            }
+            // Exhausted without a handler (or no match) — fall through to
+            // discard / rescue / default failure handling.
+            _ => {}
         }
 
         // 2. Check if should discard
@@ -975,7 +1023,10 @@ impl Runnable {
         strategy: &RescueStrategy,
         error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
-        match strategy.handler.call1(py, (error.value(py),)) {
+        let job_arg = self
+            .build_job_instance(py, job)
+            .unwrap_or_else(|| py.None().into_bound(py));
+        match strategy.handler.call1(py, (job_arg, error.value(py))) {
             Ok(_) => {
                 info!("Job rescued from error");
                 Ok(job.clone())

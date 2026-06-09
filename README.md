@@ -203,6 +203,22 @@ QUEBEC_FORCE_OVERRIDE_QUEUE=branch_x python -m quebec your.jobs
 
 Every enqueue path rewrites `queue_name` to this value (ignoring whatever the class, call site, or scheduler specified), and the worker only consumes that queue — so jobs enqueued by one branch are never picked up by another. URL-hostile characters in the name are sanitized to `-`.
 
+### Transactional Enqueue
+
+> [!IMPORTANT]
+> **Enqueuing is _not_ part of your database transaction — even on the same database.** Quebec's enqueue runs through the Rust engine on its own connection pool, completely separate from your Python connection (SQLAlchemy / Django / psycopg). There is no way to atomically commit a business write and a job enqueue together.
+
+This is the deliberate cost of keeping the engine fully decoupled from your ORM and connection — the upside is that Quebec drags no Python database dependencies into your app, but it means the enqueue cannot join your transaction. Two failure windows follow:
+
+- The business transaction commits but the enqueue fails → **the job is lost**.
+- The enqueue commits but the business transaction rolls back → **the job runs against missing or stale data**.
+
+Recommendations:
+
+- **Enqueue after your business transaction commits.** This removes the worse direction — a job running for a write that was rolled back.
+- **Make jobs idempotent** and tolerant of data that may not be visible yet; lean on retries.
+- If you genuinely need atomicity, use a **transactional outbox**: write an outbox row inside your own transaction (business + outbox commit atomically), then relay it into a real job (at-least-once delivery).
+
 ### Delayed Jobs
 
 ```python
@@ -234,7 +250,8 @@ class PaymentJob(quebec.BaseClass):
             (ValueError,),
             wait=timedelta(seconds=5),
             attempts=1,
-            handler=lambda exc: True,  # optional callback
+            # Called once retries are exhausted; receives (job, error).
+            handler=lambda job, error: notify_admin(error),
         ),
     ]
 
@@ -242,7 +259,7 @@ class PaymentJob(quebec.BaseClass):
         process_payment(order_id)
 ```
 
-Multiple `RetryStrategy` entries can target different exception types with independent wait/attempts.
+Multiple `RetryStrategy` entries can target different exception types with independent wait/attempts. The optional `handler` fires only when a strategy's attempts are exhausted (mirroring ActiveJob's `retry_on ... do |job, error|` block) and is called with `(job, error)`. `discard_on` and `rescue_from` handlers use the same `(job, error)` signature.
 
 ### Concurrency Control
 
@@ -332,7 +349,7 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker.
+Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker. If you'd rather not have planned recycles show up as failures (in `systemctl status` or the start-limit counter), add `SuccessExitStatus=75` together with `RestartForceExitStatus=75` — the former keeps 75 out of the failure tally, the latter still forces the restart.
 
 ### Per-Queue Concurrency (experimental)
 
