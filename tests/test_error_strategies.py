@@ -37,6 +37,24 @@ class RetryWithAttemptsJob(quebec.BaseClass):
     def perform(self, value: int) -> None:
         raise ValueError(f"boom {value}")
 
+
+class MixedSpecJob(quebec.BaseClass):
+    # A tuple mixing a real exception class with a non-class entry: the valid
+    # class must still match (the bogus entry is ignored, with a warning).
+    handled: list[str] = []
+    retry_on = [
+        quebec.RetryStrategy(
+            (ValueError, lambda exc: exc),
+            wait=timedelta(seconds=1),
+            attempts=1,
+            handler=lambda job, exc: MixedSpecJob.handled.append(str(exc)),
+        )
+    ]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"mixed {value}")
+
+
 class DiscardingJob(quebec.BaseClass):
     discard_events: list[str] = []
     discard_on = [quebec.DiscardStrategy((ValueError,), lambda job, exc: None)]
@@ -102,6 +120,26 @@ def test_retry_handler_does_not_fire_on_intermediate_attempt(
     assert RetryWithAttemptsJob.handled == []
     assert db_assert.count_scheduled_executions() == 1
     assert db_assert.count_failed_executions() == 0
+
+
+def test_mixed_exception_tuple_still_matches_valid_class(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+
+    MixedSpecJob.handled = []
+    qc.register_job(MixedSpecJob)
+
+    MixedSpecJob.perform_later(qc, 3)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # The ValueError entry matches even though the tuple also contains a bogus
+    # non-class entry; the handler fires on exhaustion (attempts=1).
+    assert MixedSpecJob.handled == ["mixed 3"]
+    assert db_assert.count_failed_executions() == 0
+    assert db_assert.count_scheduled_executions() == 0
+
 
 def test_discard_strategy_marks_job_finished_without_failed_execution(
     qc_with_sqlalchemy, db_assert

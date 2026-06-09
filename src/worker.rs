@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use tracing::{debug, error, info, trace, warn};
 
+use pyo3::exceptions::PyBaseException;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 
@@ -498,30 +499,82 @@ impl Runnable {
         Ok(None)
     }
 
-    /// Check if exception matches
+    /// Check whether `error` matches the strategy's declared exception spec.
+    ///
+    /// The spec must be an exception class or a tuple of them. Every entry is
+    /// validated up front: anything that is not a `BaseException` subclass
+    /// (e.g. a lambda or a non-exception type) can never match and is almost
+    /// certainly a misconfiguration, so it is warned about regardless of
+    /// whether another entry in the tuple matched.
     fn is_exception_match(
         &self,
         py: Python,
         exceptions: &Py<PyAny>,
         error: &PyErr,
     ) -> PyResult<bool> {
-        let exceptions_bound = exceptions.bind(py);
+        let bound = exceptions.bind(py);
 
-        if let Ok(exception_type) = exceptions_bound.cast::<PyType>() {
-            return Ok(error.is_instance(py, exception_type));
-        }
+        // Normalize a single class or a tuple of classes into a flat item list.
+        let items: Vec<Bound<PyAny>> = match bound.cast::<PyTuple>() {
+            Ok(tuple) => tuple.iter().collect(),
+            Err(_) => vec![bound.clone()],
+        };
 
-        if let Ok(exception_tuple) = exceptions_bound.cast::<PyTuple>() {
-            let matched = exception_tuple.iter().any(|item| {
-                item.cast::<PyType>()
-                    .is_ok_and(|exception_type| error.is_instance(py, exception_type))
-            });
-            if matched {
-                return Ok(true);
+        let mut matched = false;
+        for item in &items {
+            let valid_class = item
+                .cast::<PyType>()
+                .ok()
+                .filter(|ty| ty.is_subclass_of::<PyBaseException>().unwrap_or(false));
+
+            match valid_class {
+                Some(ty) => {
+                    if error.is_instance(py, ty) {
+                        matched = true;
+                    }
+                }
+                None => warn!(
+                    "retry_on/discard_on/rescue_from exception spec must be exception \
+                     classes; got an unsupported entry (e.g. a lambda or non-exception \
+                     type), which can never match and was ignored"
+                ),
             }
         }
 
-        Ok(false)
+        Ok(matched)
+    }
+
+    /// Build the job instance handed to error-strategy handlers as the first
+    /// argument, mirroring ActiveJob's `yield self, error` (the block's first
+    /// parameter is the job instance). Constructed the same way as the
+    /// `after_discard` hook: instantiate the job class and stamp its id.
+    /// Falls back to `None` so the handler still receives `error`.
+    fn build_job_instance<'py>(
+        &self,
+        py: Python<'py>,
+        job: &quebec_jobs::Model,
+    ) -> Option<Bound<'py, PyAny>> {
+        let instance = self.handler.bind(py).call0().ok()?;
+        instance.setattr("id", job.id).ok();
+        Some(instance)
+    }
+
+    /// Invoke an error-strategy handler with `(job, error)`. Logs and swallows
+    /// any error raised inside the handler.
+    fn call_strategy_handler(
+        &self,
+        py: Python,
+        handler: &Py<PyAny>,
+        job: &quebec_jobs::Model,
+        error: &PyErr,
+        label: &str,
+    ) {
+        let job_arg = self
+            .build_job_instance(py, job)
+            .unwrap_or_else(|| py.None().into_bound(py));
+        if let Err(handler_error) = handler.call1(py, (job_arg, error.value(py))) {
+            warn!("Error in {label} handler: {handler_error}");
+        }
     }
 
     /// Handle discard - directly mark task as completed without recording failure information
