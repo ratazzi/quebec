@@ -41,10 +41,6 @@ pub struct ControlPlane {
     /// queue or job class first appears, so a short TTL avoids repeated
     /// full-table DISTINCT scans on solid_queue_jobs.
     pub(crate) filter_options_cache: moka::future::Cache<FilterKind, Arc<Vec<String>>>,
-    /// Cache for the finished-job COUNT behind the nav "Finished jobs" badge.
-    /// The count only grows and is a coarse overview number, so a short TTL
-    /// avoids re-running the index-only scan on every render / SSE tick.
-    pub(crate) finished_count_cache: moka::future::Cache<(), i64>,
 }
 
 impl ControlPlane {
@@ -79,9 +75,6 @@ impl ControlPlane {
             base_path: String::new(),
             sse_interval,
             filter_options_cache: moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(60))
-                .build(),
-            finished_count_cache: moka::future::Cache::builder()
                 .time_to_live(Duration::from_secs(60))
                 .build(),
         }

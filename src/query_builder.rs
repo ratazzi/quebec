@@ -510,32 +510,6 @@ pub mod jobs {
     }
 
     /// Count finished jobs
-    pub async fn count_finished<C>(
-        db: &C,
-        table_config: &TableConfig,
-        class_name: Option<&str>,
-        queue_name: Option<&str>,
-    ) -> Result<u64, DbErr>
-    where
-        C: ConnectionTrait,
-    {
-        let table = Alias::new(&table_config.jobs);
-        let mut query = Query::select()
-            .expr(Expr::col(Asterisk).count())
-            .from(table)
-            .and_where(Expr::col(col("finished_at")).is_not_null())
-            .to_owned();
-
-        if let Some(cn) = class_name {
-            query.and_where(Expr::col(col("class_name")).eq(cn));
-        }
-        if let Some(qn) = queue_name {
-            query.and_where(Expr::col(col("queue_name")).eq(qn));
-        }
-
-        execute_count(db, query).await
-    }
-
     /// Find finished jobs with pagination
     pub async fn find_finished_paginated<C>(
         db: &C,

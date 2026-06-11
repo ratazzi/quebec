@@ -220,6 +220,19 @@ mod tests {
         assert!(!template.contains("total_pages"));
     }
 
+    #[test]
+    fn nav_finished_badge_shows_no_count() {
+        // The finished set is unbounded; its nav badge is a static "…" rather
+        // than a COUNT, so the templates must not reference finished_jobs_count.
+        for name in ["base.html", "stats.html"] {
+            let template = get_template_content(name).expect("template exists");
+            assert!(
+                !template.contains("finished_jobs_count"),
+                "{name} should not reference finished_jobs_count"
+            );
+        }
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn manifest_template_path_points_to_control_plane_templates() {
