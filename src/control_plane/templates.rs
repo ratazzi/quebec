@@ -211,6 +211,13 @@ mod tests {
         assert_eq!(templates.first().map(String::as_str), Some("base.html"));
     }
 
+    #[test]
+    fn job_details_template_renders_job_priority() {
+        let template =
+            get_template_content("job-details.html").expect("job details template exists");
+        assert!(template.contains("{{ job.priority }}"));
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn manifest_template_path_points_to_control_plane_templates() {

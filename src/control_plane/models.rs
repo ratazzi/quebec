@@ -174,6 +174,7 @@ pub struct JobDetailsInfo {
     pub id: i64,
     pub queue_name: String,
     pub class_name: String,
+    pub priority: i32,
     pub status: String,
     pub created_at: String,
     pub failed_at: Option<String>,

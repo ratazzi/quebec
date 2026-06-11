@@ -41,6 +41,7 @@ impl ControlPlane {
             j.id,
             j.queue_name,
             j.class_name,
+            j.priority,
             j.created_at,
             j.finished_at,
             j.arguments,
@@ -87,6 +88,7 @@ impl ControlPlane {
             let job_id: i64 = row.try_get("", "id").unwrap_or_default();
             let queue_name: String = row.try_get("", "queue_name").unwrap_or_default();
             let class_name: String = row.try_get("", "class_name").unwrap_or_default();
+            let priority: i32 = row.try_get("", "priority").unwrap_or(0);
             let status: String = row.try_get("", "status").unwrap_or_default();
             let arguments: Option<String> = row.try_get("", "arguments").ok();
             let error: Option<String> = row.try_get("", "error_message").ok();
@@ -124,6 +126,7 @@ impl ControlPlane {
                 id: job_id,
                 queue_name,
                 class_name,
+                priority,
                 status: status.clone(),
                 created_at,
                 failed_at: None,
