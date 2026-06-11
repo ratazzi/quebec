@@ -509,7 +509,6 @@ pub mod jobs {
         execute_count(db, query).await
     }
 
-    /// Count finished jobs
     /// Find finished jobs with pagination
     pub async fn find_finished_paginated<C>(
         db: &C,

@@ -156,9 +156,10 @@ mod jobs {
         assert!(job.finished_at.is_some());
 
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc, None, None)
+            query_builder::jobs::find_finished_paginated(&db, &tc, 0, 100, None, None)
                 .await
-                .unwrap(),
+                .unwrap()
+                .len(),
             1
         );
     }
@@ -182,9 +183,10 @@ mod jobs {
             .unwrap();
         assert_eq!(rows, 2);
         assert_eq!(
-            query_builder::jobs::count_finished(&db, &tc, None, None)
+            query_builder::jobs::find_finished_paginated(&db, &tc, 0, 100, None, None)
                 .await
-                .unwrap(),
+                .unwrap()
+                .len(),
             2
         );
     }
