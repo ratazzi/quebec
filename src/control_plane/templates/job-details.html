@@ -87,7 +87,7 @@
           </div>
           <div class="grid grid-cols-3 gap-2">
             <div class="text-sm text-gray-500">Priority</div>
-            <div class="col-span-2 text-sm">0</div>
+            <div class="col-span-2 text-sm {% if job.priority == 0 %}text-gray-400{% else %}text-gray-900{% endif %}">{{ job.priority }}</div>
           </div>
           <div class="grid grid-cols-3 gap-2">
             <div class="text-sm text-gray-500">Created at</div>
