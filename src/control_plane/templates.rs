@@ -211,6 +211,15 @@ mod tests {
         assert_eq!(templates.first().map(String::as_str), Some("base.html"));
     }
 
+    #[test]
+    fn finished_jobs_template_paginates_without_total_count() {
+        let template =
+            get_template_content("finished-jobs.html").expect("finished jobs template exists");
+        // Next page is driven by a has_next probe, not a full COUNT-derived total.
+        assert!(template.contains("has_next"));
+        assert!(!template.contains("total_pages"));
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn manifest_template_path_points_to_control_plane_templates() {
