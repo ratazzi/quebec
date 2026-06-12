@@ -656,6 +656,61 @@ pub mod jobs {
         execute_select(db, query).await
     }
 
+    /// Build the SQL returning the sorted distinct values of an indexed,
+    /// NOT NULL column.
+    ///
+    /// Postgres has no automatic skip scan, so a plain `SELECT DISTINCT col`
+    /// scans every row even with an index on `col`. Emulate a loose index
+    /// scan with a recursive CTE: each step does a single index seek for the
+    /// next larger value, making the query cost O(distinct values) instead of
+    /// O(rows). MySQL 8.0+ already performs a loose index scan for this, and
+    /// SQLite is only used for small test databases, so both keep the plain
+    /// DISTINCT. The terminating NULL row (produced when no larger value
+    /// remains) is filtered out at the end.
+    fn distinct_column_sql(backend: DbBackend, table_name: &str, column: &str) -> String {
+        let q = match backend {
+            DbBackend::MySql => '`',
+            _ => '"',
+        };
+
+        match backend {
+            DbBackend::Postgres => format!(
+                "WITH RECURSIVE t AS (\n    \
+                 (SELECT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
+                 UNION ALL\n    \
+                 SELECT (SELECT {q}{column}{q} FROM {q}{table_name}{q} \
+                 WHERE {q}{column}{q} > t.{q}{column}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
+                 FROM t WHERE t.{q}{column}{q} IS NOT NULL\n\
+                 )\n\
+                 SELECT {q}{column}{q} FROM t WHERE {q}{column}{q} IS NOT NULL \
+                 ORDER BY {q}{column}{q} ASC"
+            ),
+            _ => format!(
+                r#"SELECT DISTINCT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC"#
+            ),
+        }
+    }
+
+    /// Fetch the sorted distinct values of an indexed column via a backend
+    /// query plan that avoids a full-table scan on Postgres.
+    async fn distinct_indexed_column<C>(
+        db: &C,
+        table_name: &str,
+        column: &'static str,
+    ) -> Result<Vec<String>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let sql = distinct_column_sql(backend, table_name, column);
+        let stmt = Statement::from_string(backend, sql);
+        let rows = db.query_all(stmt).await?;
+
+        rows.into_iter()
+            .map(|row| row.try_get("", column))
+            .collect()
+    }
+
     /// Get distinct queue names
     pub async fn get_queue_names<C>(
         db: &C,
@@ -664,24 +719,7 @@ pub mod jobs {
     where
         C: ConnectionTrait,
     {
-        let table_name = &table_config.jobs;
-        let backend = db.get_database_backend();
-
-        let (q, _) = match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
-            DbBackend::MySql => ('`', '`'),
-        };
-
-        let sql = format!(
-            r#"SELECT DISTINCT {q}queue_name{q} FROM {q}{table_name}{q} ORDER BY {q}queue_name{q} ASC"#
-        );
-
-        let stmt = Statement::from_string(backend, sql);
-        let rows = db.query_all(stmt).await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("", "queue_name"))
-            .collect()
+        distinct_indexed_column(db, &table_config.jobs, "queue_name").await
     }
 
     /// Get distinct class names
@@ -692,24 +730,7 @@ pub mod jobs {
     where
         C: ConnectionTrait,
     {
-        let table_name = &table_config.jobs;
-        let backend = db.get_database_backend();
-
-        let (q, _) = match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
-            DbBackend::MySql => ('`', '`'),
-        };
-
-        let sql = format!(
-            r#"SELECT DISTINCT {q}class_name{q} FROM {q}{table_name}{q} ORDER BY {q}class_name{q} ASC"#
-        );
-
-        let stmt = Statement::from_string(backend, sql);
-        let rows = db.query_all(stmt).await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("", "class_name"))
-            .collect()
+        distinct_indexed_column(db, &table_config.jobs, "class_name").await
     }
 
     /// Data needed to bulk-insert a single job row.
@@ -876,6 +897,39 @@ pub mod jobs {
             .to_owned();
 
         execute_count(db, query).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sqlite_uses_plain_distinct() {
+            let sql = distinct_column_sql(DbBackend::Sqlite, "solid_queue_jobs", "class_name");
+            assert_eq!(
+                sql,
+                r#"SELECT DISTINCT "class_name" FROM "solid_queue_jobs" ORDER BY "class_name" ASC"#
+            );
+        }
+
+        #[test]
+        fn mysql_uses_backtick_quoting() {
+            let sql = distinct_column_sql(DbBackend::MySql, "solid_queue_jobs", "queue_name");
+            assert_eq!(
+                sql,
+                "SELECT DISTINCT `queue_name` FROM `solid_queue_jobs` ORDER BY `queue_name` ASC"
+            );
+        }
+
+        #[test]
+        fn postgres_emulates_loose_index_scan() {
+            let sql = distinct_column_sql(DbBackend::Postgres, "solid_queue_jobs", "class_name");
+            assert!(sql.starts_with("WITH RECURSIVE t AS ("));
+            assert!(sql.contains(r#"WHERE "class_name" > t."class_name""#));
+            assert!(sql.trim_end().ends_with(
+                r#"SELECT "class_name" FROM t WHERE "class_name" IS NOT NULL ORDER BY "class_name" ASC"#
+            ));
+        }
     }
 }
 
