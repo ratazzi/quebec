@@ -736,7 +736,7 @@
             <option id="nav-option-blocked-jobs" value="{{ base_path }}/blocked-jobs">Blocked jobs · {{ nav_blocked_jobs | default(value=0) }}</option>
             <option id="nav-option-scheduled-jobs" value="{{ base_path }}/scheduled-jobs">Scheduled jobs · {{ nav_scheduled_jobs | default(value=0) }}</option>
             <option value="{{ base_path }}/recurring-jobs">Recurring jobs</option>
-            <option id="nav-option-finished-jobs" value="{{ base_path }}/finished-jobs">Finished jobs · …</option>
+            <option id="nav-option-finished-jobs" value="{{ base_path }}/finished-jobs">Finished jobs</option>
             <option value="{{ base_path }}/workers">Workers</option>
           </select>
           <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
@@ -769,7 +769,7 @@
             Recurring jobs
           </a>
           <a href="{{ base_path }}/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
-            Finished jobs <span id="finished-jobs-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">…</span>
+            Finished jobs
           </a>
 
           <a href="{{ base_path }}/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
