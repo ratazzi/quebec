@@ -36,10 +36,11 @@ pub struct ControlPlane {
     pub(crate) page_size: u64,
     pub(crate) base_path: String,
     pub(crate) sse_interval: Duration,
-    /// Cache for the queue-name / class-name DISTINCT lookups behind the filter
+    /// Cache for the queue-name / class-name distinct lookups behind the filter
     /// dropdowns and the /stats queue list. These sets change only when a new
-    /// queue or job class first appears, so a short TTL avoids repeated
-    /// full-table DISTINCT scans on solid_queue_jobs.
+    /// queue or job class first appears, so a 10-minute TTL keeps the distinct
+    /// scan on solid_queue_jobs rare. The scan itself is a loose index scan on
+    /// Postgres (see query_builder::jobs::distinct_column_sql).
     pub(crate) filter_options_cache: moka::future::Cache<FilterKind, Arc<Vec<String>>>,
 }
 
@@ -75,7 +76,7 @@ impl ControlPlane {
             base_path: String::new(),
             sse_interval,
             filter_options_cache: moka::future::Cache::builder()
-                .time_to_live(Duration::from_secs(60))
+                .time_to_live(Duration::from_secs(600))
                 .build(),
         }
     }

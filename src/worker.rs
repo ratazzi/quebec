@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 
 use sea_orm::TransactionTrait;
 use sea_orm::*;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc::Sender;
@@ -28,6 +28,19 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 
 use crate::notify::NotifyManager;
+
+fn reported_worker_rss_bytes(
+    last_rss_bytes: &AtomicU64,
+    current_rss_bytes: Option<u64>,
+) -> Option<u64> {
+    if let Some(rss_bytes) = current_rss_bytes {
+        last_rss_bytes.store(rss_bytes, Ordering::Relaxed);
+        Some(rss_bytes)
+    } else {
+        let rss_bytes = last_rss_bytes.load(Ordering::Relaxed);
+        (rss_bytes > 0).then_some(rss_bytes)
+    }
+}
 
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
@@ -4948,14 +4961,45 @@ impl ProcessTrait for Worker {
     }
 
     fn runtime_metadata(&self) -> Option<String> {
-        let rss_bytes = self.ctx.worker_last_rss_bytes.load(Ordering::Relaxed);
+        let rss_bytes = reported_worker_rss_bytes(
+            &self.ctx.worker_last_rss_bytes,
+            crate::memory::current_rss_bytes(),
+        );
         crate::process::build_runtime_metadata_with_memory(
             self.ctx.quiet.is_cancelled(),
             self.ctx
                 .worker_memory_recycle_requested
                 .load(Ordering::Relaxed)
                 .then_some("rss_limit"),
-            (rss_bytes > 0).then_some(rss_bytes),
+            rss_bytes,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reported_worker_rss_bytes;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn reported_worker_rss_updates_cache_from_current_sample() {
+        let last = AtomicU64::new(0);
+
+        assert_eq!(reported_worker_rss_bytes(&last, Some(123)), Some(123));
+        assert_eq!(last.load(Ordering::Relaxed), 123);
+    }
+
+    #[test]
+    fn reported_worker_rss_falls_back_to_cached_sample() {
+        let last = AtomicU64::new(456);
+
+        assert_eq!(reported_worker_rss_bytes(&last, None), Some(456));
+    }
+
+    #[test]
+    fn reported_worker_rss_is_absent_without_current_or_cached_sample() {
+        let last = AtomicU64::new(0);
+
+        assert_eq!(reported_worker_rss_bytes(&last, None), None);
     }
 }
