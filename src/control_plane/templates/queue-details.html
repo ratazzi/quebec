@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_pagination.html" as pagination %}
 
 {% block title %}Queue Details: {{ queue_name }} - Control Plane{% endblock %}
 
@@ -111,32 +112,7 @@
   </div>
 
   <!-- Pagination -->
-  <div class="flex items-center justify-between mt-4">
-    <div class="text-sm text-gray-700">
-      Page {{ current_page }} of {{ total_pages }}
-    </div>
-    <div class="flex space-x-2">
-      {% if current_page > 1 %}
-        <a href="{{ base_path }}/queues/{{ queue_name }}?page={{ current_page - 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
-          Previous page
-        </a>
-      {% else %}
-        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
-          Previous page
-        </button>
-      {% endif %}
-
-      {% if current_page < total_pages %}
-        <a href="{{ base_path }}/queues/{{ queue_name }}?page={{ current_page + 1 }}" data-turbo-action="advance" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 h-8 px-3 py-1">
-          Next page
-        </a>
-      {% else %}
-        <button disabled class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-gray-100 text-gray-400 h-8 px-3 py-1 cursor-not-allowed">
-          Next page
-        </button>
-      {% endif %}
-    </div>
-  </div>
+  {{ pagination::bar(base_path=base_path, path="queues/" ~ queue_name, page=current_page, total_pages=total_pages) }}
 </div>
 </turbo-frame>
 {% endblock %}

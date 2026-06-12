@@ -1,0 +1,78 @@
+{# Shared shadcn-style pagination bar.
+
+   Usage:
+     {% import "_pagination.html" as pagination %}
+     {{ pagination::bar(base_path=base_path, path="failed-jobs", page=current_page_num, total_pages=total_pages, filter_args=filter_args) }}
+
+   `total_pages=0` (the default) means the total is unknown (unbounded set):
+   pass `has_next` from a peek-one-extra-row query instead, and a trailing
+   ellipsis stands in for the unknown tail. #}
+
+{% macro num(base_path, path, p, page, filter_args="") %}
+  {%- if p == page -%}
+  <span class="inline-flex h-8 min-w-8 items-center justify-center rounded-lg border border-gray-200 px-2 text-sm font-medium text-gray-900">{{ p }}</span>
+  {%- else -%}
+  <a href="{{ base_path }}/{{ path }}?page={{ p }}{% if filter_args %}&{{ filter_args }}{% endif %}" data-turbo-action="advance" class="inline-flex h-8 min-w-8 items-center justify-center rounded-lg px-2 text-sm text-gray-700 hover:bg-gray-100">{{ p }}</a>
+  {%- endif -%}
+{% endmacro num %}
+
+{% macro gap() %}
+  <span class="inline-flex h-8 w-8 items-center justify-center text-sm text-gray-500">…</span>
+{% endmacro gap %}
+
+{% macro bar(base_path, path, page, total_pages=0, has_next=false, filter_args="") %}
+  {% set win_lo = page - 1 %}
+  {% if win_lo < 2 %}{% set win_lo = 2 %}{% endif %}
+  {% set win_hi = page %}
+  {% set tail_gap = false %}
+  {% set next_ok = false %}
+  {% if total_pages > 0 %}
+    {% set win_hi = page + 1 %}
+    {% if win_hi > total_pages - 1 %}{% set win_hi = total_pages - 1 %}{% endif %}
+    {% if win_hi < total_pages - 1 %}{% set tail_gap = true %}{% endif %}
+    {% if page < total_pages %}{% set next_ok = true %}{% endif %}
+  {% elif has_next %}
+    {% set win_hi = page + 1 %}
+    {% set tail_gap = true %}
+    {% set next_ok = true %}
+  {% endif %}
+  <div class="flex items-center justify-end mt-4">
+    <div class="flex items-center gap-1">
+      {% if page > 1 %}
+      <a href="{{ base_path }}/{{ path }}?page={{ page - 1 }}{% if filter_args %}&{{ filter_args }}{% endif %}" data-turbo-action="advance" class="inline-flex items-center gap-1 h-8 rounded-lg pl-2 pr-3 text-sm font-medium text-gray-700 hover:bg-gray-100 hover:text-gray-900">
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+        Previous
+      </a>
+      {% else %}
+      <span class="inline-flex items-center gap-1 h-8 rounded-lg pl-2 pr-3 text-sm font-medium text-gray-400">
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7"/></svg>
+        Previous
+      </span>
+      {% endif %}
+
+      <nav class="flex items-center gap-1 px-1 tabular-nums">
+        {{ self::num(base_path=base_path, path=path, p=1, page=page, filter_args=filter_args) }}
+        {% if win_lo > 2 %}{{ self::gap() }}{% endif %}
+        {% if win_hi >= win_lo %}
+          {% for p in range(start=win_lo, end=win_hi + 1) %}
+            {{ self::num(base_path=base_path, path=path, p=p, page=page, filter_args=filter_args) }}
+          {% endfor %}
+        {% endif %}
+        {% if tail_gap %}{{ self::gap() }}{% endif %}
+        {% if total_pages > 1 %}{{ self::num(base_path=base_path, path=path, p=total_pages, page=page, filter_args=filter_args) }}{% endif %}
+      </nav>
+
+      {% if next_ok %}
+      <a href="{{ base_path }}/{{ path }}?page={{ page + 1 }}{% if filter_args %}&{{ filter_args }}{% endif %}" data-turbo-action="advance" class="inline-flex items-center gap-1 h-8 rounded-lg pl-3 pr-2 text-sm font-medium text-gray-700 hover:bg-gray-100 hover:text-gray-900">
+        Next
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+      </a>
+      {% else %}
+      <span class="inline-flex items-center gap-1 h-8 rounded-lg pl-3 pr-2 text-sm font-medium text-gray-400">
+        Next
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+      </span>
+      {% endif %}
+    </div>
+  </div>
+{% endmacro bar %}
