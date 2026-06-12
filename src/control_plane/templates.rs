@@ -212,6 +212,28 @@ mod tests {
     }
 
     #[test]
+    fn finished_jobs_template_paginates_without_total_count() {
+        let template =
+            get_template_content("finished-jobs.html").expect("finished jobs template exists");
+        // Next page is driven by a has_next probe, not a full COUNT-derived total.
+        assert!(template.contains("has_next"));
+        assert!(!template.contains("total_pages"));
+    }
+
+    #[test]
+    fn nav_finished_badge_shows_no_count() {
+        // The finished set is unbounded; its nav badge is a static "…" rather
+        // than a COUNT, so the templates must not reference finished_jobs_count.
+        for name in ["base.html", "stats.html"] {
+            let template = get_template_content(name).expect("template exists");
+            assert!(
+                !template.contains("finished_jobs_count"),
+                "{name} should not reference finished_jobs_count"
+            );
+        }
+    }
+
+    #[test]
     fn job_details_template_renders_job_priority() {
         let template =
             get_template_content("job-details.html").expect("job details template exists");

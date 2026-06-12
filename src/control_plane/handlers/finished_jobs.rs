@@ -34,17 +34,22 @@ impl ControlPlane {
         let page_size = state.page_size;
         let offset = (pagination.page - 1) * page_size;
 
-        // Get completed jobs using query_builder (filters applied at SQL level)
-        let finished_jobs_models = query_builder::jobs::find_finished_paginated(
+        // Fetch one extra row to detect whether a next page exists, avoiding a
+        // full-table COUNT on the (unbounded) finished jobs. Mirrors Mission
+        // Control's keyset-style "N / ..." pagination.
+        let mut finished_jobs_models = query_builder::jobs::find_finished_paginated(
             db,
             table_config,
             offset,
-            page_size,
+            page_size + 1,
             pagination.class_name.as_deref(),
             pagination.queue_name.as_deref(),
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let has_next = finished_jobs_models.len() as u64 > page_size;
+        finished_jobs_models.truncate(page_size as usize);
 
         // Create a vector to store completed job information
         let mut finished_jobs: Vec<FinishedJobInfo> =
@@ -99,34 +104,12 @@ impl ControlPlane {
         debug!("Fetched finished jobs in {:?}", start.elapsed());
         info!("Found {} finished jobs", finished_jobs.len());
 
-        // Get total number of completed jobs for pagination using query_builder
-        let start = Instant::now();
-
-        let total_count: u64 = query_builder::jobs::count_finished(
-            db,
-            table_config,
-            pagination.class_name.as_deref(),
-            pagination.queue_name.as_deref(),
-        )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        info!("Total finished jobs count: {}", total_count);
-
-        let total_pages = ((total_count as f64) / (page_size as f64)).ceil() as u64;
-        let total_pages = total_pages.max(1);
-
-        if total_pages > 0 && pagination.page > total_pages {
-            return Err((StatusCode::NOT_FOUND, "Page not found".to_string()));
-        }
-        debug!("Fetched count in {:?}", start.elapsed());
-
         let start = Instant::now();
         let mut context = tera::Context::new();
         context.insert("finished_jobs", &finished_jobs);
         context.insert("filter_options", &filter_options);
         context.insert("current_page_num", &pagination.page);
-        context.insert("total_pages", &total_pages);
+        context.insert("has_next", &has_next);
         context.insert("active_page", "finished-jobs");
         context.insert("filter_class_name", &pagination.class_name);
         context.insert("filter_queue_name", &pagination.queue_name);

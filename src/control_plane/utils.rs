@@ -115,22 +115,6 @@ impl ControlPlane {
         Ok((*names).clone())
     }
 
-    /// Get the finished-job count (cached). Backs the nav "Finished jobs" badge,
-    /// where an exact value is not important.
-    async fn cached_finished_count(&self) -> Result<i64, DbErr> {
-        self.finished_count_cache
-            .try_get_with((), async {
-                let db = self.ctx.get_db().await?;
-                let db = db.as_ref();
-                let table_config = &self.ctx.table_config;
-                let count =
-                    query_builder::jobs::count_finished(db, table_config, None, None).await? as i64;
-                Ok::<_, DbErr>(count)
-            })
-            .await
-            .map_err(|e: Arc<DbErr>| DbErr::Custom(format!("finished count query failed: {e}")))
-    }
-
     /// Populate navigation statistics for templates using query_builder
     pub async fn populate_nav_stats(&self, context: &mut Context) -> Result<(), DbErr> {
         let db = self.ctx.get_db().await?;
@@ -178,9 +162,8 @@ impl ControlPlane {
         context.insert("blocked_jobs_count", &blocked_count);
         context.insert("scheduled_jobs_count", &scheduled_count);
 
-        // Count finished jobs by finished_at to match the /finished-jobs page
-        let finished_count = self.cached_finished_count().await?;
-        context.insert("finished_jobs_count", &finished_count);
+        // The finished set is unbounded; the nav badge shows "…" instead of an
+        // exact count (Mission Control parity), so no COUNT is issued here.
 
         // Per-queue ready-execution counts + paused-state snapshot, so the
         // /stats turbo-stream can update each row of the queues table in sync

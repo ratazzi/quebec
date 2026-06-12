@@ -35,15 +35,6 @@
   <template>Scheduled jobs · {{ scheduled_jobs_count }}</template>
 </turbo-stream>
 
-<turbo-stream action="update" target="finished-jobs-count">
-  <template>
-    <span class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ finished_jobs_count }}</span>
-  </template>
-</turbo-stream>
-<turbo-stream action="update" target="nav-option-finished-jobs">
-  <template>Finished jobs · {{ finished_jobs_count }}</template>
-</turbo-stream>
-
 {# Per-queue live counters. Anchored to id="queue-count-{slug}" and
    id="queue-status-{slug}" in queues.html. The queues page is the only one
    that renders these anchors; on other pages the targets simply don't exist
