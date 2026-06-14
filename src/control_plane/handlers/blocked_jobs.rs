@@ -53,11 +53,19 @@ impl ControlPlane {
         // Get current time, for calculating waiting time
         let now = chrono::Utc::now().naive_utc();
 
+        // Batch-fetch the jobs for this page instead of one query per row.
+        let job_ids: Vec<i64> = blocked_executions.iter().map(|e| e.job_id).collect();
+        let job_map: std::collections::HashMap<i64, _> =
+            query_builder::jobs::find_by_ids(db, table_config, job_ids)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .into_iter()
+                .map(|job| (job.id, job))
+                .collect();
+
         // Get job information for each blocked execution
         for execution in blocked_executions {
-            if let Ok(Some(job)) =
-                query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
-            {
+            if let Some(job) = job_map.get(&execution.job_id) {
                 // Calculate waiting time
                 let waiting_time = match now.signed_duration_since(execution.created_at) {
                     duration if duration.num_hours() >= 1 => {
