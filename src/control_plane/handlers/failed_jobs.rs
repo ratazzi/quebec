@@ -53,11 +53,19 @@ impl ControlPlane {
         // Create a vector to store failed job information
         let mut failed_jobs: Vec<FailedJobInfo> = Vec::with_capacity(failed_executions.len());
 
+        // Batch-fetch the jobs for this page instead of one query per row.
+        let job_ids: Vec<i64> = failed_executions.iter().map(|e| e.job_id).collect();
+        let job_map: std::collections::HashMap<i64, _> =
+            query_builder::jobs::find_by_ids(db, table_config, job_ids)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .into_iter()
+                .map(|job| (job.id, job))
+                .collect();
+
         // Get job information for each failed execution
         for execution in failed_executions {
-            if let Ok(Some(job)) =
-                query_builder::jobs::find_by_id(db, table_config, execution.job_id).await
-            {
+            if let Some(job) = job_map.get(&execution.job_id) {
                 failed_jobs.push(FailedJobInfo {
                     id: job.id,
                     queue_name: job.queue_name.clone(),
