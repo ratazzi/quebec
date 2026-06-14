@@ -396,30 +396,44 @@ impl Dispatcher {
                     return Ok(false);
                 };
 
-                // Resolve concurrency_limit from the registered runnable via the
-                // job's class_name (Solid Queue reads `job.concurrency_limit`).
-                let concurrency_limit = {
+                // Resolve concurrency_limit + duration from the registered runnable
+                // via the job's class_name. Solid Queue's `#release` calls
+                // `Semaphore.wait(job)`, which sets the semaphore TTL from
+                // `job.concurrency_duration`; pass it through so unblock matches
+                // both Solid Queue and the scheduled-dispatch path instead of
+                // falling back to `acquire_semaphore`'s default TTL.
+                let (concurrency_limit, concurrency_duration) = {
                     #[cfg(feature = "python")]
                     {
                         query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
                             .await?
                             .and_then(|job| {
                                 ctx.runnables.read().ok().and_then(|runnables| {
-                                    runnables
-                                        .get(&job.class_name)
-                                        .and_then(|r| r.concurrency_limit)
+                                    runnables.get(&job.class_name).map(|r| {
+                                        (
+                                            r.concurrency_limit.unwrap_or(1),
+                                            r.concurrency_duration
+                                                .map(|s| chrono::Duration::seconds(s as i64)),
+                                        )
+                                    })
                                 })
                             })
-                            .unwrap_or(1)
+                            .unwrap_or((1, None))
                     }
                     #[cfg(not(feature = "python"))]
                     {
-                        1
+                        (1, None)
                     }
                 };
 
-                if acquire_semaphore(txn, &ctx.table_config, key.clone(), concurrency_limit, None)
-                    .await?
+                if acquire_semaphore(
+                    txn,
+                    &ctx.table_config,
+                    key.clone(),
+                    concurrency_limit,
+                    concurrency_duration,
+                )
+                .await?
                 {
                     query_builder::ready_executions::insert(
                         txn,
