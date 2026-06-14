@@ -78,115 +78,40 @@ impl Dispatcher {
                         warn!("Failed to get DB for polling: {}", e);
                     }) else { continue };
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
+
+                    // Clean up expired semaphores (matches Solid Queue's
+                    // `expire_semaphores`). Solid Queue runs expire + unblock in a
+                    // single maintenance task, so a failed expire aborts the task
+                    // before unblock runs — mirror that by skipping unblock when
+                    // expire fails. Scheduled dispatch is a separate concern (its
+                    // own task in Solid Queue) and still runs.
+                    let expire_ok =
+                        match query_builder::semaphores::delete_expired(&*polling_db, &ctx.table_config).await {
+                            Ok(n) => {
+                                if n > 0 {
+                                    info!("Cleaned up {} expired semaphores", n);
+                                }
+                                true
+                            }
+                            Err(e) => {
+                                warn!("Error cleaning up expired semaphores: {:?}", e);
+                                false
+                            }
+                        };
+
+                    // Unblock jobs with expired concurrency keys — one transaction
+                    // per key, matching Solid Queue's `BlockedExecution.unblock`.
+                    if expire_ok {
+                        if let Err(e) =
+                            Self::unblock_blocked_executions(&polling_db, &ctx, batch_size).await
+                        {
+                            warn!("Error unblocking blocked executions: {:?}", e);
+                        }
+                    }
+
+                    // Dispatch scheduled jobs in their own transaction.
                     let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
                         Box::pin(async move {
-                          // Clean up expired semaphores
-                          let expired_semaphores_count =
-                              query_builder::semaphores::delete_expired(txn, &ctx.table_config).await?;
-
-                          if expired_semaphores_count > 0 {
-                              info!("Cleaned up {} expired semaphores", expired_semaphores_count);
-                          }
-
-                          // Unblock jobs with expired concurrency keys
-                          let backend = txn.get_database_backend();
-                          let (p1, p2) = match backend {
-                              DbBackend::Postgres => ("$1", "$2"),
-                              DbBackend::MySql | DbBackend::Sqlite => ("?", "?"),
-                          };
-                          let sql = format!(
-                              "SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < {} LIMIT {}",
-                              ctx.table_config.blocked_executions, p1, p2
-                          );
-                          let now = chrono::Utc::now().naive_utc();
-                          let expired_keys_result = txn.query_all(Statement::from_sql_and_values(
-                              backend,
-                              sql,
-                              vec![now.into(), batch_size.into()],
-                          )).await?;
-
-                          // Collect expired concurrency keys
-                          let expired_keys: Vec<String> = expired_keys_result
-                              .iter()
-                              .filter_map(|row| row.try_get::<String>("", "concurrency_key").ok())
-                              .collect();
-
-                          if expired_keys.is_empty() {
-                              trace!("No expired concurrency keys found to unblock");
-                          } else {
-                              info!(
-                                  "Found {} expired concurrency keys to unblock: {:?}",
-                                  expired_keys.len(),
-                                  expired_keys
-                              );
-                          }
-
-                          // Pre-filter: batch check semaphores (like Solid Queue's releasable)
-                          // Keys without semaphore OR with value > 0 are releasable
-                          let semaphore_map = query_builder::semaphores::find_values_by_keys(
-                              txn, &ctx.table_config, &expired_keys,
-                          ).await?;
-                          let releasable_keys: Vec<&String> = expired_keys.iter().filter(|k| {
-                              semaphore_map.get(*k).map_or(true, |&v| v > 0)
-                          }).collect();
-
-                          for concurrency_key in releasable_keys {
-                              let blocked_execution = query_builder::blocked_executions::find_one_by_key_for_update(
-                                  txn,
-                                  &ctx.table_config,
-                                  concurrency_key,
-                              ).await?;
-
-                              let Some(execution) = blocked_execution else { continue };
-
-                              // Get concurrency_limit from registered runnable via job's class_name
-                              let concurrency_limit = {
-                                  #[cfg(feature = "python")]
-                                  {
-                                      let limit = query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
-                                          .await?
-                                          .and_then(|job| {
-                                              ctx.runnables.read().ok().and_then(|runnables| {
-                                                  runnables.get(&job.class_name)
-                                                      .and_then(|r| r.concurrency_limit)
-                                              })
-                                          })
-                                          .unwrap_or(1);
-                                      limit
-                                  }
-                                  #[cfg(not(feature = "python"))]
-                                  { 1 }
-                              };
-
-                              // Try to acquire semaphore (like Solid Queue's BlockedExecution.release)
-                              match acquire_semaphore(txn, &ctx.table_config, concurrency_key.clone(), concurrency_limit, None).await {
-                                  Ok(true) => {
-                                      info!("Semaphore acquired for key: {}", concurrency_key);
-
-                                      // Use queue_name and priority from blocked_execution (already stored)
-                                      query_builder::ready_executions::insert(
-                                          txn,
-                                          &ctx.table_config,
-                                          execution.job_id,
-                                          &execution.queue_name,
-                                          execution.priority,
-                                      )
-                                      .await?;
-
-                                      query_builder::blocked_executions::delete_by_id(txn, &ctx.table_config, execution.id)
-                                          .await?;
-
-                                      info!("Unblocked job {} for concurrency key: {}", execution.job_id, concurrency_key);
-                                  },
-                                  Ok(false) => {
-                                      trace!("Failed to acquire semaphore for key: {} (no available slots)", concurrency_key);
-                                  },
-                                  Err(e) => {
-                                      warn!("Error acquiring semaphore for key {}: {:?}", concurrency_key, e);
-                                  }
-                              }
-                          }
-
                           // Dispatch scheduled jobs
                           // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
                           // This matches Solid Queue's implementation
@@ -379,6 +304,156 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// Unblock jobs whose concurrency keys have expired, mirroring Solid Queue's
+    /// `BlockedExecution.unblock`: pick the releasable expired keys, then release
+    /// one blocked execution per key, each in its own transaction.
+    async fn unblock_blocked_executions(
+        db: &DatabaseConnection,
+        ctx: &Arc<AppContext>,
+        batch_size: u64,
+    ) -> Result<usize, DbErr> {
+        // Fetch distinct expired concurrency keys, ordered by key
+        // (matches Solid Queue's `expired.order(:concurrency_key).distinct.limit`).
+        let backend = db.get_database_backend();
+        let (p1, p2) = match backend {
+            DbBackend::Postgres => ("$1", "$2"),
+            DbBackend::MySql | DbBackend::Sqlite => ("?", "?"),
+        };
+        let sql = format!(
+            "SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < {} ORDER BY concurrency_key LIMIT {}",
+            ctx.table_config.blocked_executions, p1, p2
+        );
+        let now = chrono::Utc::now().naive_utc();
+        let rows = db
+            .query_all(Statement::from_sql_and_values(
+                backend,
+                sql,
+                vec![now.into(), batch_size.into()],
+            ))
+            .await?;
+        let expired_keys: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<String>("", "concurrency_key").ok())
+            .collect();
+
+        if expired_keys.is_empty() {
+            trace!("No expired concurrency keys found to unblock");
+            return Ok(0);
+        }
+        info!(
+            "Found {} expired concurrency keys to unblock: {:?}",
+            expired_keys.len(),
+            expired_keys
+        );
+
+        // Pre-filter releasable keys with a single batched semaphore lookup
+        // (matches Solid Queue's `releasable`): keys without a semaphore OR with
+        // an open slot (value > 0).
+        let semaphore_map =
+            query_builder::semaphores::find_values_by_keys(db, &ctx.table_config, &expired_keys)
+                .await?;
+        let releasable_keys = expired_keys
+            .iter()
+            .filter(|k| semaphore_map.get(*k).map_or(true, |&v| v > 0));
+
+        // Release one blocked execution per key, each in its own transaction
+        // (matches Solid Queue's `release_many` / `release_one`).
+        let mut released = 0usize;
+        for concurrency_key in releasable_keys {
+            // Let a DbErr propagate to abort the loop, mirroring Solid Queue's
+            // `release_many` (`count { release_one }`), which lets a failing
+            // `release_one` bubble up rather than rescuing per key.
+            if Self::release_one(db, ctx, concurrency_key).await? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    /// Release a single blocked execution for `concurrency_key` in its own
+    /// transaction, mirroring Solid Queue's `BlockedExecution.release_one` +
+    /// `#release`: lock the head blocked row (FOR UPDATE SKIP LOCKED), acquire
+    /// the semaphore, then promote it to ready and delete the blocked row.
+    async fn release_one(
+        db: &DatabaseConnection,
+        ctx: &Arc<AppContext>,
+        concurrency_key: &str,
+    ) -> Result<bool, DbErr> {
+        let ctx = ctx.clone();
+        let key = concurrency_key.to_string();
+        db.transaction::<_, bool, DbErr>(|txn| {
+            Box::pin(async move {
+                let Some(execution) =
+                    query_builder::blocked_executions::find_one_by_key_for_update(
+                        txn,
+                        &ctx.table_config,
+                        &key,
+                    )
+                    .await?
+                else {
+                    return Ok(false);
+                };
+
+                // Resolve concurrency_limit from the registered runnable via the
+                // job's class_name (Solid Queue reads `job.concurrency_limit`).
+                let concurrency_limit = {
+                    #[cfg(feature = "python")]
+                    {
+                        query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
+                            .await?
+                            .and_then(|job| {
+                                ctx.runnables.read().ok().and_then(|runnables| {
+                                    runnables
+                                        .get(&job.class_name)
+                                        .and_then(|r| r.concurrency_limit)
+                                })
+                            })
+                            .unwrap_or(1)
+                    }
+                    #[cfg(not(feature = "python"))]
+                    {
+                        1
+                    }
+                };
+
+                if acquire_semaphore(txn, &ctx.table_config, key.clone(), concurrency_limit, None)
+                    .await?
+                {
+                    query_builder::ready_executions::insert(
+                        txn,
+                        &ctx.table_config,
+                        execution.job_id,
+                        &execution.queue_name,
+                        execution.priority,
+                    )
+                    .await?;
+                    query_builder::blocked_executions::delete_by_id(
+                        txn,
+                        &ctx.table_config,
+                        execution.id,
+                    )
+                    .await?;
+                    info!(
+                        "Unblocked job {} for concurrency key: {}",
+                        execution.job_id, key
+                    );
+                    Ok(true)
+                } else {
+                    trace!(
+                        "Failed to acquire semaphore for key: {} (no available slots)",
+                        key
+                    );
+                    Ok(false)
+                }
+            })
+        })
+        .await
+        .map_err(|e| match e {
+            TransactionError::Connection(e) => e,
+            TransactionError::Transaction(e) => e,
+        })
     }
 }
 
