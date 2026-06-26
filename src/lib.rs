@@ -25,6 +25,7 @@ mod scheduler;
 pub mod schema_builder;
 pub mod semaphore;
 mod supervisor;
+mod systemd;
 #[cfg(feature = "python")]
 mod types;
 pub mod utils;

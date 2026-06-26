@@ -458,12 +458,32 @@ def _quebec_start(
         t.start()
         worker_threads.append(t)
 
+    # systemd STATUS line from in-process info (spawned components + thread
+    # count), not a database query.
+    from .quebec import __version__
+
+    components = spawn if spawn is not None else ["worker", "dispatcher", "scheduler"]
+    segs = []
+    if "worker" in components:
+        segs.append(f"worker {self.worker_threads} threads")
+    if "dispatcher" in components:
+        segs.append("dispatcher")
+    if "scheduler" in components:
+        segs.append("scheduler")
+    sd_status = f"Quebec {__version__}: {', '.join(segs) or 'running'}; running"
+
     # Store state by instance id
     _quebec_state[id(self)] = {
         "shutdown_event": shutdown_event,
         "job_queue": job_queue,
         "worker_threads": worker_threads,
+        "sd_status": sd_status,
     }
+
+    # Components started: tell systemd we're ready. No-op unless launched
+    # under a Type=notify unit. In supervisor mode the forked child drops
+    # NOTIFY_SOCKET before entering qc.run(), so children stay silent here.
+    self.systemd_ready(sd_status)
 
     return self  # Enable chaining: qc.start().wait()
 
@@ -484,6 +504,9 @@ def _quebec_wait(self):
 
     try:
         while not state["shutdown_event"].is_set():
+            # Refresh status + pet the systemd watchdog (no-op without
+            # NOTIFY_SOCKET). Driven by this loop, so a hung loop stops petting.
+            self.systemd_notify(state["sd_status"])
             # Detect supervisor death in fork-based mode: if Rust flagged us
             # orphaned, unblock this wait loop so run() returns and the child
             # can exit. `is_orphaned()` stays False unless `watch_parent_pid`
@@ -508,6 +531,7 @@ def _quebec_wait(self):
         logger.debug("KeyboardInterrupt, shutting down...")
         self.graceful_shutdown()
     finally:
+        self.systemd_stop()
         # Wait for worker threads to finish
         for t in state["worker_threads"]:
             t.join(timeout=5.0)
