@@ -325,6 +325,12 @@ class Supervisor:
                 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
                 os.close(self._wakeup_r)
                 os.close(self._wakeup_w)
+                # This child runs a single role, not another supervisor. Drop
+                # QUEBEC_SUPERVISOR so the `qc.run(spawn=[...])` below takes the
+                # single-process path instead of re-entering supervisor mode
+                # (which would recurse: supervisor_plan_from_config sees the
+                # same queue.yml, forks again, ad infinitum).
+                os.environ.pop("QUEBEC_SUPERVISOR", None)
 
                 self.qc.reset_after_fork()
                 # Record ppid so role loops self-terminate if supervisor dies.
