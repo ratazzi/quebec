@@ -332,6 +332,12 @@ class Supervisor:
                 # Only the supervisor (main PID) talks to systemd; drop the
                 # socket so a child can never feed the watchdog or send status.
                 os.environ.pop("NOTIFY_SOCKET", None)
+                # This child runs a single role, not another supervisor. Drop
+                # QUEBEC_SUPERVISOR so the `qc.run(spawn=[...])` below takes the
+                # single-process path instead of re-entering supervisor mode
+                # (which would recurse: supervisor_plan_from_config sees the
+                # same queue.yml, forks again, ad infinitum).
+                os.environ.pop("QUEBEC_SUPERVISOR", None)
 
                 self.qc.reset_after_fork()
                 # Record ppid so role loops self-terminate if supervisor dies.
