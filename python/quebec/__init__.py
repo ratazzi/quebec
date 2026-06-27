@@ -389,6 +389,29 @@ class ThreadedRunner:
 _quebec_state: dict = {}
 
 
+def _systemd_status_line(qc, components):
+    """Build the single-process systemd STATUS line from in-process state.
+
+    Worker thread/idle figures come from the configured thread count and the
+    worker-owned claim ledger (``qc.in_flight_count()`` = busy threads) —
+    process-local, never a DB query. Recomputed on each notify so idle tracks
+    current load. Puma-style: report total threads and how many are idle.
+    """
+    from .quebec import __version__
+
+    segs = []
+    if "worker" in components:
+        total = qc.worker_threads
+        idle = max(0, total - qc.in_flight_count())
+        segs.append(f"worker {total} threads, {idle} idle")
+    if "dispatcher" in components:
+        segs.append("dispatcher")
+    if "scheduler" in components:
+        segs.append("scheduler")
+    body = ", ".join(segs) if segs else "running"
+    return f"Quebec {__version__}: {body}; running"
+
+
 def _quebec_start(
     self,
     *,
@@ -458,32 +481,22 @@ def _quebec_start(
         t.start()
         worker_threads.append(t)
 
-    # systemd STATUS line from in-process info (spawned components + thread
-    # count), not a database query.
-    from .quebec import __version__
-
+    # Remember which components this process spawned; the systemd STATUS line
+    # is rebuilt from in-process state (worker busy/total) on each notify.
     components = spawn if spawn is not None else ["worker", "dispatcher", "scheduler"]
-    segs = []
-    if "worker" in components:
-        segs.append(f"worker {self.worker_threads} threads")
-    if "dispatcher" in components:
-        segs.append("dispatcher")
-    if "scheduler" in components:
-        segs.append("scheduler")
-    sd_status = f"Quebec {__version__}: {', '.join(segs) or 'running'}; running"
 
     # Store state by instance id
     _quebec_state[id(self)] = {
         "shutdown_event": shutdown_event,
         "job_queue": job_queue,
         "worker_threads": worker_threads,
-        "sd_status": sd_status,
+        "sd_components": components,
     }
 
     # Components started: tell systemd we're ready. No-op unless launched
     # under a Type=notify unit. In supervisor mode the forked child drops
     # NOTIFY_SOCKET before entering qc.run(), so children stay silent here.
-    self.systemd_ready(sd_status)
+    self.systemd_ready(_systemd_status_line(self, components))
 
     return self  # Enable chaining: qc.start().wait()
 
@@ -504,9 +517,10 @@ def _quebec_wait(self):
 
     try:
         while not state["shutdown_event"].is_set():
-            # Refresh status + pet the systemd watchdog (no-op without
-            # NOTIFY_SOCKET). Driven by this loop, so a hung loop stops petting.
-            self.systemd_notify(state["sd_status"])
+            # Refresh status (live worker busy/total) + pet the systemd watchdog
+            # (no-op without NOTIFY_SOCKET). Driven by this loop, so a hung loop
+            # stops petting.
+            self.systemd_notify(_systemd_status_line(self, state["sd_components"]))
             # Detect supervisor death in fork-based mode: if Rust flagged us
             # orphaned, unblock this wait loop so run() returns and the child
             # can exit. `is_orphaned()` stays False unless `watch_parent_pid`

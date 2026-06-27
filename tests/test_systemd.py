@@ -84,3 +84,17 @@ def test_watchdog_petted_on_notify(qc, notify_socket, monkeypatch):
     msg = _drain(notify_socket)
     assert "WATCHDOG=1" in msg
     assert "STATUS=" in msg
+
+
+def test_single_process_status_reports_worker_idle(qc):
+    """The single-process STATUS line reports live worker thread/idle figures
+    from the worker-owned claim ledger — process-local, no DB query."""
+    from quebec import _systemd_status_line
+
+    assert qc.in_flight_count() == 0  # nothing claimed/running in a fresh instance
+    line = _systemd_status_line(qc, ["worker", "dispatcher", "scheduler"])
+    # Idle = total threads when nothing is running.
+    assert f"worker {qc.worker_threads} threads, {qc.worker_threads} idle" in line
+    assert "dispatcher" in line
+    assert "scheduler" in line
+    assert line.startswith("Quebec ")

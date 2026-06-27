@@ -2881,6 +2881,15 @@ impl PyQuebec {
         crate::systemd::stopping();
     }
 
+    /// Number of jobs this worker is currently handling (Dispatched + InFlight),
+    /// i.e. busy threads. Process-local (the worker-owned claim ledger), so it
+    /// is meaningful only in single-process mode — the supervisor's workers run
+    /// in separate processes and keep their own ledgers. Feeds the busy/total
+    /// figure in the single-process systemd STATUS line.
+    fn in_flight_count(&self) -> usize {
+        self.ctx.ledger_active_count()
+    }
+
     /// Clear finished jobs older than the configured threshold.
     /// Returns the total number of jobs deleted.
     ///
