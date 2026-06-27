@@ -2858,6 +2858,38 @@ impl PyQuebec {
         Ok(())
     }
 
+    /// systemd `sd_notify(3)`: send `READY=1` plus an initial status line.
+    ///
+    /// No-op unless launched under a `Type=notify` unit (`NOTIFY_SOCKET` set).
+    /// `status` is built by the caller from in-process state (the supervisor's
+    /// live child set, or a single process's component list). Must be called
+    /// from the process that holds `NOTIFY_SOCKET` — the supervisor in fork
+    /// mode, or the single process running `qc.run()`.
+    fn systemd_ready(&self, status: &str) {
+        crate::systemd::ready(status);
+    }
+
+    /// systemd `sd_notify(3)`: refresh the `STATUS=` line and pet the watchdog.
+    /// Called once per main-loop iteration, so a hung loop stops petting and
+    /// systemd restarts the process.
+    fn systemd_notify(&self, status: &str) {
+        crate::systemd::notify(status);
+    }
+
+    /// systemd `sd_notify(3)`: send `STOPPING=1` from the shutdown path.
+    fn systemd_stop(&self) {
+        crate::systemd::stopping();
+    }
+
+    /// Number of jobs this worker is currently handling (Dispatched + InFlight),
+    /// i.e. busy threads. Process-local (the worker-owned claim ledger), so it
+    /// is meaningful only in single-process mode — the supervisor's workers run
+    /// in separate processes and keep their own ledgers. Feeds the busy/total
+    /// figure in the single-process systemd STATUS line.
+    fn in_flight_count(&self) -> usize {
+        self.ctx.ledger_active_count()
+    }
+
     /// Clear finished jobs older than the configured threshold.
     /// Returns the total number of jobs deleted.
     ///

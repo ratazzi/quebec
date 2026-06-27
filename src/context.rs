@@ -688,6 +688,18 @@ impl AppContext {
             .any(|s| matches!(s, ClaimState::Dispatched | ClaimState::InFlight))
     }
 
+    /// Count active (Dispatched or InFlight) ledger entries — how many jobs this
+    /// worker is currently handling. CleanupPending entries are excluded (those
+    /// already executed). Feeds the single-process systemd STATUS busy/total line.
+    pub fn ledger_active_count(&self) -> usize {
+        self.claim_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|s| matches!(s, ClaimState::Dispatched | ClaimState::InFlight))
+            .count()
+    }
+
     /// Snapshot the claim ledger so callers can inspect states without holding
     /// the lock. Poison-recovering.
     pub fn ledger_snapshot(&self) -> std::collections::HashMap<i64, ClaimState> {

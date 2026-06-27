@@ -176,9 +176,13 @@ class Supervisor:
 
             self._start_heartbeat()
             self._start_maintenance()
+            # Children forked and control plane up: tell systemd we're ready.
+            # No-op unless launched under a Type=notify unit.
+            self.qc.systemd_ready(self._status_text())
             self._supervise()
         finally:
             try:
+                self.qc.systemd_stop()
                 self._terminate_gracefully()
             finally:
                 self._heartbeat_stop.set()
@@ -325,6 +329,9 @@ class Supervisor:
                 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
                 os.close(self._wakeup_r)
                 os.close(self._wakeup_w)
+                # Only the supervisor (main PID) talks to systemd; drop the
+                # socket so a child can never feed the watchdog or send status.
+                os.environ.pop("NOTIFY_SOCKET", None)
                 # This child runs a single role, not another supervisor. Drop
                 # QUEBEC_SUPERVISOR so the `qc.run(spawn=[...])` below takes the
                 # single-process path instead of re-entering supervisor mode
@@ -372,8 +379,33 @@ class Supervisor:
             logger.info("Forked %s[%d] as pid=%d", role, index, pid)
             self._children[pid] = _ChildInfo(role=role, index=index, pid=pid)
 
+    def _status_text(self) -> str:
+        """Build the systemd STATUS line from in-process state.
+
+        Uses the live child set (`self._children`) and the configured plan —
+        not a database query — so it reflects exactly the processes this
+        supervisor manages, never a global, cross-node view.
+        """
+        from .quebec import __version__
+
+        counts: Dict[str, int] = {}
+        for info in self._children.values():
+            counts[info.role] = counts.get(info.role, 0) + 1
+        segs = []
+        for role in (ROLE_WORKER, ROLE_DISPATCHER, ROLE_SCHEDULER):
+            expected = self.plan.get(role, 0)
+            if expected:
+                segs.append(f"{role}s {counts.get(role, 0)}/{expected}")
+        body = ", ".join(segs) if segs else "starting"
+        state = "stopping" if self._stopping else "running"
+        return f"Quebec {__version__}: supervisor; {body}; {state}"
+
     def _supervise(self) -> None:
         while not self._stopping:
+            # Refresh status + pet the systemd watchdog. Driving this from the
+            # supervise loop means a hung loop stops petting and lets systemd
+            # restart us. No-op unless launched under a Type=notify unit.
+            self.qc.systemd_notify(self._status_text())
             pid, status = self._reap_one(block=False)
             if pid == 0:
                 self._interruptible_sleep(1.0)
