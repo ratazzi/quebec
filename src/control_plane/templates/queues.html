@@ -26,7 +26,7 @@
 
   <div class="flex-grow basis-full sm:basis-auto"></div>
 
-  <form action="{{ base_path }}/queues/all/pause" method="post">
+  <form action="{{ base_path }}/queues/all/pause" method="post" data-turbo-confirm="Pause all queues?">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5 mr-2">
       <svg class="h-4 w-4 mr-1.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
         <rect x="6" y="4" width="4" height="16"></rect>

@@ -47,7 +47,7 @@
   {% set filter_qs = "" %}
   {% if filter_args %}{% set filter_qs = "?" ~ filter_args %}{% endif %}
 
-  <form action="{{ base_path }}/blocked-jobs/all/unblock{{ filter_qs }}" method="post" data-turbo-frame="_top">
+  <form action="{{ base_path }}/blocked-jobs/all/unblock{{ filter_qs }}" method="post" data-turbo-frame="_top" data-turbo-confirm="{% if filter_class_name or filter_queue_name %}Unblock all filtered blocked jobs?{% else %}Unblock all blocked jobs?{% endif %}">
     <button type="submit" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 bg-gray-900 text-gray-50 hover:bg-gray-900/90 h-8 px-4 py-1.5">
       <svg class="h-4 w-4 mr-1.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
         <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
