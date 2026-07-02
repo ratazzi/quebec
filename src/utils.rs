@@ -1,7 +1,7 @@
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 #[cfg(feature = "python")]
-use pyo3::types::{PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::Value;
 #[cfg(feature = "python")]
 use serde_yaml;
@@ -148,7 +148,9 @@ pub fn yaml_value_to_python(py: Python<'_>, value: &serde_yaml::Value) -> PyResu
 /// Convert Python object to JSON value
 #[cfg(feature = "python")]
 pub fn python_to_json_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    if obj.is_instance_of::<PyInt>() {
+    if obj.is_instance_of::<PyBool>() {
+        Ok(Value::Bool(obj.extract::<bool>()?))
+    } else if obj.is_instance_of::<PyInt>() {
         Ok(Value::Number(obj.extract::<i64>()?.into()))
     } else if obj.is_instance_of::<PyFloat>() {
         let f = obj.extract::<f64>()?;
