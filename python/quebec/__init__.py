@@ -330,6 +330,11 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
         return JobBuilder(cls, **options)
 
 
+_STOP_EXCEPTIONS = tuple(
+    e for e in (getattr(queue, "ShutDown", None), KeyboardInterrupt) if e is not None
+)
+
+
 class ThreadedRunner:
     def __init__(self, queue: queue.Queue, event: threading.Event):
         self.queue = queue
@@ -341,10 +346,16 @@ class ThreadedRunner:
         while not self.event.is_set():
             try:
                 self.execution = self.queue.get(timeout=0.1)
-                if self.execution is None:
-                    continue
+            except queue.Empty:
+                continue  # No job available, just continue waiting
+            except _STOP_EXCEPTIONS:
+                break
 
-                self.queue.task_done()
+            # From here on, get() succeeded: task_done() is owed exactly once.
+            try:
+                if self.execution is None:
+                    continue  # finally below still runs task_done()
+
                 self.execution.tid = str(threading.get_ident())
 
                 # Inject jid and queue into context before execution, clean up after
@@ -360,19 +371,19 @@ class ThreadedRunner:
                     logger.debug(self.execution.metric)
                 finally:
                     job_context_var.reset(ctx_token)
-            except queue.Empty:
-                pass  # No job available, just continue waiting
-            except (
-                getattr(queue, "ShutDown", None) or KeyboardInterrupt,
-                KeyboardInterrupt,
-            ):
+            except _STOP_EXCEPTIONS:
                 break
             except Exception as e:
                 logger.error(
                     f"Unexpected exception in ThreadedRunner: {e}", exc_info=True
                 )
             finally:
-                self.cleanup()
+                try:
+                    if self.execution is not None:
+                        self.cleanup()
+                finally:
+                    self.queue.task_done()
+                    self.execution = None
 
         logger.debug("threaded_runner exit")
 
