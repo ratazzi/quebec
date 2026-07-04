@@ -904,7 +904,8 @@ impl Runnable {
         error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
         // Check for JobInterrupted first (continuation checkpoint)
-        let job_interrupted = py.get_type::<crate::continuation::JobInterrupted>();
+        let job_interrupted =
+            <crate::continuation::JobInterrupted as pyo3::PyTypeInfo>::type_object(py);
         if error.is_instance(py, &job_interrupted) {
             info!(
                 "Job `{}' interrupted for continuation, will be re-enqueued",
