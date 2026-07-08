@@ -87,6 +87,7 @@ def test_perform_later_persists_job_and_ready_execution(
         "alice",
         {"flag": True, "_quebec_kwargs": True},
     ]
+    assert payload["arguments"]["arguments"][1]["flag"] is True
     assert db_assert.count_jobs() == 1
     assert db_assert.count_ready_executions() == 1
 
