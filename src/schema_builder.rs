@@ -11,6 +11,11 @@ use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 use crate::context::TableConfig;
 
+// Time columns use `.date_time()`, never `.timestamp()`: on MySQL, TIMESTAMP
+// caps at 2038-01-19 and applies session time-zone conversion to the naive
+// UTC values we store, while Solid Queue's Rails schema uses DATETIME.
+// Postgres and SQLite render the same type either way.
+
 /// Helper to create a column alias
 fn col(name: &str) -> Alias {
     Alias::new(name)
@@ -62,11 +67,11 @@ pub fn create_jobs_table(table_config: &TableConfig) -> TableCreateStatement {
                 .default(0),
         )
         .col(ColumnDef::new(col("active_job_id")).string())
-        .col(ColumnDef::new(col("scheduled_at")).timestamp())
-        .col(ColumnDef::new(col("finished_at")).timestamp())
+        .col(ColumnDef::new(col("scheduled_at")).date_time())
+        .col(ColumnDef::new(col("finished_at")).date_time())
         .col(ColumnDef::new(col("concurrency_key")).string())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("updated_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
         .to_owned()
 }
 
@@ -94,7 +99,7 @@ pub fn create_ready_executions_table(table_config: &TableConfig) -> TableCreateS
                 .not_null()
                 .default(0),
         )
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.ready_executions), col("job_id"))
@@ -123,7 +128,7 @@ pub fn create_claimed_executions_table(table_config: &TableConfig) -> TableCreat
                 .unique_key(),
         )
         .col(ColumnDef::new(col("process_id")).big_integer())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.claimed_executions), col("job_id"))
@@ -159,8 +164,8 @@ pub fn create_blocked_executions_table(table_config: &TableConfig) -> TableCreat
                 .default(0),
         )
         .col(ColumnDef::new(col("concurrency_key")).string().not_null())
-        .col(ColumnDef::new(col("expires_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("expires_at")).date_time().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.blocked_executions), col("job_id"))
@@ -195,8 +200,8 @@ pub fn create_scheduled_executions_table(table_config: &TableConfig) -> TableCre
                 .not_null()
                 .default(0),
         )
-        .col(ColumnDef::new(col("scheduled_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("scheduled_at")).date_time().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.scheduled_executions), col("job_id"))
@@ -225,7 +230,7 @@ pub fn create_failed_executions_table(table_config: &TableConfig) -> TableCreate
                 .unique_key(),
         )
         .col(ColumnDef::new(col("error")).text())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.failed_executions), col("job_id"))
@@ -254,8 +259,8 @@ pub fn create_recurring_executions_table(table_config: &TableConfig) -> TableCre
                 .unique_key(),
         )
         .col(ColumnDef::new(col("task_key")).string().not_null())
-        .col(ColumnDef::new(col("run_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("run_at")).date_time().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.recurring_executions), col("job_id"))
@@ -291,8 +296,8 @@ pub fn create_recurring_tasks_table(table_config: &TableConfig) -> TableCreateSt
                 .default(false),
         )
         .col(ColumnDef::new(col("description")).text())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("updated_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
         .to_owned()
 }
 
@@ -310,14 +315,14 @@ pub fn create_processes_table(table_config: &TableConfig) -> TableCreateStatemen
         .col(ColumnDef::new(col("kind")).string().not_null())
         .col(
             ColumnDef::new(col("last_heartbeat_at"))
-                .timestamp()
+                .date_time()
                 .not_null(),
         )
         .col(ColumnDef::new(col("supervisor_id")).big_integer())
         .col(ColumnDef::new(col("pid")).integer().not_null())
         .col(ColumnDef::new(col("hostname")).string())
         .col(ColumnDef::new(col("metadata")).text())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .col(ColumnDef::new(col("name")).string().not_null())
         .to_owned()
 }
@@ -335,9 +340,9 @@ pub fn create_semaphores_table(table_config: &TableConfig) -> TableCreateStateme
         )
         .col(ColumnDef::new(col("key")).string().not_null().unique_key())
         .col(ColumnDef::new(col("value")).integer().not_null().default(0))
-        .col(ColumnDef::new(col("expires_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
-        .col(ColumnDef::new(col("updated_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("expires_at")).date_time().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
         .to_owned()
 }
 
@@ -358,7 +363,7 @@ pub fn create_pauses_table(table_config: &TableConfig) -> TableCreateStatement {
                 .not_null()
                 .unique_key(),
         )
-        .col(ColumnDef::new(col("created_at")).timestamp().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .to_owned()
 }
 
