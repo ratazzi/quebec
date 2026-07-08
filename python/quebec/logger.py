@@ -109,6 +109,8 @@ class TracingConsoleRenderer:
         filename = event_dict.pop("filename", "")
         lineno = event_dict.pop("lineno", "")
         target = event_dict.pop("target", filename or "quebec")
+        # `format_exc_info` renders exc_info into this key; print it below the line.
+        exception = event_dict.pop("exception", None)
 
         extra = self._format_kv(event_dict)
         loc_parts = [p for p in [func_name, str(lineno) if lineno else ""] if p]
@@ -119,9 +121,11 @@ class TracingConsoleRenderer:
             ts = f"{s['dim']}{timestamp}{s['reset']}"
             lvl_style = s["levels"].get(method_name, "")
             lvl = f"{lvl_style}{level:>5}{s['reset']}"
-            return f"{ts} {lvl} {origin} {event}{extra}"
+            line = f"{ts} {lvl} {origin} {event}{extra}"
+        else:
+            line = f"{timestamp} {level:>5} {origin} {event}{extra}"
 
-        return f"{timestamp} {level:>5} {origin} {event}{extra}"
+        return f"{line}\n{exception}" if exception else line
 
     @staticmethod
     def _format_kv(event_dict: dict) -> str:
@@ -142,13 +146,22 @@ class TracingConsoleRenderer:
         return " " + " ".join(parts)
 
 
-def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> None:
+def setup_structlog(
+    level: int = logging.INFO,
+    *,
+    format: str | None = None,
+    show_locals: bool = False,
+) -> None:
     """Configure structlog with job_id context support.
 
     Args:
         level: Logging level (default INFO)
         format: Output format - "console" (colored), "json", or "logfmt".
                 Defaults to QUEBEC_LOG_FORMAT env var, or "console" if not set.
+        show_locals: Include frame-local variables in JSON tracebacks. Off by
+                default since locals often carry secrets (db URLs, tokens,
+                payloads) that would leak into aggregated logs. Only affects
+                the "json" format.
 
     Example:
         from quebec.logger import setup_structlog, get_structlog
@@ -182,6 +195,11 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
 
     if format == "json":
         processors = shared_processors + [
+            # show_locals defaults off: local variables (secrets, tokens,
+            # payloads) would otherwise leak into aggregated JSON logs.
+            structlog.processors.ExceptionRenderer(
+                structlog.tracebacks.ExceptionDictTransformer(show_locals=show_locals)
+            ),
             structlog.processors.TimeStamper(fmt="iso"),
             structlog.processors.JSONRenderer(),
         ]
@@ -190,6 +208,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
         processors = shared_processors + [
             structlog.processors.TimeStamper(fmt="iso", key="ts"),
             _rename_event_to_message,
+            structlog.processors.format_exc_info,
             structlog.processors.LogfmtRenderer(
                 key_order=["ts", "level", "message"],
                 sort_keys=True,
@@ -198,6 +217,7 @@ def setup_structlog(level: int = logging.INFO, *, format: str | None = None) -> 
     else:  # console
         processors = shared_processors + [
             structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.format_exc_info,
             TracingConsoleRenderer(colors=True),
         ]
 
