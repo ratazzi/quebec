@@ -595,7 +595,7 @@ impl Continuable {
                 }
                 Err(e) => {
                     // Check if it's JobInterrupted
-                    let job_interrupted = py.get_type::<JobInterrupted>();
+                    let job_interrupted = <JobInterrupted as pyo3::PyTypeInfo>::type_object(py);
                     if e.is_instance(py, &job_interrupted) {
                         // Propagate interruption
                         return Err(e);
@@ -730,7 +730,7 @@ impl StepContextManager {
 
         // Check if JobInterrupted was raised
         if let Some(exc_type) = exc_type {
-            let job_interrupted = py.get_type::<JobInterrupted>();
+            let job_interrupted = <JobInterrupted as pyo3::PyTypeInfo>::type_object(py);
             if exc_type.is(&job_interrupted) {
                 // JobInterrupted: save current state and propagate
                 debug!(
