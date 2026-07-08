@@ -95,7 +95,9 @@ impl NotifyManager {
                     break;
                 }
 
-                match Self::listen_loop(&dsn, &channel, &tx, &graceful_shutdown).await {
+                match Self::listen_loop(&dsn, &channel, &tx, &graceful_shutdown, &mut retry_count)
+                    .await
+                {
                     Ok(_) => {
                         info!("LISTEN loop for {} completed normally", channel);
                         break;
@@ -129,6 +131,7 @@ impl NotifyManager {
         channel: &str,
         tx: &mpsc::Sender<String>,
         graceful_shutdown: &tokio_util::sync::CancellationToken,
+        retry_count: &mut u32,
     ) -> Result<()> {
         // Create a dedicated connection for LISTEN with optimized settings
         // Note: PgListener creates its own connection internally, so we use the DSN directly
@@ -145,6 +148,12 @@ impl NotifyManager {
             "Started LISTEN on channel: {} (dedicated connection)",
             channel
         );
+
+        // LISTEN is established — reset the retry budget so MAX_RETRIES
+        // bounds consecutive failures only. A long-lived worker would
+        // otherwise burn one retry per reconnect over its lifetime and
+        // permanently fall back to polling after the fifth.
+        *retry_count = 0;
 
         loop {
             tokio::select! {
