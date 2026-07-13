@@ -1489,7 +1489,6 @@ impl Execution {
         }
         .await;
 
-        let mut db = self.ctx.get_db().await?;
         let failed = result.is_err();
         let err = result.as_ref().err().map(|e| e.to_string());
 
@@ -1536,15 +1535,26 @@ impl Execution {
                     job_id, attempt, max_retries
                 );
                 tokio::time::sleep(backoff).await;
-                // Re-acquire connection from pool for retry
-                db = match self.ctx.get_db().await {
-                    Ok(db) => db,
-                    Err(e) => {
-                        warn!("Failed to re-acquire connection: {}", e);
-                        continue;
-                    }
-                };
+            }
 
+            // Acquire a fresh connection for this attempt. A transient failure
+            // here (momentary pool exhaustion / connection blip) must not bypass
+            // the cleanup and leave the already-executed job's claimed row for
+            // the orphan sweep to mark FAILED — retry it exactly like the
+            // transaction. Only a persistent failure across every attempt falls
+            // through to the emergency path below.
+            let db = match self.ctx.get_db().await {
+                Ok(db) => db,
+                Err(e) => {
+                    warn!(
+                        "Failed to acquire DB connection for cleanup of job {} (attempt {}): {}",
+                        job_id, attempt, e
+                    );
+                    continue;
+                }
+            };
+
+            if attempt > 0 {
                 // Lost-ack guard (mirrors Solid Queue's "the claimed row is the
                 // source of truth"): the cleanup closure is atomic, so a prior
                 // attempt either committed everything — mark_finished/failed,
