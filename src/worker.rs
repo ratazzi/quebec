@@ -4465,7 +4465,16 @@ impl Worker {
                     let Ok(heartbeat_db) = self.ctx.get_db().await.inspect_err(|e| {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
-                    self.heartbeat(&heartbeat_db, &process).await?;
+                    // A transient heartbeat failure must not tear down the whole
+                    // worker. Like every other periodic branch (prune, cleanup,
+                    // reconcile) and the quiet-mode heartbeat below, log and
+                    // continue — the next tick retries. If heartbeats fail
+                    // persistently the process row goes stale and another
+                    // worker's prune reclaims its jobs, which is the designed
+                    // recovery path.
+                    if let Err(e) = self.heartbeat(&heartbeat_db, &process).await {
+                        warn!("Failed to flush heartbeat: {}", e);
+                    }
                 }
                 // Quiet mode entered: immediately push a heartbeat so the
                 // metadata column reflects the new state without waiting
