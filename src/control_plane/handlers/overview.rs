@@ -33,11 +33,16 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // Get time range parameter, default to 24 hours
+        // Get time range parameter, default to 24 hours. Clamp to [1, 1 year]:
+        // the value drives both `chrono::Duration::hours` (which panics on
+        // overflow, e.g. `?hours=9999999999999999`) and the per-bucket COUNT
+        // loop below (an unbounded value would fire tens of thousands of serial
+        // COUNTs — a page-load query storm).
         let hours: i64 = params
             .get("hours")
             .and_then(|h| h.parse().ok())
-            .unwrap_or(24);
+            .unwrap_or(24)
+            .clamp(1, 24 * 365);
 
         let now = chrono::Utc::now().naive_utc();
         let period_start = now - chrono::Duration::hours(hours);
