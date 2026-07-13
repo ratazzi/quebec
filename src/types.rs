@@ -317,6 +317,18 @@ pub struct PyQuebec {
     control_plane_router: Arc<tokio::sync::Mutex<Option<axum::Router>>>,
 }
 
+/// Kwargs injected by `JobBuilder.set()` (queue / priority / scheduled_at
+/// overrides). They are consumed by the enqueue path and must be stripped from
+/// the job's serialized arguments and from any user `queue` callable. Only
+/// these exact keys are reserved — a user kwarg that merely starts with `_`
+/// (e.g. `_id`, `_type`, `_meta`) is a real argument and must pass through to
+/// `perform()`.
+const JOB_BUILDER_INTERNAL_KWARGS: [&str; 3] = ["_queue", "_priority", "_scheduled_at"];
+
+fn is_job_builder_internal_kwarg(key: &str) -> bool {
+    JOB_BUILDER_INTERNAL_KWARGS.contains(&key)
+}
+
 /// Resolve `wait` / `wait_until` options from a Python dict into an optional
 /// `NaiveDateTime`.  Returns `None` when neither key is present.
 fn resolve_scheduled_at(
@@ -2023,7 +2035,7 @@ impl PyQuebec {
                 if let Some(k) = kwargs {
                     for (key, value) in k.iter() {
                         if let Ok(key_str) = key.extract::<String>() {
-                            if !key_str.starts_with('_') {
+                            if !is_job_builder_internal_kwarg(&key_str) {
                                 filtered.set_item(key, value)?;
                             }
                         }
@@ -2103,7 +2115,7 @@ impl PyQuebec {
         if let Some(Value::Object(kwargs_map)) = &kwargs_json {
             let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
                 .iter()
-                .filter(|(key, _)| !key.starts_with('_'))
+                .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
 
@@ -2344,7 +2356,7 @@ impl PyQuebec {
                     let filtered = PyDict::new(py);
                     for (key, value) in kwargs_bound.iter() {
                         if let Ok(key_str) = key.extract::<String>() {
-                            if !key_str.starts_with('_') {
+                            if !is_job_builder_internal_kwarg(&key_str) {
                                 filtered.set_item(key, value)?;
                             }
                         }
@@ -2402,7 +2414,7 @@ impl PyQuebec {
             if let Some(Value::Object(kwargs_map)) = &kwargs_json {
                 let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
                     .iter()
-                    .filter(|(key, _)| !key.starts_with('_'))
+                    .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 if !real_kwargs.is_empty() {
