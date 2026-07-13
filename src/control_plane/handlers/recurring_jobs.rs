@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect},
 };
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement, TransactionTrait, Value};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -148,13 +148,9 @@ impl ControlPlane {
         let now = chrono::Utc::now().naive_utc();
         let ctx = state.ctx.clone();
 
-        let enqueued_queue = db
-            .transaction::<_, Option<String>, DbErr>(|txn| {
-                let entry = entry.clone();
-                let ctx = ctx.clone();
-                Box::pin(async move { enqueue_job(&ctx, txn, entry, now).await })
-            })
-            .await?;
+        // enqueue_job opens its own transaction around just the DB writes; its
+        // enqueue hooks stay outside that transaction (M5).
+        let enqueued_queue = enqueue_job(&ctx, db, entry, now).await?;
 
         // Send NOTIFY after transaction commits (only if job was created).
         // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.

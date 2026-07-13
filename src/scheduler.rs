@@ -5,7 +5,10 @@ use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, ExecResult, Statement, TransactionTrait, Value};
+use sea_orm::{
+    ConnectionTrait, DbBackend, DbErr, ExecResult, Statement, TransactionError, TransactionTrait,
+    Value,
+};
 use serde_json::json;
 use serde_yaml;
 use std::collections::HashMap;
@@ -167,7 +170,7 @@ pub async fn enqueue_job<C>(
     scheduled_at: NaiveDateTime,
 ) -> std::result::Result<Option<String>, DbErr>
 where
-    C: ConnectionTrait,
+    C: ConnectionTrait + TransactionTrait,
 {
     let task_key = entry
         .key
@@ -328,105 +331,130 @@ where
         }
     }
 
-    // Run the actual DB enqueue; on any error, close the around_enqueue generator
-    let concurrency_key_str = concurrency_constraint.as_ref().map(|c| c.key.as_str());
-    let db_result: std::result::Result<(crate::entities::quebec_jobs::Model, bool), DbErr> =
-        async {
-            let job = query_builder::jobs::insert_returning(
-                db,
-                &ctx.table_config,
-                routed_queue_name,
-                &entry.class,
-                Some(params.to_string()).as_deref(),
-                priority,
-                Some(active_job_id.as_str()),
-                Some(scheduled_at),
-                concurrency_key_str,
-            )
-            .await?;
-
-            let claimed = query_builder::recurring_executions::try_insert(
-                db,
-                &ctx.table_config,
-                job.id,
-                &task_key,
-                scheduled_at,
-            )
-            .await?;
-
-            if !claimed {
-                query_builder::jobs::delete_by_id(db, &ctx.table_config, job.id).await?;
-                trace!(
-                    "Skipping job {} at {} - already claimed by another scheduler",
-                    task_key,
-                    scheduled_at
-                );
-                return Ok((job, false)); // not claimed
-            }
-
-            let blocked_by = if let Some(constraint) = &concurrency_constraint {
-                use crate::semaphore::acquire_semaphore_with_constraint;
-                if acquire_semaphore_with_constraint(db, &ctx.table_config, constraint).await? {
-                    info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
-                    None
-                } else {
-                    warn!(
-                        "Scheduler: Failed to acquire semaphore for key: {}",
-                        constraint.key
-                    );
-                    Some(constraint)
-                }
-            } else {
-                None
-            };
-
-            if let Some(constraint) = blocked_by {
-                match constraint.on_conflict {
-                    crate::context::ConcurrencyConflict::Discard => {
-                        warn!(
-                            job_id = job.id,
-                            "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
-                            job.class_name,
-                            constraint.key,
-                            constraint.limit,
-                            constraint.duration.map_or(0, |d| d.num_seconds())
-                        );
-                        query_builder::jobs::mark_finished(db, &ctx.table_config, job.id).await?;
-                        return Ok((job, false)); // discarded
-                    }
-                    crate::context::ConcurrencyConflict::Block => {
-                        let block_now = chrono::Utc::now().naive_utc();
-                        let duration = constraint.duration.unwrap_or_else(|| {
-                            chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                                .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                        });
-                        let expires_at = block_now + duration;
-                        query_builder::blocked_executions::insert(
-                            db,
-                            &ctx.table_config,
-                            job.id,
-                            &job.queue_name,
-                            job.priority,
-                            &constraint.key,
-                            expires_at,
-                        )
-                        .await?;
-                    }
-                }
-            } else {
-                query_builder::ready_executions::insert(
-                    db,
-                    &ctx.table_config,
-                    job.id,
-                    &job.queue_name,
-                    job.priority,
+    // Run the actual DB enqueue inside its OWN transaction. The enqueue hooks
+    // above (before/around up to yield) and below (around-resume/after) run
+    // OUTSIDE this transaction on purpose: they execute arbitrary user Python
+    // under the GIL, and holding a DB transaction across them deadlocks SQLite
+    // (the transaction already holds the global write lock, so a hook that
+    // writes the DB self-deadlocks / hits SQLITE_BUSY) and needlessly widens
+    // row-lock contention on Postgres. Only the DB writes are transactional.
+    let db_result: std::result::Result<(crate::entities::quebec_jobs::Model, bool), DbErr> = {
+        let txn_ctx = ctx.clone();
+        let class = entry.class.clone();
+        let routed = routed_queue_name.to_string();
+        let params_str = params.to_string();
+        let active_job_id = active_job_id.clone();
+        let task_key = task_key.clone();
+        let constraint = concurrency_constraint;
+        db.transaction::<_, (crate::entities::quebec_jobs::Model, bool), DbErr>(move |txn| {
+            Box::pin(async move {
+                let concurrency_key_str = constraint.as_ref().map(|c| c.key.as_str());
+                let job = query_builder::jobs::insert_returning(
+                    txn,
+                    &txn_ctx.table_config,
+                    &routed,
+                    &class,
+                    Some(params_str.as_str()),
+                    priority,
+                    Some(active_job_id.as_str()),
+                    Some(scheduled_at),
+                    concurrency_key_str,
                 )
                 .await?;
-            }
 
-            Ok((job, true)) // success
-        }
-        .await;
+                let claimed = query_builder::recurring_executions::try_insert(
+                    txn,
+                    &txn_ctx.table_config,
+                    job.id,
+                    &task_key,
+                    scheduled_at,
+                )
+                .await?;
+
+                if !claimed {
+                    query_builder::jobs::delete_by_id(txn, &txn_ctx.table_config, job.id).await?;
+                    trace!(
+                        "Skipping job {} at {} - already claimed by another scheduler",
+                        task_key,
+                        scheduled_at
+                    );
+                    return Ok((job, false)); // not claimed
+                }
+
+                let blocked_by = if let Some(constraint) = &constraint {
+                    use crate::semaphore::acquire_semaphore_with_constraint;
+                    if acquire_semaphore_with_constraint(txn, &txn_ctx.table_config, constraint)
+                        .await?
+                    {
+                        info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
+                        None
+                    } else {
+                        warn!(
+                            "Scheduler: Failed to acquire semaphore for key: {}",
+                            constraint.key
+                        );
+                        Some(constraint)
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(constraint) = blocked_by {
+                    match constraint.on_conflict {
+                        crate::context::ConcurrencyConflict::Discard => {
+                            warn!(
+                                job_id = job.id,
+                                "Job `{}' discarded due to: {{key={:?}, limit={}, duration={}s}}",
+                                job.class_name,
+                                constraint.key,
+                                constraint.limit,
+                                constraint.duration.map_or(0, |d| d.num_seconds())
+                            );
+                            query_builder::jobs::mark_finished(txn, &txn_ctx.table_config, job.id)
+                                .await?;
+                            return Ok((job, false)); // discarded
+                        }
+                        crate::context::ConcurrencyConflict::Block => {
+                            let block_now = chrono::Utc::now().naive_utc();
+                            let duration = constraint.duration.unwrap_or_else(|| {
+                                chrono::Duration::from_std(
+                                    txn_ctx.default_concurrency_control_period,
+                                )
+                                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                            });
+                            let expires_at = block_now + duration;
+                            query_builder::blocked_executions::insert(
+                                txn,
+                                &txn_ctx.table_config,
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                                &constraint.key,
+                                expires_at,
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    query_builder::ready_executions::insert(
+                        txn,
+                        &txn_ctx.table_config,
+                        job.id,
+                        &job.queue_name,
+                        job.priority,
+                    )
+                    .await?;
+                }
+
+                Ok((job, true)) // success
+            })
+        })
+        .await
+        .map_err(|e| match e {
+            TransactionError::Connection(e) => e,
+            TransactionError::Transaction(e) => e,
+        })
+    };
 
     // On any DB error or early exit, throw into generator before propagating
     let (job, enqueued) = match db_result {
@@ -816,21 +844,14 @@ impl Scheduler {
             }
 
             let start_time = Instant::now();
-            let result = db
-                .transaction::<_, Option<String>, DbErr>(|txn| {
-                    let entry = entry.clone();
-                    let task_key = task_key.clone();
-                    let ctx = ctx.clone();
-                    Box::pin(async move {
-                        let queue_name = enqueue_job(&ctx, txn, entry, scheduled_at).await?;
-                        if queue_name.is_some() {
-                            trace!("Job({:?}) enqueued", task_key);
-                        }
-                        Ok(queue_name)
-                    })
-                })
+            // enqueue_job opens its own transaction around just the DB writes;
+            // the enqueue hooks it runs stay outside that transaction (see M5).
+            let result = enqueue_job(&ctx, db.as_ref(), entry.clone(), scheduled_at)
                 .await
                 .inspect_err(|e| error!("Failed to enqueue scheduled job {}: {}", task_key, e));
+            if let Ok(Some(_)) = &result {
+                trace!("Job({:?}) enqueued", task_key);
+            }
 
             // Send NOTIFY after transaction commits (only if job was actually created).
             // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
