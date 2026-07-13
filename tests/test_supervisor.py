@@ -422,3 +422,65 @@ class TestSupervisorClassValidation:
         Supervisor(qc, {"worker": 2})
         # List-style (length is what matters)
         Supervisor(qc, {"worker": [None, None, None]})
+
+
+class TestSupervisorStopDuringStartup:
+    """A shutdown signal arriving mid-startup must halt forking.
+
+    `start()` installs the signal handlers before forking the plan, so a
+    SIGTERM/SIGQUIT can flip `_stopping` while the fork loop is still running.
+    The loop must stop forking the rest of the plan and skip standing up the
+    control plane / heartbeat / maintenance, rather than build the whole fleet
+    only to tear it down immediately.
+    """
+
+    def _stub_supervisor(self, plan, *, control_plane=None):
+        from unittest.mock import MagicMock
+
+        qc = MagicMock()
+        qc.register_supervisor.return_value = 1
+        sup = Supervisor(qc, plan, control_plane=control_plane)
+
+        started = {"heartbeat": False, "maintenance": False}
+        sup._start_heartbeat = lambda: started.__setitem__("heartbeat", True)
+        sup._start_maintenance = lambda: started.__setitem__("maintenance", True)
+        sup._supervise = lambda: None
+        sup._terminate_gracefully = lambda: None
+        return sup, qc, started
+
+    def test_stop_mid_fork_halts_remaining_forks(self):
+        sup, qc, started = self._stub_supervisor(
+            {ROLE_WORKER: 3}, control_plane="dummy"
+        )
+
+        spawned = []
+
+        def fake_fork(role, index):
+            spawned.append((role, index))
+            # Simulate SIGTERM landing right after the first child is forked.
+            sup._stopping = True
+
+        sup._fork_child = fake_fork
+
+        sup.start()
+
+        # Only the first child was forked; the remaining two were skipped.
+        assert spawned == [(ROLE_WORKER, 0)]
+        # Control plane and background threads were never stood up.
+        qc.start_control_plane.assert_not_called()
+        assert started == {"heartbeat": False, "maintenance": False}
+
+    def test_stop_before_any_fork_forks_nothing(self):
+        sup, qc, started = self._stub_supervisor(
+            {ROLE_WORKER: 3}, control_plane="dummy"
+        )
+        sup._stopping = True  # signal already delivered before the loop runs
+
+        spawned = []
+        sup._fork_child = lambda role, index: spawned.append((role, index))
+
+        sup.start()
+
+        assert spawned == []
+        qc.start_control_plane.assert_not_called()
+        assert started == {"heartbeat": False, "maintenance": False}

@@ -163,22 +163,36 @@ class Supervisor:
         try:
             for role, count in self.plan.items():
                 for index in range(count):
+                    # A SIGTERM/SIGQUIT arriving mid-startup sets _stopping via
+                    # the signal handler. Stop forking the rest of the plan
+                    # instead of standing up the whole fleet only to tear it
+                    # down immediately in _supervise().
+                    if self._stopping:
+                        break
                     self._fork_child(role, index)
+                if self._stopping:
+                    break
 
-            # Start the control plane only after all children are forked so
-            # the listening socket/runtime task stays parent-only. Children
-            # would otherwise inherit the TcpListener fd.
-            if self.control_plane:
-                try:
-                    self.qc.start_control_plane(self.control_plane)
-                except Exception:
-                    logger.exception("Failed to start control plane")
+            # If shutdown was already requested during the fork loop, skip
+            # standing up the control plane and background threads; go straight
+            # to _supervise() (which returns at once) and let `finally` reap the
+            # children that were already forked.
+            if not self._stopping:
+                # Start the control plane only after all children are forked so
+                # the listening socket/runtime task stays parent-only. Children
+                # would otherwise inherit the TcpListener fd.
+                if self.control_plane:
+                    try:
+                        self.qc.start_control_plane(self.control_plane)
+                    except Exception:
+                        logger.exception("Failed to start control plane")
 
-            self._start_heartbeat()
-            self._start_maintenance()
-            # Children forked and control plane up: tell systemd we're ready.
-            # No-op unless launched under a Type=notify unit.
-            self.qc.systemd_ready(self._status_text())
+                self._start_heartbeat()
+                self._start_maintenance()
+                # Children forked and control plane up: tell systemd we're
+                # ready. No-op unless launched under a Type=notify unit.
+                self.qc.systemd_ready(self._status_text())
+
             self._supervise()
         finally:
             try:
