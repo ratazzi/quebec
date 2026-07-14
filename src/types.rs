@@ -802,7 +802,11 @@ impl PyQuebec {
                         if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {
                             // default value
                             _ctx.dispatcher_polling_interval =
-                                Duration::from_secs_f64(polling_interval);
+                                Duration::try_from_secs_f64(polling_interval).map_err(|_| {
+                                    pyo3::exceptions::PyValueError::new_err(format!(
+                                        "dispatcher_polling_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.polling_interval, got {polling_interval})"
+                                    ))
+                                })?;
                         }
                     }
                     if let Some(batch_size) = dispatcher.batch_size {
@@ -817,7 +821,11 @@ impl PyQuebec {
                         {
                             // default value
                             _ctx.dispatcher_concurrency_maintenance_interval =
-                                Duration::from_secs_f64(interval);
+                                Duration::try_from_secs_f64(interval).map_err(|_| {
+                                    pyo3::exceptions::PyValueError::new_err(format!(
+                                        "dispatcher_concurrency_maintenance_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.concurrency_maintenance_interval, got {interval})"
+                                    ))
+                                })?;
                         }
                     }
                 }
