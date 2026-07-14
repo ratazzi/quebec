@@ -79,33 +79,39 @@ impl Dispatcher {
                     }) else { continue };
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
 
-                    // Clean up expired semaphores (matches Solid Queue's
-                    // `expire_semaphores`). Solid Queue runs expire + unblock in a
-                    // single maintenance task, so a failed expire aborts the task
-                    // before unblock runs — mirror that by skipping unblock when
-                    // expire fails. Scheduled dispatch is a separate concern (its
-                    // own task in Solid Queue) and still runs.
-                    let expire_ok =
-                        match query_builder::semaphores::delete_expired(&*polling_db, &ctx.table_config).await {
-                            Ok(n) => {
-                                if n > 0 {
-                                    info!("Cleaned up {} expired semaphores", n);
+                    // Concurrency maintenance: expire stale semaphores + unblock
+                    // blocked jobs. Skipped when the operator sets
+                    // `concurrency_maintenance: false`. Scheduled dispatch below is
+                    // a separate concern (its own task in Solid Queue) and always
+                    // runs regardless of this flag.
+                    if ctx.dispatcher_concurrency_maintenance {
+                        // Clean up expired semaphores (matches Solid Queue's
+                        // `expire_semaphores`). Solid Queue runs expire + unblock in
+                        // a single maintenance task, so a failed expire aborts the
+                        // task before unblock runs — mirror that by skipping unblock
+                        // when expire fails.
+                        let expire_ok =
+                            match query_builder::semaphores::delete_expired(&*polling_db, &ctx.table_config).await {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        info!("Cleaned up {} expired semaphores", n);
+                                    }
+                                    true
                                 }
-                                true
-                            }
-                            Err(e) => {
-                                warn!("Error cleaning up expired semaphores: {:?}", e);
-                                false
-                            }
-                        };
+                                Err(e) => {
+                                    warn!("Error cleaning up expired semaphores: {:?}", e);
+                                    false
+                                }
+                            };
 
-                    // Unblock jobs with expired concurrency keys — one transaction
-                    // per key, matching Solid Queue's `BlockedExecution.unblock`.
-                    if expire_ok {
-                        if let Err(e) =
-                            Self::unblock_blocked_executions(&polling_db, &ctx, batch_size).await
-                        {
-                            warn!("Error unblocking blocked executions: {:?}", e);
+                        // Unblock jobs with expired concurrency keys — one transaction
+                        // per key, matching Solid Queue's `BlockedExecution.unblock`.
+                        if expire_ok {
+                            if let Err(e) =
+                                Self::unblock_blocked_executions(&polling_db, &ctx, batch_size).await
+                            {
+                                warn!("Error unblocking blocked executions: {:?}", e);
+                            }
                         }
                     }
 
