@@ -44,6 +44,16 @@ impl Dispatcher {
             != 0;
         let mut parent_check_interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let batch_size = self.ctx.dispatcher_batch_size;
+        // Concurrency maintenance runs on its own cadence (Solid Queue's
+        // ConcurrencyMaintenance timer, default 600s), separate from polling.
+        // Clamp to >= 1s: a zero period would panic tokio's interval (same
+        // guard as the worker's cleanup_interval).
+        let maintenance_enabled = self.ctx.dispatcher_concurrency_maintenance;
+        let mut maintenance_interval = tokio::time::interval(
+            self.ctx
+                .dispatcher_concurrency_maintenance_interval
+                .max(std::time::Duration::from_secs(1)),
+        );
 
         let init_db = self.ctx.get_db().await?;
         let process = self.on_start(&init_db).await?;
@@ -73,47 +83,54 @@ impl Dispatcher {
                     self.on_stop(&stop_db, &process).await?;
                     return Ok(());
                 }
+                // Concurrency maintenance: expire stale semaphores + unblock
+                // blocked jobs. Runs every `concurrency_maintenance_interval`
+                // (Solid Queue parity — its ConcurrencyMaintenance TimerTask,
+                // `run_now: true`, which tokio's immediate first tick matches),
+                // not every polling tick. The completion path releases the
+                // semaphore and unblocks the next job directly (after_executed),
+                // so this sweep only reclaims semaphores whose holder crashed.
+                // Skipped entirely when `concurrency_maintenance: false`.
+                _ = maintenance_interval.tick(), if maintenance_enabled => {
+                    let Ok(maintenance_db) = self.ctx.get_db().await.inspect_err(|e| {
+                        warn!("Failed to get DB for concurrency maintenance: {}", e);
+                    }) else { continue };
+                    let ctx = self.ctx.clone();
+
+                    // Clean up expired semaphores (matches Solid Queue's
+                    // `expire_semaphores`). Solid Queue runs expire + unblock in
+                    // a single maintenance task, so a failed expire aborts the
+                    // task before unblock runs — mirror that by skipping unblock
+                    // when expire fails.
+                    let expire_ok =
+                        match query_builder::semaphores::delete_expired(&*maintenance_db, &ctx.table_config).await {
+                            Ok(n) => {
+                                if n > 0 {
+                                    info!("Cleaned up {} expired semaphores", n);
+                                }
+                                true
+                            }
+                            Err(e) => {
+                                warn!("Error cleaning up expired semaphores: {:?}", e);
+                                false
+                            }
+                        };
+
+                    // Unblock jobs with expired concurrency keys — one transaction
+                    // per key, matching Solid Queue's `BlockedExecution.unblock`.
+                    if expire_ok {
+                        if let Err(e) =
+                            Self::unblock_blocked_executions(&maintenance_db, &ctx, batch_size).await
+                        {
+                            warn!("Error unblocking blocked executions: {:?}", e);
+                        }
+                    }
+                }
                 _ = polling_interval.tick() => {
                     let Ok(polling_db) = self.ctx.get_db().await.inspect_err(|e| {
                         warn!("Failed to get DB for polling: {}", e);
                     }) else { continue };
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
-
-                    // Concurrency maintenance: expire stale semaphores + unblock
-                    // blocked jobs. Skipped when the operator sets
-                    // `concurrency_maintenance: false`. Scheduled dispatch below is
-                    // a separate concern (its own task in Solid Queue) and always
-                    // runs regardless of this flag.
-                    if ctx.dispatcher_concurrency_maintenance {
-                        // Clean up expired semaphores (matches Solid Queue's
-                        // `expire_semaphores`). Solid Queue runs expire + unblock in
-                        // a single maintenance task, so a failed expire aborts the
-                        // task before unblock runs — mirror that by skipping unblock
-                        // when expire fails.
-                        let expire_ok =
-                            match query_builder::semaphores::delete_expired(&*polling_db, &ctx.table_config).await {
-                                Ok(n) => {
-                                    if n > 0 {
-                                        info!("Cleaned up {} expired semaphores", n);
-                                    }
-                                    true
-                                }
-                                Err(e) => {
-                                    warn!("Error cleaning up expired semaphores: {:?}", e);
-                                    false
-                                }
-                            };
-
-                        // Unblock jobs with expired concurrency keys — one transaction
-                        // per key, matching Solid Queue's `BlockedExecution.unblock`.
-                        if expire_ok {
-                            if let Err(e) =
-                                Self::unblock_blocked_executions(&polling_db, &ctx, batch_size).await
-                            {
-                                warn!("Error unblocking blocked executions: {:?}", e);
-                            }
-                        }
-                    }
 
                     // Dispatch scheduled jobs in their own transaction.
                     let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
