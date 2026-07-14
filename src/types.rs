@@ -170,6 +170,9 @@ fn apply_dispatcher_cfg_to(
         }
         ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
     }
+    if let Some(enabled) = dispatcher_cfg.concurrency_maintenance {
+        ctx.dispatcher_concurrency_maintenance = enabled;
+    }
     Ok(())
 }
 
@@ -827,6 +830,9 @@ impl PyQuebec {
                                     ))
                                 })?;
                         }
+                    }
+                    if let Some(enabled) = dispatcher.concurrency_maintenance {
+                        _ctx.dispatcher_concurrency_maintenance = enabled;
                     }
                 }
             }
@@ -1777,6 +1783,13 @@ impl PyQuebec {
     #[pyo3(name = "_proc_slot")]
     fn proc_slot(&self) -> Option<(usize, usize)> {
         self.ctx.proc_slot
+    }
+
+    /// Test-only: the resolved dispatcher concurrency-maintenance flag after
+    /// queue.yml is applied. Underscore-prefixed.
+    #[pyo3(name = "_dispatcher_concurrency_maintenance")]
+    fn dispatcher_concurrency_maintenance(&self) -> bool {
+        self.ctx.dispatcher_concurrency_maintenance
     }
 
     /// Read `workers`/`dispatchers` from the loaded queue.yml and return a plan

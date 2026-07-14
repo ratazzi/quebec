@@ -391,6 +391,9 @@ pub struct AppContext {
     pub dispatcher_polling_interval: Duration,
     pub dispatcher_batch_size: u64,
     pub dispatcher_concurrency_maintenance_interval: Duration,
+    /// Whether the dispatcher runs concurrency maintenance (expiring stale
+    /// semaphores + unblocking blocked jobs) each polling cycle. Default true.
+    pub dispatcher_concurrency_maintenance: bool,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
     /// Optional worker RSS soft limit. When set, a worker that stays above the
@@ -1049,6 +1052,7 @@ impl AppContext {
             dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
+            dispatcher_concurrency_maintenance: true,
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
             worker_max_rss_bytes: None,
@@ -1231,6 +1235,7 @@ impl AppContext {
             dispatcher_batch_size: self.dispatcher_batch_size,
             dispatcher_concurrency_maintenance_interval: self
                 .dispatcher_concurrency_maintenance_interval,
+            dispatcher_concurrency_maintenance: self.dispatcher_concurrency_maintenance,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
             worker_max_rss_bytes: self.worker_max_rss_bytes,
