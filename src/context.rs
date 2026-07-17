@@ -652,6 +652,18 @@ pub struct RunnableDefaults {
 }
 
 impl AppContext {
+    /// Queue selector the worker actually claims from. When
+    /// `force_override_queue` is active it wins unconditionally over any
+    /// `worker_queues` config: every enqueue is rewritten to that queue, so
+    /// consuming anything else would break the branch isolation the override
+    /// exists for.
+    pub fn effective_worker_queues(&self) -> Option<crate::config::QueueSelector> {
+        self.force_override_queue
+            .as_ref()
+            .map(|q| crate::config::QueueSelector::Single(q.clone()))
+            .or_else(|| self.worker_queues.clone())
+    }
+
     /// Record `id` in the claim ledger with the given state. Poison-recovering;
     /// never held across an await.
     pub fn ledger_set(&self, id: i64, state: ClaimState) {

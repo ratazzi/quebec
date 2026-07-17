@@ -788,7 +788,11 @@ impl PyQuebec {
                     if worker.queues.is_some() {
                         _ctx.worker_queues = worker.queues.clone();
                     }
-                    if let Some(ref queues) = _ctx.worker_queues {
+                    // Log the effective selector so the override's consumption
+                    // pin is visible — raw worker_queues would claim "all
+                    // queues" while the worker actually only drains the
+                    // forced queue.
+                    if let Some(queues) = _ctx.effective_worker_queues() {
                         info!("Worker queues configured: {:?}", queues.to_list());
                     } else {
                         info!("Worker queues: None (will process all queues)");
@@ -844,8 +848,9 @@ impl PyQuebec {
             warn!(
                 "QUEBEC_FORCE_OVERRIDE_QUEUE is active: every enqueue will be \
                  rewritten to queue '{}', ignoring class queue config and any \
-                 `.set(queue=...)` call. Intended for dev isolation; do not \
-                 leave this set in production.",
+                 `.set(queue=...)` call, and the worker will only consume that \
+                 queue. Intended for dev isolation; do not leave this set in \
+                 production.",
                 override_q
             );
         }
