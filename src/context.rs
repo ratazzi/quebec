@@ -335,7 +335,10 @@ pub(crate) fn sanitize_queue_name(raw: &str) -> (String, bool) {
     let cleaned: String = raw
         .chars()
         .map(|c| match c {
-            '/' | '\\' | '?' | '#' | '%' => '-',
+            // '*' would be enqueued literally but reinterpreted as a
+            // wildcard prefix by the worker's queue selector, silently
+            // widening the pinned worker to other queues.
+            '/' | '\\' | '?' | '#' | '%' | '*' => '-',
             c if c.is_whitespace() || c.is_control() => '-',
             c => c,
         })

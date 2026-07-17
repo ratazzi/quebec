@@ -201,7 +201,7 @@ Set `QUEBEC_FORCE_OVERRIDE_QUEUE` to pin every enqueue and consumption to one qu
 QUEBEC_FORCE_OVERRIDE_QUEUE=branch_x python -m quebec your.jobs
 ```
 
-Every enqueue path rewrites `queue_name` to this value (ignoring whatever the class, call site, or scheduler specified), and the worker only consumes that queue — so jobs enqueued by one branch are never picked up by another. URL-hostile characters in the name are sanitized to `-`.
+Every enqueue path rewrites `queue_name` to this value (ignoring whatever the class, call site, or scheduler specified), and the worker only consumes that queue — so jobs enqueued by one branch are never picked up by another. URL-hostile characters and `*` in the name are sanitized to `-` (a literal `*` would otherwise be reinterpreted as a wildcard by the consuming worker).
 
 ### Transactional Enqueue
 

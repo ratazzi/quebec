@@ -39,6 +39,26 @@ def test_enqueue_is_rewritten_to_forced_queue(temp_db_path, test_prefix) -> None
     qc.close()
 
 
+def test_wildcard_chars_are_sanitized_from_forced_queue(
+    temp_db_path, test_prefix
+) -> None:
+    # A '*' in the forced name would be enqueued literally but reinterpreted
+    # as a wildcard prefix on the consumption side, silently widening the
+    # pinned worker to other branches' queues.
+    qc = quebec.Quebec(
+        f"sqlite:///{temp_db_path}?mode=rwc",
+        table_name_prefix=test_prefix,
+        force_override_queue="branch*",
+    )
+    assert qc.create_tables() is True
+    qc.register_job(OverrideJob)
+
+    job = OverrideJob.perform_later(qc)
+    assert job.queue_name == "branch-"
+
+    qc.close()
+
+
 def test_worker_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
     dsn = f"sqlite:///{temp_db_path}?mode=rwc"
 
