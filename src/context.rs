@@ -394,6 +394,9 @@ pub struct AppContext {
     pub dispatcher_polling_interval: Duration,
     pub dispatcher_batch_size: u64,
     pub dispatcher_concurrency_maintenance_interval: Duration,
+    pub(crate) has_explicit_dispatcher_polling: bool,
+    pub(crate) has_explicit_dispatcher_batch_size: bool,
+    pub(crate) has_explicit_dispatcher_maintenance: bool,
     /// Whether the dispatcher runs concurrency maintenance (expiring stale
     /// semaphores + unblocking blocked jobs) each polling cycle. Default true.
     pub dispatcher_concurrency_maintenance: bool,
@@ -1075,6 +1078,9 @@ impl AppContext {
             dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
+            has_explicit_dispatcher_polling: false,
+            has_explicit_dispatcher_batch_size: false,
+            has_explicit_dispatcher_maintenance: false,
             dispatcher_concurrency_maintenance: true,
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
@@ -1258,6 +1264,9 @@ impl AppContext {
             dispatcher_batch_size: self.dispatcher_batch_size,
             dispatcher_concurrency_maintenance_interval: self
                 .dispatcher_concurrency_maintenance_interval,
+            has_explicit_dispatcher_polling: self.has_explicit_dispatcher_polling,
+            has_explicit_dispatcher_batch_size: self.has_explicit_dispatcher_batch_size,
+            has_explicit_dispatcher_maintenance: self.has_explicit_dispatcher_maintenance,
             dispatcher_concurrency_maintenance: self.dispatcher_concurrency_maintenance,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,

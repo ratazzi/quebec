@@ -17,6 +17,7 @@ import socket
 import pytest
 from sqlalchemy import text
 
+import quebec
 from quebec.supervisor import (
     RECYCLE_EXIT_CODE,
     ROLE_WORKER,
@@ -242,6 +243,17 @@ class TestSupervisorExitStatus:
 
 
 class TestApplyConfig:
+    @pytest.fixture(autouse=True)
+    def _clear_explicit_config_env(self, monkeypatch):
+        for key in (
+            "QUEBEC_WORKER_THREADS",
+            "QUEBEC_WORKER_POLLING_INTERVAL",
+            "QUEBEC_DISPATCHER_POLLING_INTERVAL",
+            "QUEBEC_DISPATCHER_BATCH_SIZE",
+            "QUEBEC_DISPATCHER_CONCURRENCY_MAINTENANCE_INTERVAL",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
     def test_apply_worker_config_out_of_range_raises(self, qc):
         # No queue.yml loaded in this test context; out-of-range should raise
         # IndexError (or be a no-op if config missing). We can't guarantee
@@ -304,6 +316,56 @@ development:
 
         with pytest.raises(ValueError, match="within Duration range"):
             qc.apply_worker_config(1)
+
+    def test_apply_dispatcher_config_rejects_duration_overflow(
+        self, qc, monkeypatch, tmp_path
+    ):
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  dispatchers:
+    - polling_interval: 1.0
+    - concurrency_maintenance_interval: 1.0e30
+"""
+        )
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+        with pytest.raises(ValueError, match="within Duration range"):
+            qc.apply_dispatcher_config(1)
+
+    def test_apply_dispatcher_config_preserves_explicit_constructor_values(
+        self, monkeypatch, tmp_path, db_url, test_prefix
+    ):
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  dispatchers:
+    - polling_interval: 5.0
+      batch_size: 100
+      concurrency_maintenance_interval: 50.0
+"""
+        )
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+        inst = quebec.Quebec(
+            db_url,
+            table_name_prefix=test_prefix,
+            dispatcher_polling_interval=2.0,
+            dispatcher_batch_size=200,
+            dispatcher_concurrency_maintenance_interval=20.0,
+        )
+        try:
+            inst.apply_dispatcher_config(0)
+            snapshot = inst._config_snapshot()
+            assert snapshot["dispatcher_polling_interval"] == 2.0
+            assert snapshot["dispatcher_batch_size"] == 200
+            assert snapshot["dispatcher_concurrency_maintenance_interval"] == 20.0
+        finally:
+            inst.close()
 
 
 class TestSupervisorPlanFromConfig:

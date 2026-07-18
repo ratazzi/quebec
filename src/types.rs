@@ -181,23 +181,21 @@ fn apply_dispatcher_cfg_to(
     dispatcher_cfg: &crate::config::DispatcherConfig,
 ) -> PyResult<()> {
     if let Some(polling_interval) = dispatcher_cfg.polling_interval {
-        if !polling_interval.is_finite() || polling_interval < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dispatcher polling_interval must be finite and >= 0, got {polling_interval}"
-            )));
+        if !ctx.has_explicit_dispatcher_polling {
+            ctx.dispatcher_polling_interval =
+                secs_to_duration("dispatcher polling_interval", polling_interval)?;
         }
-        ctx.dispatcher_polling_interval = Duration::from_secs_f64(polling_interval);
     }
     if let Some(batch_size) = dispatcher_cfg.batch_size {
-        ctx.dispatcher_batch_size = batch_size;
+        if !ctx.has_explicit_dispatcher_batch_size {
+            ctx.dispatcher_batch_size = batch_size;
+        }
     }
     if let Some(interval) = dispatcher_cfg.concurrency_maintenance_interval {
-        if !interval.is_finite() || interval < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dispatcher concurrency_maintenance_interval must be finite and >= 0, got {interval}"
-            )));
+        if !ctx.has_explicit_dispatcher_maintenance {
+            ctx.dispatcher_concurrency_maintenance_interval =
+                secs_to_duration("dispatcher concurrency_maintenance_interval", interval)?;
         }
-        ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
     }
     if let Some(enabled) = dispatcher_cfg.concurrency_maintenance {
         ctx.dispatcher_concurrency_maintenance = enabled;
@@ -755,6 +753,9 @@ impl PyQuebec {
             has_explicit_duration(kwargs, "dispatcher_concurrency_maintenance_interval");
 
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
+        _ctx.has_explicit_dispatcher_polling = has_explicit_dispatcher_polling;
+        _ctx.has_explicit_dispatcher_batch_size = has_explicit_dispatcher_batch_size;
+        _ctx.has_explicit_dispatcher_maintenance = has_explicit_dispatcher_maintenance;
 
         if _ctx.worker_threads == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1941,7 +1942,8 @@ impl PyQuebec {
     }
 
     /// Apply the Nth dispatcher configuration. Same slot semantics as
-    /// apply_worker_config.
+    /// apply_worker_config; constructor/env overrides remain authoritative for
+    /// polling interval, batch size, and concurrency-maintenance interval.
     fn apply_dispatcher_config(&mut self, py: Python<'_>, slot_index: usize) -> PyResult<()> {
         let env = std::env::var("QUEBEC_ENV").ok();
         let dispatchers_opt = crate::config::QueueConfig::find(env.as_deref())
