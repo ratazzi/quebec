@@ -1266,17 +1266,25 @@ pub mod ready_executions {
         C: ConnectionTrait,
     {
         let table_name = &table_config.ready_executions;
-        let like_pattern = format!("{pattern}%");
+        // Escape LIKE metacharacters so the pattern is a literal prefix match:
+        // `_` matches any single character in SQL LIKE, so `order_*` would
+        // otherwise also match `orders`. Solid Queue semantics are a plain
+        // string prefix (`starts_with?`).
+        let escaped_prefix = pattern
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like_pattern = format!("{escaped_prefix}%");
 
         let sql = match db.get_database_backend() {
             DbBackend::Postgres => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ORDER BY "queue_name" ASC"#
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ESCAPE '\' ORDER BY "queue_name" ASC"#
             ),
             DbBackend::MySql => format!(
-                r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ORDER BY `queue_name` ASC"#
+                r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ESCAPE '\\' ORDER BY `queue_name` ASC"#
             ),
             DbBackend::Sqlite => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ORDER BY "queue_name" ASC"#
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ESCAPE '\' ORDER BY "queue_name" ASC"#
             ),
         };
 

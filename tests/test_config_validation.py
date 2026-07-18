@@ -2,7 +2,7 @@
 
 An out-of-range interval must surface as a readable ``ValueError`` from the
 Quebec constructor, not a Rust panic (`Duration::from_secs_f64` panics on
-negative / non-finite input). Mirrors the worker-path validation.
+negative / non-finite / overflowing input). Mirrors the worker-path validation.
 """
 
 from __future__ import annotations
@@ -57,6 +57,27 @@ development:
     with pytest.raises(
         ValueError, match="concurrency_maintenance_interval must be finite"
     ):
+        quebec.Quebec(db_url, table_name_prefix=test_prefix)
+
+
+def test_dispatcher_polling_interval_overflow_raises(
+    tmp_path, monkeypatch, db_url, test_prefix
+) -> None:
+    """A huge finite value overflows Duration and must also raise, not panic."""
+    monkeypatch.setenv(
+        "QUEBEC_CONFIG",
+        _queue_yml(
+            tmp_path,
+            """
+development:
+  dispatchers:
+    - polling_interval: 1.0e30
+""",
+        ),
+    )
+    monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+    with pytest.raises(ValueError, match="dispatcher_polling_interval must be finite"):
         quebec.Quebec(db_url, table_name_prefix=test_prefix)
 
 

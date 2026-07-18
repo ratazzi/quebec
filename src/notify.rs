@@ -8,13 +8,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, trace, warn};
 
-/// Per-queue last-NOTIFY timestamps, shared across the process. Producers
-/// consult this table before emitting a NOTIFY to coalesce bursts (e.g.
-/// thousands of `perform_later` calls in a loop) into one wake-up per
-/// `notify_throttle_interval`. The window is per process — workers still
-/// catch up via polling / IDLE fallback if a NOTIFY is dropped.
-static LAST_NOTIFY: LazyLock<Mutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Per-queue NOTIFY throttle state, shared across the process. `last` records
+/// the last-emitted time per queue so producers coalesce bursts (e.g. thousands
+/// of `perform_later` calls in a loop) into one wake-up per
+/// `notify_throttle_interval`. `last_swept` bounds how often stale entries are
+/// evicted so a churn of dynamic queue names (`customer_<id>`) can't leak the
+/// map unboundedly. The window is per process — workers still catch up via
+/// polling / IDLE fallback if a NOTIFY is dropped.
+struct NotifyThrottle {
+    last: HashMap<String, Instant>,
+    last_swept: Instant,
+}
+
+static LAST_NOTIFY: LazyLock<Mutex<NotifyThrottle>> = LazyLock::new(|| {
+    Mutex::new(NotifyThrottle {
+        last: HashMap::new(),
+        last_swept: Instant::now(),
+    })
+});
 
 /// Should the producer emit a NOTIFY for `queue` given the current context?
 ///
@@ -39,14 +50,30 @@ pub fn should_emit_notify(queue: &str, throttle: Duration) -> bool {
         return true;
     }
     let now = Instant::now();
-    let mut map = LAST_NOTIFY.lock().expect("notify throttle map poisoned");
-    match map.get(queue) {
+    let mut state = LAST_NOTIFY.lock().expect("notify throttle map poisoned");
+
+    let emit = match state.last.get(queue) {
         Some(last) if now.duration_since(*last) < throttle => false,
         _ => {
-            map.insert(queue.to_string(), now);
+            state.last.insert(queue.to_string(), now);
             true
         }
+    };
+
+    // Opportunistically evict entries older than the throttle window. Such an
+    // entry would allow a NOTIFY through anyway, so dropping it never changes
+    // throttling behavior — it only reclaims memory from queue names that will
+    // never recur. The sweep is O(n), so it runs at most once per throttle
+    // window to keep steady-state cost bounded no matter how many distinct
+    // (dynamic) queue names churn through the map.
+    if now.duration_since(state.last_swept) >= throttle {
+        state
+            .last
+            .retain(|_, last| now.duration_since(*last) < throttle);
+        state.last_swept = now;
     }
+
+    emit
 }
 
 /// PostgreSQL LISTEN/NOTIFY manager for reducing queue latency

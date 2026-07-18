@@ -2739,7 +2739,7 @@ impl Worker {
     pub async fn claim_job(&self) -> Result<quebec_claimed_executions::Model> {
         let db = self.ctx.get_db().await?;
         let table_config = self.ctx.table_config.clone();
-        let queue_selector = self.ctx.worker_queues.clone();
+        let queue_selector = self.ctx.effective_worker_queues();
         let use_skip_locked = self.ctx.use_skip_locked;
         let process_id = *self.process_id.lock().await;
         // EXPERIMENTAL: queue-level concurrency overrides — acquired here at
@@ -2913,7 +2913,7 @@ impl Worker {
         let db = self.ctx.get_db().await?;
         let use_skip_locked = self.ctx.use_skip_locked;
         let table_config = self.ctx.table_config.clone();
-        let queue_selector = self.ctx.worker_queues.clone();
+        let queue_selector = self.ctx.effective_worker_queues();
         let process_id = *self.process_id.lock().await;
         // EXPERIMENTAL: shared `ctx` for per-record queue-level acquire below.
         let ctx = self.ctx.clone();
@@ -3289,6 +3289,12 @@ impl Worker {
         };
 
         trace!("Received NOTIFY for queue: {}", queue_name);
+
+        // Hot path (once per NOTIFY): check the override by reference instead
+        // of cloning the effective selector for every message.
+        if let Some(forced) = self.ctx.force_override_queue.as_deref() {
+            return queue_name == forced;
+        }
 
         let Some(ref queues) = self.ctx.worker_queues else {
             return true; // No queue config, process all queues
@@ -4465,7 +4471,16 @@ impl Worker {
                     let Ok(heartbeat_db) = self.ctx.get_db().await.inspect_err(|e| {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
-                    self.heartbeat(&heartbeat_db, &process).await?;
+                    // A transient heartbeat failure must not tear down the whole
+                    // worker. Like every other periodic branch (prune, cleanup,
+                    // reconcile) and the quiet-mode heartbeat below, log and
+                    // continue — the next tick retries. If heartbeats fail
+                    // persistently the process row goes stale and another
+                    // worker's prune reclaims its jobs, which is the designed
+                    // recovery path.
+                    if let Err(e) = self.heartbeat(&heartbeat_db, &process).await {
+                        warn!("Failed to flush heartbeat: {}", e);
+                    }
                 }
                 // Quiet mode entered: immediately push a heartbeat so the
                 // metadata column reflects the new state without waiting

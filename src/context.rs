@@ -335,7 +335,10 @@ pub(crate) fn sanitize_queue_name(raw: &str) -> (String, bool) {
     let cleaned: String = raw
         .chars()
         .map(|c| match c {
-            '/' | '\\' | '?' | '#' | '%' => '-',
+            // '*' would be enqueued literally but reinterpreted as a
+            // wildcard prefix by the worker's queue selector, silently
+            // widening the pinned worker to other queues.
+            '/' | '\\' | '?' | '#' | '%' | '*' => '-',
             c if c.is_whitespace() || c.is_control() => '-',
             c => c,
         })
@@ -391,6 +394,9 @@ pub struct AppContext {
     pub dispatcher_polling_interval: Duration,
     pub dispatcher_batch_size: u64,
     pub dispatcher_concurrency_maintenance_interval: Duration,
+    /// Whether the dispatcher runs concurrency maintenance (expiring stale
+    /// semaphores + unblocking blocked jobs) each polling cycle. Default true.
+    pub dispatcher_concurrency_maintenance: bool,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
     /// Optional worker RSS soft limit. When set, a worker that stays above the
@@ -649,6 +655,18 @@ pub struct RunnableDefaults {
 }
 
 impl AppContext {
+    /// Queue selector the worker actually claims from. When
+    /// `force_override_queue` is active it wins unconditionally over any
+    /// `worker_queues` config: every enqueue is rewritten to that queue, so
+    /// consuming anything else would break the branch isolation the override
+    /// exists for.
+    pub fn effective_worker_queues(&self) -> Option<crate::config::QueueSelector> {
+        self.force_override_queue
+            .as_ref()
+            .map(|q| crate::config::QueueSelector::Single(q.clone()))
+            .or_else(|| self.worker_queues.clone())
+    }
+
     /// Record `id` in the claim ledger with the given state. Poison-recovering;
     /// never held across an await.
     pub fn ledger_set(&self, id: i64, state: ClaimState) {
@@ -1049,6 +1067,7 @@ impl AppContext {
             dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
+            dispatcher_concurrency_maintenance: true,
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
             worker_max_rss_bytes: None,
@@ -1231,6 +1250,7 @@ impl AppContext {
             dispatcher_batch_size: self.dispatcher_batch_size,
             dispatcher_concurrency_maintenance_interval: self
                 .dispatcher_concurrency_maintenance_interval,
+            dispatcher_concurrency_maintenance: self.dispatcher_concurrency_maintenance,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
             worker_max_rss_bytes: self.worker_max_rss_bytes,

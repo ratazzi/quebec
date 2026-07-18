@@ -170,6 +170,9 @@ fn apply_dispatcher_cfg_to(
         }
         ctx.dispatcher_concurrency_maintenance_interval = Duration::from_secs_f64(interval);
     }
+    if let Some(enabled) = dispatcher_cfg.concurrency_maintenance {
+        ctx.dispatcher_concurrency_maintenance = enabled;
+    }
     Ok(())
 }
 
@@ -830,7 +833,11 @@ impl PyQuebec {
                     if worker.queues.is_some() {
                         _ctx.worker_queues = worker.queues.clone();
                     }
-                    if let Some(ref queues) = _ctx.worker_queues {
+                    // Log the effective selector so the override's consumption
+                    // pin is visible — raw worker_queues would claim "all
+                    // queues" while the worker actually only drains the
+                    // forced queue.
+                    if let Some(queues) = _ctx.effective_worker_queues() {
                         info!("Worker queues configured: {:?}", queues.to_list());
                     } else {
                         info!("Worker queues: None (will process all queues)");
@@ -845,13 +852,12 @@ impl PyQuebec {
                 if let Some(dispatcher) = dispatchers.first() {
                     if let Some(polling_interval) = dispatcher.polling_interval {
                         if !has_explicit_dispatcher_polling {
-                            if !polling_interval.is_finite() || polling_interval < 0.0 {
-                                return Err(pyo3::exceptions::PyValueError::new_err(
-                                    format!("dispatcher_polling_interval must be finite and >= 0 (set via queue.yml dispatchers.polling_interval, got {polling_interval})"),
-                                ));
-                            }
                             _ctx.dispatcher_polling_interval =
-                                Duration::from_secs_f64(polling_interval);
+                                Duration::try_from_secs_f64(polling_interval).map_err(|_| {
+                                    pyo3::exceptions::PyValueError::new_err(format!(
+                                        "dispatcher_polling_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.polling_interval, got {polling_interval})"
+                                    ))
+                                })?;
                         }
                     }
                     if let Some(batch_size) = dispatcher.batch_size {
@@ -861,14 +867,16 @@ impl PyQuebec {
                     }
                     if let Some(interval) = dispatcher.concurrency_maintenance_interval {
                         if !has_explicit_dispatcher_maintenance {
-                            if !interval.is_finite() || interval < 0.0 {
-                                return Err(pyo3::exceptions::PyValueError::new_err(
-                                    format!("dispatcher_concurrency_maintenance_interval must be finite and >= 0 (set via queue.yml dispatchers.concurrency_maintenance_interval, got {interval})"),
-                                ));
-                            }
                             _ctx.dispatcher_concurrency_maintenance_interval =
-                                Duration::from_secs_f64(interval);
+                                Duration::try_from_secs_f64(interval).map_err(|_| {
+                                    pyo3::exceptions::PyValueError::new_err(format!(
+                                        "dispatcher_concurrency_maintenance_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.concurrency_maintenance_interval, got {interval})"
+                                    ))
+                                })?;
                         }
+                    }
+                    if let Some(enabled) = dispatcher.concurrency_maintenance {
+                        _ctx.dispatcher_concurrency_maintenance = enabled;
                     }
                 }
             }
@@ -880,8 +888,9 @@ impl PyQuebec {
             warn!(
                 "QUEBEC_FORCE_OVERRIDE_QUEUE is active: every enqueue will be \
                  rewritten to queue '{}', ignoring class queue config and any \
-                 `.set(queue=...)` call. Intended for dev isolation; do not \
-                 leave this set in production.",
+                 `.set(queue=...)` call, and the worker will only consume that \
+                 queue. Intended for dev isolation; do not leave this set in \
+                 production.",
                 override_q
             );
         }
@@ -1838,6 +1847,13 @@ impl PyQuebec {
                 .as_secs_f64(),
         )?;
         Ok(dict.into())
+    }
+
+    /// Test-only: the resolved dispatcher concurrency-maintenance flag after
+    /// queue.yml is applied. Underscore-prefixed.
+    #[pyo3(name = "_dispatcher_concurrency_maintenance")]
+    fn dispatcher_concurrency_maintenance(&self) -> bool {
+        self.ctx.dispatcher_concurrency_maintenance
     }
 
     /// Read `workers`/`dispatchers` from the loaded queue.yml and return a plan
