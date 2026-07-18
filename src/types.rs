@@ -738,16 +738,10 @@ impl PyQuebec {
         // Same treatment for dispatcher fields: distinguish "user explicitly
         // set this via code/env" from "still at the default value" so a
         // queue.yml value can't silently override an explicit setting that
-        // happens to equal the default (e.g. dispatcher_polling_interval=1.0).
+        // happens to equal the default.
         let has_explicit_dispatcher_polling = kwargs
             .and_then(|k| k.get_item("dispatcher_polling_interval").ok().flatten())
-            .filter(|v| {
-                v.extract::<Duration>().is_ok()
-                    || v.extract::<u64>().is_ok()
-                    || v.extract::<f64>()
-                        .map(|f| f.is_finite() && f >= 0.0)
-                        .unwrap_or(false)
-            })
+            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
             .is_some()
             || std::env::var("QUEBEC_DISPATCHER_POLLING_INTERVAL")
                 .ok()
@@ -767,13 +761,7 @@ impl PyQuebec {
                     .ok()
                     .flatten()
             })
-            .filter(|v| {
-                v.extract::<Duration>().is_ok()
-                    || v.extract::<u64>().is_ok()
-                    || v.extract::<f64>()
-                        .map(|f| f.is_finite() && f >= 0.0)
-                        .unwrap_or(false)
-            })
+            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
             .is_some()
             || std::env::var("QUEBEC_DISPATCHER_CONCURRENCY_MAINTENANCE_INTERVAL")
                 .ok()

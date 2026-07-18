@@ -7,6 +7,8 @@ negative / non-finite / overflowing input). Mirrors the worker-path validation.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 import quebec
@@ -117,22 +119,26 @@ development:
   dispatchers:
     - polling_interval: 5.0
       batch_size: 100
+      concurrency_maintenance_interval: 30.0
 """,
         ),
     )
     monkeypatch.delenv("QUEBEC_ENV", raising=False)
 
-    # 1.0 / 500 are the defaults, passed explicitly. queue.yml sets 5.0 / 100.
+    # 1 second / 500 / 600 seconds are the defaults, passed explicitly using
+    # supported constructor types. queue.yml sets different values for all three.
     inst = quebec.Quebec(
         db_url,
         table_name_prefix=test_prefix,
-        dispatcher_polling_interval=1.0,
+        dispatcher_polling_interval=timedelta(seconds=1),
         dispatcher_batch_size=500,
+        dispatcher_concurrency_maintenance_interval=timedelta(seconds=600),
     )
     try:
         cfg = inst._dispatcher_config()
         assert cfg["polling_interval"] == 1.0
         assert cfg["batch_size"] == 500
+        assert cfg["concurrency_maintenance_interval"] == 600.0
     finally:
         inst.close()
 
