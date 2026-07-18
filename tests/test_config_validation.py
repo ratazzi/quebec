@@ -7,6 +7,8 @@ negative / non-finite / overflowing input). Mirrors the worker-path validation.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 import quebec
@@ -100,3 +102,69 @@ development:
 
     inst = quebec.Quebec(db_url, table_name_prefix=test_prefix)
     inst.close()
+
+
+def test_dispatcher_explicit_default_not_overridden_by_yaml(
+    tmp_path, monkeypatch, db_url, test_prefix
+) -> None:
+    """An explicit code value equal to the default must not be overridden by
+    a different queue.yml value (the value-equality check couldn't tell an
+    explicit setting from an untouched default)."""
+    monkeypatch.setenv(
+        "QUEBEC_CONFIG",
+        _queue_yml(
+            tmp_path,
+            """
+development:
+  dispatchers:
+    - polling_interval: 5.0
+      batch_size: 100
+      concurrency_maintenance_interval: 30.0
+""",
+        ),
+    )
+    monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+    # 1 second / 500 / 600 seconds are the defaults, passed explicitly using
+    # supported constructor types. queue.yml sets different values for all three.
+    inst = quebec.Quebec(
+        db_url,
+        table_name_prefix=test_prefix,
+        dispatcher_polling_interval=timedelta(seconds=1),
+        dispatcher_batch_size=500,
+        dispatcher_concurrency_maintenance_interval=timedelta(seconds=600),
+    )
+    try:
+        cfg = inst._dispatcher_config()
+        assert cfg["polling_interval"] == 1.0
+        assert cfg["batch_size"] == 500
+        assert cfg["concurrency_maintenance_interval"] == 600.0
+    finally:
+        inst.close()
+
+
+def test_dispatcher_yaml_applies_when_not_explicit(
+    tmp_path, monkeypatch, db_url, test_prefix
+) -> None:
+    """With no code/env override, the queue.yml value takes effect."""
+    monkeypatch.setenv(
+        "QUEBEC_CONFIG",
+        _queue_yml(
+            tmp_path,
+            """
+development:
+  dispatchers:
+    - polling_interval: 5.0
+      batch_size: 100
+""",
+        ),
+    )
+    monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+    inst = quebec.Quebec(db_url, table_name_prefix=test_prefix)
+    try:
+        cfg = inst._dispatcher_config()
+        assert cfg["polling_interval"] == 5.0
+        assert cfg["batch_size"] == 100
+    finally:
+        inst.close()

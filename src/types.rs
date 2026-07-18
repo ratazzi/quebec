@@ -735,6 +735,39 @@ impl PyQuebec {
                 .and_then(|s| parse_duration_f64_env(&s))
                 .is_some();
 
+        // Same treatment for dispatcher fields: distinguish "user explicitly
+        // set this via code/env" from "still at the default value" so a
+        // queue.yml value can't silently override an explicit setting that
+        // happens to equal the default.
+        let has_explicit_dispatcher_polling = kwargs
+            .and_then(|k| k.get_item("dispatcher_polling_interval").ok().flatten())
+            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
+            .is_some()
+            || std::env::var("QUEBEC_DISPATCHER_POLLING_INTERVAL")
+                .ok()
+                .and_then(|s| parse_duration_f64_env(&s))
+                .is_some();
+        let has_explicit_dispatcher_batch_size = kwargs
+            .and_then(|k| k.get_item("dispatcher_batch_size").ok().flatten())
+            .and_then(|v| v.extract::<u64>().ok())
+            .is_some()
+            || std::env::var("QUEBEC_DISPATCHER_BATCH_SIZE")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some();
+        let has_explicit_dispatcher_maintenance = kwargs
+            .and_then(|k| {
+                k.get_item("dispatcher_concurrency_maintenance_interval")
+                    .ok()
+                    .flatten()
+            })
+            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
+            .is_some()
+            || std::env::var("QUEBEC_DISPATCHER_CONCURRENCY_MAINTENANCE_INTERVAL")
+                .ok()
+                .and_then(|s| parse_duration_f64_env(&s))
+                .is_some();
+
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
 
         if _ctx.worker_threads == 0 {
@@ -806,8 +839,7 @@ impl PyQuebec {
             if let Some(dispatchers) = config.dispatchers {
                 if let Some(dispatcher) = dispatchers.first() {
                     if let Some(polling_interval) = dispatcher.polling_interval {
-                        if _ctx.dispatcher_polling_interval == Duration::from_secs(1) {
-                            // default value
+                        if !has_explicit_dispatcher_polling {
                             _ctx.dispatcher_polling_interval =
                                 Duration::try_from_secs_f64(polling_interval).map_err(|_| {
                                     pyo3::exceptions::PyValueError::new_err(format!(
@@ -817,16 +849,12 @@ impl PyQuebec {
                         }
                     }
                     if let Some(batch_size) = dispatcher.batch_size {
-                        if _ctx.dispatcher_batch_size == 500 {
-                            // default value
+                        if !has_explicit_dispatcher_batch_size {
                             _ctx.dispatcher_batch_size = batch_size;
                         }
                     }
                     if let Some(interval) = dispatcher.concurrency_maintenance_interval {
-                        if _ctx.dispatcher_concurrency_maintenance_interval
-                            == Duration::from_secs(600)
-                        {
-                            // default value
+                        if !has_explicit_dispatcher_maintenance {
                             _ctx.dispatcher_concurrency_maintenance_interval =
                                 Duration::try_from_secs_f64(interval).map_err(|_| {
                                     pyo3::exceptions::PyValueError::new_err(format!(
@@ -1788,6 +1816,25 @@ impl PyQuebec {
     #[pyo3(name = "_proc_slot")]
     fn proc_slot(&self) -> Option<(usize, usize)> {
         self.ctx.proc_slot
+    }
+
+    /// Test-only: the effective dispatcher config after code/env/queue.yml
+    /// precedence has been resolved at construction. Underscore-prefixed.
+    #[pyo3(name = "_dispatcher_config")]
+    fn dispatcher_config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item(
+            "polling_interval",
+            self.ctx.dispatcher_polling_interval.as_secs_f64(),
+        )?;
+        dict.set_item("batch_size", self.ctx.dispatcher_batch_size)?;
+        dict.set_item(
+            "concurrency_maintenance_interval",
+            self.ctx
+                .dispatcher_concurrency_maintenance_interval
+                .as_secs_f64(),
+        )?;
+        Ok(dict.into())
     }
 
     /// Test-only: the resolved dispatcher concurrency-maintenance flag after
