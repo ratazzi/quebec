@@ -77,6 +77,31 @@ where
     None
 }
 
+fn config_env_key(key: &str) -> String {
+    format!("QUEBEC_{}", key.to_ascii_uppercase())
+}
+
+fn has_explicit_duration(kwargs: Option<&Bound<'_, PyDict>>, key: &str) -> bool {
+    kwargs
+        .and_then(|values| values.get_item(key).ok().flatten())
+        .is_some_and(|value| parse_py_duration(&value).is_some())
+        || std::env::var(config_env_key(key))
+            .ok()
+            .and_then(|value| parse_duration_f64_env(&value))
+            .is_some()
+}
+
+fn has_explicit_u64(kwargs: Option<&Bound<'_, PyDict>>, key: &str) -> bool {
+    kwargs
+        .and_then(|values| values.get_item(key).ok().flatten())
+        .and_then(|value| value.extract::<u64>().ok())
+        .is_some()
+        || std::env::var(config_env_key(key))
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some()
+}
+
 fn secs_to_duration(field: &str, seconds: f64) -> PyResult<Duration> {
     Duration::try_from_secs_f64(seconds).map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
@@ -716,61 +741,18 @@ impl PyQuebec {
 
         // Check if worker config was explicitly set via code/env before options is moved
         // Verify the value is actually extractable, not just present
-        let has_explicit_threads = kwargs
-            .and_then(|k| k.get_item("worker_threads").ok().flatten())
-            .and_then(|v| v.extract::<u64>().ok())
-            .is_some()
-            || std::env::var("QUEBEC_WORKER_THREADS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .is_some();
-        let has_explicit_polling = kwargs
-            .and_then(|k| k.get_item("worker_polling_interval").ok().flatten())
-            .filter(|v| {
-                v.extract::<Duration>().is_ok()
-                    || v.extract::<u64>().is_ok()
-                    || v.extract::<f64>()
-                        .map(|f| f.is_finite() && f >= 0.0)
-                        .unwrap_or(false)
-            })
-            .is_some()
-            || std::env::var("QUEBEC_WORKER_POLLING_INTERVAL")
-                .ok()
-                .and_then(|s| parse_duration_f64_env(&s))
-                .is_some();
+        let has_explicit_threads = has_explicit_u64(kwargs, "worker_threads");
+        let has_explicit_polling = has_explicit_duration(kwargs, "worker_polling_interval");
 
         // Same treatment for dispatcher fields: distinguish "user explicitly
         // set this via code/env" from "still at the default value" so a
         // queue.yml value can't silently override an explicit setting that
         // happens to equal the default.
-        let has_explicit_dispatcher_polling = kwargs
-            .and_then(|k| k.get_item("dispatcher_polling_interval").ok().flatten())
-            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
-            .is_some()
-            || std::env::var("QUEBEC_DISPATCHER_POLLING_INTERVAL")
-                .ok()
-                .and_then(|s| parse_duration_f64_env(&s))
-                .is_some();
-        let has_explicit_dispatcher_batch_size = kwargs
-            .and_then(|k| k.get_item("dispatcher_batch_size").ok().flatten())
-            .and_then(|v| v.extract::<u64>().ok())
-            .is_some()
-            || std::env::var("QUEBEC_DISPATCHER_BATCH_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .is_some();
-        let has_explicit_dispatcher_maintenance = kwargs
-            .and_then(|k| {
-                k.get_item("dispatcher_concurrency_maintenance_interval")
-                    .ok()
-                    .flatten()
-            })
-            .filter(|v| v.extract::<Duration>().is_ok() || v.extract::<u64>().is_ok())
-            .is_some()
-            || std::env::var("QUEBEC_DISPATCHER_CONCURRENCY_MAINTENANCE_INTERVAL")
-                .ok()
-                .and_then(|s| parse_duration_f64_env(&s))
-                .is_some();
+        let has_explicit_dispatcher_polling =
+            has_explicit_duration(kwargs, "dispatcher_polling_interval");
+        let has_explicit_dispatcher_batch_size = has_explicit_u64(kwargs, "dispatcher_batch_size");
+        let has_explicit_dispatcher_maintenance =
+            has_explicit_duration(kwargs, "dispatcher_concurrency_maintenance_interval");
 
         let mut _ctx = AppContext::new(dsn.clone(), db_option, opt.clone(), options);
 
