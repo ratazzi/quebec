@@ -581,6 +581,23 @@ pub(crate) fn parse_duration_f64_env(s: &str) -> Option<Duration> {
         .or_else(|| s.parse::<u64>().ok().map(Duration::from_secs))
 }
 
+/// Parse a Python duration option from `datetime.timedelta`, integer seconds,
+/// or floating-point seconds. Invalid, negative, non-finite, and overflowing
+/// values return `None` so the caller can consistently warn and fall back.
+#[cfg(feature = "python")]
+pub(crate) fn parse_py_duration(value: &Bound<'_, PyAny>) -> Option<Duration> {
+    value
+        .extract::<Duration>()
+        .ok()
+        .or_else(|| value.extract::<u64>().ok().map(Duration::from_secs))
+        .or_else(|| {
+            value
+                .extract::<f64>()
+                .ok()
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        })
+}
+
 /// Build the `<basename>@<sha>` suffix appended to `set_proc_title`. Pure
 /// function (path + revision in, string out) so it can be reasoned about
 /// without spinning up an `AppContext`. Either component is dropped when
@@ -796,21 +813,28 @@ impl AppContext {
                         })
                     })
             };
+            let parse_duration_option = |key: &str, value: &Py<PyAny>| -> Option<Duration> {
+                let value = value.bind(py);
+                parse_py_duration(value).or_else(|| {
+                    if let Ok(seconds) = value.extract::<f64>() {
+                        warn!(
+                            "Config '{}': seconds must be finite, non-negative, and within Duration range, got {:?}",
+                            key, seconds
+                        );
+                    } else {
+                        warn!(
+                            "Config '{}': expected timedelta or numeric seconds, got {:?}",
+                            key,
+                            value.get_type()
+                        );
+                    }
+                    None
+                })
+            };
             let get_duration = |key: &str| -> Option<Duration> {
                 options
                     .get(key)
-                    .and_then(|v| {
-                        v.extract::<Duration>(py)
-                            .or_else(|_| v.extract::<u64>(py).map(Duration::from_secs))
-                            .map_err(|_| {
-                                warn!(
-                                    "Config '{}': expected Duration or u64, got {:?}",
-                                    key,
-                                    v.bind(py).get_type()
-                                );
-                            })
-                            .ok()
-                    })
+                    .and_then(|v| parse_duration_option(key, v))
                     .or_else(|| {
                         let s = env_var(key)?;
                         parse_duration_f64_env(&s).or_else(|| {
@@ -875,36 +899,20 @@ impl AppContext {
             if let Some(v) = get_duration("control_plane_sse_interval") {
                 ctx.control_plane_sse_interval = v;
             }
-            // worker_polling_interval: also accepts f64 for sub-second precision
-            if let Some(val) = options.get("worker_polling_interval") {
-                let result = val
-                    .extract::<Duration>(py)
-                    .or_else(|_| val.extract::<u64>(py).map(Duration::from_secs))
-                    .or_else(|_| {
-                        val.extract::<f64>(py).and_then(|f| {
-                            if f.is_finite() && f >= 0.0 {
-                                Ok(Duration::from_secs_f64(f))
-                            } else {
-                                warn!("Config 'worker_polling_interval': invalid f64 value {}", f);
-                                Err(pyo3::PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                                    "invalid",
-                                ))
-                            }
-                        })
-                    });
-                match result {
-                    Ok(v) => ctx.worker_polling_interval = v,
-                    Err(_) => warn!(
-                        "Config 'worker_polling_interval': expected Duration, u64 or f64, got {:?}",
-                        val.bind(py).get_type()
-                    ),
+            // Preserve the historical worker precedence: an invalid kwarg is
+            // warned about and ignored, but must not expose a lower-priority
+            // environment value. Other Duration options retain their existing
+            // invalid-kwarg -> env fallback behavior through `get_duration`.
+            if let Some(value) = options.get("worker_polling_interval") {
+                if let Some(v) = parse_duration_option("worker_polling_interval", value) {
+                    ctx.worker_polling_interval = v;
                 }
-            } else if let Some(s) = env_var("worker_polling_interval") {
-                match parse_duration_f64_env(&s) {
+            } else if let Some(raw) = env_var("worker_polling_interval") {
+                match parse_duration_f64_env(&raw) {
                     Some(v) => ctx.worker_polling_interval = v,
                     None => warn!(
                         "Env 'QUEBEC_WORKER_POLLING_INTERVAL': failed to parse '{}' as duration",
-                        s
+                        raw
                     ),
                 }
             }

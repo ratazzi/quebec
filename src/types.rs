@@ -77,6 +77,14 @@ where
     None
 }
 
+fn secs_to_duration(field: &str, seconds: f64) -> PyResult<Duration> {
+    Duration::try_from_secs_f64(seconds).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{field} must be finite, >= 0, and within Duration range, got {seconds}"
+        ))
+    })
+}
+
 use crate::control_plane::{ControlPlane, ControlPlaneExt};
 
 use crate::context::*;
@@ -131,12 +139,8 @@ fn apply_worker_cfg_to(
         ctx.worker_threads = threads as u64;
     }
     if let Some(polling_interval) = worker_cfg.polling_interval {
-        if !polling_interval.is_finite() || polling_interval < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "worker polling_interval must be finite and >= 0, got {polling_interval}"
-            )));
-        }
-        ctx.worker_polling_interval = Duration::from_secs_f64(polling_interval);
+        ctx.worker_polling_interval =
+            secs_to_duration("worker polling_interval", polling_interval)?;
     }
     if worker_cfg.queues.is_some() {
         ctx.worker_queues = worker_cfg.queues.clone();
@@ -808,13 +812,8 @@ impl PyQuebec {
                     }
                     if let Some(polling_interval) = worker.polling_interval {
                         if !has_explicit_polling {
-                            if !polling_interval.is_finite() || polling_interval < 0.0 {
-                                return Err(pyo3::exceptions::PyValueError::new_err(
-                                    format!("worker_polling_interval must be finite and >= 0 (set via queue.yml workers.polling_interval, got {polling_interval})"),
-                                ));
-                            }
                             _ctx.worker_polling_interval =
-                                Duration::from_secs_f64(polling_interval);
+                                secs_to_duration("worker_polling_interval", polling_interval)?;
                         }
                     }
                     // Apply queue configuration (always apply from config if present, as there's no code parameter for this)
@@ -841,11 +840,7 @@ impl PyQuebec {
                     if let Some(polling_interval) = dispatcher.polling_interval {
                         if !has_explicit_dispatcher_polling {
                             _ctx.dispatcher_polling_interval =
-                                Duration::try_from_secs_f64(polling_interval).map_err(|_| {
-                                    pyo3::exceptions::PyValueError::new_err(format!(
-                                        "dispatcher_polling_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.polling_interval, got {polling_interval})"
-                                    ))
-                                })?;
+                                secs_to_duration("dispatcher_polling_interval", polling_interval)?;
                         }
                     }
                     if let Some(batch_size) = dispatcher.batch_size {
@@ -855,12 +850,10 @@ impl PyQuebec {
                     }
                     if let Some(interval) = dispatcher.concurrency_maintenance_interval {
                         if !has_explicit_dispatcher_maintenance {
-                            _ctx.dispatcher_concurrency_maintenance_interval =
-                                Duration::try_from_secs_f64(interval).map_err(|_| {
-                                    pyo3::exceptions::PyValueError::new_err(format!(
-                                        "dispatcher_concurrency_maintenance_interval must be finite, >= 0, and within Duration range (set via queue.yml dispatchers.concurrency_maintenance_interval, got {interval})"
-                                    ))
-                                })?;
+                            _ctx.dispatcher_concurrency_maintenance_interval = secs_to_duration(
+                                "dispatcher_concurrency_maintenance_interval",
+                                interval,
+                            )?;
                         }
                     }
                     if let Some(enabled) = dispatcher.concurrency_maintenance {
@@ -1818,22 +1811,55 @@ impl PyQuebec {
         self.ctx.proc_slot
     }
 
-    /// Test-only: the effective dispatcher config after code/env/queue.yml
-    /// precedence has been resolved at construction. Underscore-prefixed.
-    #[pyo3(name = "_dispatcher_config")]
-    fn dispatcher_config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+    /// Test-only: constructor configuration after code/env/queue.yml precedence.
+    #[pyo3(name = "_config_snapshot")]
+    fn config_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
-        dict.set_item(
-            "polling_interval",
-            self.ctx.dispatcher_polling_interval.as_secs_f64(),
-        )?;
-        dict.set_item("batch_size", self.ctx.dispatcher_batch_size)?;
-        dict.set_item(
-            "concurrency_maintenance_interval",
-            self.ctx
-                .dispatcher_concurrency_maintenance_interval
-                .as_secs_f64(),
-        )?;
+        for (key, value) in [
+            (
+                "notify_throttle_interval",
+                self.ctx.notify_throttle_interval,
+            ),
+            (
+                "process_heartbeat_interval",
+                self.ctx.process_heartbeat_interval,
+            ),
+            ("process_alive_threshold", self.ctx.process_alive_threshold),
+            ("shutdown_timeout", self.ctx.shutdown_timeout),
+            (
+                "clear_finished_jobs_after",
+                self.ctx.clear_finished_jobs_after,
+            ),
+            ("cleanup_interval", self.ctx.cleanup_interval),
+            (
+                "default_concurrency_control_period",
+                self.ctx.default_concurrency_control_period,
+            ),
+            (
+                "dispatcher_polling_interval",
+                self.ctx.dispatcher_polling_interval,
+            ),
+            (
+                "dispatcher_concurrency_maintenance_interval",
+                self.ctx.dispatcher_concurrency_maintenance_interval,
+            ),
+            (
+                "control_plane_sse_interval",
+                self.ctx.control_plane_sse_interval,
+            ),
+            ("worker_polling_interval", self.ctx.worker_polling_interval),
+            (
+                "worker_memory_check_interval",
+                self.ctx.worker_memory_check_interval,
+            ),
+            (
+                "worker_memory_graceful_timeout",
+                self.ctx.worker_memory_graceful_timeout,
+            ),
+        ] {
+            dict.set_item(key, value.as_secs_f64())?;
+        }
+        dict.set_item("dispatcher_batch_size", self.ctx.dispatcher_batch_size)?;
         Ok(dict.into())
     }
 

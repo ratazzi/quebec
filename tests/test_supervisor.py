@@ -287,6 +287,24 @@ class TestApplyConfig:
         qc.apply_dispatcher_config(1)
         assert qc._proc_slot() == (0, 1)
 
+    def test_apply_worker_config_rejects_duration_overflow(
+        self, qc, monkeypatch, tmp_path
+    ):
+        queue_yml = tmp_path / "queue.yml"
+        queue_yml.write_text(
+            """
+development:
+  workers:
+    - polling_interval: 0.1
+    - polling_interval: 1.0e30
+"""
+        )
+        monkeypatch.setenv("QUEBEC_CONFIG", str(queue_yml))
+        monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+        with pytest.raises(ValueError, match="within Duration range"):
+            qc.apply_worker_config(1)
+
 
 class TestSupervisorPlanFromConfig:
     def test_returns_dict_or_none(self, qc):
