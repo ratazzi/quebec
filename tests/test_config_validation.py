@@ -14,6 +14,17 @@ import pytest
 import quebec
 
 
+@pytest.fixture(autouse=True)
+def _clear_interval_overrides(monkeypatch) -> None:
+    for key in (
+        "QUEBEC_WORKER_POLLING_INTERVAL",
+        "QUEBEC_DISPATCHER_POLLING_INTERVAL",
+        "QUEBEC_DISPATCHER_BATCH_SIZE",
+        "QUEBEC_DISPATCHER_CONCURRENCY_MAINTENANCE_INTERVAL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def _queue_yml(tmp_path, body: str) -> str:
     path = tmp_path / "queue.yml"
     path.write_text(body)
@@ -83,6 +94,26 @@ development:
         quebec.Quebec(db_url, table_name_prefix=test_prefix)
 
 
+def test_worker_polling_interval_overflow_raises(
+    tmp_path, monkeypatch, db_url, test_prefix
+) -> None:
+    monkeypatch.setenv(
+        "QUEBEC_CONFIG",
+        _queue_yml(
+            tmp_path,
+            """
+development:
+  workers:
+    - polling_interval: 1.0e30
+""",
+        ),
+    )
+    monkeypatch.delenv("QUEBEC_ENV", raising=False)
+
+    with pytest.raises(ValueError, match="worker_polling_interval must be finite"):
+        quebec.Quebec(db_url, table_name_prefix=test_prefix)
+
+
 def test_dispatcher_polling_interval_valid_ok(
     tmp_path, monkeypatch, db_url, test_prefix
 ) -> None:
@@ -135,10 +166,10 @@ development:
         dispatcher_concurrency_maintenance_interval=timedelta(seconds=600),
     )
     try:
-        cfg = inst._dispatcher_config()
-        assert cfg["polling_interval"] == 1.0
-        assert cfg["batch_size"] == 500
-        assert cfg["concurrency_maintenance_interval"] == 600.0
+        cfg = inst._config_snapshot()
+        assert cfg["dispatcher_polling_interval"] == 1.0
+        assert cfg["dispatcher_batch_size"] == 500
+        assert cfg["dispatcher_concurrency_maintenance_interval"] == 600.0
     finally:
         inst.close()
 
@@ -163,8 +194,8 @@ development:
 
     inst = quebec.Quebec(db_url, table_name_prefix=test_prefix)
     try:
-        cfg = inst._dispatcher_config()
-        assert cfg["polling_interval"] == 5.0
-        assert cfg["batch_size"] == 100
+        cfg = inst._config_snapshot()
+        assert cfg["dispatcher_polling_interval"] == 5.0
+        assert cfg["dispatcher_batch_size"] == 100
     finally:
         inst.close()
