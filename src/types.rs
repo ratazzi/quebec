@@ -3711,13 +3711,8 @@ impl PyQuebec {
                     DbBackend::Postgres => "$1",
                     DbBackend::MySql | DbBackend::Sqlite => "?",
                 };
-                // `key` is a reserved word in MySQL and must be quoted; Postgres
-                // and SQLite need double quotes. Unquoted `WHERE key = ?` is a
-                // 1064 syntax error on MySQL.
-                let key_col = match backend {
-                    DbBackend::MySql => "`key`",
-                    _ => "\"key\"",
-                };
+                // `key` is a reserved word in MySQL, so quote it for every backend.
+                let key_col = crate::query_builder::quote_identifier(backend, "key");
 
                 let sql = format!(
                     "SELECT class_name, queue_name, priority, arguments FROM {} WHERE {} = {}",

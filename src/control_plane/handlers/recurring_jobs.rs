@@ -106,10 +106,11 @@ impl ControlPlane {
             DbBackend::Postgres => "$1",
             DbBackend::MySql | DbBackend::Sqlite => "?",
         };
+        let key_col = crate::query_builder::quote_identifier(backend, "key");
 
         let sql = clean_sql(&format!(
-            "SELECT key, class_name, queue_name, priority, arguments FROM {} WHERE id = {}",
-            table_config.recurring_tasks, p1
+            "SELECT {}, class_name, queue_name, priority, arguments FROM {} WHERE id = {}",
+            key_col, table_config.recurring_tasks, p1
         ));
 
         let row = db
