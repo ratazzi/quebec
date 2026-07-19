@@ -1544,6 +1544,35 @@ impl Execution {
                         continue;
                     }
                 };
+
+                // Lost-ack guard (mirrors Solid Queue's "the claimed row is the
+                // source of truth"): the cleanup closure is atomic, so a prior
+                // attempt either committed everything — mark_finished/failed,
+                // semaphore release, retry schedule AND the claimed-row delete —
+                // or rolled back entirely. If the claimed row is already gone,
+                // the previous attempt committed and we merely lost the commit
+                // ack; re-running the closure would double every side effect
+                // (second failed_executions row, second retry job, double
+                // semaphore release). Treat the missing row as success instead.
+                match query_builder::claimed_executions::find_by_id(
+                    db.as_ref(),
+                    &table_config_orig,
+                    claimed_id,
+                )
+                .await
+                {
+                    Ok(None) => {
+                        transaction_result = Ok(failed);
+                        break;
+                    }
+                    Ok(Some(_)) => {} // still present: safe to re-run the closure
+                    Err(e) => {
+                        warn!(
+                            "Could not verify claimed_execution {} before retry {}: {:?}; re-running cleanup transaction",
+                            claimed_id, attempt, e
+                        );
+                    }
+                }
             }
 
             let retry_job_data = retry_job_data.clone();
