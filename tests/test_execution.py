@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import quebec
+from sqlalchemy import text
 
 from .helpers import get_job_by_active_job_id
 
@@ -67,3 +68,52 @@ def test_bool_arguments_round_trip_to_perform_as_bool(qc_with_sqlalchemy) -> Non
     assert dry_run is True
     assert enabled is False
     assert nested is True
+
+
+def test_after_executed_retry_treats_missing_claim_as_committed(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """A committed cleanup whose acknowledgement was lost is not run twice.
+
+    The first ``perform`` creates the durable database state left by a cleanup
+    transaction that committed even though its caller observed a commit error:
+    the job is finished and its claimed row is gone. Restoring the worker-local
+    ledger entry and driving cleanup again models the caller entering its retry
+    path without knowing that the first transaction committed.
+
+    Without the lost-ack guard, every retry re-runs the transaction, fails its
+    claimed-row delete, and eventually invokes emergency cleanup, which records
+    an already-finished job as failed. The guard must instead treat the missing
+    claimed row as proof of the earlier commit and skip all duplicate effects.
+    """
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    ExecutingJob.executions = []
+    qc.register_job(ExecutingJob)
+
+    enqueued = ExecutingJob.perform_later(qc, "lost-ack", status="queued")
+    execution = qc.drain_one()
+    claimed_id = session.execute(
+        text(f"SELECT id FROM {prefix}_claimed_executions WHERE job_id = :job_id"),
+        {"job_id": enqueued.id},
+    ).scalar_one()
+
+    execution.perform()
+    session.expire_all()
+
+    assert db_assert.job_is_finished(enqueued.id)
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 0
+
+    # A lost commit acknowledgement leaves the caller's in-memory state on the
+    # retry path even though all transaction effects are already durable.
+    qc._set_ledger_state(claimed_id, 1)
+    execution.post(None, "")
+    session.expire_all()
+
+    assert db_assert.job_is_finished(enqueued.id)
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 0
+    assert qc._ledger_state(claimed_id) is None
