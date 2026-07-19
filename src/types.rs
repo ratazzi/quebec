@@ -170,6 +170,7 @@ fn apply_worker_cfg_to(
     if worker_cfg.queues.is_some() {
         ctx.worker_queues = worker_cfg.queues.clone();
     }
+    ctx.pin_worker_queue_to_override();
     Ok(())
 }
 
@@ -803,15 +804,6 @@ impl PyQuebec {
                     if worker.queues.is_some() {
                         _ctx.worker_queues = worker.queues.clone();
                     }
-                    // Log the effective selector so the override's consumption
-                    // pin is visible — raw worker_queues would claim "all
-                    // queues" while the worker actually only drains the
-                    // forced queue.
-                    if let Some(queues) = _ctx.effective_worker_queues() {
-                        info!("Worker queues configured: {:?}", queues.to_list());
-                    } else {
-                        info!("Worker queues: None (will process all queues)");
-                    }
                 }
             }
 
@@ -846,7 +838,16 @@ impl PyQuebec {
             }
         }
 
-        // All parameters have been processed in AppContext.new
+        // All parameters and queue.yml values have been processed. Resolve the
+        // forced queue once here so claim and NOTIFY hot paths only read the
+        // final worker selector.
+        _ctx.pin_worker_queue_to_override();
+        if let Some(ref queues) = _ctx.worker_queues {
+            info!("Worker queues configured: {:?}", queues.to_list());
+        } else {
+            info!("Worker queues: None (will process all queues)");
+        }
+
         let ctx = Arc::new(_ctx);
         if let Some(override_q) = ctx.force_override_queue.as_deref() {
             warn!(

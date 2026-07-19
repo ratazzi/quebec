@@ -90,3 +90,31 @@ def test_worker_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
 
     pinned.close()
     plain.close()
+
+
+def test_worker_batch_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
+    dsn = f"sqlite:///{temp_db_path}?mode=rwc"
+
+    plain = quebec.Quebec(dsn, table_name_prefix=test_prefix)
+    assert plain.create_tables() is True
+    plain.register_job(OverrideJob)
+    OverrideJob.set(queue="other_branch").perform_later(plain)
+
+    pinned = quebec.Quebec(
+        dsn, table_name_prefix=test_prefix, force_override_queue="pinned"
+    )
+    pinned.register_job(OverrideJob)
+    OverrideJob.perform_later(pinned)
+
+    executions = pinned.drain_batch(10)
+    assert [execution.queue for execution in executions] == ["pinned"]
+    executions[0].perform()
+
+    assert pinned.drain_batch(10) == []
+
+    execution = plain.drain_one()
+    assert execution.queue == "other_branch"
+    execution.perform()
+
+    pinned.close()
+    plain.close()
