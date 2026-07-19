@@ -47,6 +47,33 @@ class RecurringSkipHookJob(quebec.BaseClass):
         return None
 
 
+class RecurringDatabaseHookJob(quebec.BaseClass):
+    engine = None
+    task_table = ""
+    task_key = ""
+
+    def after_enqueue(self) -> None:
+        engine = type(self).engine
+        assert engine is not None
+
+        # Use a separate connection so this write fails immediately on SQLite
+        # if the scheduler still holds its enqueue write transaction.
+        with engine.begin() as connection:
+            if connection.dialect.name == "sqlite":
+                connection.exec_driver_sql("PRAGMA busy_timeout = 0")
+            result = connection.execute(
+                text(
+                    f"UPDATE {type(self).task_table} "
+                    "SET description = :description WHERE key = :key"
+                ),
+                {"description": "written-by-after-hook", "key": type(self).task_key},
+            )
+            assert result.rowcount == 1
+
+    def perform(self, *args, **kwargs) -> None:
+        return None
+
+
 def _seed_recurring_task(session, prefix: str, key: str, class_name: str) -> None:
     """Insert a recurring_tasks row so run_recurring_now() can look it up."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -94,6 +121,33 @@ def test_recurring_enqueue_runs_all_hooks(qc_with_sqlalchemy, db_assert) -> None
         "around:after",
         "after",
     ]
+    assert db_assert.count_ready_executions() == 1
+
+
+def test_recurring_enqueue_post_hook_runs_after_transaction_commits(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    engine = qc_with_sqlalchemy["engine"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    task_key = "recurring_hook_db_write"
+    RecurringDatabaseHookJob.engine = engine
+    RecurringDatabaseHookJob.task_table = f"{prefix}_recurring_tasks"
+    RecurringDatabaseHookJob.task_key = task_key
+    qc.register_job(RecurringDatabaseHookJob)
+    _seed_recurring_task(
+        session, prefix, task_key, RecurringDatabaseHookJob.__qualname__
+    )
+
+    assert qc.run_recurring_now(task_key) is True
+
+    description = session.execute(
+        text(f"SELECT description FROM {prefix}_recurring_tasks WHERE key = :key"),
+        {"key": task_key},
+    ).scalar_one()
+    assert description == "written-by-after-hook"
     assert db_assert.count_ready_executions() == 1
 
 
