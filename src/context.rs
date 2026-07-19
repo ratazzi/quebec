@@ -655,16 +655,16 @@ pub struct RunnableDefaults {
 }
 
 impl AppContext {
-    /// Queue selector the worker actually claims from. When
-    /// `force_override_queue` is active it wins unconditionally over any
-    /// `worker_queues` config: every enqueue is rewritten to that queue, so
-    /// consuming anything else would break the branch isolation the override
-    /// exists for.
-    pub fn effective_worker_queues(&self) -> Option<crate::config::QueueSelector> {
-        self.force_override_queue
-            .as_ref()
-            .map(|q| crate::config::QueueSelector::Single(q.clone()))
-            .or_else(|| self.worker_queues.clone())
+    /// Resolve the final worker selector after configuration has been applied.
+    ///
+    /// Caching the forced queue in `worker_queues` keeps the claim and NOTIFY
+    /// hot paths identical to the normal configuration path: they do not need
+    /// to check `force_override_queue` on every invocation. Call this whenever
+    /// a worker configuration is applied, including in supervisor children.
+    pub(crate) fn pin_worker_queue_to_override(&mut self) {
+        if let Some(queue) = self.force_override_queue.as_ref() {
+            self.worker_queues = Some(crate::config::QueueSelector::Single(queue.clone()));
+        }
     }
 
     /// Record `id` in the claim ledger with the given state. Poison-recovering;
@@ -1020,7 +1020,8 @@ impl AppContext {
         db: Option<Arc<DatabaseConnection>>,
         connect_options: ConnectOptions,
     ) -> Self {
-        let ctx = Self::new_inner(dsn, db, connect_options);
+        let mut ctx = Self::new_inner(dsn, db, connect_options);
+        ctx.pin_worker_queue_to_override();
         crate::set_silence_polling(ctx.silence_polling);
         ctx
     }
