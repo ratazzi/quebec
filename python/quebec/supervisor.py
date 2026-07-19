@@ -173,22 +173,27 @@ class Supervisor:
                 if self._stopping:
                     break
 
-            # If shutdown was already requested during the fork loop, skip
-            # standing up the control plane and background threads; go straight
-            # to _supervise() (which returns at once) and let `finally` reap the
-            # children that were already forked.
-            if not self._stopping:
-                # Start the control plane only after all children are forked so
-                # the listening socket/runtime task stays parent-only. Children
-                # would otherwise inherit the TcpListener fd.
-                if self.control_plane:
-                    try:
-                        self.qc.start_control_plane(self.control_plane)
-                    except Exception:
-                        logger.exception("Failed to start control plane")
+            # Treat each startup phase as a separate checkpoint. Signal handlers
+            # run on this main thread, including after a blocking startup call
+            # returns, so re-check before every later phase instead of relying on
+            # one guard around the whole block.
+            #
+            # Start the control plane only after all children are forked so the
+            # listening socket/runtime task stays parent-only. Children would
+            # otherwise inherit the TcpListener fd.
+            if not self._stopping and self.control_plane:
+                try:
+                    self.qc.start_control_plane(self.control_plane)
+                except Exception:
+                    logger.exception("Failed to start control plane")
 
+            if not self._stopping:
                 self._start_heartbeat()
+
+            if not self._stopping:
                 self._start_maintenance()
+
+            if not self._stopping:
                 # Children forked and control plane up: tell systemd we're
                 # ready. No-op unless launched under a Type=notify unit.
                 self.qc.systemd_ready(self._status_text())

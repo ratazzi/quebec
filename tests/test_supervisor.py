@@ -442,11 +442,20 @@ class TestSupervisorStopDuringStartup:
         sup = Supervisor(qc, plan, control_plane=control_plane)
 
         started = {"heartbeat": False, "maintenance": False}
+        sup._install_signal_handlers = lambda: None
         sup._start_heartbeat = lambda: started.__setitem__("heartbeat", True)
         sup._start_maintenance = lambda: started.__setitem__("maintenance", True)
-        sup._supervise = lambda: None
-        sup._terminate_gracefully = lambda: None
+        sup._supervise = MagicMock()
+        sup._terminate_gracefully = MagicMock()
         return sup, qc, started
+
+    @staticmethod
+    def _assert_stopped_cleanly(sup, qc):
+        qc.systemd_ready.assert_not_called()
+        sup._supervise.assert_called_once_with()
+        qc.systemd_stop.assert_called_once_with()
+        sup._terminate_gracefully.assert_called_once_with()
+        qc.deregister_process.assert_called_once_with(1)
 
     def test_stop_mid_fork_halts_remaining_forks(self):
         sup, qc, started = self._stub_supervisor(
@@ -469,6 +478,7 @@ class TestSupervisorStopDuringStartup:
         # Control plane and background threads were never stood up.
         qc.start_control_plane.assert_not_called()
         assert started == {"heartbeat": False, "maintenance": False}
+        self._assert_stopped_cleanly(sup, qc)
 
     def test_stop_before_any_fork_forks_nothing(self):
         sup, qc, started = self._stub_supervisor(
@@ -484,3 +494,26 @@ class TestSupervisorStopDuringStartup:
         assert spawned == []
         qc.start_control_plane.assert_not_called()
         assert started == {"heartbeat": False, "maintenance": False}
+        self._assert_stopped_cleanly(sup, qc)
+
+    def test_stop_during_control_plane_skips_remaining_startup(self):
+        sup, qc, started = self._stub_supervisor(
+            {ROLE_WORKER: 1}, control_plane="dummy"
+        )
+
+        spawned = []
+        sup._fork_child = lambda role, index: spawned.append((role, index))
+
+        def stop_during_control_plane(_address):
+            # Model a signal handled while the blocking startup call is in
+            # progress. Once the call returns, no later startup phase may run.
+            sup._stopping = True
+
+        qc.start_control_plane.side_effect = stop_during_control_plane
+
+        sup.start()
+
+        assert spawned == [(ROLE_WORKER, 0)]
+        qc.start_control_plane.assert_called_once_with("dummy")
+        assert started == {"heartbeat": False, "maintenance": False}
+        self._assert_stopped_cleanly(sup, qc)
