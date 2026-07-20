@@ -3841,18 +3841,13 @@ impl PyQuebec {
                 };
 
                 let now = chrono::Utc::now().naive_utc();
-                let enqueued_queue = db_ref
-                    .transaction::<_, Option<String>, sea_orm::DbErr>(|txn| {
-                        let entry = entry.clone();
-                        let ctx = ctx.clone();
-                        Box::pin(async move { enqueue_job(&ctx, txn, entry, now).await })
-                    })
-                    .await
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Failed to enqueue recurring task {key}: {e}"
-                        ))
-                    })?;
+                // enqueue_job opens its own transaction around just the DB
+                // writes; its enqueue hooks stay outside that transaction (M5).
+                let enqueued_queue = enqueue_job(&ctx, db_ref, entry, now).await.map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to enqueue recurring task {key}: {e}"
+                    ))
+                })?;
 
                 if let Some(ref queue) = enqueued_queue {
                     if crate::notify::should_send_notify(&ctx, queue) {
