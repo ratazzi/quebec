@@ -371,3 +371,49 @@ def test_register_job_raises_for_non_str_queue(qc_with_sqlalchemy) -> None:
 
     with pytest.raises(TypeError, match=r"NonStrQueueJob\.queue must be str, got int"):
         qc.register_job(NonStrQueueJob)
+
+
+def test_perform_later_passes_through_user_underscore_kwargs(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """User kwargs that merely start with `_` (e.g. `_meta`, `_id`) are real
+    arguments and must reach perform() — only JobBuilder's reserved
+    `_queue`/`_priority`/`_scheduled_at` are stripped."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(DefaultQueueJob)
+
+    enqueued = DefaultQueueJob.perform_later(qc, "alice", _meta="m", _id=7, normal="n")
+    persisted = get_job_by_active_job_id(session, prefix, enqueued.active_job_id)
+    payload = json.loads(persisted["arguments"])
+
+    kwargs_dict = payload["arguments"]["arguments"][1]
+    assert kwargs_dict["_meta"] == "m"
+    assert kwargs_dict["_id"] == 7
+    assert kwargs_dict["normal"] == "n"
+    assert kwargs_dict["_quebec_kwargs"] is True
+
+
+def test_perform_later_reserved_underscore_kwargs_still_stripped(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """The reserved `_queue` override is still consumed and stripped from the
+    serialized kwargs (the fix narrows the filter, it doesn't remove it)."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(DefaultQueueJob)
+
+    enqueued = DefaultQueueJob.perform_later(qc, "alice", _queue="override-q", keep="y")
+    persisted = get_job_by_active_job_id(session, prefix, enqueued.active_job_id)
+    payload = json.loads(persisted["arguments"])
+
+    # _queue was consumed as the queue override...
+    assert persisted["queue_name"] == "override-q"
+    kwargs_dict = payload["arguments"]["arguments"][1]
+    # ...and stripped from the arguments, while the real kwarg passes through.
+    assert "_queue" not in kwargs_dict
+    assert kwargs_dict["keep"] == "y"
