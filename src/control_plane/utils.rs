@@ -268,13 +268,24 @@ impl ControlPlane {
             .expect("static response builder is infallible")
     }
 
-    /// Redirect back to the given URL with 303 See Other
+    /// Redirect back to the given URL with 303 See Other.
+    ///
+    /// `url` is often built from a percent-decoded `:name` path segment, which
+    /// can contain control characters (e.g. `%0D` decodes to a carriage return)
+    /// that are illegal in an HTTP header value. Building the response then
+    /// fails, so fall back to a 400 instead of panicking the handler task (a
+    /// cheap remote-triggerable DoS otherwise).
     pub fn redirect_back(url: &str) -> Response {
         Response::builder()
             .status(StatusCode::SEE_OTHER)
             .header(header::LOCATION, url)
             .body(axum::body::Body::empty())
-            .expect("static response builder is infallible")
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(axum::body::Body::empty())
+                    .expect("static 400 response builder is infallible")
+            })
     }
 
     /// Get pagination parameters
