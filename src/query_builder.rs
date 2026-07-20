@@ -11,6 +11,40 @@ use sea_orm::{ConnectionTrait, DbBackend, DbErr, FromQueryResult, Statement, Val
 
 use crate::context::TableConfig;
 
+/// Quote an SQL identifier with the delimiter required by the database backend.
+pub(crate) fn quote_identifier(backend: DbBackend, identifier: &str) -> String {
+    match backend {
+        DbBackend::MySql => format!("`{}`", identifier.replace('`', "``")),
+        DbBackend::Postgres | DbBackend::Sqlite => {
+            format!("\"{}\"", identifier.replace('"', "\"\""))
+        }
+    }
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::*;
+
+    #[test]
+    fn quotes_identifiers_for_each_backend() {
+        assert_eq!(quote_identifier(DbBackend::Postgres, "key"), "\"key\"");
+        assert_eq!(quote_identifier(DbBackend::Sqlite, "key"), "\"key\"");
+        assert_eq!(quote_identifier(DbBackend::MySql, "key"), "`key`");
+    }
+
+    #[test]
+    fn escapes_identifier_delimiters() {
+        assert_eq!(
+            quote_identifier(DbBackend::Postgres, "quoted\"name"),
+            "\"quoted\"\"name\""
+        );
+        assert_eq!(
+            quote_identifier(DbBackend::MySql, "quoted`name"),
+            "`quoted``name`"
+        );
+    }
+}
+
 /// Build SQL string from a SelectStatement based on database backend
 pub fn build_select_sql(backend: DbBackend, query: &SelectStatement) -> (String, Vec<Value>) {
     let (sql, values) = match backend {

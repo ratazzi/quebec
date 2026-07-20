@@ -3807,10 +3807,12 @@ impl PyQuebec {
                     DbBackend::Postgres => "$1",
                     DbBackend::MySql | DbBackend::Sqlite => "?",
                 };
+                // `key` is a reserved word in MySQL, so quote it for every backend.
+                let key_col = crate::query_builder::quote_identifier(backend, "key");
 
                 let sql = format!(
-                    "SELECT class_name, queue_name, priority, arguments FROM {} WHERE key = {}",
-                    table_config.recurring_tasks, p1
+                    "SELECT class_name, queue_name, priority, arguments FROM {} WHERE {} = {}",
+                    table_config.recurring_tasks, key_col, p1
                 );
                 let row = db_ref
                     .query_one(Statement::from_sql_and_values(
