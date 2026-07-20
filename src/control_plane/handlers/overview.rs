@@ -17,6 +17,25 @@ use tracing::{debug, instrument};
 use crate::control_plane::{utils::clean_sql, ControlPlane};
 use crate::query_builder;
 
+const DEFAULT_OVERVIEW_HOURS: i64 = 24;
+const MAX_OVERVIEW_HOURS: i64 = 24 * 30;
+
+fn normalize_overview_hours(raw: Option<&str>) -> i64 {
+    raw.and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_OVERVIEW_HOURS)
+        .clamp(1, MAX_OVERVIEW_HOURS)
+}
+
+fn overview_chart_interval(hours: i64) -> (i64, &'static str) {
+    if hours <= 24 {
+        (1, "%H:%M")
+    } else if hours <= 168 {
+        (6, "%m-%d %H:%M")
+    } else {
+        (24, "%m-%d")
+    }
+}
+
 impl ControlPlane {
     #[instrument(skip(state), fields(path = "/"))]
     pub async fn overview(
@@ -33,16 +52,14 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         debug!("Database connection obtained in {:?}", start.elapsed());
 
-        // Get time range parameter, default to 24 hours. Clamp to [1, 1 year]:
-        // the value drives both `chrono::Duration::hours` (which panics on
+        // Get time range parameter, default to 24 hours. Clamp to the largest
+        // range exposed by the UI (30 days), which also caps the chart at 30
+        // serial bucket COUNTs.
+        // The value drives both `chrono::Duration::hours` (which panics on
         // overflow, e.g. `?hours=9999999999999999`) and the per-bucket COUNT
         // loop below (an unbounded value would fire tens of thousands of serial
         // COUNTs — a page-load query storm).
-        let hours: i64 = params
-            .get("hours")
-            .and_then(|h| h.parse().ok())
-            .unwrap_or(24)
-            .clamp(1, 24 * 365);
+        let hours = normalize_overview_hours(params.get("hours").map(String::as_str));
 
         let now = chrono::Utc::now().naive_utc();
         let period_start = now - chrono::Duration::hours(hours);
@@ -223,14 +240,7 @@ impl ControlPlane {
         let mut jobs_processed_data = Vec::new();
 
         // Determine time interval based on selected time range
-        let (interval_hours, format_string) = if hours <= 24 {
-            (1, "%H:%M") // Every hour, display hour:minute
-        } else if hours <= 168 {
-            // 7 days
-            (6, "%m-%d %H:%M") // Every 6 hours, display month-day hour:minute
-        } else {
-            (24, "%m-%d") // Every day, display month-day
-        };
+        let (interval_hours, format_string) = overview_chart_interval(hours);
 
         // Generate time series data
         for i in 0..(hours / interval_hours) {
@@ -481,5 +491,43 @@ impl ControlPlane {
         debug!("Template rendering completed in {:?}", start.elapsed());
 
         Ok(Html(html))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overview_hours_defaults_and_clamps_to_supported_range() {
+        for (raw, expected) in [
+            (None, DEFAULT_OVERVIEW_HOURS),
+            (Some(""), DEFAULT_OVERVIEW_HOURS),
+            (Some("invalid"), DEFAULT_OVERVIEW_HOURS),
+            (Some("999999999999999999999999999"), DEFAULT_OVERVIEW_HOURS),
+            (Some("-1"), 1),
+            (Some("0"), 1),
+            (Some("1"), 1),
+            (Some("24"), 24),
+            (Some("168"), 168),
+            (Some("720"), MAX_OVERVIEW_HOURS),
+            (Some("721"), MAX_OVERVIEW_HOURS),
+        ] {
+            assert_eq!(normalize_overview_hours(raw), expected);
+        }
+
+        let huge = i64::MAX.to_string();
+        assert_eq!(
+            normalize_overview_hours(Some(huge.as_str())),
+            MAX_OVERVIEW_HOURS
+        );
+    }
+
+    #[test]
+    fn supported_overview_ranges_never_exceed_thirty_chart_buckets() {
+        for hours in 1..=MAX_OVERVIEW_HOURS {
+            let (interval_hours, _) = overview_chart_interval(hours);
+            assert!(hours / interval_hours <= 30);
+        }
     }
 }
