@@ -139,6 +139,7 @@ class Supervisor:
         self._slots: Dict[Tuple[str, int], _SlotState] = {}
         self._stopping = False
         self._immediate = False
+        self._quiet = False
         self._hostname = socket.gethostname()
         self._wakeup_r, self._wakeup_w = os.pipe()
         os.set_blocking(self._wakeup_r, False)
@@ -244,6 +245,7 @@ class Supervisor:
         # cascade the signal to every worker child. Dispatcher/scheduler are
         # unaffected (they don't own in-flight job execution).
         def quiet(signum, _frame):
+            self._quiet = True
             logger.info(
                 "Supervisor received signal %d, forwarding quiet (SIGUSR1) "
                 "to worker children",
@@ -416,7 +418,12 @@ class Supervisor:
             if expected:
                 segs.append(f"{role}s {counts.get(role, 0)}/{expected}")
         body = ", ".join(segs) if segs else "starting"
-        state = "stopping" if self._stopping else "running"
+        if self._stopping:
+            state = "stopping"
+        elif self._quiet:
+            state = "quiet"
+        else:
+            state = "running"
         return f"Quebec {__version__}: supervisor; {body}; {state}"
 
     def _supervise(self) -> None:

@@ -504,6 +504,17 @@ class TestSupervisorClassValidation:
         Supervisor(qc, {"worker": [None, None, None]})
 
 
+class TestSupervisorStatusText:
+    def test_status_text_reports_quiet(self, qc):
+        """The systemd STATUS line reflects quiet mode; stopping wins over it."""
+        sup = Supervisor(qc, {ROLE_WORKER: 1})
+        assert sup._status_text().endswith("; running")
+        sup._quiet = True
+        assert sup._status_text().endswith("; quiet")
+        sup._stopping = True
+        assert sup._status_text().endswith("; stopping")
+
+
 class TestSupervisorStopDuringStartup:
     """A shutdown signal arriving mid-startup must halt forking.
 
