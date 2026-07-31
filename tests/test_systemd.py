@@ -98,3 +98,13 @@ def test_single_process_status_reports_worker_idle(qc):
     assert "dispatcher" in line
     assert "scheduler" in line
     assert line.startswith("Quebec ")
+
+
+def test_single_process_status_reports_quiet(qc):
+    """After entering quiet mode (SIGUSR1/SIGTSTP or qc.quiet()) the STATUS
+    line ends in "; quiet" so `systemctl status` shows the drain state."""
+    from quebec import _systemd_status_line
+
+    assert _systemd_status_line(qc, ["worker"]).endswith("; running")
+    qc.quiet()
+    assert _systemd_status_line(qc, ["worker"]).endswith("; quiet")

@@ -420,7 +420,8 @@ def _systemd_status_line(qc, components):
     if "scheduler" in components:
         segs.append("scheduler")
     body = ", ".join(segs) if segs else "running"
-    return f"Quebec {__version__}: {body}; running"
+    state = "quiet" if qc.is_quiet else "running"
+    return f"Quebec {__version__}: {body}; {state}"
 
 
 def _quebec_start(
