@@ -1,6 +1,6 @@
 [project]
 name = "quebec"
-version = "0.3.12"
+version = "0.3.13"
 requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Rust",
