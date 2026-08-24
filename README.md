@@ -40,6 +40,52 @@ Built-in web dashboard for monitoring jobs, queues, and workers in real-time.
 - PostgreSQL
 - MySQL
 
+### Upgrading an existing PostgreSQL deployment
+
+On PostgreSQL only, Quebec no longer creates the `(key, value)` and
+`(expires_at)` indexes on the semaphores table. They prevent HOT updates: every
+concurrency wait/signal rewrites both `value` and `expires_at`, and indexing a
+column that every `UPDATE` touches forces a new row version plus an index write
+each time. Dead tuples then pile up faster than autovacuum can reclaim them, and
+a table holding a handful of live rows can end up costing thousands of buffer
+hits per statement.
+
+Databases created before this version still carry both indexes.
+
+`create_tables()` does not drop indexes, so run this once against an existing
+database (substitute your table prefix):
+
+```sql
+DROP INDEX IF EXISTS idx_solid_queue_semaphores_key_value;
+DROP INDEX IF EXISTS idx_solid_queue_semaphores_expires_at;
+
+ALTER TABLE solid_queue_semaphores SET (
+  fillfactor = 70,
+  autovacuum_vacuum_scale_factor = 0,
+  autovacuum_vacuum_threshold = 1000
+);
+
+-- Reclaims space already lost to bloat and applies the new fillfactor.
+-- Takes an ACCESS EXCLUSIVE lock, so concurrency operations block for its
+-- duration -- normally well under a second on a healthy table.
+VACUUM FULL solid_queue_semaphores;
+```
+
+The unique index on `key` stays: it serves the only hot-path lookup
+(`WHERE key = $1`), and PostgreSQL applies the `value` predicate as a filter
+after it. Calling `create_tables()` afterwards re-applies the storage
+parameters but never re-creates the dropped indexes.
+
+The `expires_at` index only served `delete_expired`, which the dispatcher runs
+once per `concurrency_maintenance_interval` (default 600s). That scan is a
+sequential one now -- roughly 11 ms on a 50k-row table, against an index that
+would otherwise be maintained on every write.
+
+SQLite and MySQL keep both indexes and need no migration. InnoDB's undo-log
+MVCC and SQLite's rollback journal do not accumulate heap bloat this way, so
+there the indexes are a plain win -- `delete_expired` in particular gets to use
+`(expires_at)` instead of scanning.
+
 ## Quick Start
 
 ### Module Runner (Recommended)
