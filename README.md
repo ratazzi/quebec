@@ -411,6 +411,53 @@ qc.run()
 
 Each listed queue acquires a `queue:<name>` semaphore at claim time; queues not present are unlimited. Useful for isolating a misbehaving queue during remediation. Naming and semantics are experimental and may change.
 
+### Global Priority Across Queues (experimental, off by default)
+
+With `queues: "*"` and nothing to skip, a worker polls with a single unfiltered query, so `priority` orders jobs across every queue. That stops being possible as soon as a queue must be skipped — paused, or with a full `experimental_queue_concurrency` slot — because excluding queues with `NOT IN` cannot use an index. Quebec then does what Solid Queue does: one query per live queue, which makes queue order override `priority` until the queue is resumed.
+
+Enabling this flag keeps one global order in that situation by polling with an `IN` list instead:
+
+```sql
+SELECT * FROM solid_queue_ready_executions
+WHERE queue_name IN ($live_queues)
+ORDER BY priority, job_id
+LIMIT $batch
+FOR UPDATE SKIP LOCKED;
+```
+
+```python
+qc = quebec.Quebec(
+    "postgresql://localhost/myapp",
+    experimental_global_priority=True,   # or QUEBEC_EXPERIMENTAL_GLOBAL_PRIORITY=true
+)
+```
+
+**Measure before enabling — this is not universally faster.** It moves the scan from the excluded side to the live side, and which one wins depends on where your backlog sits:
+
+| Backlog distribution | Default (per-queue) | `experimental_global_priority` |
+|---|---|---|
+| Skipped queues hold most rows | fine — skipped rows never scanned | likely much better: one query, shallow live set |
+| Live queues hold most rows | fine — each query is an index range | likely far worse: reads and sorts the live rows |
+| Many live queues, all deep | fine | worst case |
+
+PostgreSQL picks between two plans for the `IN` form, and the choice depends on statistics: walk `(queue_name, priority, job_id)` per listed queue and sort the union, or walk `(priority, job_id)` and filter. Check which one you get on real data:
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM solid_queue_ready_executions
+WHERE queue_name IN ('live_a', 'live_b')
+ORDER BY priority, job_id
+LIMIT 10
+FOR UPDATE SKIP LOCKED;
+```
+
+Look at whether the queue_name index is used, how many rows feed the Sort, `Rows Removed by Filter`, and shared buffers. Note that `LockRows` sits *above* `Sort`, so `SKIP LOCKED` does not shrink the sort input.
+
+Two things it does not change:
+
+- It only ever applies to `*`. Explicit queue lists (`["real_time", "background"]`) and wildcard prefixes (`"beta*"`) keep Solid Queue's contract that queue order takes precedence over `priority`.
+- Ordering and locking stay in one statement, so there is no window where the order is decided from rows another worker has already taken.
+
 ### TLS Configuration (PostgreSQL)
 
 Quebec links `sqlx` against `rustls` + `webpki-roots`. Public CAs (AWS RDS,
