@@ -1129,7 +1129,6 @@ pub mod ready_executions {
         db: &C,
         table_config: &TableConfig,
         queue_name: Option<&str>,
-        exclude_queues: &[String],
         use_skip_locked: bool,
     ) -> Result<Option<quebec_ready_executions::Model>, DbErr>
     where
@@ -1166,22 +1165,6 @@ pub mod ready_executions {
             ));
         }
 
-        if !exclude_queues.is_empty() {
-            let placeholders: Vec<String> = exclude_queues
-                .iter()
-                .map(|eq| {
-                    params.push(eq.clone().into());
-                    placeholder(params.len())
-                })
-                .collect();
-            conditions.push(format!(
-                "{}queue_name{} NOT IN ({})",
-                q,
-                q,
-                placeholders.join(", ")
-            ));
-        }
-
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -1210,7 +1193,6 @@ pub mod ready_executions {
         db: &C,
         table_config: &TableConfig,
         queue_name: Option<&str>,
-        exclude_queues: &[String],
         use_skip_locked: bool,
         limit: u64,
     ) -> Result<Vec<quebec_ready_executions::Model>, DbErr>
@@ -1245,22 +1227,6 @@ pub mod ready_executions {
                 q,
                 q,
                 placeholder(params.len())
-            ));
-        }
-
-        if !exclude_queues.is_empty() {
-            let placeholders: Vec<String> = exclude_queues
-                .iter()
-                .map(|eq| {
-                    params.push(eq.clone().into());
-                    placeholder(params.len())
-                })
-                .collect();
-            conditions.push(format!(
-                "{}queue_name{} NOT IN ({})",
-                q,
-                q,
-                placeholders.join(", ")
             ));
         }
 
@@ -1329,6 +1295,21 @@ pub mod ready_executions {
         rows.into_iter()
             .map(|row| row.try_get("", "queue_name"))
             .collect()
+    }
+
+    /// Find every distinct queue name that currently has a ready execution.
+    ///
+    /// Mirrors Solid Queue's `QueueSelector#all_queues`: used to expand `*`
+    /// into per-queue polls when some queues have to be skipped, so the
+    /// skipped rows never enter the index scan at all.
+    pub async fn find_all_queue_names<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Vec<String>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        distinct_indexed_column(db, &table_config.ready_executions, "queue_name").await
     }
 
     pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>

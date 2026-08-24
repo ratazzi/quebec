@@ -2815,24 +2815,16 @@ impl Worker {
 
                     // For queues listed in `experimental_queue_concurrency`,
                     // attempt the `queue:<name>` semaphore between find and
-                    // claim via `try_acquire_queue_slot`; if the slot is
-                    // full, add the queue to a local exclude list and re-find
-                    // so the next candidate (potentially from a different
-                    // queue) gets a chance. Without this retry, a single
-                    // throttled candidate from the wildcard pattern would
-                    // block claims from every other queue in this poll.
+                    // claim via `try_acquire_queue_slot`. A full slot ends this
+                    // poll and reports the queue back through `$throttled`; the
+                    // caller decides how to retry the remaining queues.
                     macro_rules! try_claim_one {
-                        ($filter:expr, $exclude:expr) => {{
-                            let mut local_throttled: Vec<String> = Vec::new();
+                        ($filter:expr, $throttled:expr) => {{
                             loop {
-                                let mut effective_exclude: Vec<String> =
-                                    $exclude.iter().cloned().collect();
-                                effective_exclude.extend(local_throttled.iter().cloned());
                                 let record = query_builder::ready_executions::find_one_for_update(
                                     txn,
                                     &table_config,
                                     $filter,
-                                    &effective_exclude,
                                     use_skip_locked,
                                 )
                                 .await?;
@@ -2848,8 +2840,12 @@ impl Worker {
                                     )
                                     .await?;
                                     if !acquired {
-                                        local_throttled.push(execution.queue_name.clone());
-                                        continue;
+                                        // Re-finding here would have to exclude
+                                        // the queue with `NOT IN`, and an
+                                        // anti-join cannot use the queue_name
+                                        // index. Report it instead.
+                                        $throttled.push(execution.queue_name.clone());
+                                        break;
                                     }
                                     queue_slot_held = true;
                                 }
@@ -2898,6 +2894,8 @@ impl Worker {
                     }
 
                     for (is_wildcard, pattern) in queue_patterns {
+                        let mut throttled: Vec<String> = Vec::new();
+
                         if is_wildcard {
                             let matching_queues =
                                 query_builder::ready_executions::find_matching_queue_names(
@@ -2911,16 +2909,43 @@ impl Worker {
                                 if paused_queues.contains(queue_name) {
                                     continue;
                                 }
-                                try_claim_one!(Some(queue_name.as_str()), &[]);
+                                try_claim_one!(Some(queue_name.as_str()), &mut throttled);
                             }
-                        } else {
-                            if pattern != "*" && paused_queues.contains(&pattern) {
+                        } else if pattern != "*" {
+                            if paused_queues.contains(&pattern) {
                                 continue;
                             }
-                            if pattern != "*" {
-                                try_claim_one!(Some(pattern.as_str()), &[]);
-                            } else {
-                                try_claim_one!(None, &paused_queues);
+                            try_claim_one!(Some(pattern.as_str()), &mut throttled);
+                        } else {
+                            // Solid Queue's `QueueSelector#all?`: with nothing
+                            // to skip, one unfiltered poll keeps the global
+                            // priority order and rides the poll-all index.
+                            if paused_queues.is_empty() {
+                                try_claim_one!(None, &mut throttled);
+                            }
+
+                            // Fall back to per-queue polls only for what the
+                            // unfiltered poll cannot express: paused queues, and
+                            // queues whose concurrency slot was found full just
+                            // now. Filtering those out with `NOT IN` would cost
+                            // a full scan of their backlog on every poll, since
+                            // an anti-join cannot use the queue_name index.
+                            if !paused_queues.is_empty() || !throttled.is_empty() {
+                                let all_queues =
+                                    query_builder::ready_executions::find_all_queue_names(
+                                        txn,
+                                        &table_config,
+                                    )
+                                    .await?;
+
+                                for queue_name in &all_queues {
+                                    if paused_queues.contains(queue_name)
+                                        || throttled.contains(queue_name)
+                                    {
+                                        continue;
+                                    }
+                                    try_claim_one!(Some(queue_name.as_str()), &mut throttled);
+                                }
                             }
                         }
                     }
@@ -2987,36 +3012,22 @@ impl Worker {
                     // configured, each candidate goes through
                     // `try_acquire_queue_slot` before being added to the
                     // batch. Throttled candidates stay in ready_executions
-                    // so the next poll re-attempts them; the queue's
-                    // throttled state is cached locally inside this batch
-                    // to avoid redundant acquire calls when many candidates
-                    // share the same queue.
+                    // so the next poll re-attempts them, and their queue is
+                    // reported back through `$throttled` so the caller can
+                    // decide how to retry the remaining queues.
                     macro_rules! claim_from_queue {
-                        ($filter:expr, $exclude:expr) => {{
-                            // Loop in the same transaction: when the first
-                            // find returns rows that are all from throttled
-                            // queues, add them to `local_throttled` and
-                            // re-find so unrelated queues' rows can still
-                            // be claimed this poll. Without this, a single
-                            // throttled queue sitting at the head of the
-                            // priority order (e.g. `default` with limit=1
-                            // already held) would block claims from every
-                            // other queue until the next poll tick.
-                            let mut local_throttled = std::collections::HashSet::<String>::new();
+                        ($filter:expr, $throttled:expr) => {{
+                            let mut hit_throttle = false;
                             loop {
                                 if remaining == 0 {
                                     break;
                                 }
-                                let mut effective_exclude: Vec<String> =
-                                    $exclude.iter().cloned().collect();
-                                effective_exclude.extend(local_throttled.iter().cloned());
                                 let requested = remaining;
                                 let records =
                                     query_builder::ready_executions::find_many_for_update(
                                         txn,
                                         &table_config,
                                         $filter,
-                                        &effective_exclude,
                                         use_skip_locked,
                                         requested,
                                     )
@@ -3039,7 +3050,8 @@ impl Worker {
                                     for record in &records {
                                         let mut queue_slot_held = false;
                                         if queue_concurrency_enabled {
-                                            if local_throttled.contains(&record.queue_name) {
+                                            if $throttled.iter().any(|q| q == &record.queue_name) {
+                                                hit_throttle = true;
                                                 continue;
                                             }
                                             let acquired = Self::try_acquire_queue_slot(
@@ -3050,7 +3062,8 @@ impl Worker {
                                             )
                                             .await?;
                                             if !acquired {
-                                                local_throttled.insert(record.queue_name.clone());
+                                                $throttled.push(record.queue_name.clone());
+                                                hit_throttle = true;
                                                 continue;
                                             }
                                             queue_slot_held = true;
@@ -3132,7 +3145,11 @@ impl Worker {
                                     remaining = remaining.saturating_sub(accepted.len() as u64);
                                 }
 
-                                if exhausted {
+                                // Re-finding after a throttle would have to
+                                // exclude the queue with `NOT IN`, which cannot
+                                // use the queue_name index. Stop and let the
+                                // caller retry the rest per queue.
+                                if exhausted || hit_throttle {
                                     break;
                                 }
                             }
@@ -3143,6 +3160,8 @@ impl Worker {
                         if remaining == 0 {
                             break;
                         }
+
+                        let mut throttled: Vec<String> = Vec::new();
 
                         if is_wildcard {
                             let matching_queues =
@@ -3160,16 +3179,47 @@ impl Worker {
                                 if paused_queues.contains(queue_name) {
                                     continue;
                                 }
-                                claim_from_queue!(Some(queue_name.as_str()), &[]);
+                                claim_from_queue!(Some(queue_name.as_str()), &mut throttled);
                             }
-                        } else {
-                            if pattern != "*" && paused_queues.contains(&pattern) {
+                        } else if pattern != "*" {
+                            if paused_queues.contains(&pattern) {
                                 continue;
                             }
-                            if pattern != "*" {
-                                claim_from_queue!(Some(pattern.as_str()), &[]);
-                            } else {
-                                claim_from_queue!(None, &paused_queues);
+                            claim_from_queue!(Some(pattern.as_str()), &mut throttled);
+                        } else {
+                            // Solid Queue's `QueueSelector#all?`: with nothing
+                            // to skip, one unfiltered poll keeps the global
+                            // priority order and rides the poll-all index.
+                            if paused_queues.is_empty() {
+                                claim_from_queue!(None, &mut throttled);
+                            }
+
+                            // Fall back to per-queue polls only for what the
+                            // unfiltered poll cannot express: paused queues, and
+                            // queues whose concurrency slot was found full just
+                            // now. Filtering those out with `NOT IN` would cost
+                            // a full scan of their backlog on every poll, since
+                            // an anti-join cannot use the queue_name index.
+                            if remaining > 0 && (!paused_queues.is_empty() || !throttled.is_empty())
+                            {
+                                let all_queues =
+                                    query_builder::ready_executions::find_all_queue_names(
+                                        txn,
+                                        &table_config,
+                                    )
+                                    .await?;
+
+                                for queue_name in &all_queues {
+                                    if remaining == 0 {
+                                        break;
+                                    }
+                                    if paused_queues.contains(queue_name)
+                                        || throttled.contains(queue_name)
+                                    {
+                                        continue;
+                                    }
+                                    claim_from_queue!(Some(queue_name.as_str()), &mut throttled);
+                                }
                             }
                         }
                     }

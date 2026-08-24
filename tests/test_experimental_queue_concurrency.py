@@ -165,9 +165,9 @@ def test_batch_claim_no_head_of_line_block(db_url, test_prefix) -> None:
     ``experimental_queue_concurrency={"default": 1}``, ``batch_size=2``.
     Old behaviour: find_many returns [default-1, default-2]; default-1
     claims the slot, default-2 throttled, other-1 left in ready — to wait
-    for next poll. Fixed behaviour: claim_jobs re-finds with `default` in
-    the exclude list within the same transaction → other-1 also gets
-    claimed.
+    for next poll. Fixed behaviour: the unfiltered poll reports `default`
+    as throttled, and claim_jobs retries the remaining queues with
+    per-queue polls in the same transaction → other-1 also gets claimed.
     """
     qc = _qc(db_url, test_prefix, experimental_queue_concurrency={"default": 1})
     try:
@@ -273,5 +273,69 @@ def test_invalid_limit_is_ignored_with_warning(db_url, test_prefix) -> None:
         e1.perform()
         e2.perform()
         assert sorted(PlainJob.calls) == [1, 2]
+    finally:
+        qc.close()
+
+
+def test_unrelated_queue_limit_keeps_global_priority(db_url, test_prefix) -> None:
+    """Configuring a limit for a queue that holds no jobs must not change how
+    a ``*`` worker orders its claims.
+
+    The `*` poll only expands into per-queue polls once something actually
+    has to be skipped. A limit on an idle queue skips nothing, so the single
+    unfiltered poll — and with it the global priority order — stays in
+    effect. Regression: keying the expansion off the *config* instead sorted
+    claims by queue name, so `a_low` beat `z_high`.
+    """
+    qc = _qc(db_url, test_prefix, experimental_queue_concurrency={"idle_queue": 1})
+    try:
+        PlainJob.calls = []
+        qc.register_job(PlainJob)
+
+        PlainJob.set(queue="a_low", priority=100).perform_later(qc, 1)
+        PlainJob.set(queue="z_high", priority=-100).perform_later(qc, 2)
+
+        first = qc.drain_one()
+        assert first.queue == "z_high", (
+            f"global priority order lost: claimed {first.queue!r} first"
+        )
+        first.perform()
+
+        second = qc.drain_one()
+        assert second.queue == "a_low"
+        second.perform()
+    finally:
+        qc.close()
+
+
+def test_throttled_queue_falls_back_without_losing_other_queues(
+    db_url, test_prefix
+) -> None:
+    """When the head-of-order queue is genuinely throttled, the `*` poll
+    hands that queue back and retries the rest per queue, so a lower-priority
+    job on an unthrottled queue is still claimed in the same poll.
+    """
+    qc = _qc(db_url, test_prefix, experimental_queue_concurrency={"default": 1})
+    try:
+        PlainJob.calls = []
+        OtherJob.calls = []
+        qc.register_job(PlainJob)
+        qc.register_job(OtherJob)
+
+        # "default" sorts first by priority and is limited to one slot.
+        PlainJob.set(priority=-100).perform_later(qc, 1)
+        PlainJob.set(priority=-100).perform_later(qc, 2)
+        OtherJob.set(priority=100).perform_later(qc, 100)
+
+        first = qc.drain_one()
+        assert first.queue == "default"
+
+        # queue:default is now full and `first` has not run yet; the next
+        # poll must still reach "other" instead of stalling.
+        second = qc.drain_one()
+        assert second.queue == "other"
+
+        first.perform()
+        second.perform()
     finally:
         qc.close()
