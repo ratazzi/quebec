@@ -221,6 +221,61 @@ pub fn col(name: &str) -> Alias {
     Alias::new(name)
 }
 
+/// Build the SQL returning the sorted distinct values of an indexed,
+/// NOT NULL column.
+///
+/// Postgres has no automatic skip scan, so a plain `SELECT DISTINCT col`
+/// scans every row even with an index on `col`. Emulate a loose index
+/// scan with a recursive CTE: each step does a single index seek for the
+/// next larger value, making the query cost O(distinct values) instead of
+/// O(rows). MySQL 8.0+ already performs a loose index scan for this, and
+/// SQLite is only used for small test databases, so both keep the plain
+/// DISTINCT. The terminating NULL row (produced when no larger value
+/// remains) is filtered out at the end.
+fn distinct_column_sql(backend: DbBackend, table_name: &str, column: &str) -> String {
+    let q = match backend {
+        DbBackend::MySql => '`',
+        _ => '"',
+    };
+
+    match backend {
+        DbBackend::Postgres => format!(
+            "WITH RECURSIVE t AS (\n    \
+             (SELECT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
+             UNION ALL\n    \
+             SELECT (SELECT {q}{column}{q} FROM {q}{table_name}{q} \
+             WHERE {q}{column}{q} > t.{q}{column}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
+             FROM t WHERE t.{q}{column}{q} IS NOT NULL\n\
+             )\n\
+             SELECT {q}{column}{q} FROM t WHERE {q}{column}{q} IS NOT NULL \
+             ORDER BY {q}{column}{q} ASC"
+        ),
+        _ => format!(
+            r#"SELECT DISTINCT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC"#
+        ),
+    }
+}
+
+/// Fetch the sorted distinct values of an indexed column via a backend
+/// query plan that avoids a full-table scan on Postgres.
+async fn distinct_indexed_column<C>(
+    db: &C,
+    table_name: &str,
+    column: &'static str,
+) -> Result<Vec<String>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let sql = distinct_column_sql(backend, table_name, column);
+    let stmt = Statement::from_string(backend, sql);
+    let rows = db.query_all(stmt).await?;
+
+    rows.into_iter()
+        .map(|row| row.try_get("", column))
+        .collect()
+}
+
 // =============================================================================
 // Jobs table queries
 // =============================================================================
@@ -663,61 +718,6 @@ pub mod jobs {
         execute_select(db, query).await
     }
 
-    /// Build the SQL returning the sorted distinct values of an indexed,
-    /// NOT NULL column.
-    ///
-    /// Postgres has no automatic skip scan, so a plain `SELECT DISTINCT col`
-    /// scans every row even with an index on `col`. Emulate a loose index
-    /// scan with a recursive CTE: each step does a single index seek for the
-    /// next larger value, making the query cost O(distinct values) instead of
-    /// O(rows). MySQL 8.0+ already performs a loose index scan for this, and
-    /// SQLite is only used for small test databases, so both keep the plain
-    /// DISTINCT. The terminating NULL row (produced when no larger value
-    /// remains) is filtered out at the end.
-    fn distinct_column_sql(backend: DbBackend, table_name: &str, column: &str) -> String {
-        let q = match backend {
-            DbBackend::MySql => '`',
-            _ => '"',
-        };
-
-        match backend {
-            DbBackend::Postgres => format!(
-                "WITH RECURSIVE t AS (\n    \
-                 (SELECT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
-                 UNION ALL\n    \
-                 SELECT (SELECT {q}{column}{q} FROM {q}{table_name}{q} \
-                 WHERE {q}{column}{q} > t.{q}{column}{q} ORDER BY {q}{column}{q} ASC LIMIT 1)\n    \
-                 FROM t WHERE t.{q}{column}{q} IS NOT NULL\n\
-                 )\n\
-                 SELECT {q}{column}{q} FROM t WHERE {q}{column}{q} IS NOT NULL \
-                 ORDER BY {q}{column}{q} ASC"
-            ),
-            _ => format!(
-                r#"SELECT DISTINCT {q}{column}{q} FROM {q}{table_name}{q} ORDER BY {q}{column}{q} ASC"#
-            ),
-        }
-    }
-
-    /// Fetch the sorted distinct values of an indexed column via a backend
-    /// query plan that avoids a full-table scan on Postgres.
-    async fn distinct_indexed_column<C>(
-        db: &C,
-        table_name: &str,
-        column: &'static str,
-    ) -> Result<Vec<String>, DbErr>
-    where
-        C: ConnectionTrait,
-    {
-        let backend = db.get_database_backend();
-        let sql = distinct_column_sql(backend, table_name, column);
-        let stmt = Statement::from_string(backend, sql);
-        let rows = db.query_all(stmt).await?;
-
-        rows.into_iter()
-            .map(|row| row.try_get("", column))
-            .collect()
-    }
-
     /// Get distinct queue names
     pub async fn get_queue_names<C>(
         db: &C,
@@ -1129,7 +1129,6 @@ pub mod ready_executions {
         db: &C,
         table_config: &TableConfig,
         queue_name: Option<&str>,
-        exclude_queues: &[String],
         use_skip_locked: bool,
     ) -> Result<Option<quebec_ready_executions::Model>, DbErr>
     where
@@ -1166,22 +1165,6 @@ pub mod ready_executions {
             ));
         }
 
-        if !exclude_queues.is_empty() {
-            let placeholders: Vec<String> = exclude_queues
-                .iter()
-                .map(|eq| {
-                    params.push(eq.clone().into());
-                    placeholder(params.len())
-                })
-                .collect();
-            conditions.push(format!(
-                "{}queue_name{} NOT IN ({})",
-                q,
-                q,
-                placeholders.join(", ")
-            ));
-        }
-
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {
@@ -1210,7 +1193,6 @@ pub mod ready_executions {
         db: &C,
         table_config: &TableConfig,
         queue_name: Option<&str>,
-        exclude_queues: &[String],
         use_skip_locked: bool,
         limit: u64,
     ) -> Result<Vec<quebec_ready_executions::Model>, DbErr>
@@ -1245,22 +1227,6 @@ pub mod ready_executions {
                 q,
                 q,
                 placeholder(params.len())
-            ));
-        }
-
-        if !exclude_queues.is_empty() {
-            let placeholders: Vec<String> = exclude_queues
-                .iter()
-                .map(|eq| {
-                    params.push(eq.clone().into());
-                    placeholder(params.len())
-                })
-                .collect();
-            conditions.push(format!(
-                "{}queue_name{} NOT IN ({})",
-                q,
-                q,
-                placeholders.join(", ")
             ));
         }
 
@@ -1329,6 +1295,21 @@ pub mod ready_executions {
         rows.into_iter()
             .map(|row| row.try_get("", "queue_name"))
             .collect()
+    }
+
+    /// Find every distinct queue name that currently has a ready execution.
+    ///
+    /// Mirrors Solid Queue's `QueueSelector#all_queues`: used to expand `*`
+    /// into per-queue polls when some queues have to be skipped, so the
+    /// skipped rows never enter the index scan at all.
+    pub async fn find_all_queue_names<C>(
+        db: &C,
+        table_config: &TableConfig,
+    ) -> Result<Vec<String>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        distinct_indexed_column(db, &table_config.ready_executions, "queue_name").await
     }
 
     pub async fn count_all<C>(db: &C, table_config: &TableConfig) -> Result<u64, DbErr>

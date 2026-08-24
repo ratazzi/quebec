@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import text
+
+import quebec
 
 
 def test_pause_queue_inserts_row_and_resume_deletes_it(qc_with_sqlalchemy) -> None:
@@ -69,3 +72,52 @@ def test_pause_all_skips_already_paused_and_resume_all_clears(
     resumed = qc.resume_all()
     assert resumed == 2
     assert qc.paused_queues() == []
+
+
+class PauseJob(quebec.BaseClass):
+    def perform(self, *args, **kwargs) -> None:
+        pass
+
+
+def test_paused_queue_is_skipped_by_single_claim(qc) -> None:
+    # A `*` worker expands into per-queue polls once anything is paused
+    # (Solid Queue's QueueSelector semantics), so the paused queue is never
+    # a claim candidate — not even when its job sorts first by job_id.
+    qc.register_job(PauseJob)
+    PauseJob.set(queue="paused_q").perform_later(qc)
+    PauseJob.set(queue="live_a").perform_later(qc)
+    PauseJob.set(queue="live_b").perform_later(qc)
+
+    assert qc.pause_queue("paused_q") is True
+
+    claimed = []
+    for _ in range(2):
+        execution = qc.drain_one()
+        claimed.append(execution.queue)
+        execution.perform()
+
+    assert sorted(claimed) == ["live_a", "live_b"]
+
+    with pytest.raises(RuntimeError):
+        qc.drain_one()
+
+    assert qc.resume_queue("paused_q") is True
+    execution = qc.drain_one()
+    assert execution.queue == "paused_q"
+    execution.perform()
+
+
+def test_paused_queue_is_skipped_by_batch_claim(qc) -> None:
+    qc.register_job(PauseJob)
+    PauseJob.set(queue="paused_q").perform_later(qc)
+    PauseJob.set(queue="live_a").perform_later(qc)
+    PauseJob.set(queue="live_b").perform_later(qc)
+
+    assert qc.pause_queue("paused_q") is True
+
+    claimed = qc.drain_batch(10)
+    assert sorted(e.queue for e in claimed) == ["live_a", "live_b"]
+    for execution in claimed:
+        execution.perform()
+
+    assert qc.drain_batch(10) == []
