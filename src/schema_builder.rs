@@ -395,7 +395,7 @@ pub async fn create_indexes<C>(db: &C, table_config: &TableConfig) -> Result<(),
 where
     C: ConnectionTrait,
 {
-    let indexes = vec![
+    let mut indexes = vec![
         // Jobs indexes
         Index::create()
             .if_not_exists()
@@ -488,20 +488,7 @@ where
             .col(col("process_id"))
             .col(col("job_id"))
             .to_owned(),
-        // Semaphores indexes
-        Index::create()
-            .if_not_exists()
-            .name(&format!("idx_{}_key_value", table_config.semaphores))
-            .table(tbl(&table_config.semaphores))
-            .col(col("key"))
-            .col(col("value"))
-            .to_owned(),
-        Index::create()
-            .if_not_exists()
-            .name(&format!("idx_{}_expires_at", table_config.semaphores))
-            .table(tbl(&table_config.semaphores))
-            .col(col("expires_at"))
-            .to_owned(),
+        // Semaphores indexes are backend-dependent; see below.
         // Processes indexes
         Index::create()
             .if_not_exists()
@@ -529,6 +516,46 @@ where
             .col(col("run_at"))
             .to_owned(),
     ];
+
+    // Semaphores: the (key, value) and (expires_at) indexes that Solid Queue
+    // declares are kept on SQLite and MySQL, but skipped on Postgres.
+    //
+    // Every wait/signal rewrites both indexed columns:
+    //
+    //     UPDATE ... SET value = value +/- 1, expires_at = $2 WHERE key = $1
+    //
+    // On Postgres, indexing a column that every UPDATE touches makes HOT
+    // updates structurally impossible, so each write leaves a dead tuple that
+    // only autovacuum can reclaim. Under sustained load the version chains grow
+    // faster than autovacuum can prune them and reads degrade from a handful of
+    // buffer hits per call into the thousands. Skipping both indexes lets HOT --
+    // and with it opportunistic page pruning -- reclaim versions inline; the
+    // unique constraint on `key` still serves the only hot-path lookup, and
+    // `semaphores::delete_expired` (once per `concurrency_maintenance_interval`,
+    // default 600s) falls back to a seq scan that costs far less than
+    // maintaining an index on every write.
+    //
+    // InnoDB's undo-log MVCC and SQLite's rollback journal do not accumulate
+    // heap bloat this way, so there the indexes are a plain win and stay.
+    if !matches!(db.get_database_backend(), DbBackend::Postgres) {
+        indexes.push(
+            Index::create()
+                .if_not_exists()
+                .name(&format!("idx_{}_key_value", table_config.semaphores))
+                .table(tbl(&table_config.semaphores))
+                .col(col("key"))
+                .col(col("value"))
+                .to_owned(),
+        );
+        indexes.push(
+            Index::create()
+                .if_not_exists()
+                .name(&format!("idx_{}_expires_at", table_config.semaphores))
+                .table(tbl(&table_config.semaphores))
+                .col(col("expires_at"))
+                .to_owned(),
+        );
+    }
 
     for index in indexes {
         let sql = match db.get_database_backend() {
@@ -574,6 +601,57 @@ where
 {
     create_all_tables(db, table_config).await?;
     create_indexes(db, table_config).await?;
+    tune_storage_parameters(db, table_config).await?;
+    Ok(())
+}
+
+/// Apply Postgres storage parameters to the semaphores table.
+///
+/// Postgres only: SQLite has no equivalent, and InnoDB's undo-log MVCC does not
+/// accumulate heap bloat the same way. The statement is idempotent, so calling
+/// `create_tables()` again on an existing database re-applies it.
+///
+/// Failures are logged and swallowed -- these are tuning hints rather than
+/// correctness requirements, and the connecting role may not own the tables
+/// (for instance when the schema is managed by a Rails-side Solid Queue).
+pub async fn tune_storage_parameters<C>(db: &C, table_config: &TableConfig) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Postgres) {
+        return Ok(());
+    }
+
+    // `fillfactor` reserves room on each page so a HOT update can place the new
+    // row version alongside the old one; on a full page it has to go elsewhere
+    // and the HOT chain breaks, which is the whole reason the secondary indexes
+    // were dropped (see `create_indexes`).
+    //
+    // The absolute autovacuum threshold matters because the default
+    // `scale_factor = 0.2` scales off the live row count: on a table holding a
+    // few dozen rows, 20% is reached only long after tens of thousands of dead
+    // tuples have piled up.
+    let sql = format!(
+        "ALTER TABLE {} SET (\
+         fillfactor = 70, \
+         autovacuum_vacuum_scale_factor = 0, \
+         autovacuum_vacuum_threshold = 1000)",
+        table_config.semaphores
+    );
+
+    if let Err(e) = db
+        .execute(Statement::from_string(DbBackend::Postgres, sql))
+        .await
+    {
+        tracing::warn!(
+            "Could not set storage parameters on {}: {}. The table still works, \
+             but under sustained concurrency-key churn it may accumulate dead \
+             tuples faster than autovacuum reclaims them.",
+            table_config.semaphores,
+            e
+        );
+    }
+
     Ok(())
 }
 
