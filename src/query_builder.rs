@@ -3544,3 +3544,125 @@ pub mod pauses {
         execute_select_one(db, query).await
     }
 }
+
+/// Reads and writes of `recurring_tasks.paused_at`. The column only exists
+/// once `AppContext::ensure_recurring_pause` has run, so callers must check
+/// `recurring_pause_ready()` first. The task upsert in `scheduler.rs` names
+/// its columns explicitly and never touches `paused_at`.
+pub mod recurring_tasks {
+    use super::*;
+
+    /// `paused_at` of one task by key: `Ok(None)` when no task has that key,
+    /// `Ok(Some(None))` when it exists and is not paused.
+    pub async fn find_paused_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+        key: &str,
+    ) -> Result<Option<Option<chrono::NaiveDateTime>>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let sql = format!(
+            "SELECT {paused} FROM {table} WHERE {key_col} = {p1}",
+            paused = quote_identifier(backend, "paused_at"),
+            table = quote_identifier(backend, &table_config.recurring_tasks),
+            key_col = quote_identifier(backend, "key"),
+            p1 = placeholder(backend, 1),
+        );
+        let stmt = Statement::from_sql_and_values(backend, sql, [key.into()]);
+        db.query_one(stmt)
+            .await?
+            .map(|row| row.try_get::<Option<chrono::NaiveDateTime>>("", "paused_at"))
+            .transpose()
+    }
+
+    /// Pause (`Some(now)`) or resume (`None`) the task with this key. Returns
+    /// the rows changed: 0 when no task has the key or it is already in the
+    /// requested state.
+    pub async fn set_paused_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+        key: &str,
+        paused_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        set_paused_at_where(db, table_config, "key", key.into(), paused_at).await
+    }
+
+    /// Same as `set_paused_at`, addressing the task by row id.
+    pub async fn set_paused_at_by_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+        paused_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        set_paused_at_where(db, table_config, "id", id.into(), paused_at).await
+    }
+
+    async fn set_paused_at_where<C>(
+        db: &C,
+        table_config: &TableConfig,
+        column: &str,
+        value: sea_orm::Value,
+        paused_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let table = quote_identifier(backend, &table_config.recurring_tasks);
+        let paused = quote_identifier(backend, "paused_at");
+        let selector = quote_identifier(backend, column);
+
+        // The state predicate makes the update idempotent and lets the row
+        // count report "already paused" / "already running".
+        let (sql, values) = match paused_at {
+            Some(at) => (
+                format!(
+                    "UPDATE {table} SET {paused} = {p1} WHERE {selector} = {p2} AND {paused} IS NULL",
+                    p1 = placeholder(backend, 1),
+                    p2 = placeholder(backend, 2),
+                ),
+                vec![at.into(), value],
+            ),
+            None => (
+                format!(
+                    "UPDATE {table} SET {paused} = NULL WHERE {selector} = {p1} AND {paused} IS NOT NULL",
+                    p1 = placeholder(backend, 1),
+                ),
+                vec![value],
+            ),
+        };
+        let stmt = Statement::from_sql_and_values(backend, sql, values);
+        Ok(db.execute(stmt).await?.rows_affected())
+    }
+
+    /// Keys of every paused task, sorted.
+    pub async fn paused_keys<C>(db: &C, table_config: &TableConfig) -> Result<Vec<String>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let key_col = quote_identifier(backend, "key");
+        let sql = format!(
+            "SELECT {key_col} FROM {table} WHERE {paused} IS NOT NULL ORDER BY {key_col} ASC",
+            table = quote_identifier(backend, &table_config.recurring_tasks),
+            paused = quote_identifier(backend, "paused_at"),
+        );
+        let rows = db.query_all(Statement::from_string(backend, sql)).await?;
+        rows.into_iter().map(|row| row.try_get("", "key")).collect()
+    }
+
+    fn placeholder(backend: DbBackend, idx: usize) -> String {
+        match backend {
+            DbBackend::Postgres => format!("${idx}"),
+            DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+        }
+    }
+}

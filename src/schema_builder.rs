@@ -686,3 +686,81 @@ where
         }
     }
 }
+
+/// Add the nullable `recurring_tasks.paused_at` column behind
+/// `AppContext::recurring_pause`. Idempotent: probes for the column first, and
+/// again after the `ALTER TABLE`, so losing a race with another process that
+/// adds it at the same time is not an error.
+pub async fn ensure_recurring_paused_at<C>(db: &C, table_config: &TableConfig) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let table = &table_config.recurring_tasks;
+    if column_exists(db, table, "paused_at").await {
+        return Ok(());
+    }
+
+    let backend = db.get_database_backend();
+    let stmt = Table::alter()
+        .table(tbl(table))
+        .add_column(ColumnDef::new(col("paused_at")).date_time().null())
+        .to_owned();
+    let sql = match backend {
+        DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
+        DbBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
+        DbBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+    };
+    let altered = db.execute(Statement::from_string(backend, sql)).await;
+
+    if column_exists(db, table, "paused_at").await {
+        return Ok(());
+    }
+    altered.map(|_| ()).and_then(|()| {
+        Err(DbErr::Custom(format!(
+            "column `paused_at` still missing on `{table}` after ALTER TABLE"
+        )))
+    })
+}
+
+/// Whether `recurring_tasks.paused_at` exists, without trying to add it.
+pub async fn recurring_paused_at_exists<C>(db: &C, table_config: &TableConfig) -> bool
+where
+    C: ConnectionTrait,
+{
+    column_exists(db, &table_config.recurring_tasks, "paused_at").await
+}
+
+/// Whether `table` has `column`, via the backend's catalog. A catalog lookup
+/// rather than a probing `SELECT column ... WHERE 1 = 0`: the probe would
+/// have to *fail* to report "missing", which logs an error on the PostgreSQL
+/// server and would poison any enclosing transaction — and on SQLite a
+/// double-quoted unknown column is silently read as a string literal, so it
+/// would not even fail. This runs repeatedly while the feature is
+/// unavailable, so it has to be quiet and cheap.
+async fn column_exists<C>(db: &C, table: &str, column: &str) -> bool
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DbBackend::Postgres => {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = ANY (current_schemas(false)) \
+             AND table_name = $1 AND column_name = $2 LIMIT 1"
+        }
+        DbBackend::MySql => {
+            "SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = DATABASE() \
+             AND table_name = ? AND column_name = ? LIMIT 1"
+        }
+        DbBackend::Sqlite => "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1",
+    };
+    let stmt = Statement::from_sql_and_values(backend, sql, [table.into(), column.into()]);
+    match db.query_one(stmt).await {
+        Ok(row) => row.is_some(),
+        Err(e) => {
+            tracing::debug!("column probe for {table}.{column} failed, assuming missing: {e}");
+            false
+        }
+    }
+}

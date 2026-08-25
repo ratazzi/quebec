@@ -441,6 +441,28 @@ pub struct AppContext {
     /// queue lists and wildcard prefixes keep Solid Queue's contract that queue
     /// order wins over priority. Naming and semantics may change.
     pub experimental_global_priority: bool,
+    /// Off by default: let recurring tasks be paused and resumed at runtime.
+    /// Solid Queue has no such state, so this adds a nullable
+    /// `recurring_tasks.paused_at` column — the one deliberate departure from
+    /// the Solid Queue schema, kept behind this switch so an unmodified Solid
+    /// Queue database keeps working exactly as before.
+    ///
+    /// When enabled, the column is added on `create_tables()` and when a
+    /// scheduler starts. Detection is per process (`recurring_pause_state`):
+    /// a Rails-managed schema without the column, or a role that cannot
+    /// `ALTER TABLE`, degrades to "unavailable" with a warning instead of
+    /// failing. Every Quebec write to `recurring_tasks` names its columns
+    /// explicitly, so Solid Queue reading or writing the table is unaffected.
+    /// Solid Queue's own scheduler ignores the pause and, on boot, upserts
+    /// *all* attributes of static tasks, which resets `paused_at` — pausing
+    /// only takes effect for Quebec's scheduler.
+    pub recurring_pause: bool,
+    /// Runtime state of `recurring_pause`, shared across clones of this
+    /// context: 0 unknown, 1 ready, 2 unavailable. See `ensure_recurring_pause`.
+    pub recurring_pause_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Unix seconds of the last column probe made while
+    /// `recurring_pause_state` is "unavailable"; throttles re-detection.
+    pub recurring_pause_probed_at: Arc<AtomicU64>,
     /// EXPERIMENTAL: per-class sliding-window rate limits. Empty means
     /// no class declared `rate_limit_max`; the worker claim path uses
     /// `.is_empty()` to skip the rate check path with zero overhead.
@@ -582,6 +604,19 @@ impl Drop for InFlightGuard {
 }
 
 /// Parse env var string as bool: true/1/yes → true, false/0/no → false
+/// How often a process whose `recurring_pause` probe failed looks again for
+/// the column. Bounds both the cost of a misconfigured deployment (one catalog
+/// lookup per interval, however many tasks or pages poll) and the delay before
+/// a column added elsewhere takes effect.
+const RECURRING_PAUSE_REPROBE_SECS: u64 = 5;
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn parse_bool_env(s: &str) -> Option<bool> {
     match s.to_lowercase().as_str() {
         "true" | "1" | "yes" => Some(true),
@@ -893,6 +928,9 @@ impl AppContext {
             if let Some(v) = get_bool("experimental_global_priority") {
                 ctx.experimental_global_priority = v;
             }
+            if let Some(v) = get_bool("recurring_pause") {
+                ctx.recurring_pause = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -1117,6 +1155,9 @@ impl AppContext {
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
             experimental_queue_concurrency: HashMap::new(),
             experimental_global_priority: false,
+            recurring_pause: false,
+            recurring_pause_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            recurring_pause_probed_at: Arc::new(AtomicU64::new(0)),
             rate_limited_classes: Arc::new(RwLock::new(HashMap::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
@@ -1304,6 +1345,9 @@ impl AppContext {
             concurrency_enabled: self.concurrency_enabled.clone(),
             experimental_queue_concurrency: self.experimental_queue_concurrency.clone(),
             experimental_global_priority: self.experimental_global_priority,
+            recurring_pause: self.recurring_pause,
+            recurring_pause_state: self.recurring_pause_state.clone(),
+            recurring_pause_probed_at: self.recurring_pause_probed_at.clone(),
             rate_limited_classes: self.rate_limited_classes.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
@@ -1342,6 +1386,82 @@ impl AppContext {
         }
         let conn = Database::connect(self.connect_options.clone()).await?;
         Ok(Arc::new(conn))
+    }
+
+    /// `ensure_recurring_pause` after forgetting an earlier failure: a fresh
+    /// ALTER attempt and a fresh warning. For explicit actions —
+    /// `create_tables()`, the Python API, a control-plane button — where an
+    /// attempt made before the tables existed must not leave the feature off
+    /// once they do, and the caller wants the current answer, not a throttled
+    /// one.
+    pub async fn reapply_recurring_pause<C>(&self, db: &C) -> bool
+    where
+        C: sea_orm::ConnectionTrait,
+    {
+        if self.recurring_pause_state.load(Ordering::Acquire) == 2 {
+            self.recurring_pause_state.store(0, Ordering::Release);
+        }
+        self.ensure_recurring_pause(db).await
+    }
+
+    /// Resolve `recurring_pause` against the database: add
+    /// `recurring_tasks.paused_at` if it is missing, then remember the outcome.
+    /// Free once ready (an atomic read), so hot paths — every scheduler tick,
+    /// every control-plane refresh — call it directly. Never fails: an
+    /// unusable schema is reported once and the feature stays off, except
+    /// that a column added later (by a DBA, or by `create_tables()` in another
+    /// process) is still picked up by a probe repeated at most every
+    /// `RECURRING_PAUSE_REPROBE_SECS`, so a pause set elsewhere is honoured
+    /// within that window instead of never.
+    pub async fn ensure_recurring_pause<C>(&self, db: &C) -> bool
+    where
+        C: sea_orm::ConnectionTrait,
+    {
+        if !self.recurring_pause {
+            return false;
+        }
+        match self.recurring_pause_state.load(Ordering::Acquire) {
+            1 => return true,
+            // No ALTER retry and no repeated warning here — only a throttled
+            // catalog lookup for a column that appeared since.
+            2 => {
+                let now = unix_now_secs();
+                let last = self.recurring_pause_probed_at.load(Ordering::Acquire);
+                if now.saturating_sub(last) < RECURRING_PAUSE_REPROBE_SECS {
+                    return false;
+                }
+                self.recurring_pause_probed_at.store(now, Ordering::Release);
+                let found =
+                    crate::schema_builder::recurring_paused_at_exists(db, &self.table_config).await;
+                if found {
+                    tracing::info!(
+                        "recurring_pause: `{}.paused_at` appeared, pausing is now available",
+                        self.table_config.recurring_tasks
+                    );
+                    self.recurring_pause_state.store(1, Ordering::Release);
+                }
+                return found;
+            }
+            _ => {}
+        }
+
+        let column = format!("{}.paused_at", self.table_config.recurring_tasks);
+        let ready = crate::schema_builder::ensure_recurring_paused_at(db, &self.table_config)
+            .await
+            .inspect(|()| tracing::info!("recurring_pause: `{column}` is ready"))
+            .inspect_err(|e| {
+                warn!(
+                    "recurring_pause: could not add `{column}` ({e}); pausing recurring tasks \
+                     is unavailable in this process. Add the nullable datetime column yourself \
+                     if Quebec is not allowed to ALTER TABLE."
+                )
+            })
+            .is_ok();
+        self.recurring_pause_probed_at
+            .store(unix_now_secs(), Ordering::Release);
+        self.recurring_pause_state
+            .store(if ready { 1 } else { 2 }, Ordering::Release);
+        ready
     }
 
     pub async fn get_db(&self) -> Result<Arc<DatabaseConnection>, DbErr> {
