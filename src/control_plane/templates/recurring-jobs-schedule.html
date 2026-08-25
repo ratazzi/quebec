@@ -1,3 +1,4 @@
+{% import "_recurring.html" as recurring %}
 {% for time in times %}
 <turbo-stream action="update" target="recurring-{{ time.id }}-last-run">
   <template>
@@ -20,7 +21,9 @@
 
 <turbo-stream action="update" target="recurring-{{ time.id }}-next-run">
   <template>
-    {% if time.next_run_at %}
+    {% if time.paused %}
+      <span class="text-gray-400">Paused</span>
+    {% elif time.next_run_at %}
       <span data-controller="timeago" data-timeago-datetime-value="{{ time.next_run_at }}"></span>
     {% else %}
       <span class="text-gray-400">-</span>
@@ -29,11 +32,25 @@
 </turbo-stream>
 <turbo-stream action="update" target="recurring-{{ time.id }}-next-run-m">
   <template>
-    {% if time.next_run_at %}
+    {% if time.paused %}
+      <span class="text-gray-400">Paused</span>
+    {% elif time.next_run_at %}
       <span data-controller="timeago" data-timeago-datetime-value="{{ time.next_run_at }}"></span>
     {% else %}
       <span class="text-gray-400">-</span>
     {% endif %}
   </template>
+</turbo-stream>
+<turbo-stream action="update" target="recurring-{{ time.id }}-state">
+  <template>{{ recurring::badge(paused_at=time.paused_at) }}</template>
+</turbo-stream>
+<turbo-stream action="update" target="recurring-{{ time.id }}-state-m">
+  <template>{{ recurring::badge(paused_at=time.paused_at) }}</template>
+</turbo-stream>
+<turbo-stream action="update" target="recurring-{{ time.id }}-actions">
+  <template>{{ recurring::actions(base_path=base_path, id=time.id, paused_at=time.paused_at, pausable=recurring_pause) }}</template>
+</turbo-stream>
+<turbo-stream action="update" target="recurring-{{ time.id }}-actions-m">
+  <template>{{ recurring::actions(base_path=base_path, id=time.id, paused_at=time.paused_at, pausable=recurring_pause, compact=true) }}</template>
 </turbo-stream>
 {% endfor %}

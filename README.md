@@ -464,6 +464,34 @@ Two things it does not change:
 - It only ever applies to `*`. Explicit queue lists (`["real_time", "background"]`) and wildcard prefixes (`"beta*"`) keep Solid Queue's contract that queue order takes precedence over `priority`.
 - Ordering and locking stay in one statement, so there is no window where the order is decided from rows another worker has already taken.
 
+### Pausing Recurring Tasks (opt-in)
+
+Recurring tasks can be paused and resumed at runtime — from Python or from the control plane's Recurring Jobs page — without editing `recurring.yml` or restarting the scheduler:
+
+```python
+qc = quebec.Quebec(db_url, recurring_pause=True)   # or QUEBEC_RECURRING_PAUSE=true
+
+qc.pause_recurring("nightly_report")      # True; False if it was already paused
+qc.recurring_paused("nightly_report")     # True
+qc.paused_recurring_tasks()               # ["nightly_report"]
+qc.resume_recurring("nightly_report")     # True; False if it was not paused
+```
+
+While paused, the scheduler skips each occurrence (nothing is enqueued, no `recurring_executions` row is written) and moves on to the next one. Resuming does not replay the skipped runs; the next occurrence after the resume fires as scheduled. `run_recurring_now()` still works on a paused task. Unknown keys raise `LookupError` — static tasks appear in the table once a scheduler has started.
+
+Solid Queue has no such state, so this is the one place Quebec extends its schema: enabling `recurring_pause` adds a nullable `paused_at` column to the recurring tasks table. It is added automatically by `create_tables()` and when a scheduler starts, and each process checks for it on its own. It is off by default so an unmodified Solid Queue database keeps working exactly as before; with it off, the column is not added even if it exists elsewhere, and the pause API raises `RuntimeError`.
+
+Sharing the database with a Rails app:
+
+- Solid Queue reads and writes the table as usual and leaves `paused_at` alone, with one exception: its **scheduler** upserts every attribute of the static tasks when it boots, which resets `paused_at`. Solid Queue's scheduler also ignores the pause, so pausing only takes effect when Quebec runs the scheduler.
+- If the connecting role is not allowed to `ALTER TABLE`, Quebec logs a warning and pausing is unavailable in that process until the column exists. Add it yourself in that case:
+
+  ```ruby
+  add_column :solid_queue_recurring_tasks, :paused_at, :datetime
+  ```
+
+  No restart is needed: a process whose attempt failed keeps looking for the column (a catalog lookup, at most every 5 seconds) and starts honouring pauses as soon as it appears. Explicit calls — `create_tables()`, the pause API, the control-plane buttons — retry the `ALTER` right away.
+
 ### TLS Configuration (PostgreSQL)
 
 Quebec links `sqlx` against `rustls` + `webpki-roots`. Public CAs (AWS RDS,

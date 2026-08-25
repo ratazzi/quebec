@@ -185,6 +185,11 @@ impl ControlPlane {
                 get(Self::recurring_jobs_schedule),
             )
             .route("/recurring-jobs/:id/run", post(Self::run_recurring_job_now))
+            .route("/recurring-jobs/:id/pause", post(Self::pause_recurring_job))
+            .route(
+                "/recurring-jobs/:id/resume",
+                post(Self::resume_recurring_job),
+            )
             .route("/finished-jobs", get(Self::finished_jobs))
             .route("/jobs/:id", get(Self::job_details))
             .route("/stats", get(Self::stats))

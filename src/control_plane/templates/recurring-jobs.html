@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_recurring.html" as recurring %}
 
 {% block title %}Recurring Jobs - Control Plane{% endblock %}
 
@@ -13,20 +14,18 @@
     <div class="rounded-lg border border-gray-200 p-4 space-y-2 text-sm">
       <div class="flex items-start justify-between gap-2">
         <div class="min-w-0">
-          <div class="font-medium text-gray-900 truncate">{{ task.key }}</div>
+          <div class="font-medium text-gray-900 truncate">
+            {{ task.key }}
+            <span id="recurring-{{ task.id }}-state-m">{{ recurring::badge(paused_at=task.paused_at) }}</span>
+          </div>
           <div class="text-xs text-gray-500">{{ task.class_name }}</div>
           {% if task.description %}
           <div class="text-xs text-gray-400">{{ task.description }}</div>
           {% endif %}
         </div>
-        <form action="{{ base_path }}/recurring-jobs/{{ task.id }}/run" method="post" class="shrink-0" data-turbo-frame="_top">
-          <button type="submit" aria-label="Run Now" title="Run Now" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
-            <svg class="h-4 w-4 sm:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
-              <polygon points="6 4 20 12 6 20 6 4"></polygon>
-            </svg>
-            <span class="hidden sm:inline">Run Now</span>
-          </button>
-        </form>
+        <div id="recurring-{{ task.id }}-actions-m" class="flex shrink-0 gap-1">
+          {{ recurring::actions(base_path=base_path, id=task.id, paused_at=task.paused_at, pausable=recurring_pause, compact=true) }}
+        </div>
       </div>
       <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
         <dt class="text-gray-500">Schedule</dt>
@@ -75,7 +74,10 @@
         {% for task in recurring_tasks %}
         <tr>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
-            <div class="text-sm font-medium text-gray-900">{{ task.key }}</div>
+            <div class="text-sm font-medium text-gray-900">
+              {{ task.key }}
+              <span id="recurring-{{ task.id }}-state">{{ recurring::badge(paused_at=task.paused_at) }}</span>
+            </div>
             <div class="text-sm text-gray-500">{{ task.class_name }}</div>
             {% if task.description %}
             <div class="text-xs text-gray-400">{{ task.description }}</div>
@@ -99,14 +101,9 @@
             </div>
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap text-right text-sm font-medium">
-            <form action="{{ base_path }}/recurring-jobs/{{ task.id }}/run" method="post" class="inline" data-turbo-frame="_top">
-              <button type="submit" aria-label="Run Now" title="Run Now" class="inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1">
-                <svg class="h-4 w-4 sm:hidden" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
-                  <polygon points="6 4 20 12 6 20 6 4"></polygon>
-                </svg>
-                <span class="hidden sm:inline">Run Now</span>
-              </button>
-            </form>
+            <div id="recurring-{{ task.id }}-actions" class="inline-flex gap-2">
+              {{ recurring::actions(base_path=base_path, id=task.id, paused_at=task.paused_at, pausable=recurring_pause) }}
+            </div>
           </td>
         </tr>
         {% endfor %}

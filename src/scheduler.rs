@@ -848,6 +848,38 @@ impl Scheduler {
             }
 
             let start_time = Instant::now();
+
+            // `recurring_pause`: a paused task skips this occurrence and moves
+            // on to the next one — nothing is enqueued and no
+            // recurring_execution is recorded, so resuming never catches up
+            // on missed runs. Checked at fire time rather than cached so a
+            // pause from any process takes effect on the very next tick.
+            // `ensure` rather than a flag so a column that appeared after a
+            // failed startup probe is picked up too (throttled, see there).
+            if ctx.ensure_recurring_pause(db.as_ref()).await {
+                match query_builder::recurring_tasks::find_paused_at(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &task_key,
+                )
+                .await
+                {
+                    Ok(Some(Some(paused_at))) => {
+                        info!(
+                            "Recurring task `{}' is paused since {}, skipping occurrence at {}",
+                            task_key, paused_at, scheduled_at
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    // Fail open: a lookup error must not silently stop the schedule.
+                    Err(e) => warn!(
+                        "Could not read pause state for recurring task `{}', enqueueing anyway: {}",
+                        task_key, e
+                    ),
+                }
+            }
+
             // enqueue_job opens its own transaction around just the DB writes;
             // the enqueue hooks it runs stay outside that transaction (see M5).
             let result = enqueue_job(&ctx, db.as_ref(), entry.clone(), scheduled_at)
@@ -952,6 +984,12 @@ impl Scheduler {
         let process = self.on_start(&db).await?;
         info!(">> Process started: {:?}", process);
         *self.process_id.lock().await = Some(process.id);
+
+        // Adds `recurring_tasks.paused_at` when `recurring_pause` is on and
+        // nobody ran `create_tables()` with it yet. Outside `sync_tasks_to_db`'s
+        // transaction on purpose: the column probe fails by design when the
+        // column is missing, which would poison a PostgreSQL transaction.
+        self.ctx.ensure_recurring_pause(&*db).await;
 
         let scheduled = Self::sync_tasks_to_db(&*db, &self.ctx.table_config, schedule).await?;
 
