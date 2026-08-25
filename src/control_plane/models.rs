@@ -212,6 +212,8 @@ pub struct RecurringTaskInfo {
     pub queue_name: String,
     pub priority: i32,
     pub description: Option<String>,
+    /// Formatted `paused_at`; `None` when running or when `recurring_pause` is off.
+    pub paused_at: Option<String>,
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
 }

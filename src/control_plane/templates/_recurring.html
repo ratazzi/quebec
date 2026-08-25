@@ -1,0 +1,55 @@
+{# Recurring task fragments shared by the page and its turbo-stream refresh
+   (recurring-jobs.html / recurring-jobs-schedule.html), so pause state
+   changed from anywhere — API, another browser — redraws the badge and the
+   Pause/Resume button on the next refresh instead of only "Next Run".
+
+   Usage:
+     {% import "_recurring.html" as recurring %}
+     {{ recurring::badge(paused_at=task.paused_at) }}
+     {{ recurring::actions(base_path=base_path, id=task.id, paused_at=task.paused_at, pausable=recurring_pause, compact=false) }}
+
+   `compact=true` renders icon-only buttons for the mobile cards. #}
+
+{% macro badge(paused_at) %}
+  {%- if paused_at -%}
+  <span class="ml-1 inline-flex items-center rounded-md bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-700" title="Paused since {{ paused_at }}">Paused</span>
+  {%- endif -%}
+{% endmacro badge %}
+
+{% macro actions(base_path, id, paused_at, pausable, compact=false) %}
+  {%- set outline = "inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-950 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-gray-200 bg-white hover:bg-gray-100 hover:text-gray-900 h-8 px-3 py-1" -%}
+  {%- set danger = "inline-flex items-center justify-center whitespace-nowrap rounded-md text-xs font-medium ring-offset-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-600 focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50 border border-red-300 bg-white text-red-700 hover:bg-red-50 h-8 px-3 py-1" -%}
+  {%- if pausable -%}
+    {%- if paused_at -%}
+    <form action="{{ base_path }}/recurring-jobs/{{ id }}/resume" method="post" class="inline" data-turbo-frame="_top">
+      <button type="submit" aria-label="Resume" title="Resume" class="{{ outline }}">
+        {%- if compact -%}
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+        {%- else -%}Resume{%- endif -%}
+      </button>
+    </form>
+    {%- else -%}
+    <form action="{{ base_path }}/recurring-jobs/{{ id }}/pause" method="post" class="inline" data-turbo-frame="_top">
+      <button type="submit" aria-label="Pause" title="Pause" class="{{ danger }}">
+        {%- if compact -%}
+        <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="6" y="4" width="4" height="16"></rect>
+          <rect x="14" y="4" width="4" height="16"></rect>
+        </svg>
+        {%- else -%}Pause{%- endif -%}
+      </button>
+    </form>
+    {%- endif -%}
+  {%- endif -%}
+  <form action="{{ base_path }}/recurring-jobs/{{ id }}/run" method="post" class="inline" data-turbo-frame="_top">
+    <button type="submit" aria-label="Run Now" title="Run Now" class="{{ outline }}">
+      {%- if compact -%}
+      <svg class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24" aria-hidden="true">
+        <polygon points="6 4 20 12 6 20 6 4"></polygon>
+      </svg>
+      {%- else -%}Run Now{%- endif -%}
+    </button>
+  </form>
+{% endmacro actions %}

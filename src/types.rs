@@ -2018,6 +2018,15 @@ impl PyQuebec {
                     .inspect_err(|err| error!("Failed to create tables: {:?}", err))
                     .is_ok();
 
+            if success {
+                // `recurring_pause` adds its column here so a fresh install
+                // has it before any scheduler starts. No-op when the switch
+                // is off; a failure is logged and leaves pausing unavailable.
+                // Re-applied rather than merely ensured: an API call made
+                // before the tables existed has already failed the probe.
+                self.ctx.reapply_recurring_pause(db.as_ref()).await;
+            }
+
             Ok(success)
         })
     }
@@ -3774,6 +3783,138 @@ impl PyQuebec {
         })
     }
 
+    /// Pause a recurring task so the scheduler skips its occurrences.
+    ///
+    /// Requires ``recurring_pause=True`` (or ``QUEBEC_RECURRING_PAUSE=true``),
+    /// which adds a nullable ``paused_at`` column to the recurring tasks
+    /// table. Skipped occurrences are not deferred: resuming does not catch
+    /// up on missed runs. ``run_recurring_now`` keeps working while paused.
+    /// Only Quebec's scheduler honours the pause — Solid Queue's ignores it
+    /// and resets it when it boots.
+    ///
+    /// Returns:
+    ///     bool: True if the task was paused, False if it was already paused.
+    ///
+    /// Raises:
+    ///     LookupError: no recurring task has this ``key`` (static tasks are
+    ///         written to the table when a scheduler starts).
+    ///     RuntimeError: ``recurring_pause`` is off, or the column could not
+    ///         be added (see the warning logged when that happened).
+    fn pause_recurring(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
+        let ctx = self.ctx.clone();
+        let key = key.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = require_recurring_pause(&ctx).await?;
+                let now = chrono::Utc::now().naive_utc();
+                let changed = crate::query_builder::recurring_tasks::set_paused_at(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &key,
+                    Some(now),
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to pause recurring task {key}: {e}"
+                    ))
+                })?;
+                if changed > 0 {
+                    return Ok(true);
+                }
+                recurring_task_exists(&ctx, db.as_ref(), &key).await?;
+                Ok(false)
+            })
+        })
+    }
+
+    /// Resume a paused recurring task. The next occurrence after now runs
+    /// as scheduled; occurrences skipped while paused are not replayed.
+    ///
+    /// Returns:
+    ///     bool: True if the task was resumed, False if it was not paused.
+    ///
+    /// Raises:
+    ///     LookupError: no recurring task has this ``key``.
+    ///     RuntimeError: ``recurring_pause`` is off or unavailable.
+    fn resume_recurring(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
+        let ctx = self.ctx.clone();
+        let key = key.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = require_recurring_pause(&ctx).await?;
+                let changed = crate::query_builder::recurring_tasks::set_paused_at(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &key,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to resume recurring task {key}: {e}"
+                    ))
+                })?;
+                if changed > 0 {
+                    return Ok(true);
+                }
+                recurring_task_exists(&ctx, db.as_ref(), &key).await?;
+                Ok(false)
+            })
+        })
+    }
+
+    /// Whether a recurring task is currently paused.
+    ///
+    /// Raises:
+    ///     LookupError: no recurring task has this ``key``.
+    ///     RuntimeError: ``recurring_pause`` is off or unavailable.
+    fn recurring_paused(&self, py: Python<'_>, key: &str) -> PyResult<bool> {
+        let ctx = self.ctx.clone();
+        let key = key.to_string();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = require_recurring_pause(&ctx).await?;
+                let state = crate::query_builder::recurring_tasks::find_paused_at(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &key,
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to read pause state of recurring task {key}: {e}"
+                    ))
+                })?;
+                state.map(|paused_at| paused_at.is_some()).ok_or_else(|| {
+                    pyo3::exceptions::PyLookupError::new_err(format!(
+                        "No recurring task with key {key:?}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Return the keys of all paused recurring tasks (sorted).
+    ///
+    /// Raises:
+    ///     RuntimeError: ``recurring_pause`` is off or unavailable.
+    fn paused_recurring_tasks(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.rt.block_on(async {
+                let db = require_recurring_pause(&ctx).await?;
+                crate::query_builder::recurring_tasks::paused_keys(db.as_ref(), &ctx.table_config)
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to list paused recurring tasks: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
     /// Enqueue a recurring task immediately, bypassing its cron schedule.
     ///
     /// Mirrors the control-plane ``POST /recurring-jobs/:id/run-now`` action,
@@ -4107,4 +4248,47 @@ fn resolve_quebec_from_cls(cls: &Bound<'_, PyType>) -> PyResult<PyQuebec> {
     };
     let attr = cls.getattr("quebec").map_err(|_| name_err())?;
     attr.extract::<PyQuebec>().map_err(|_| name_err())
+}
+
+/// Connection for the `recurring_pause` Python API, or a `RuntimeError`
+/// explaining why pausing is unavailable in this process.
+async fn require_recurring_pause(
+    ctx: &Arc<AppContext>,
+) -> PyResult<Arc<sea_orm::DatabaseConnection>> {
+    let db = ctx.get_db().await.map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Database connection failed: {e}"))
+    })?;
+    // An explicit call gets a fresh attempt (and a fresh warning on failure);
+    // the throttled `ensure` is for hot paths that poll.
+    if ctx.reapply_recurring_pause(db.as_ref()).await {
+        return Ok(db);
+    }
+    let reason = if ctx.recurring_pause {
+        "the `paused_at` column could not be added to the recurring tasks table; \
+         see the warning logged when Quebec tried"
+    } else {
+        "construct Quebec with recurring_pause=True or set QUEBEC_RECURRING_PAUSE=true"
+    };
+    Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "Pausing recurring tasks is not enabled: {reason}"
+    )))
+}
+
+/// `LookupError` unless a recurring task with this key exists.
+async fn recurring_task_exists(
+    ctx: &Arc<AppContext>,
+    db: &sea_orm::DatabaseConnection,
+    key: &str,
+) -> PyResult<()> {
+    crate::query_builder::recurring_tasks::find_paused_at(db, &ctx.table_config, key)
+        .await
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to look up recurring task {key}: {e}"
+            ))
+        })?
+        .map(|_| ())
+        .ok_or_else(|| {
+            pyo3::exceptions::PyLookupError::new_err(format!("No recurring task with key {key:?}"))
+        })
 }
