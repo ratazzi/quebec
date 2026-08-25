@@ -272,7 +272,11 @@ where
                         let mut inner = cell.borrow_mut();
                         inner.queue_name = routed_queue_name.to_string();
                         inner.arguments = params.to_string();
-                        inner.active_job_id = task_key.clone();
+                        // Same unique id persisted as `jobs.active_job_id` /
+                        // `provider_job_id`. The recurring task key stays in
+                        // the arguments envelope as `job_id` for Solid Queue
+                        // compatibility — do not leak it onto the instance.
+                        inner.active_job_id = active_job_id.clone();
                         inner.priority = priority;
                     }
 

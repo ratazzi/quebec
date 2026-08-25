@@ -426,6 +426,21 @@ pub struct AppContext {
     /// semantics may change. Use to isolate misbehaving queues during
     /// remediation. Queues not present here are unlimited.
     pub experimental_queue_concurrency: HashMap<String, i32>,
+    /// EXPERIMENTAL, off by default: keep `priority` global across queues when
+    /// a `*` worker has to skip something (a paused queue, or one whose
+    /// concurrency slot is full). Such a poll cannot stay a single unfiltered
+    /// query; the default behaviour matches Solid Queue and degrades into
+    /// per-queue polls, which order claims by queue rather than by priority.
+    /// When enabled, the poll instead filters with `queue_name IN (live)` and
+    /// keeps one global `ORDER BY priority, job_id`.
+    ///
+    /// Whether this is faster than the per-queue fallback depends on where the
+    /// backlog sits: it reads and sorts the live queues' rows, so it wins when
+    /// the skipped queues hold most of the backlog and loses when the live ones
+    /// do. Measure before enabling. Only affects the `*` selector — explicit
+    /// queue lists and wildcard prefixes keep Solid Queue's contract that queue
+    /// order wins over priority. Naming and semantics may change.
+    pub experimental_global_priority: bool,
     /// EXPERIMENTAL: per-class sliding-window rate limits. Empty means
     /// no class declared `rate_limit_max`; the worker claim path uses
     /// `.is_empty()` to skip the rate check path with zero overhead.
@@ -875,6 +890,9 @@ impl AppContext {
             if let Some(v) = get_bool("quiet_then_exit") {
                 ctx.quiet_then_exit = v;
             }
+            if let Some(v) = get_bool("experimental_global_priority") {
+                ctx.experimental_global_priority = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -1098,6 +1116,7 @@ impl AppContext {
             runnables: Arc::new(RwLock::new(HashMap::new())),
             concurrency_enabled: Arc::new(RwLock::new(HashSet::new())),
             experimental_queue_concurrency: HashMap::new(),
+            experimental_global_priority: false,
             rate_limited_classes: Arc::new(RwLock::new(HashMap::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
@@ -1284,6 +1303,7 @@ impl AppContext {
             runnables: self.runnables.clone(),
             concurrency_enabled: self.concurrency_enabled.clone(),
             experimental_queue_concurrency: self.experimental_queue_concurrency.clone(),
+            experimental_global_priority: self.experimental_global_priority,
             rate_limited_classes: self.rate_limited_classes.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),

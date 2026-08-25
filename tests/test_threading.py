@@ -36,7 +36,9 @@ class BlockingExecution(FakeExecution):
         super().perform()
 
 
-def _join_queue_in_thread(work_queue: queue.Queue) -> tuple[threading.Thread, threading.Event]:
+def _join_queue_in_thread(
+    work_queue: queue.Queue,
+) -> tuple[threading.Thread, threading.Event]:
     joined = threading.Event()
 
     def join_queue() -> None:

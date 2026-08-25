@@ -9,6 +9,7 @@ row-lock contention. These tests fire the exact scheduler enqueue path via
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import text
@@ -42,6 +43,24 @@ class RecurringSkipHookJob(quebec.BaseClass):
         # A generator that never yields -> enqueue is skipped.
         if False:
             yield
+
+    def perform(self, *args, **kwargs) -> None:
+        return None
+
+
+class RecurringJidHookJob(quebec.BaseClass):
+    seen: dict[str, str] = {}
+
+    def before_enqueue(self) -> None:
+        type(self).seen["before"] = self.active_job_id
+
+    def around_enqueue(self):
+        type(self).seen["around_before"] = self.active_job_id
+        yield
+        type(self).seen["around_after"] = self.active_job_id
+
+    def after_enqueue(self) -> None:
+        type(self).seen["after"] = self.active_job_id
 
     def perform(self, *args, **kwargs) -> None:
         return None
@@ -122,6 +141,36 @@ def test_recurring_enqueue_runs_all_hooks(qc_with_sqlalchemy, db_assert) -> None
         "after",
     ]
     assert db_assert.count_ready_executions() == 1
+
+
+def test_recurring_enqueue_hooks_see_persisted_active_job_id(
+    qc_with_sqlalchemy,
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    RecurringJidHookJob.seen = {}
+    qc.register_job(RecurringJidHookJob)
+
+    task_key = "recurring_hook_jid"
+    _seed_recurring_task(session, prefix, task_key, RecurringJidHookJob.__qualname__)
+
+    assert qc.run_recurring_now(task_key) is True
+
+    persisted = session.execute(
+        text(f"SELECT active_job_id FROM {prefix}_jobs")
+    ).scalar_one()
+    payload = json.loads(
+        session.execute(text(f"SELECT arguments FROM {prefix}_jobs")).scalar_one()
+    )
+
+    assert RecurringJidHookJob.seen["before"] == persisted
+    assert RecurringJidHookJob.seen["around_before"] == persisted
+    assert RecurringJidHookJob.seen["around_after"] == persisted
+    assert RecurringJidHookJob.seen["after"] == persisted
+    assert RecurringJidHookJob.seen["before"] != task_key
+    assert payload["provider_job_id"] == persisted
 
 
 def test_recurring_enqueue_post_hook_runs_after_transaction_commits(

@@ -97,6 +97,22 @@ enum RateGateResult {
     Routed,
 }
 
+/// Outcome of running a candidate past the claim-time gates.
+///
+/// Used by the `experimental_global_priority` poll, which needs to tell "this
+/// queue is done for now" apart from "this row went away": the first shrinks
+/// the queue list it polls with, the second only means re-poll.
+enum CandidateGate {
+    /// Clear to claim.
+    Accept,
+    /// The queue's concurrency slot is full, so nothing else in this queue can
+    /// be claimed on this poll either.
+    QueueExhausted,
+    /// The rate limiter routed the candidate out of `ready_executions`. The
+    /// queue itself is still open.
+    Dropped,
+}
+
 #[pyclass(name = "Runnable", subclass)]
 #[derive(Debug)]
 pub struct Runnable {
@@ -2893,6 +2909,78 @@ impl Worker {
                         }};
                     }
 
+                    // EXPERIMENTAL (`experimental_global_priority`, off by
+                    // default): poll the live queues in one query that keeps a
+                    // single global ORDER BY, instead of one query per queue.
+                    // A queue whose slot turns out to be full is dropped from
+                    // the list and the poll is retried — shrinking an `IN` list
+                    // is free, whereas expressing the same exclusion as
+                    // `NOT IN` would cost a full scan of the excluded queue's
+                    // backlog.
+                    macro_rules! try_claim_in_queues {
+                        ($queues:expr) => {{
+                            let mut live: Vec<&str> = $queues;
+                            loop {
+                                if live.is_empty() {
+                                    break;
+                                }
+                                let record =
+                                    query_builder::ready_executions::find_many_in_queues_for_update(
+                                        txn,
+                                        &table_config,
+                                        &live,
+                                        use_skip_locked,
+                                        1,
+                                    )
+                                    .await?
+                                    .into_iter()
+                                    .next();
+                                let Some(execution) = record else { break };
+
+                                match Self::gate_candidate(
+                                    &ctx,
+                                    txn,
+                                    &table_config,
+                                    &execution,
+                                    queue_concurrency_enabled,
+                                    rate_limit_enabled,
+                                )
+                                .await?
+                                {
+                                    CandidateGate::QueueExhausted => {
+                                        let before = live.len();
+                                        live.retain(|q| *q != execution.queue_name.as_str());
+                                        // The DB matched a name Rust does not
+                                        // (e.g. a case-insensitive MySQL
+                                        // collation folding `Foo` and `foo`):
+                                        // re-polling would return this same
+                                        // row forever.
+                                        if live.len() == before {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    // The row left ready_executions, so the
+                                    // same poll now surfaces the next one.
+                                    CandidateGate::Dropped => continue,
+                                    CandidateGate::Accept => {}
+                                }
+
+                                if let Some(claimed) = Self::claim_execution(
+                                    txn,
+                                    &table_config,
+                                    &execution,
+                                    process_id,
+                                )
+                                .await?
+                                {
+                                    return Ok(Some(claimed));
+                                }
+                                break;
+                            }
+                        }};
+                    }
+
                     for (is_wildcard, pattern) in queue_patterns {
                         let mut throttled: Vec<String> = Vec::new();
 
@@ -2937,14 +3025,20 @@ impl Worker {
                                         &table_config,
                                     )
                                     .await?;
+                                let live: Vec<&str> = all_queues
+                                    .iter()
+                                    .filter(|q| {
+                                        !paused_queues.contains(*q) && !throttled.contains(*q)
+                                    })
+                                    .map(|q| q.as_str())
+                                    .collect();
 
-                                for queue_name in &all_queues {
-                                    if paused_queues.contains(queue_name)
-                                        || throttled.contains(queue_name)
-                                    {
-                                        continue;
+                                if ctx.experimental_global_priority {
+                                    try_claim_in_queues!(live);
+                                } else {
+                                    for queue_name in live {
+                                        try_claim_one!(Some(queue_name), &mut throttled);
                                     }
-                                    try_claim_one!(Some(queue_name.as_str()), &mut throttled);
                                 }
                             }
                         }
@@ -3156,6 +3250,121 @@ impl Worker {
                         }};
                     }
 
+                    // EXPERIMENTAL (`experimental_global_priority`, off by
+                    // default): batch counterpart of `try_claim_in_queues!`.
+                    // One query per round over the whole live queue list, so
+                    // the batch is filled in global (priority, job_id) order
+                    // rather than queue by queue. A round is repeated only when
+                    // it changed something the next query would see: a queue
+                    // dropped for a full slot, or a row routed away by the rate
+                    // limiter. Accepted rows are claimed before the retry, so
+                    // they cannot come back.
+                    macro_rules! claim_in_queues {
+                        ($queues:expr) => {{
+                            let mut live: Vec<&str> = $queues;
+                            loop {
+                                if remaining == 0 || live.is_empty() {
+                                    break;
+                                }
+                                let requested = remaining;
+                                let records =
+                                    query_builder::ready_executions::find_many_in_queues_for_update(
+                                        txn,
+                                        &table_config,
+                                        &live,
+                                        use_skip_locked,
+                                        requested,
+                                    )
+                                    .await?;
+                                if records.is_empty() {
+                                    break;
+                                }
+                                let exhausted = (records.len() as u64) < requested;
+
+                                let mut accepted: Vec<&quebec_ready_executions::Model> = Vec::new();
+                                let mut retry_worthwhile = false;
+                                if !queue_concurrency_enabled && !rate_limit_enabled {
+                                    accepted.extend(records.iter());
+                                } else {
+                                    for record in &records {
+                                        // Either the queue was dropped earlier
+                                        // in this batch, or the DB matched a
+                                        // name Rust does not (a case-insensitive
+                                        // MySQL collation folding `Foo` and
+                                        // `foo`). Gating it again is wasted
+                                        // work at best; counting it as a retry
+                                        // would re-poll the same row forever.
+                                        if !live.contains(&record.queue_name.as_str()) {
+                                            continue;
+                                        }
+                                        match Self::gate_candidate(
+                                            &ctx,
+                                            txn,
+                                            &table_config,
+                                            record,
+                                            queue_concurrency_enabled,
+                                            rate_limit_enabled,
+                                        )
+                                        .await?
+                                        {
+                                            CandidateGate::QueueExhausted => {
+                                                live.retain(|q| *q != record.queue_name.as_str());
+                                                retry_worthwhile = true;
+                                            }
+                                            CandidateGate::Dropped => retry_worthwhile = true,
+                                            CandidateGate::Accept => accepted.push(record),
+                                        }
+                                    }
+                                }
+
+                                if !accepted.is_empty() {
+                                    let now = chrono::Utc::now().naive_utc();
+                                    let insert_data: Vec<(
+                                        i64,
+                                        Option<i64>,
+                                        chrono::NaiveDateTime,
+                                    )> = accepted
+                                        .iter()
+                                        .map(|r| (r.job_id, process_id, now))
+                                        .collect();
+                                    let ready_ids: Vec<i64> =
+                                        accepted.iter().map(|r| r.id).collect();
+                                    let job_ids: Vec<i64> =
+                                        accepted.iter().map(|r| r.job_id).collect();
+
+                                    let mut claimed =
+                                        query_builder::claimed_executions::insert_all_returning(
+                                            txn,
+                                            &table_config,
+                                            &insert_data,
+                                        )
+                                        .await?;
+                                    query_builder::ready_executions::delete_by_ids(
+                                        txn,
+                                        &table_config,
+                                        &ready_ids,
+                                    )
+                                    .await?;
+
+                                    let order_map: std::collections::HashMap<i64, usize> = job_ids
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, &id)| (id, i))
+                                        .collect();
+                                    claimed.sort_by_key(|c| {
+                                        order_map.get(&c.job_id).copied().unwrap_or(usize::MAX)
+                                    });
+                                    claimed_jobs.extend(claimed);
+                                    remaining = remaining.saturating_sub(accepted.len() as u64);
+                                }
+
+                                if exhausted || !retry_worthwhile {
+                                    break;
+                                }
+                            }
+                        }};
+                    }
+
                     for (is_wildcard, pattern) in queue_patterns {
                         if remaining == 0 {
                             break;
@@ -3208,17 +3417,23 @@ impl Worker {
                                         &table_config,
                                     )
                                     .await?;
+                                let live: Vec<&str> = all_queues
+                                    .iter()
+                                    .filter(|q| {
+                                        !paused_queues.contains(*q) && !throttled.contains(*q)
+                                    })
+                                    .map(|q| q.as_str())
+                                    .collect();
 
-                                for queue_name in &all_queues {
-                                    if remaining == 0 {
-                                        break;
+                                if ctx.experimental_global_priority {
+                                    claim_in_queues!(live);
+                                } else {
+                                    for queue_name in live {
+                                        if remaining == 0 {
+                                            break;
+                                        }
+                                        claim_from_queue!(Some(queue_name), &mut throttled);
                                     }
-                                    if paused_queues.contains(queue_name)
-                                        || throttled.contains(queue_name)
-                                    {
-                                        continue;
-                                    }
-                                    claim_from_queue!(Some(queue_name.as_str()), &mut throttled);
                                 }
                             }
                         }
@@ -4104,6 +4319,48 @@ impl Worker {
     /// the slot was acquired; `Ok(false)` when the queue is throttled and
     /// no slot is currently free.
     ///
+    /// Run one candidate past the queue-concurrency and rate-limit gates.
+    ///
+    /// Keeps the slot bookkeeping — including handing back a slot taken just
+    /// before the rate limiter routes the row away — in one place. On `Accept`
+    /// the caller owns any acquired slot and must claim the row; the slot is
+    /// released later by `after_executed`.
+    async fn gate_candidate<C>(
+        ctx: &Arc<AppContext>,
+        txn: &C,
+        table_config: &TableConfig,
+        execution: &quebec_ready_executions::Model,
+        queue_concurrency_enabled: bool,
+        rate_limit_enabled: bool,
+    ) -> std::result::Result<CandidateGate, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let mut queue_slot_held = false;
+        if queue_concurrency_enabled {
+            if !Self::try_acquire_queue_slot(ctx, txn, table_config, &execution.queue_name).await? {
+                return Ok(CandidateGate::QueueExhausted);
+            }
+            queue_slot_held = true;
+        }
+
+        if rate_limit_enabled {
+            if let RateGateResult::Routed =
+                Self::try_consume_rate_for_candidate(ctx, txn, table_config, execution).await?
+            {
+                // The row left ready_executions, so `after_executed` will never
+                // fire for it — hand the slot back or it leaks until the TTL
+                // sweep.
+                if queue_slot_held {
+                    Self::release_queue_slot(ctx, txn, table_config, &execution.queue_name).await?;
+                }
+                return Ok(CandidateGate::Dropped);
+            }
+        }
+
+        Ok(CandidateGate::Accept)
+    }
+
     /// Zero-overhead fast path when the override map is empty: a single
     /// `is_empty()` check returns immediately, skipping the per-queue
     /// HashMap lookup, hash, and async work.

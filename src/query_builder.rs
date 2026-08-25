@@ -1256,6 +1256,82 @@ pub mod ready_executions {
             .await
     }
 
+    /// Find ready executions restricted to a set of queues, ordered globally by
+    /// `(priority, job_id)`, with FOR UPDATE SKIP LOCKED.
+    ///
+    /// The third poll shape, used only by `experimental_global_priority`.
+    /// Solid Queue sticks to two — unfiltered, or a single `queue_name = ?` —
+    /// so that a covering index is always usable. This one keeps one global
+    /// ORDER BY while still excluding queues, at the cost of a plan that
+    /// depends on data distribution: PostgreSQL either walks
+    /// `(queue_name, priority, job_id)` per listed queue and sorts the union
+    /// (cheap when the live queues are shallow), or walks
+    /// `(priority, job_id)` and filters (cheap when the excluded queues are
+    /// shallow). Callers should measure on their own distribution.
+    ///
+    /// `queues` must be non-empty; an empty list would produce `IN ()`, which
+    /// is a syntax error on MySQL. Emitted as an expanded `IN (?, ?, ...)`
+    /// rather than PostgreSQL's `= ANY($1)` — the planner lowers both to the
+    /// same ScalarArrayOpExpr, and the expanded form works on all three
+    /// backends.
+    pub async fn find_many_in_queues_for_update<C>(
+        db: &C,
+        table_config: &TableConfig,
+        queues: &[&str],
+        use_skip_locked: bool,
+        limit: u64,
+    ) -> Result<Vec<quebec_ready_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if queues.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table_name = &table_config.ready_executions;
+        let backend = db.get_database_backend();
+        let mut params: Vec<sea_orm::Value> = Vec::new();
+
+        let placeholder = |idx: usize| -> String {
+            match backend {
+                DbBackend::Postgres => format!("${idx}"),
+                DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+            }
+        };
+
+        let (q, tq) = match backend {
+            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
+            DbBackend::MySql => ('`', '`'),
+        };
+
+        let placeholders: Vec<String> = queues
+            .iter()
+            .map(|queue_name| {
+                params.push((*queue_name).into());
+                placeholder(params.len())
+            })
+            .collect();
+
+        let lock_clause = if use_skip_locked && backend != DbBackend::Sqlite {
+            "FOR UPDATE SKIP LOCKED"
+        } else {
+            ""
+        };
+
+        params.push((limit as i64).into());
+        let limit_placeholder = placeholder(params.len());
+        let queue_list = placeholders.join(", ");
+
+        let sql = format!(
+            r#"SELECT * FROM {tq}{table_name}{tq} WHERE {q}queue_name{q} IN ({queue_list}) ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_placeholder} {lock_clause}"#
+        );
+
+        let stmt = Statement::from_sql_and_values(backend, sql, params);
+        quebec_ready_executions::Model::find_by_statement(stmt)
+            .all(db)
+            .await
+    }
+
     /// Find distinct queue names matching a pattern (for wildcard expansion)
     pub async fn find_matching_queue_names<C>(
         db: &C,
