@@ -2948,7 +2948,16 @@ impl Worker {
                                 .await?
                                 {
                                     CandidateGate::QueueExhausted => {
+                                        let before = live.len();
                                         live.retain(|q| *q != execution.queue_name.as_str());
+                                        // The DB matched a name Rust does not
+                                        // (e.g. a case-insensitive MySQL
+                                        // collation folding `Foo` and `foo`):
+                                        // re-polling would return this same
+                                        // row forever.
+                                        if live.len() == before {
+                                            break;
+                                        }
                                         continue;
                                     }
                                     // The row left ready_executions, so the
@@ -3278,6 +3287,16 @@ impl Worker {
                                     accepted.extend(records.iter());
                                 } else {
                                     for record in &records {
+                                        // Either the queue was dropped earlier
+                                        // in this batch, or the DB matched a
+                                        // name Rust does not (a case-insensitive
+                                        // MySQL collation folding `Foo` and
+                                        // `foo`). Gating it again is wasted
+                                        // work at best; counting it as a retry
+                                        // would re-poll the same row forever.
+                                        if !live.contains(&record.queue_name.as_str()) {
+                                            continue;
+                                        }
                                         match Self::gate_candidate(
                                             &ctx,
                                             txn,

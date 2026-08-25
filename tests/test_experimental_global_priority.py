@@ -14,6 +14,8 @@ alone.
 
 from __future__ import annotations
 
+import sqlite3
+import threading
 from datetime import timedelta
 
 import pytest
@@ -300,3 +302,50 @@ def test_wildcard_prefix_keeps_queue_order(wildcard_qc) -> None:
         "wildcard expansion must keep queue order ahead of priority"
     )
     first.perform()
+
+
+def test_batch_stops_when_db_collation_folds_queue_names(db_url, test_prefix) -> None:
+    """The `IN` list is shrunk by exact Rust string comparison, but the DB
+    matches names under its own collation. A case-insensitive collation (the
+    MySQL default) folds `Foo` and `foo` into one distinct name, so a full
+    `Foo` slot cannot be removed from a list that only holds `foo`. The batch
+    must notice the list did not shrink and stop instead of re-polling the
+    same row forever. SQLite reproduces this with `COLLATE NOCASE`.
+    """
+    assert db_url.startswith("sqlite:///")
+    path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            f'CREATE TABLE "{test_prefix}_ready_executions" ('
+            '"id" integer PRIMARY KEY AUTOINCREMENT, '
+            '"job_id" bigint NOT NULL UNIQUE, '
+            '"queue_name" varchar NOT NULL COLLATE NOCASE, '
+            '"priority" integer NOT NULL DEFAULT 0, '
+            '"created_at" datetime_text NOT NULL, '
+            f'FOREIGN KEY ("job_id") REFERENCES "{test_prefix}_jobs" ("id") '
+            "ON DELETE CASCADE ON UPDATE NO ACTION)"
+        )
+
+    qc = _qc(db_url, test_prefix, experimental_queue_concurrency={"Foo": 1})
+    try:
+        PriorityJob.set(queue="Foo", priority=-200).perform_later(qc, 0)
+        held = qc.drain_one()
+        assert held.queue == "Foo"  # the only `Foo` slot is now taken
+
+        PriorityJob.set(queue="foo", priority=-100).perform_later(qc, 1)
+        PriorityJob.set(queue="Foo", priority=0).perform_later(qc, 2)
+        PriorityJob.set(queue="foo", priority=100).perform_later(qc, 3)
+        assert qc.pause_queue("some_other_queue") is True
+
+        result: list[str] = []
+
+        def drain() -> None:
+            result.extend(e.queue for e in qc.drain_batch(3))
+
+        worker = threading.Thread(target=drain, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), "batch claim looped forever on a folded name"
+        assert result == ["foo", "foo"]
+    finally:
+        qc.close()
