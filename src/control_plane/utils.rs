@@ -231,6 +231,18 @@ impl ControlPlane {
                 if path.starts_with("//") {
                     return None;
                 }
+                // A Referer is client-controlled. Only reuse it when it points
+                // inside this control-plane mount; otherwise the prefixed
+                // fallback below keeps the redirect within the dashboard.
+                let base_path = self.base_path.trim_end_matches('/');
+                let inside_mount = base_path.is_empty()
+                    || path == base_path
+                    || path
+                        .strip_prefix(base_path)
+                        .is_some_and(|suffix| suffix.starts_with('/'));
+                if !inside_mount {
+                    return None;
+                }
                 let mut target = path.to_string();
                 if drop_page {
                     let mut ser = url::form_urlencoded::Serializer::new(String::new());

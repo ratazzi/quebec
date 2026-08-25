@@ -76,6 +76,14 @@ def test_scheduled_job_cancel_redirects_within_the_mount(
     assert location == f"{BASE}/scheduled-jobs"
 
 
+def test_recurring_run_now_redirects_within_the_mount(qc) -> None:
+    # The action redirects even when the row is stale/missing, which is enough
+    # to exercise its Location without seeding a recurring schedule.
+    status, location = _request(qc, "POST", "/recurring-jobs/999/run")
+    assert status == 303
+    assert location == f"{BASE}/recurring-jobs"
+
+
 def test_failed_job_actions_fall_back_within_the_mount(qc) -> None:
     """Without a Referer the fallback path is app-relative and must be
     prefixed; with one, the browser already sent the prefixed URL and it is
@@ -102,5 +110,26 @@ def test_failed_job_actions_fall_back_within_the_mount(qc) -> None:
 
 def test_blocked_job_actions_fall_back_within_the_mount(qc) -> None:
     status, location = _request(qc, "POST", "/blocked-jobs/all/unblock")
+    assert status == 303
+    assert location == f"{BASE}/blocked-jobs"
+
+
+@pytest.mark.parametrize(
+    "referer",
+    [
+        "http://example.test/blocked-jobs",
+        "https://other.test/blocked-jobs",
+        "not a URL",
+    ],
+)
+def test_referer_outside_the_mount_uses_the_prefixed_fallback(
+    qc, referer
+) -> None:
+    status, location = _request(
+        qc,
+        "POST",
+        "/blocked-jobs/all/unblock",
+        {"Referer": referer},
+    )
     assert status == 303
     assert location == f"{BASE}/blocked-jobs"
