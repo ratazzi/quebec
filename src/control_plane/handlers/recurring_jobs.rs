@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, Response},
 };
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use std::sync::Arc;
@@ -105,17 +105,17 @@ impl ControlPlane {
     pub async fn pause_recurring_job(
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         Self::set_recurring_job_paused(&state, id, true).await;
-        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
+        state.redirect_to("/recurring-jobs")
     }
 
     pub async fn resume_recurring_job(
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         Self::set_recurring_job_paused(&state, id, false).await;
-        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
+        state.redirect_to("/recurring-jobs")
     }
 
     /// Both actions are idempotent, so a stale page posting the same state
@@ -151,11 +151,11 @@ impl ControlPlane {
     pub async fn run_recurring_job_now(
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
-    ) -> impl IntoResponse {
+    ) -> Response {
         if let Err(e) = Self::do_run_recurring_job(&state, id).await {
             error!("Failed to run recurring job {}: {}", id, e);
         }
-        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
+        state.redirect_to("/recurring-jobs")
     }
 
     async fn do_run_recurring_job(state: &Arc<ControlPlane>, id: i64) -> crate::error::Result<()> {

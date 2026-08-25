@@ -180,7 +180,7 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
-        let redirect = Self::referer_or(&headers, "/blocked-jobs");
+        let redirect = state.referer_or(&headers, "/blocked-jobs");
 
         match db
             .transaction::<_, (), DbErr>(|txn| {
@@ -229,7 +229,7 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
-        let redirect = Self::referer_or(&headers, "/blocked-jobs");
+        let redirect = state.referer_or(&headers, "/blocked-jobs");
 
         match db
             .transaction::<_, i64, DbErr>(|txn| {
@@ -280,7 +280,7 @@ impl ControlPlane {
         };
         let db = db.as_ref();
         let table_config = state.ctx.table_config.clone();
-        let redirect = Self::referer_without_page_or(&headers, "/blocked-jobs");
+        let redirect = state.referer_without_page_or(&headers, "/blocked-jobs");
         let class_name = pagination.class_name.clone();
         let queue_name = pagination.queue_name.clone();
 
