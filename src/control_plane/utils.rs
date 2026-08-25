@@ -207,17 +207,20 @@ impl ControlPlane {
     }
 
     /// Extract path+query from Referer header, falling back to default_path
-    pub fn referer_or(headers: &HeaderMap, default_path: &str) -> String {
-        Self::referer_or_inner(headers, default_path, false)
+    pub fn referer_or(&self, headers: &HeaderMap, default_path: &str) -> String {
+        self.referer_or_inner(headers, default_path, false)
     }
 
     /// Like [`referer_or`] but strips any `page` query parameter, so bulk actions
     /// that shrink the result set won't bounce the user onto an out-of-range page.
-    pub fn referer_without_page_or(headers: &HeaderMap, default_path: &str) -> String {
-        Self::referer_or_inner(headers, default_path, true)
+    pub fn referer_without_page_or(&self, headers: &HeaderMap, default_path: &str) -> String {
+        self.referer_or_inner(headers, default_path, true)
     }
 
-    fn referer_or_inner(headers: &HeaderMap, default_path: &str, drop_page: bool) -> String {
+    /// The Referer already carries the mount prefix (the browser sends the
+    /// full URL); only the fallback is an app-relative path that needs
+    /// `base_path` prepended.
+    fn referer_or_inner(&self, headers: &HeaderMap, default_path: &str, drop_page: bool) -> String {
         headers
             .get(header::REFERER)
             .and_then(|v| v.to_str().ok())
@@ -249,7 +252,20 @@ impl ControlPlane {
                 }
                 Some(target)
             })
-            .unwrap_or_else(|| default_path.to_string())
+            .unwrap_or_else(|| self.prefixed(default_path))
+    }
+
+    /// An app-relative path (`/queues`) as the browser must request it,
+    /// with the mount prefix in front. Handlers see paths with the prefix
+    /// already stripped, so every redirect target they build from scratch
+    /// goes through here.
+    pub fn prefixed(&self, path: &str) -> String {
+        format!("{}{}", self.base_path, path)
+    }
+
+    /// 303 to an app-relative path, prefixed with `base_path`.
+    pub fn redirect_to(&self, path: &str) -> Response {
+        Self::redirect_back(&self.prefixed(path))
     }
 
     /// Return a 500 Internal Server Error response

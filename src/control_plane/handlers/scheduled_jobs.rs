@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{Html, Response},
 };
 use sea_orm::{ConnectionTrait, DbErr, Statement, TransactionTrait, Value};
 use std::sync::Arc;
@@ -291,7 +291,7 @@ impl ControlPlane {
             .await;
 
         match txn_result {
-            Ok(_) => Redirect::to("/scheduled-jobs").into_response(),
+            Ok(_) => state.redirect_to("/scheduled-jobs"),
             Err(e) => {
                 error!("Failed to cancel scheduled job {}: {}", id, e);
                 Self::error_response()
