@@ -4,7 +4,13 @@ Quebec is a simple background task queue for processing asynchronous tasks. The 
 
 This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 
-> **Warning:** This project is in early development stage. Not recommended for production use.
+> [!NOTE]
+> **Project status: Production-tested beta.** Quebec is actively maintained and has
+> been running in the maintainers' own production projects since April 2026, with no
+> known stability issues. Its core job-processing APIs are suitable for production
+> deployments. The project remains pre-1.0, so pin the version you deploy and review
+> changes before upgrading. APIs and configuration explicitly marked **experimental**
+> may still change between minor releases.
 
 ## Why Quebec?
 
