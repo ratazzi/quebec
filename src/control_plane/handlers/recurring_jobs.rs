@@ -29,6 +29,11 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
 
+        // `paused_at` only exists once `recurring_pause` added it; selecting
+        // it unconditionally would break the page on a plain Solid Queue schema.
+        let pausable = state.ctx.ensure_recurring_pause(db).await;
+        let paused_column = if pausable { ", rt.paused_at" } else { "" };
+
         // Get all recurring tasks (times are loaded separately via /recurring-jobs/times)
         let sql = clean_sql(&format!(
             "SELECT
@@ -38,10 +43,10 @@ impl ControlPlane {
                 rt.schedule,
                 rt.queue_name,
                 rt.priority,
-                rt.description
+                rt.description{}
             FROM {} rt
             ORDER BY rt.key ASC",
-            table_config.recurring_tasks
+            paused_column, table_config.recurring_tasks
         ));
 
         let result = db
@@ -60,6 +65,14 @@ impl ControlPlane {
                 .unwrap_or_else(|_| "default".to_string());
             let priority: i32 = row.try_get("", "priority").unwrap_or(0);
             let description: Option<String> = row.try_get("", "description").ok();
+            let paused_at = pausable
+                .then(|| {
+                    row.try_get::<Option<chrono::NaiveDateTime>>("", "paused_at")
+                        .ok()
+                        .flatten()
+                })
+                .flatten()
+                .map(Self::format_naive_datetime);
 
             tasks.push(RecurringTaskInfo {
                 id,
@@ -69,6 +82,7 @@ impl ControlPlane {
                 queue_name,
                 priority,
                 description,
+                paused_at,
                 last_run_at: None,
                 next_run_at: None,
             });
@@ -78,6 +92,7 @@ impl ControlPlane {
 
         let mut context = tera::Context::new();
         context.insert("recurring_tasks", &tasks);
+        context.insert("recurring_pause", &pausable);
         context.insert("active_page", "recurring-jobs");
 
         let html = state
@@ -87,6 +102,52 @@ impl ControlPlane {
         Ok(Html(html))
     }
 
+    pub async fn pause_recurring_job(
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
+    ) -> impl IntoResponse {
+        Self::set_recurring_job_paused(&state, id, true).await;
+        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
+    }
+
+    pub async fn resume_recurring_job(
+        State(state): State<Arc<ControlPlane>>,
+        Path(id): Path<i64>,
+    ) -> impl IntoResponse {
+        Self::set_recurring_job_paused(&state, id, false).await;
+        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
+    }
+
+    /// Both actions are idempotent, so a stale page posting the same state
+    /// twice is harmless; without `recurring_pause` the buttons are not
+    /// rendered and a direct POST is ignored.
+    async fn set_recurring_job_paused(state: &Arc<ControlPlane>, id: i64, paused: bool) {
+        let Ok(db) = state.ctx.get_db().await else {
+            error!("Failed to get database connection");
+            return;
+        };
+        if !state.ctx.reapply_recurring_pause(db.as_ref()).await {
+            warn!("Ignoring pause/resume for recurring task {id}: recurring_pause is not enabled");
+            return;
+        }
+        let paused_at = paused.then(|| chrono::Utc::now().naive_utc());
+        match crate::query_builder::recurring_tasks::set_paused_at_by_id(
+            db.as_ref(),
+            &state.ctx.table_config,
+            id,
+            paused_at,
+        )
+        .await
+        {
+            Ok(changed) => info!(
+                "Recurring task {id} {}{}",
+                if paused { "paused" } else { "resumed" },
+                if changed == 0 { " (no change)" } else { "" }
+            ),
+            Err(e) => error!("Failed to update pause state of recurring task {id}: {e}"),
+        }
+    }
+
     pub async fn run_recurring_job_now(
         State(state): State<Arc<ControlPlane>>,
         Path(id): Path<i64>,
@@ -94,7 +155,7 @@ impl ControlPlane {
         if let Err(e) = Self::do_run_recurring_job(&state, id).await {
             error!("Failed to run recurring job {}: {}", id, e);
         }
-        Redirect::to("/recurring-jobs")
+        Redirect::to(&format!("{}/recurring-jobs", state.base_path))
     }
 
     async fn do_run_recurring_job(state: &Arc<ControlPlane>, id: i64) -> crate::error::Result<()> {
@@ -187,14 +248,17 @@ impl ControlPlane {
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
 
+        let pausable = state.ctx.ensure_recurring_pause(db).await;
+        let paused_column = if pausable { ", rt.paused_at" } else { "" };
+
         let sql = clean_sql(&format!(
             "SELECT
                 rt.id,
-                rt.schedule,
+                rt.schedule{},
                 (SELECT MAX(re.run_at) FROM {} re WHERE re.task_key = rt.key) as last_run_at
             FROM {} rt
             ORDER BY rt.key ASC",
-            table_config.recurring_executions, table_config.recurring_tasks
+            paused_column, table_config.recurring_executions, table_config.recurring_tasks
         ));
 
         let result = db
@@ -210,17 +274,34 @@ impl ControlPlane {
                 .try_get::<chrono::NaiveDateTime>("", "last_run_at")
                 .ok()
                 .map(|dt| Self::format_naive_datetime(dt));
-            let next_run_at = Self::calculate_next_run(&schedule);
+            let paused_at = pausable
+                .then(|| {
+                    row.try_get::<Option<chrono::NaiveDateTime>>("", "paused_at")
+                        .ok()
+                        .flatten()
+                })
+                .flatten()
+                .map(Self::format_naive_datetime);
+            // A paused task has no next run to count down to.
+            let next_run_at = paused_at
+                .is_none()
+                .then(|| Self::calculate_next_run(&schedule))
+                .flatten();
 
             times.push(serde_json::json!({
                 "id": id,
                 "last_run_at": last_run_at,
                 "next_run_at": next_run_at,
+                "paused": paused_at.is_some(),
+                "paused_at": paused_at,
             }));
         }
 
         let mut context = tera::Context::new();
         context.insert("times", &times);
+        // The refresh redraws the badge and Pause/Resume button too, so it
+        // needs the same inputs as the page.
+        context.insert("recurring_pause", &pausable);
 
         let html = state
             .render_template("recurring-jobs-schedule.html", &mut context)
