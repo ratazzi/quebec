@@ -200,6 +200,43 @@ pub struct JobDetailsInfo {
 }
 
 #[derive(Debug, Serialize)]
+pub struct BatchInfo {
+    pub id: i64,
+    pub active_job_batch_id: Option<String>,
+    pub description: Option<String>,
+    pub status: String,
+    pub total_jobs: i64,
+    pub completed_jobs: i64,
+    pub failed_jobs: i64,
+    pub pending_jobs: i64,
+    pub progress_percentage: f64,
+    pub metadata: Option<String>,
+    pub created_at: String,
+    pub enqueued_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub failed_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchJobInfo {
+    pub id: i64,
+    pub class_name: String,
+    pub queue_name: String,
+    pub status: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchCallbackInfo {
+    pub kind: String,
+    pub job_class: String,
+    pub queue_name: String,
+    pub job_id: Option<i64>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ExecutionHistoryItem {
     pub attempt: i32,
     pub timestamp: String,

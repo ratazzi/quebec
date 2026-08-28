@@ -4066,6 +4066,122 @@ pub mod batches {
             .map(|row| row.try_get::<i64>("", "id"))
             .collect()
     }
+
+    /// Control-plane status filter: `pending` (not started), `enqueued`
+    /// (running), `completed`, `failed`. Anything else means no filter.
+    fn status_condition(status: Option<&str>) -> Option<sea_orm::sea_query::SimpleExpr> {
+        match status {
+            Some("pending") => Some(
+                Expr::col(col("enqueued_at"))
+                    .is_null()
+                    .and(Expr::col(col("finished_at")).is_null()),
+            ),
+            Some("enqueued") => Some(
+                Expr::col(col("enqueued_at"))
+                    .is_not_null()
+                    .and(Expr::col(col("finished_at")).is_null()),
+            ),
+            Some("completed") => Some(
+                Expr::col(col("finished_at"))
+                    .is_not_null()
+                    .and(Expr::col(col("failed_at")).is_null()),
+            ),
+            Some("failed") => Some(Expr::col(col("failed_at")).is_not_null()),
+            _ => None,
+        }
+    }
+
+    /// Newest batches first, for the control plane.
+    pub async fn find_paginated<C>(
+        db: &C,
+        table_config: &TableConfig,
+        offset: u64,
+        limit: u64,
+        status: Option<&str>,
+    ) -> Result<Vec<quebec_batches::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let mut query = Query::select()
+            .column(Asterisk)
+            .from(Alias::new(&table_config.batches))
+            .order_by(col("id"), Order::Desc)
+            .offset(offset)
+            .limit(limit)
+            .to_owned();
+        if let Some(cond) = status_condition(status) {
+            query.and_where(cond);
+        }
+        execute_select(db, query).await
+    }
+
+    pub async fn count_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        status: Option<&str>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let mut query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(Alias::new(&table_config.batches))
+            .to_owned();
+        if let Some(cond) = status_condition(status) {
+            query.and_where(cond);
+        }
+        execute_count(db, query).await
+    }
+
+    /// Failed-job counts for several unfinished batches at once
+    /// (`batch_id -> count`), for list pages.
+    pub async fn count_failed_jobs_by_batch_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if batch_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let jobs = Alias::new(&table_config.jobs);
+        let failed = Alias::new(&table_config.failed_executions);
+        let query = Query::select()
+            .column((jobs.clone(), col("batch_id")))
+            .expr_as(Expr::col(Asterisk).count(), col("n"))
+            .from(jobs.clone())
+            .inner_join(
+                failed.clone(),
+                Expr::col((failed, col("job_id"))).equals((jobs.clone(), col("id"))),
+            )
+            .and_where(Expr::col((jobs.clone(), col("batch_id"))).is_in(batch_ids.iter().copied()))
+            .group_by_col((jobs, col("batch_id")))
+            .to_owned();
+        grouped_counts(db, query).await
+    }
+
+    pub(super) async fn grouped_counts<C>(
+        db: &C,
+        query: SelectStatement,
+    ) -> Result<std::collections::HashMap<i64, i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        db.query_all(stmt)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i64>("", "batch_id")?,
+                    row.try_get::<i64>("", "n")?,
+                ))
+            })
+            .collect()
+    }
 }
 
 /// Solid Queue batch executions (`solid_queue_batch_executions`): one row per
@@ -4265,5 +4381,28 @@ pub mod batch_executions {
                 ))
             })
             .collect()
+    }
+
+    /// Outstanding-attempt counts for several batches at once
+    /// (`batch_id -> count`), for list pages.
+    pub async fn count_by_batch_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if batch_ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let query = Query::select()
+            .column(col("batch_id"))
+            .expr_as(Expr::col(Asterisk).count(), col("n"))
+            .from(Alias::new(&table_config.batch_executions))
+            .and_where(Expr::col(col("batch_id")).is_in(batch_ids.iter().copied()))
+            .group_by_col(col("batch_id"))
+            .to_owned();
+        super::batches::grouped_counts(db, query).await
     }
 }
