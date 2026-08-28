@@ -137,6 +137,8 @@ pub struct TableConfig {
     pub pauses: String,
     pub processes: String,
     pub semaphores: String,
+    pub batches: String,
+    pub batch_executions: String,
 }
 
 impl Default for TableConfig {
@@ -153,6 +155,8 @@ impl Default for TableConfig {
             pauses: "solid_queue_pauses".to_string(),
             processes: "solid_queue_processes".to_string(),
             semaphores: "solid_queue_semaphores".to_string(),
+            batches: "solid_queue_batches".to_string(),
+            batch_executions: "solid_queue_batch_executions".to_string(),
         }
     }
 }
@@ -173,6 +177,8 @@ impl TableConfig {
             pauses: format!("{prefix}_pauses"),
             processes: format!("{prefix}_processes"),
             semaphores: format!("{prefix}_semaphores"),
+            batches: format!("{prefix}_batches"),
+            batch_executions: format!("{prefix}_batch_executions"),
         }
     }
 }

@@ -2,6 +2,8 @@
 
 pub mod prelude;
 
+pub mod quebec_batch_executions;
+pub mod quebec_batches;
 pub mod quebec_blocked_executions;
 pub mod quebec_claimed_executions;
 pub mod quebec_failed_executions;

@@ -72,6 +72,87 @@ pub fn create_jobs_table(table_config: &TableConfig) -> TableCreateStatement {
         .col(ColumnDef::new(col("concurrency_key")).string())
         .col(ColumnDef::new(col("created_at")).date_time().not_null())
         .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .col(ColumnDef::new(col("batch_id")).big_integer())
+        .to_owned()
+}
+
+/// Create the batches table (Solid Queue >= 1.5 `solid_queue_batches`)
+pub fn create_batches_table(table_config: &TableConfig) -> TableCreateStatement {
+    Table::create()
+        .table(tbl(&table_config.batches))
+        .if_not_exists()
+        .col(
+            ColumnDef::new(col("id"))
+                .big_integer()
+                .auto_increment()
+                .primary_key(),
+        )
+        .col(ColumnDef::new(col("active_job_batch_id")).string())
+        .col(ColumnDef::new(col("description")).string())
+        .col(ColumnDef::new(col("on_finish")).text())
+        .col(ColumnDef::new(col("on_success")).text())
+        .col(ColumnDef::new(col("on_failure")).text())
+        .col(ColumnDef::new(col("metadata")).text())
+        .col(
+            ColumnDef::new(col("total_jobs"))
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .col(
+            ColumnDef::new(col("completed_jobs"))
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .col(
+            ColumnDef::new(col("failed_jobs"))
+                .integer()
+                .not_null()
+                .default(0),
+        )
+        .col(ColumnDef::new(col("enqueued_at")).date_time())
+        .col(ColumnDef::new(col("finished_at")).date_time())
+        .col(ColumnDef::new(col("failed_at")).date_time())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .to_owned()
+}
+
+/// Create the batch_executions table: one row per outstanding attempt of a
+/// batched job. Its disappearance is what drives batch completion.
+pub fn create_batch_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+    Table::create()
+        .table(tbl(&table_config.batch_executions))
+        .if_not_exists()
+        .col(
+            ColumnDef::new(col("id"))
+                .big_integer()
+                .auto_increment()
+                .primary_key(),
+        )
+        .col(
+            ColumnDef::new(col("job_id"))
+                .big_integer()
+                .not_null()
+                .unique_key(),
+        )
+        .col(ColumnDef::new(col("batch_id")).big_integer().not_null())
+        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .foreign_key(
+            ForeignKey::create()
+                .from(tbl(&table_config.batch_executions), col("batch_id"))
+                .to(tbl(&table_config.batches), col("id"))
+                .on_delete(ForeignKeyAction::Cascade)
+                .on_update(ForeignKeyAction::NoAction),
+        )
+        .foreign_key(
+            ForeignKey::create()
+                .from(tbl(&table_config.batch_executions), col("job_id"))
+                .to(tbl(&table_config.jobs), col("id"))
+                .on_delete(ForeignKeyAction::Cascade)
+                .on_update(ForeignKeyAction::NoAction),
+        )
         .to_owned()
 }
 
@@ -378,6 +459,7 @@ where
     execute_create_table(db, create_processes_table(table_config)).await?;
     execute_create_table(db, create_semaphores_table(table_config)).await?;
     execute_create_table(db, create_pauses_table(table_config)).await?;
+    execute_create_table(db, create_batches_table(table_config)).await?;
 
     // Then create tables with foreign keys to jobs
     execute_create_table(db, create_ready_executions_table(table_config)).await?;
@@ -386,6 +468,7 @@ where
     execute_create_table(db, create_scheduled_executions_table(table_config)).await?;
     execute_create_table(db, create_failed_executions_table(table_config)).await?;
     execute_create_table(db, create_recurring_executions_table(table_config)).await?;
+    execute_create_table(db, create_batch_executions_table(table_config)).await?;
 
     Ok(())
 }
@@ -415,6 +498,32 @@ where
             .name(&format!("idx_{}_finished_at", table_config.jobs))
             .table(tbl(&table_config.jobs))
             .col(col("finished_at"))
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name(&format!("idx_{}_batch_id", table_config.jobs))
+            .table(tbl(&table_config.jobs))
+            .col(col("batch_id"))
+            .to_owned(),
+        // Batches indexes
+        Index::create()
+            .if_not_exists()
+            .unique()
+            .name(&format!("idx_{}_active_job_batch_id", table_config.batches))
+            .table(tbl(&table_config.batches))
+            .col(col("active_job_batch_id"))
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name(&format!("idx_{}_finished_at", table_config.batches))
+            .table(tbl(&table_config.batches))
+            .col(col("finished_at"))
+            .to_owned(),
+        Index::create()
+            .if_not_exists()
+            .name(&format!("idx_{}_batch_id", table_config.batch_executions))
+            .table(tbl(&table_config.batch_executions))
+            .col(col("batch_id"))
             .to_owned(),
         // Ready executions indexes
         // Covering index for poll: WHERE queue_name = ? ORDER BY priority, job_id LIMIT N
@@ -600,9 +709,88 @@ where
     C: ConnectionTrait,
 {
     create_all_tables(db, table_config).await?;
+    // Databases created before batches existed lack `jobs.batch_id`; add it
+    // before the index pass so the batch_id index has a column to land on.
+    ensure_jobs_batch_id(db, table_config).await?;
     create_indexes(db, table_config).await?;
     tune_storage_parameters(db, table_config).await?;
     Ok(())
+}
+
+/// Add the nullable `jobs.batch_id` column that Solid Queue >= 1.5 ships with,
+/// for databases created by an older Quebec. Idempotent, same shape as
+/// `ensure_recurring_paused_at`.
+pub async fn ensure_jobs_batch_id<C>(db: &C, table_config: &TableConfig) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let table = &table_config.jobs;
+    if column_exists(db, table, "batch_id").await {
+        return Ok(());
+    }
+
+    let backend = db.get_database_backend();
+    let stmt = Table::alter()
+        .table(tbl(table))
+        .add_column(ColumnDef::new(col("batch_id")).big_integer().null())
+        .to_owned();
+    let sql = match backend {
+        DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
+        DbBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
+        DbBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+    };
+    let altered = db.execute(Statement::from_string(backend, sql)).await;
+
+    if column_exists(db, table, "batch_id").await {
+        return Ok(());
+    }
+    altered.map(|_| ()).and_then(|()| {
+        Err(DbErr::Custom(format!(
+            "column `batch_id` still missing on `{table}` after ALTER TABLE"
+        )))
+    })
+}
+
+/// Whether the batches schema (`jobs.batch_id` plus the two batch tables) is
+/// present. Mirrors Solid Queue's `Batch.migrated?`.
+pub async fn batches_schema_exists<C>(db: &C, table_config: &TableConfig) -> bool
+where
+    C: ConnectionTrait,
+{
+    column_exists(db, &table_config.jobs, "batch_id").await
+        && table_exists(db, &table_config.batches).await
+        && table_exists(db, &table_config.batch_executions).await
+}
+
+/// Whether `table` exists, via the backend's catalog (see `column_exists` for
+/// why a catalog lookup rather than a probing SELECT).
+pub(crate) async fn table_exists<C>(db: &C, table: &str) -> bool
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DbBackend::Postgres => {
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = ANY (current_schemas(false)) \
+             AND table_name = $1 LIMIT 1"
+        }
+        DbBackend::MySql => {
+            "SELECT 1 FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
+        }
+        DbBackend::Sqlite => {
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
+        }
+    };
+    let stmt = Statement::from_sql_and_values(backend, sql, [table.into()]);
+    match db.query_one(stmt).await {
+        Ok(row) => row.is_some(),
+        Err(e) => {
+            tracing::debug!("table probe for {table} failed, assuming missing: {e}");
+            false
+        }
+    }
 }
 
 /// Apply Postgres storage parameters to the semaphores table.
@@ -737,7 +925,7 @@ where
 /// double-quoted unknown column is silently read as a string literal, so it
 /// would not even fail. This runs repeatedly while the feature is
 /// unavailable, so it has to be quiet and cheap.
-async fn column_exists<C>(db: &C, table: &str, column: &str) -> bool
+pub(crate) async fn column_exists<C>(db: &C, table: &str, column: &str) -> bool
 where
     C: ConnectionTrait,
 {

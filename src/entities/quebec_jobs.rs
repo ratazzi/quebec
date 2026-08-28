@@ -24,6 +24,10 @@ pub struct Model {
     pub concurrency_key: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    /// Solid Queue >= 1.5. Read via `SELECT *`, so a database without the
+    /// column yields `None` (sea-orm maps `ColumnNotFound` to `None` for
+    /// `Option<T>`) instead of failing.
+    pub batch_id: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

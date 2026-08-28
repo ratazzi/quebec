@@ -36,6 +36,8 @@ mod worker;
 use context::*;
 pub use control_plane::ControlPlaneExt;
 #[cfg(feature = "python")]
+use entities::quebec_batches;
+#[cfg(feature = "python")]
 use entities::quebec_claimed_executions;
 #[cfg(feature = "python")]
 use entities::quebec_jobs;
@@ -199,6 +201,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DiscardStrategy>()?;
     m.add_class::<quebec_jobs::Model>()?;
     m.add_class::<quebec_claimed_executions::Model>()?;
+    m.add_class::<quebec_batches::Model>()?;
     m.add_class::<Runnable>()?;
     m.add_class::<Execution>()?;
 
