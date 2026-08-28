@@ -367,6 +367,8 @@ Every job enqueued inside the `with` block joins the batch; leaving the block st
 - Counters count logical jobs: a job that retries and then succeeds is one `total_jobs`. Jobs discarded by `discard_on` or a concurrency `Discard` conflict count as completed. Manually retrying a failed job (`qc.retry_failed`) does not rejoin its batch.
 - Adding to a finished batch raises `quebec.BatchAlreadyFinished`. Building a descriptor inside a batch does not keep it open: enqueue it before the batch finishes.
 
+Completion is detected as jobs finish. The few cases that can't trigger it (a crash between a job's terminal write and its batch release, a bulk delete that cascaded a tracking row away, a callback enqueue that failed, a process that died before starting its batch) are repaired by the dispatcher's maintenance timer (`batch_maintenance: true` by default, sharing `concurrency_maintenance_interval`; disable it via queue.yml, `dispatcher_batch_maintenance=False` or `QUEBEC_DISPATCHER_BATCH_MAINTENANCE=false`). Without a dispatcher, call `qc.sweep_stalled_batches()` yourself. Succeeded batches older than `clear_finished_jobs_after` are cleared by the worker's periodic cleanup or `qc.clear_finished_batches()`; failed batches are kept, like failed jobs.
+
 `create_tables()` creates the batch tables and adds `jobs.batch_id` to an existing database. Against a Rails-managed database that predates the Solid Queue batches migration, jobs enqueue and run without batch bookkeeping and `qc.batch()` raises `RuntimeError` until the migration is applied.
 
 ### Rate Limiting (experimental)
