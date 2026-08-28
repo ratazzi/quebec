@@ -24,6 +24,7 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Scheduled tasks
 - Recurring tasks
 - Concurrency control
+- Batches (Solid Queue-compatible)
 - Per-queue concurrency limits
 - Rate limiting
 - Exclusive (stop-the-world) jobs
@@ -330,6 +331,43 @@ class ReportJob(quebec.BaseClass):
 ```
 
 The actual concurrency key is `"ClassName/key"` (e.g. `"ReportJob/123"`), so different job classes never conflict. When the limit is reached, new jobs are blocked until a slot becomes available. The `concurrency_duration` acts as a safety TTL — the semaphore is released automatically if a worker crashes.
+
+### Batches
+
+Group jobs so you can track the set as a whole and run callbacks when it finishes. Batches follow Solid Queue's tables and semantics (`solid_queue_batches` / `solid_queue_batch_executions`, added in Solid Queue 1.5), so a batch started by Rails can be finished by Quebec and vice versa.
+
+```python
+class ImportRow(quebec.BaseClass):
+    def perform(self, row):
+        ...
+
+class ImportDone(quebec.BaseClass):
+    def perform(self):
+        b = self.batch          # the batch that enqueued this callback
+        print(f"{b.completed_jobs}/{b.total_jobs} imported, {b.failed_jobs} failed")
+
+with qc.batch(description="import 42",
+              on_success=ImportDone,                                # job class ...
+              on_failure=AlertJob.set(queue="alerts").build("import"),  # ... or a built descriptor
+              on_finish=ImportDone,
+              user_id=42) as batch:                                # extra kwargs -> batch.metadata
+    for row in rows:
+        ImportRow.perform_later(qc, row)
+    qc.perform_all_later([ImportRow.build(r) for r in more_rows])  # bulk enqueue joins too
+
+batch.id, batch.status            # "enqueued"
+batch.total_jobs, batch.pending_jobs, batch.completed_jobs, batch.failed_jobs, batch.progress_percentage
+batch.reload()                    # refresh from the database
+qc.find_batch(batch.id)           # or qc.find_batch_by_active_job_batch_id(uuid)
+```
+
+Every job enqueued inside the `with` block joins the batch; leaving the block starts it (an empty batch finishes right away). To add jobs later, including from one of the batch's own jobs, use `with batch.enqueue(): ...`. A member job can read `self.batch_id` / `self.batch`. Nested `with qc.batch()` blocks are independent batches.
+
+- `on_success` runs when every job finished without failing, `on_failure` when at least one job exhausted its retries, and `on_finish` in either case. Callback jobs are enqueued when the batch finishes; their queue, priority and `wait` come from the `.set(...)` used when the batch was created.
+- Counters count logical jobs: a job that retries and then succeeds is one `total_jobs`. Jobs discarded by `discard_on` or a concurrency `Discard` conflict count as completed. Manually retrying a failed job (`qc.retry_failed`) does not rejoin its batch.
+- Adding to a finished batch raises `quebec.BatchAlreadyFinished`. Building a descriptor inside a batch does not keep it open: enqueue it before the batch finishes.
+
+`create_tables()` creates the batch tables and adds `jobs.batch_id` to an existing database. Against a Rails-managed database that predates the Solid Queue batches migration, jobs enqueue and run without batch bookkeeping and `qc.batch()` raises `RuntimeError` until the migration is applied.
 
 ### Rate Limiting (experimental)
 
