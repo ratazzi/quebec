@@ -193,6 +193,10 @@ pub struct JobDetailsInfo {
     pub context: Option<String>,
     pub execution_id: Option<i64>,
     pub execution_history: Vec<ExecutionHistoryItem>,
+    /// Batch this job is a member of (Solid Queue >= 1.5), when the schema exists.
+    pub batch_id: Option<i64>,
+    /// For batch callback jobs: the batch whose completion enqueued them.
+    pub callback_batch_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

@@ -109,6 +109,18 @@
             <div class="text-sm text-gray-500">Attempts</div>
             <div class="col-span-2 text-sm">1</div>
           </div>
+          {% if job.batch_id %}
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Batch</div>
+            <div class="col-span-2 text-sm"><a href="{{ base_path }}/batches/{{ job.batch_id }}" data-turbo-action="advance" class="text-gray-900 hover:underline">Batch #{{ job.batch_id }}</a></div>
+          </div>
+          {% endif %}
+          {% if job.callback_batch_id %}
+          <div class="grid grid-cols-3 gap-2">
+            <div class="text-sm text-gray-500">Callback of</div>
+            <div class="col-span-2 text-sm"><a href="{{ base_path }}/batches/{{ job.callback_batch_id }}" data-turbo-action="advance" class="text-gray-900 hover:underline">Batch #{{ job.callback_batch_id }}</a></div>
+          </div>
+          {% endif %}
         </div>
       </div>
       
