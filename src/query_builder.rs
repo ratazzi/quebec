@@ -3956,6 +3956,116 @@ pub mod batches {
             .to_owned();
         execute_update(db, query).await
     }
+
+    /// Delete succeeded batches (finished, not failed) older than
+    /// `finished_before`, `batch_size` at a time. Failed batches are kept for
+    /// inspection, like failed jobs. Tracking rows cascade.
+    pub async fn delete_finished_before<C>(
+        db: &C,
+        table_config: &TableConfig,
+        finished_before: chrono::NaiveDateTime,
+        batch_size: u64,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_name = &table_config.batches;
+        let backend = db.get_database_backend();
+        let sql = match backend {
+            DbBackend::Postgres => format!(
+                r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "failed_at" IS NULL AND "finished_at" < $1 LIMIT $2)"#
+            ),
+            DbBackend::MySql => format!(
+                r#"DELETE FROM `{table_name}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table_name}` WHERE `finished_at` IS NOT NULL AND `failed_at` IS NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#
+            ),
+            DbBackend::Sqlite => format!(
+                r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "failed_at" IS NULL AND "finished_at" < ? LIMIT ?)"#
+            ),
+        };
+        let stmt = Statement::from_sql_and_values(
+            backend,
+            sql,
+            [finished_before.into(), (batch_size as i64).into()],
+        );
+        Ok(db.execute(stmt).await?.rows_affected())
+    }
+
+    /// Started, unfinished batches with no tracking rows left, by id after
+    /// `after_id` (keyset: a batch whose finish keeps failing must not be
+    /// returned forever).
+    pub async fn finishable_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        after_id: i64,
+        limit: u64,
+    ) -> Result<Vec<i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let batches = Alias::new(&table_config.batches);
+        let executions = Alias::new(&table_config.batch_executions);
+        let query = Query::select()
+            .column((batches.clone(), col("id")))
+            .from(batches.clone())
+            .and_where(Expr::col((batches.clone(), col("finished_at"))).is_null())
+            .and_where(Expr::col((batches.clone(), col("enqueued_at"))).is_not_null())
+            .and_where(Expr::col((batches.clone(), col("id"))).gt(after_id))
+            .and_where(
+                Expr::exists(
+                    Query::select()
+                        .expr(Expr::value(1))
+                        .from(executions.clone())
+                        .and_where(
+                            Expr::col((executions, col("batch_id")))
+                                .equals((batches.clone(), col("id"))),
+                        )
+                        .to_owned(),
+                )
+                .not(),
+            )
+            .order_by((batches, col("id")), Order::Asc)
+            .limit(limit)
+            .to_owned();
+        select_ids(db, query).await
+    }
+
+    /// Batches created before `created_before` that were never started
+    /// (the creator died between creating and starting), by id after `after_id`.
+    pub async fn unstarted_ids<C>(
+        db: &C,
+        table_config: &TableConfig,
+        created_before: chrono::NaiveDateTime,
+        after_id: i64,
+        limit: u64,
+    ) -> Result<Vec<i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .column(col("id"))
+            .from(Alias::new(&table_config.batches))
+            .and_where(Expr::col(col("finished_at")).is_null())
+            .and_where(Expr::col(col("enqueued_at")).is_null())
+            .and_where(Expr::col(col("created_at")).lt(created_before))
+            .and_where(Expr::col(col("id")).gt(after_id))
+            .order_by(col("id"), Order::Asc)
+            .limit(limit)
+            .to_owned();
+        select_ids(db, query).await
+    }
+
+    async fn select_ids<C>(db: &C, query: SelectStatement) -> Result<Vec<i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        db.query_all(stmt)
+            .await?
+            .iter()
+            .map(|row| row.try_get::<i64>("", "id"))
+            .collect()
+    }
 }
 
 /// Solid Queue batch executions (`solid_queue_batch_executions`): one row per
@@ -4075,5 +4185,85 @@ pub mod batch_executions {
                 Ok((db.execute(delete).await?.rows_affected() > 0).then_some(batch_id))
             }
         }
+    }
+
+    /// Tracking rows whose job has already finished, oldest first.
+    pub async fn stale_with_finished_jobs<C>(
+        db: &C,
+        table_config: &TableConfig,
+        limit: u64,
+    ) -> Result<Vec<(i64, i64)>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let executions = Alias::new(&table_config.batch_executions);
+        let jobs = Alias::new(&table_config.jobs);
+        let query = Query::select()
+            .column((executions.clone(), col("id")))
+            .column((executions.clone(), col("batch_id")))
+            .from(executions.clone())
+            .inner_join(
+                jobs.clone(),
+                Expr::col((jobs.clone(), col("id"))).equals((executions.clone(), col("job_id"))),
+            )
+            .and_where(Expr::col((jobs, col("finished_at"))).is_not_null())
+            .order_by((executions, col("id")), Order::Asc)
+            .limit(limit)
+            .to_owned();
+        select_id_pairs(db, query).await
+    }
+
+    /// Tracking rows whose job has a failed execution, oldest first.
+    pub async fn stale_with_failed_jobs<C>(
+        db: &C,
+        table_config: &TableConfig,
+        limit: u64,
+    ) -> Result<Vec<(i64, i64)>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let executions = Alias::new(&table_config.batch_executions);
+        let failed = Alias::new(&table_config.failed_executions);
+        let query = Query::select()
+            .column((executions.clone(), col("id")))
+            .column((executions.clone(), col("batch_id")))
+            .from(executions.clone())
+            .inner_join(
+                failed.clone(),
+                Expr::col((failed, col("job_id"))).equals((executions.clone(), col("job_id"))),
+            )
+            .order_by((executions, col("id")), Order::Asc)
+            .limit(limit)
+            .to_owned();
+        select_id_pairs(db, query).await
+    }
+
+    pub async fn delete_by_id<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::delete()
+            .from_table(Alias::new(&table_config.batch_executions))
+            .and_where(Expr::col(col("id")).eq(id))
+            .to_owned();
+        execute_delete(db, query).await
+    }
+
+    async fn select_id_pairs<C>(db: &C, query: SelectStatement) -> Result<Vec<(i64, i64)>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        db.query_all(stmt)
+            .await?
+            .iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<i64>("", "id")?,
+                    row.try_get::<i64>("", "batch_id")?,
+                ))
+            })
+            .collect()
     }
 }

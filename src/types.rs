@@ -2855,6 +2855,104 @@ impl PyQuebec {
         })
     }
 
+    /// Repair stalled batches (Solid Queue's ``Batch.sweep_stalled``): drop
+    /// tracking rows of jobs that already finished or failed, finish started
+    /// batches with nothing outstanding, and start batches created more than
+    /// ``stalled_for`` seconds ago that were never started. The dispatcher
+    /// runs this on its maintenance timer when ``batch_maintenance`` is on;
+    /// call it yourself when you run no dispatcher.
+    ///
+    /// Returns:
+    ///     dict: ``stale_executions``, ``finished_batches``, ``started_batches``.
+    #[pyo3(signature = (stalled_for=300.0, batch_size=500))]
+    fn sweep_stalled_batches<'py>(
+        &self,
+        py: Python<'py>,
+        stalled_for: f64,
+        batch_size: u64,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if !stalled_for.is_finite() || stalled_for < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "stalled_for must be a non-negative number of seconds",
+            ));
+        }
+        let ctx = self.ctx.clone();
+        let stalled_for = std::time::Duration::from_secs_f64(stalled_for);
+        let stats = py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                crate::batch::sweep_stalled(&ctx, db.as_ref(), stalled_for, batch_size)
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Batch sweep failed: {e}"
+                        ))
+                    })
+            })
+        })?;
+        let dict = PyDict::new(py);
+        dict.set_item("stale_executions", stats.stale_executions)?;
+        dict.set_item("finished_batches", stats.finished_batches)?;
+        dict.set_item("started_batches", stats.started_batches)?;
+        Ok(dict)
+    }
+
+    /// Delete succeeded batches whose ``finished_at`` is older than
+    /// ``finished_before`` (a POSIX timestamp; default: now minus
+    /// ``clear_finished_jobs_after``). Failed batches are kept, like failed
+    /// jobs. The worker's periodic cleanup does the same after clearing jobs.
+    ///
+    /// Returns:
+    ///     int: Number of batches deleted.
+    #[pyo3(signature = (batch_size=None, finished_before=None))]
+    fn clear_finished_batches(
+        &self,
+        py: Python<'_>,
+        batch_size: Option<u64>,
+        finished_before: Option<f64>,
+    ) -> PyResult<u64> {
+        let batch_size = batch_size.unwrap_or(self.ctx.cleanup_batch_size).max(1);
+        let finished_before = match finished_before {
+            Some(ts) => parse_optional_timestamp(Some(ts), "finished_before")?
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid timestamp"))?,
+            None => {
+                let duration = chrono::Duration::from_std(self.ctx.clear_finished_jobs_after)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "Invalid clear_finished_jobs_after duration: {e}"
+                        ))
+                    })?;
+                chrono::Utc::now().naive_utc() - duration
+            }
+        };
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                let mut total = 0u64;
+                loop {
+                    let deleted = crate::query_builder::batches::delete_finished_before(
+                        db.as_ref(),
+                        &ctx.table_config,
+                        finished_before,
+                        batch_size,
+                    )
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to delete finished batches: {e}"
+                        ))
+                    })?;
+                    total += deleted;
+                    if deleted == 0 {
+                        break;
+                    }
+                }
+                Ok(total)
+            })
+        })
+    }
+
     fn __repr__(&self) -> PyResult<String> {
         Ok(format!("Quebec(url={})", self.url))
     }

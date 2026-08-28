@@ -363,6 +363,118 @@ fn deserialize_callback(
     })
 }
 
+/// What one [`sweep_stalled`] pass repaired.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepStats {
+    /// Tracking rows removed because their job had already finished or failed.
+    pub stale_executions: u64,
+    /// Started batches with no outstanding work that were finished.
+    pub finished_batches: u64,
+    /// Batches created more than `stalled_for` ago that were never started.
+    pub started_batches: u64,
+}
+
+/// Repair batches the regular completion path cannot finish on its own,
+/// mirroring Solid Queue's `Batch.sweep_stalled`: tracking rows left behind
+/// by bulk discards or a crash between the terminal write and the release,
+/// batches whose callback enqueue failed, and batches whose creator died
+/// before starting them. Runs from the dispatcher's maintenance timer.
+pub async fn sweep_stalled(
+    ctx: &Arc<AppContext>,
+    db: &DatabaseConnection,
+    stalled_for: std::time::Duration,
+    batch_size: u64,
+) -> Result<SweepStats> {
+    let table_config = &ctx.table_config;
+    let batch_size = batch_size.max(1);
+    let mut stats = SweepStats::default();
+
+    // 1. A tracking row for a resolved job violates the invariant; remove it
+    //    and re-run the completion check for its batch.
+    for with_failed_jobs in [false, true] {
+        loop {
+            if ctx.graceful_shutdown.is_cancelled() {
+                return Ok(stats);
+            }
+            let rows = if with_failed_jobs {
+                batch_executions::stale_with_failed_jobs(db, table_config, batch_size).await?
+            } else {
+                batch_executions::stale_with_finished_jobs(db, table_config, batch_size).await?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            let mut touched = std::collections::BTreeSet::new();
+            for (id, batch_id) in rows {
+                if batch_executions::delete_by_id(db, table_config, id).await? > 0 {
+                    stats.stale_executions += 1;
+                    touched.insert(batch_id);
+                }
+            }
+            for batch_id in touched {
+                if try_finish(ctx, db, batch_id).await? {
+                    stats.finished_batches += 1;
+                }
+            }
+        }
+    }
+
+    // 2. Started batches with nothing outstanding. Keyset pagination: a batch
+    //    whose callbacks keep failing to enqueue stays unfinished and must not
+    //    be returned again in this pass.
+    let mut after_id = 0;
+    loop {
+        if ctx.graceful_shutdown.is_cancelled() {
+            return Ok(stats);
+        }
+        let ids = batches::finishable_ids(db, table_config, after_id, batch_size).await?;
+        let Some(&last) = ids.last() else { break };
+        for batch_id in ids {
+            match try_finish(ctx, db, batch_id).await {
+                Ok(true) => stats.finished_batches += 1,
+                Ok(false) => {}
+                Err(e) => warn!(batch_id, "batch sweep: could not finish batch: {e}"),
+            }
+        }
+        after_id = last;
+    }
+
+    // 3. Batches that were created but never started.
+    let created_before = chrono::Utc::now().naive_utc()
+        - chrono::Duration::from_std(stalled_for).unwrap_or_else(|_| chrono::Duration::minutes(5));
+    let mut after_id = 0;
+    loop {
+        if ctx.graceful_shutdown.is_cancelled() {
+            return Ok(stats);
+        }
+        let ids =
+            batches::unstarted_ids(db, table_config, created_before, after_id, batch_size).await?;
+        let Some(&last) = ids.last() else { break };
+        for batch_id in ids {
+            match start(ctx, db, batch_id).await {
+                Ok(finished) => {
+                    stats.started_batches += 1;
+                    if finished {
+                        stats.finished_batches += 1;
+                    }
+                }
+                Err(e) => warn!(batch_id, "batch sweep: could not start batch: {e}"),
+            }
+        }
+        after_id = last;
+    }
+
+    if stats != SweepStats::default() {
+        info!(
+            stale_executions = stats.stale_executions,
+            finished_batches = stats.finished_batches,
+            started_batches = stats.started_batches,
+            "batch sweep: repaired stalled batches"
+        );
+    }
+    Ok(stats)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

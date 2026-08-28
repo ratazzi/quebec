@@ -3952,6 +3952,31 @@ impl Worker {
             );
         }
 
+        // Succeeded batches age out on the same schedule; failed ones are kept.
+        if self.ctx.ensure_batches(db.as_ref()).await {
+            let mut batches_deleted = 0u64;
+            while !graceful_shutdown.is_cancelled() {
+                let deleted = query_builder::batches::delete_finished_before(
+                    db.as_ref(),
+                    &table_config,
+                    finished_before,
+                    batch_size,
+                )
+                .await?;
+                batches_deleted += deleted;
+                if deleted == 0 {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            }
+            if batches_deleted > 0 {
+                info!(
+                    "Cleared {} finished batch(es) older than {:?}",
+                    batches_deleted, clear_after
+                );
+            }
+        }
+
         Ok(total_deleted)
     }
 
