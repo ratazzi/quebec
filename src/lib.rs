@@ -1,3 +1,5 @@
+#[cfg(feature = "python")]
+mod batch;
 mod config;
 pub mod context;
 pub mod continuation;
@@ -212,6 +214,10 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "JobInterrupted",
         <continuation::JobInterrupted as pyo3::PyTypeInfo>::type_object(_py),
+    )?;
+    m.add(
+        "BatchAlreadyFinished",
+        <batch::BatchAlreadyFinished as pyo3::PyTypeInfo>::type_object(_py),
     )?;
     m.add(
         "InvalidStepError",

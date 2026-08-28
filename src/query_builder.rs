@@ -334,6 +334,50 @@ pub mod jobs {
         Ok(results)
     }
 
+    /// Column list and values for one jobs row. `batch_id` is only named when
+    /// present so a Solid Queue database that predates the batches migration
+    /// keeps accepting non-batched jobs.
+    #[allow(clippy::too_many_arguments)]
+    fn job_columns_and_values(
+        queue_name: &str,
+        class_name: &str,
+        arguments: Option<&str>,
+        priority: i32,
+        active_job_id: Option<&str>,
+        scheduled_at: Option<chrono::NaiveDateTime>,
+        concurrency_key: Option<&str>,
+        batch_id: Option<i64>,
+        now: chrono::NaiveDateTime,
+    ) -> (Vec<Alias>, Vec<sea_orm::sea_query::SimpleExpr>) {
+        let mut columns = vec![
+            col("queue_name"),
+            col("class_name"),
+            col("arguments"),
+            col("priority"),
+            col("active_job_id"),
+            col("scheduled_at"),
+            col("concurrency_key"),
+            col("created_at"),
+            col("updated_at"),
+        ];
+        let mut values: Vec<sea_orm::sea_query::SimpleExpr> = vec![
+            queue_name.into(),
+            class_name.into(),
+            arguments.into(),
+            priority.into(),
+            active_job_id.into(),
+            scheduled_at.into(),
+            concurrency_key.into(),
+            now.into(),
+            now.into(),
+        ];
+        if let Some(batch_id) = batch_id {
+            columns.push(col("batch_id"));
+            values.push(batch_id.into());
+        }
+        (columns, values)
+    }
+
     /// Insert a new job and return its ID
     #[allow(clippy::too_many_arguments)]
     pub async fn insert<C>(
@@ -346,6 +390,7 @@ pub mod jobs {
         active_job_id: Option<&str>,
         scheduled_at: Option<chrono::NaiveDateTime>,
         concurrency_key: Option<&str>,
+        batch_id: Option<i64>,
     ) -> Result<i64, DbErr>
     where
         C: ConnectionTrait,
@@ -353,30 +398,21 @@ pub mod jobs {
         let table = Alias::new(&table_config.jobs);
         let now = chrono::Utc::now().naive_utc();
 
+        let (columns, values) = job_columns_and_values(
+            queue_name,
+            class_name,
+            arguments,
+            priority,
+            active_job_id,
+            scheduled_at,
+            concurrency_key,
+            batch_id,
+            now,
+        );
         let mut query = Query::insert()
             .into_table(table)
-            .columns([
-                col("queue_name"),
-                col("class_name"),
-                col("arguments"),
-                col("priority"),
-                col("active_job_id"),
-                col("scheduled_at"),
-                col("concurrency_key"),
-                col("created_at"),
-                col("updated_at"),
-            ])
-            .values_panic([
-                queue_name.into(),
-                class_name.into(),
-                arguments.into(),
-                priority.into(),
-                active_job_id.into(),
-                scheduled_at.into(),
-                concurrency_key.into(),
-                now.into(),
-                now.into(),
-            ])
+            .columns(columns)
+            .values_panic(values)
             .to_owned();
 
         // For PostgreSQL, add RETURNING clause
@@ -399,6 +435,7 @@ pub mod jobs {
         active_job_id: Option<&str>,
         scheduled_at: Option<chrono::NaiveDateTime>,
         concurrency_key: Option<&str>,
+        batch_id: Option<i64>,
     ) -> Result<quebec_jobs::Model, DbErr>
     where
         C: ConnectionTrait,
@@ -407,30 +444,21 @@ pub mod jobs {
         let table = Alias::new(&table_name);
         let now = chrono::Utc::now().naive_utc();
 
+        let (columns, values) = job_columns_and_values(
+            queue_name,
+            class_name,
+            arguments,
+            priority,
+            active_job_id,
+            scheduled_at,
+            concurrency_key,
+            batch_id,
+            now,
+        );
         let query = Query::insert()
             .into_table(table)
-            .columns([
-                col("queue_name"),
-                col("class_name"),
-                col("arguments"),
-                col("priority"),
-                col("active_job_id"),
-                col("scheduled_at"),
-                col("concurrency_key"),
-                col("created_at"),
-                col("updated_at"),
-            ])
-            .values_panic([
-                queue_name.into(),
-                class_name.into(),
-                arguments.into(),
-                priority.into(),
-                active_job_id.into(),
-                scheduled_at.into(),
-                concurrency_key.into(),
-                now.into(),
-                now.into(),
-            ])
+            .columns(columns)
+            .values_panic(values)
             .to_owned();
 
         // Use execute_insert_returning which handles RETURNING * for Postgres/SQLite
@@ -749,6 +777,7 @@ pub mod jobs {
         pub active_job_id: String,
         pub scheduled_at: Option<chrono::NaiveDateTime>,
         pub concurrency_key: Option<String>,
+        pub batch_id: Option<i64>,
     }
 
     /// Bulk insert jobs and return inserted models.
@@ -769,7 +798,9 @@ pub mod jobs {
         }
 
         let backend = db.get_database_backend();
-        let cols_per_row: usize = 9;
+        // Name `batch_id` only when some row carries one (see job_columns_and_values).
+        let with_batch = rows.iter().any(|r| r.batch_id.is_some());
+        let cols_per_row: usize = if with_batch { 10 } else { 9 };
         // SQLite: 999 bind vars → 111 rows; PostgreSQL: 65535 bind vars → 7281 rows
         let max_params = match backend {
             DbBackend::Sqlite => 999,
@@ -781,23 +812,27 @@ pub mod jobs {
 
         for chunk in rows.chunks(chunk_size) {
             let table = Alias::new(&table_config.jobs);
+            let mut columns = vec![
+                col("queue_name"),
+                col("class_name"),
+                col("arguments"),
+                col("priority"),
+                col("active_job_id"),
+                col("scheduled_at"),
+                col("concurrency_key"),
+                col("created_at"),
+                col("updated_at"),
+            ];
+            if with_batch {
+                columns.push(col("batch_id"));
+            }
             let mut query = Query::insert()
                 .into_table(table)
-                .columns([
-                    col("queue_name"),
-                    col("class_name"),
-                    col("arguments"),
-                    col("priority"),
-                    col("active_job_id"),
-                    col("scheduled_at"),
-                    col("concurrency_key"),
-                    col("created_at"),
-                    col("updated_at"),
-                ])
+                .columns(columns)
                 .to_owned();
 
             for row in chunk {
-                query.values_panic([
+                let mut values: Vec<sea_orm::sea_query::SimpleExpr> = vec![
                     row.queue_name.as_str().into(),
                     row.class_name.as_str().into(),
                     row.arguments.as_deref().into(),
@@ -807,7 +842,11 @@ pub mod jobs {
                     row.concurrency_key.as_deref().into(),
                     now.into(),
                     now.into(),
-                ]);
+                ];
+                if with_batch {
+                    values.push(row.batch_id.into());
+                }
+                query.values_panic(values);
             }
 
             match backend {
@@ -835,6 +874,7 @@ pub mod jobs {
                             Some(&row.active_job_id),
                             row.scheduled_at,
                             row.concurrency_key.as_deref(),
+                            row.batch_id,
                         )
                         .await?;
                         all_models.push(model);
@@ -3663,6 +3703,377 @@ pub mod recurring_tasks {
         match backend {
             DbBackend::Postgres => format!("${idx}"),
             DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+        }
+    }
+}
+
+/// Solid Queue batches (`solid_queue_batches`).
+pub mod batches {
+    use super::*;
+    use crate::entities::quebec_batches;
+
+    /// Insert a batch row and return it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert<C>(
+        db: &C,
+        table_config: &TableConfig,
+        active_job_batch_id: &str,
+        description: Option<&str>,
+        on_finish: Option<&str>,
+        on_success: Option<&str>,
+        on_failure: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<quebec_batches::Model, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_name = table_config.batches.clone();
+        let now = chrono::Utc::now().naive_utc();
+
+        let query = Query::insert()
+            .into_table(Alias::new(&table_name))
+            .columns([
+                col("active_job_batch_id"),
+                col("description"),
+                col("on_finish"),
+                col("on_success"),
+                col("on_failure"),
+                col("metadata"),
+                col("created_at"),
+                col("updated_at"),
+            ])
+            .values_panic([
+                active_job_batch_id.into(),
+                description.into(),
+                on_finish.into(),
+                on_success.into(),
+                on_failure.into(),
+                metadata.into(),
+                now.into(),
+                now.into(),
+            ])
+            .to_owned();
+
+        execute_insert_returning(db, query, |id| {
+            Query::select()
+                .column(Asterisk)
+                .from(Alias::new(&table_name))
+                .and_where(Expr::col(col("id")).eq(id))
+                .to_owned()
+        })
+        .await
+    }
+
+    pub async fn find_by_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+    ) -> Result<Option<quebec_batches::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .column(Asterisk)
+            .from(Alias::new(&table_config.batches))
+            .and_where(Expr::col(col("id")).eq(id))
+            .to_owned();
+        execute_select_one(db, query).await
+    }
+
+    pub async fn find_by_active_job_batch_id<C>(
+        db: &C,
+        table_config: &TableConfig,
+        active_job_batch_id: &str,
+    ) -> Result<Option<quebec_batches::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .column(Asterisk)
+            .from(Alias::new(&table_config.batches))
+            .and_where(Expr::col(col("active_job_batch_id")).eq(active_job_batch_id))
+            .to_owned();
+        execute_select_one(db, query).await
+    }
+
+    /// `(enqueued_at, finished_at)` of a batch, skipping the serialized
+    /// callback and metadata columns on this hot path.
+    pub async fn find_status<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+    ) -> Result<Option<(Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .columns([col("enqueued_at"), col("finished_at")])
+            .from(Alias::new(&table_config.batches))
+            .and_where(Expr::col(col("id")).eq(id))
+            .to_owned();
+        let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        db.query_one(stmt)
+            .await?
+            .map(|row| {
+                Ok((
+                    row.try_get::<Option<chrono::NaiveDateTime>>("", "enqueued_at")?,
+                    row.try_get::<Option<chrono::NaiveDateTime>>("", "finished_at")?,
+                ))
+            })
+            .transpose()
+    }
+
+    /// Bump `total_jobs` on an unfinished batch. Returns `false` when the
+    /// batch has already finished (or does not exist), which callers treat as
+    /// "can't add jobs any more". Runs even for a zero increment so retries
+    /// share the same guard.
+    pub async fn add_jobs<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+        new_jobs_count: i64,
+    ) -> Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let now = chrono::Utc::now().naive_utc();
+        let query = Query::update()
+            .table(Alias::new(&table_config.batches))
+            .values([
+                (
+                    col("total_jobs"),
+                    Expr::col(col("total_jobs")).add(new_jobs_count),
+                ),
+                (col("updated_at"), now.into()),
+            ])
+            .and_where(Expr::col(col("id")).eq(id))
+            .and_where(Expr::col(col("finished_at")).is_null())
+            .to_owned();
+        Ok(execute_update(db, query).await? > 0)
+    }
+
+    /// Set `enqueued_at` once. Returns the number of rows changed (0 when
+    /// the batch was already started).
+    pub async fn mark_enqueued<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let now = chrono::Utc::now().naive_utc();
+        let query = Query::update()
+            .table(Alias::new(&table_config.batches))
+            .values([
+                (col("enqueued_at"), now.into()),
+                (col("updated_at"), now.into()),
+            ])
+            .and_where(Expr::col(col("id")).eq(id))
+            .and_where(Expr::col(col("enqueued_at")).is_null())
+            .to_owned();
+        execute_update(db, query).await
+    }
+
+    /// The single-winner completion CAS: claim `finished_at` only while the
+    /// batch is started, unfinished, and has no outstanding tracking rows.
+    /// Returns the number of rows updated (1 = this caller won).
+    pub async fn try_mark_finished<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+        now: chrono::NaiveDateTime,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let batches = quote_identifier(backend, &table_config.batches);
+        let executions = quote_identifier(backend, &table_config.batch_executions);
+        let (p1, p2, p3) = match backend {
+            DbBackend::Postgres => ("$1", "$2", "$3"),
+            _ => ("?", "?", "?"),
+        };
+        let sql = format!(
+            "UPDATE {batches} SET \"finished_at\" = {p1}, \"updated_at\" = {p2} \
+             WHERE \"id\" = {p3} AND \"finished_at\" IS NULL AND \"enqueued_at\" IS NOT NULL \
+             AND NOT EXISTS (SELECT 1 FROM {executions} \
+             WHERE {executions}.\"batch_id\" = {batches}.\"id\")"
+        );
+        // MySQL quotes identifiers with backticks, not double quotes.
+        let sql = if backend == DbBackend::MySql {
+            sql.replace('"', "`")
+        } else {
+            sql
+        };
+        let stmt =
+            Statement::from_sql_and_values(backend, sql, [now.into(), now.into(), id.into()]);
+        Ok(db.execute(stmt).await?.rows_affected())
+    }
+
+    /// Jobs of this batch that currently have a failed execution.
+    pub async fn count_failed_jobs<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_id: i64,
+    ) -> Result<i64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let jobs = Alias::new(&table_config.jobs);
+        let failed = Alias::new(&table_config.failed_executions);
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(jobs.clone())
+            .inner_join(
+                failed.clone(),
+                Expr::col((failed, col("job_id"))).equals((jobs.clone(), col("id"))),
+            )
+            .and_where(Expr::col((jobs, col("batch_id"))).eq(batch_id))
+            .to_owned();
+        Ok(execute_count(db, query).await? as i64)
+    }
+
+    /// Write the final counters once the completion CAS has been won.
+    pub async fn finalize_counters<C>(
+        db: &C,
+        table_config: &TableConfig,
+        id: i64,
+        failed_jobs: i64,
+        completed_jobs: i64,
+        failed_at: Option<chrono::NaiveDateTime>,
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let now = chrono::Utc::now().naive_utc();
+        let query = Query::update()
+            .table(Alias::new(&table_config.batches))
+            .values([
+                (col("failed_jobs"), (failed_jobs as i32).into()),
+                (col("completed_jobs"), (completed_jobs as i32).into()),
+                (col("failed_at"), failed_at.into()),
+                (col("updated_at"), now.into()),
+            ])
+            .and_where(Expr::col(col("id")).eq(id))
+            .to_owned();
+        execute_update(db, query).await
+    }
+}
+
+/// Solid Queue batch executions (`solid_queue_batch_executions`): one row per
+/// outstanding attempt of a batched job.
+pub mod batch_executions {
+    use super::*;
+
+    /// Insert tracking rows for `job_ids`. Chunked so SQLite's bind limit holds.
+    pub async fn insert_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_id: i64,
+        job_ids: &[i64],
+    ) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if job_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = chrono::Utc::now().naive_utc();
+        let mut inserted = 0u64;
+        for chunk in job_ids.chunks(300) {
+            let mut query = Query::insert()
+                .into_table(Alias::new(&table_config.batch_executions))
+                .columns([col("job_id"), col("batch_id"), col("created_at")])
+                .to_owned();
+            for job_id in chunk {
+                query.values_panic([(*job_id).into(), batch_id.into(), now.into()]);
+            }
+            let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
+            let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+            inserted += db.execute(stmt).await?.rows_affected();
+        }
+        Ok(inserted)
+    }
+
+    pub async fn exists_for_batch<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_id: i64,
+    ) -> Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .column(col("id"))
+            .from(Alias::new(&table_config.batch_executions))
+            .and_where(Expr::col(col("batch_id")).eq(batch_id))
+            .limit(1)
+            .to_owned();
+        let (sql, values) = build_select_sql(db.get_database_backend(), &query);
+        let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
+        Ok(db.query_one(stmt).await?.is_some())
+    }
+
+    pub async fn count_for_batch<C>(
+        db: &C,
+        table_config: &TableConfig,
+        batch_id: i64,
+    ) -> Result<i64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let query = Query::select()
+            .expr(Expr::col(Asterisk).count())
+            .from(Alias::new(&table_config.batch_executions))
+            .and_where(Expr::col(col("batch_id")).eq(batch_id))
+            .to_owned();
+        Ok(execute_count(db, query).await? as i64)
+    }
+
+    /// Remove the tracking row for `job_id`, returning the batch it belonged
+    /// to (if any). Postgres/SQLite use `DELETE ... RETURNING`; MySQL selects
+    /// first and only reports the batch when its delete actually removed a row.
+    pub async fn delete_by_job_id_returning_batch<C>(
+        db: &C,
+        table_config: &TableConfig,
+        job_id: i64,
+    ) -> Result<Option<i64>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let table = quote_identifier(backend, &table_config.batch_executions);
+        match backend {
+            DbBackend::Postgres | DbBackend::Sqlite => {
+                let placeholder = if backend == DbBackend::Postgres {
+                    "$1"
+                } else {
+                    "?"
+                };
+                let sql = format!(
+                    "DELETE FROM {table} WHERE \"job_id\" = {placeholder} RETURNING \"batch_id\""
+                );
+                let stmt = Statement::from_sql_and_values(backend, sql, [job_id.into()]);
+                db.query_one(stmt)
+                    .await?
+                    .map(|row| row.try_get::<i64>("", "batch_id"))
+                    .transpose()
+            }
+            DbBackend::MySql => {
+                let select = Statement::from_sql_and_values(
+                    backend,
+                    format!("SELECT `batch_id` FROM {table} WHERE `job_id` = ?"),
+                    [job_id.into()],
+                );
+                let Some(row) = db.query_one(select).await? else {
+                    return Ok(None);
+                };
+                let batch_id: i64 = row.try_get("", "batch_id")?;
+                let delete = Statement::from_sql_and_values(
+                    backend,
+                    format!("DELETE FROM {table} WHERE `job_id` = ?"),
+                    [job_id.into()],
+                );
+                Ok((db.execute(delete).await?.rows_affected() > 0).then_some(batch_id))
+            }
         }
     }
 }

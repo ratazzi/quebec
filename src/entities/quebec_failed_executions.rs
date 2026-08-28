@@ -127,6 +127,8 @@ async fn route_retried_job(
                 "Retried job `{}' discarded due to concurrency limit",
                 job.class_name
             );
+            // No batch release here: a manual retry never re-joins its batch
+            // (its tracking row went when the job failed), like Solid Queue.
             query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
         }
         ConcurrencyConflict::Block => {
@@ -154,16 +156,19 @@ async fn route_retried_job(
 
 #[allow(async_fn_in_trait)]
 pub trait Discardable {
-    /// Discard a failed job by removing it from failed_executions and optionally marking the job as finished
+    /// Discard a failed job by removing it from failed_executions and marking the job as finished.
+    /// Returns the job's batch, if any, for a completion check after the transaction commits.
     async fn discard(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
-    ) -> Result<(), DbErr>;
+    ) -> Result<Option<i64>, DbErr>;
 
     /// Discard all failed jobs by removing them from failed_executions and marking the jobs as finished.
     /// Optional filters: `class_name`, `queue_name`, `since`/`until` (failed_executions.created_at
     /// range), and `error_like` (SQL LIKE pattern against the stored error message).
+    /// Returns the count plus the batches of the discarded jobs, for completion
+    /// checks after the transaction commits.
     #[allow(clippy::too_many_arguments)]
     async fn discard_all(
         &self,
@@ -174,7 +179,22 @@ pub trait Discardable {
         since: Option<chrono::NaiveDateTime>,
         until: Option<chrono::NaiveDateTime>,
         error_like: Option<&str>,
-    ) -> Result<u64, DbErr>;
+    ) -> Result<(u64, Vec<i64>), DbErr>;
+}
+
+/// Mark `job_ids` finished and release their batch tracking rows.
+async fn finish_discarded_jobs(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    job_ids: &[i64],
+) -> Result<Vec<i64>, DbErr> {
+    let jobs = query_builder::jobs::find_by_ids(txn, table_config, job_ids.to_vec()).await?;
+    let mut released = Vec::new();
+    for job in &jobs {
+        query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
+        released.extend(crate::batch::release_batched_job(txn, table_config, job).await?);
+    }
+    Ok(released)
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
@@ -260,20 +280,21 @@ impl Discardable for Model {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
-    ) -> Result<(), DbErr> {
+    ) -> Result<Option<i64>, DbErr> {
         // 1. Find job record
         let job_result = query_builder::jobs::find_by_id(txn, table_config, self.job_id).await?;
 
-        if job_result.is_some() {
+        if let Some(job) = job_result {
             // 2. Update job status to completed
             query_builder::jobs::mark_finished(txn, table_config, self.job_id).await?;
+            let released = crate::batch::release_batched_job(txn, table_config, &job).await?;
 
             // 3. Delete failed execution record
             query_builder::failed_executions::delete_by_job_id(txn, table_config, self.job_id)
                 .await?;
 
             info!("Discarded failed job {}", self.job_id);
-            Ok(())
+            Ok(released)
         } else {
             Err(DbErr::Custom(format!(
                 "Job with ID {} not found",
@@ -291,39 +312,18 @@ impl Discardable for Model {
         since: Option<chrono::NaiveDateTime>,
         until: Option<chrono::NaiveDateTime>,
         error_like: Option<&str>,
-    ) -> Result<u64, DbErr> {
-        // 1. Get all failed job records
-        let failed_executions = query_builder::failed_executions::find_all(
-            txn,
-            table_config,
-            class_name,
-            queue_name,
-            since,
-            until,
-            error_like,
-        )
-        .await?;
-
-        if failed_executions.is_empty() {
-            return Ok(0);
-        }
-
-        let job_ids: Vec<i64> = failed_executions
-            .iter()
-            .map(|execution| execution.job_id)
-            .collect();
-
-        // 2. Update all related jobs to completed status
-        for job_id in &job_ids {
-            query_builder::jobs::mark_finished(txn, table_config, *job_id).await?;
-        }
-
-        // 3. Delete all failed execution records
-        let count =
-            query_builder::failed_executions::delete_by_job_ids(txn, table_config, job_ids).await?;
-
-        info!("Discarded all {} failed jobs", count);
-        Ok(count)
+    ) -> Result<(u64, Vec<i64>), DbErr> {
+        Entity
+            .discard_all(
+                txn,
+                table_config,
+                class_name,
+                queue_name,
+                since,
+                until,
+                error_like,
+            )
+            .await
     }
 }
 
@@ -397,7 +397,7 @@ impl Discardable for Entity {
         &self,
         _txn: &DatabaseTransaction,
         _table_config: &TableConfig,
-    ) -> Result<(), DbErr> {
+    ) -> Result<Option<i64>, DbErr> {
         // Since Entity doesn't have a specific job_id, this method needs a different implementation
         Err(DbErr::Custom(
             "Cannot discard a job from Entity, please use a Model instance instead".to_string(),
@@ -413,7 +413,7 @@ impl Discardable for Entity {
         since: Option<chrono::NaiveDateTime>,
         until: Option<chrono::NaiveDateTime>,
         error_like: Option<&str>,
-    ) -> Result<u64, DbErr> {
+    ) -> Result<(u64, Vec<i64>), DbErr> {
         // 1. Get all failed job records
         let failed_executions = query_builder::failed_executions::find_all(
             txn,
@@ -427,7 +427,7 @@ impl Discardable for Entity {
         .await?;
 
         if failed_executions.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
         let job_ids: Vec<i64> = failed_executions
@@ -435,16 +435,14 @@ impl Discardable for Entity {
             .map(|execution| execution.job_id)
             .collect();
 
-        // 2. Update all related jobs to completed status
-        for job_id in &job_ids {
-            query_builder::jobs::mark_finished(txn, table_config, *job_id).await?;
-        }
+        // 2. Update all related jobs to completed status (releasing batch rows)
+        let released = finish_discarded_jobs(txn, table_config, &job_ids).await?;
 
         // 3. Delete all failed execution records
         let count =
             query_builder::failed_executions::delete_by_job_ids(txn, table_config, job_ids).await?;
 
         info!("Discarded all {} failed jobs", count);
-        Ok(count)
+        Ok((count, released))
     }
 }

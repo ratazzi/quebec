@@ -363,6 +363,8 @@ where
                     Some(active_job_id.as_str()),
                     Some(scheduled_at),
                     concurrency_key_str,
+                    // Recurring tasks are never batch members.
+                    None,
                 )
                 .await?;
 

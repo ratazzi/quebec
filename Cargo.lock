@@ -2086,6 +2086,7 @@ dependencies = [
  "tracing-logfmt",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

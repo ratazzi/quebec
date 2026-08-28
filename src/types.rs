@@ -356,6 +356,30 @@ pub struct PyQuebec {
 /// `perform()`.
 const JOB_BUILDER_INTERNAL_KWARGS: [&str; 3] = ["_queue", "_priority", "_scheduled_at"];
 
+/// The batch active in the calling Python context (`quebec.context.current_batch_id`),
+/// set by `with qc.batch(...)`. `None` when no batch is open or the module
+/// cannot be imported (embedding without the Python package).
+fn current_batch_id(py: Python<'_>) -> PyResult<Option<i64>> {
+    let Ok(module) = py.import("quebec.context") else {
+        return Ok(None);
+    };
+    module
+        .getattr("current_batch_id")?
+        .call_method0("get")?
+        .extract()
+}
+
+/// Map an enqueue failure to Python: a refused add to a finished batch raises
+/// `BatchAlreadyFinished`; anything else stays a `RuntimeError`.
+fn enqueue_error_to_py(e: crate::error::QuebecError) -> PyErr {
+    match crate::batch::already_finished_id(&e) {
+        Some(batch_id) => crate::batch::BatchAlreadyFinished::new_err(format!(
+            "Can't add jobs to batch {batch_id}: it has already finished"
+        )),
+        None => pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}")),
+    }
+}
+
 fn is_job_builder_internal_kwarg(key: &str) -> bool {
     JOB_BUILDER_INTERNAL_KWARGS.contains(&key)
 }
@@ -496,6 +520,224 @@ impl PyQuebec {
         self.worker = new_worker;
         self.dispatcher = new_dispatcher;
         self.scheduler = new_scheduler;
+    }
+
+    /// Everything `perform_all_later` needs from one `JobDescriptor`, resolved
+    /// with the GIL held: class attributes, argument serialization, option
+    /// overrides, concurrency, and the batch captured at `build()` time.
+    /// Shared with batch callback serialization.
+    fn prepare_descriptor(
+        &self,
+        py: Python<'_>,
+        job_class: &Bound<'_, PyAny>,
+        args_bound: &Bound<'_, PyTuple>,
+        kwargs_bound: &Bound<'_, PyDict>,
+        options: &Bound<'_, PyDict>,
+    ) -> PyResult<PreparedJob> {
+        // Extract class attributes (same as perform_later)
+        let class_name = job_class.cast::<PyType>()?.qualname()?.to_string();
+
+        let queue_name = match crate::utils::lookup_class_queue(&job_class, py)? {
+            Some((attr, _)) if attr.is_callable() => {
+                // Filter out internal _-prefixed kwargs for consistency with perform_later
+                let filtered = PyDict::new(py);
+                for (key, value) in kwargs_bound.iter() {
+                    if let Ok(key_str) = key.extract::<String>() {
+                        if !is_job_builder_internal_kwarg(&key_str) {
+                            filtered.set_item(key, value)?;
+                        }
+                    }
+                }
+                let kwargs_arg: Option<&Bound<'_, PyDict>> = if filtered.is_empty() {
+                    None
+                } else {
+                    Some(&filtered)
+                };
+                let result = attr.call(args_bound.clone(), kwargs_arg)?;
+                let name = result.extract::<String>()?;
+                if name.is_empty() {
+                    "default".to_string()
+                } else {
+                    name
+                }
+            }
+            Some((attr, attr_name)) => {
+                crate::utils::extract_queue_name_attr(&job_class, &attr, attr_name)?
+            }
+            None => "default".to_string(),
+        };
+
+        let priority = crate::utils::extract_class_priority(&job_class, py)?;
+
+        // Apply option overrides
+        let queue_name = options
+            .get_item("queue")?
+            .and_then(|v| v.extract::<String>().ok())
+            .unwrap_or(queue_name);
+        let priority = options
+            .get_item("priority")?
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(priority);
+
+        // Calculate scheduled_at from wait/wait_until options
+        let scheduled_at = resolve_scheduled_at(py, &options)?;
+
+        // Batch captured at build() time; perform_all_later lets an open batch win.
+        let batch_id = options
+            .get_item("batch_id")?
+            .and_then(|v| v.extract::<i64>().ok());
+
+        // Serialize args/kwargs to JSON (reuse perform_later logic)
+        let args_json = crate::utils::python_object(&args_bound).into_json()?;
+
+        let kwargs_json = if kwargs_bound.is_empty() {
+            None
+        } else {
+            Some(crate::utils::python_object(&kwargs_bound).into_json()?)
+        };
+
+        let mut arguments_array = if let Value::Array(arr) = args_json {
+            arr
+        } else {
+            vec![]
+        };
+
+        if let Some(Value::Object(kwargs_map)) = &kwargs_json {
+            let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
+                .iter()
+                .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !real_kwargs.is_empty() {
+                real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
+                arguments_array.push(Value::Object(real_kwargs));
+            }
+        }
+
+        let job_id = crate::utils::generate_job_id();
+
+        let job_data = serde_json::json!({
+            "job_class": class_name,
+            "job_id": job_id,
+            "queue_name": queue_name,
+            "priority": priority,
+            "arguments": arguments_array,
+            "continuation": {},
+            "resumptions": 0
+        });
+
+        let arguments = serde_json::to_string(&job_data).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Failed to serialize job data: {e}"
+            ))
+        })?;
+
+        // Resolve concurrency (if registered)
+        let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+            if self.worker.ctx.has_concurrency_control(&class_name) {
+                if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
+                    let kwargs_opt = if kwargs_bound.is_empty() {
+                        None
+                    } else {
+                        Some(kwargs_bound)
+                    };
+                    let constraint = runnable
+                        .get_concurrency_constraint(Some(args_bound), kwargs_opt)
+                        .map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "Failed to get concurrency info: {e:?}"
+                            ))
+                        })?;
+                    match constraint {
+                        Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
+                        None => (None, None, runnable.concurrency_on_conflict),
+                    }
+                } else {
+                    (None, None, ConcurrencyConflict::default())
+                }
+            } else {
+                (None, None, ConcurrencyConflict::default())
+            };
+
+        // Note: perform_all_later does NOT run enqueue callbacks, matching
+        // ActiveJob's documented behavior: "Push many jobs onto the queue at
+        // once without running enqueue callbacks."
+
+        // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class config
+        // and per-descriptor options. Applied here (after `arguments`
+        // serialization) so the persisted queue_name column and the
+        // ActiveJob returned to Python use the override, while the inner
+        // `arguments` JSON keeps the original queue_name as an audit
+        // trail — matching the single-enqueue path's behaviour.
+        let queue_name = self
+            .worker
+            .ctx
+            .force_override_queue
+            .clone()
+            .unwrap_or(queue_name);
+
+        Ok(PreparedJob {
+            class_name,
+            queue_name,
+            priority,
+            active_job_id: job_id,
+            arguments,
+            scheduled_at,
+            concurrency_key,
+            concurrency_limit,
+            concurrency_on_conflict,
+            batch_id,
+        })
+    }
+
+    /// Serialize a batch callback — a job class or a `JobDescriptor` from
+    /// `build()` — into the Active Job-shaped JSON stored on the batch row.
+    /// Resolved now, with the GIL, because the batch finishes on a worker
+    /// thread that has none. Callbacks never carry a batch of their own.
+    fn serialize_callback(&self, py: Python<'_>, callback: &Bound<'_, PyAny>) -> PyResult<String> {
+        let empty_args = PyTuple::empty(py);
+        let empty_kwargs = PyDict::new(py);
+        let empty_options = PyDict::new(py);
+        let job = if callback.is_instance_of::<PyType>() {
+            self.prepare_descriptor(py, callback, &empty_args, &empty_kwargs, &empty_options)?
+        } else {
+            let job_class = callback.getattr("job_class").map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "batch callbacks must be a job class or a JobDescriptor from build()",
+                )
+            })?;
+            let args = callback.getattr("args")?;
+            let kwargs = callback.getattr("kwargs")?;
+            let options = callback.getattr("options")?;
+            self.prepare_descriptor(
+                py,
+                &job_class,
+                args.cast::<PyTuple>()?,
+                kwargs.cast::<PyDict>()?,
+                options.cast::<PyDict>()?,
+            )?
+        };
+
+        let inner: Value = serde_json::from_str(&job.arguments).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize callback: {e}"))
+        })?;
+        let mut overrides = serde_json::json!({
+            "job_class": job.class_name,
+            "job_id": job.active_job_id,
+            "queue_name": job.queue_name,
+            "priority": job.priority,
+            "arguments": inner.get("arguments").cloned().unwrap_or(Value::Array(vec![])),
+            "scheduled_at": job.scheduled_at,
+        });
+        if let Some(key) = job.concurrency_key {
+            overrides["concurrency_key"] = Value::from(key);
+            overrides["concurrency_limit"] = Value::from(job.concurrency_limit.unwrap_or(1));
+            overrides["concurrency_on_conflict"] = Value::from(match job.concurrency_on_conflict {
+                ConcurrencyConflict::Discard => "discard",
+                ConcurrencyConflict::Block => "block",
+            });
+        }
+        Ok(crate::utils::build_job_params(overrides).to_string())
     }
 }
 
@@ -2025,6 +2267,9 @@ impl PyQuebec {
                 // Re-applied rather than merely ensured: an API call made
                 // before the tables existed has already failed the probe.
                 self.ctx.reapply_recurring_pause(db.as_ref()).await;
+                // The batches tables may have just appeared: let the next
+                // probe see them instead of waiting out the throttle.
+                self.ctx.forget_batches_probe();
             }
 
             Ok(success)
@@ -2259,6 +2504,8 @@ impl PyQuebec {
         obj.concurrency_key = concurrency_key;
         obj.concurrency_limit = concurrency_limit;
         obj.concurrency_on_conflict = concurrency_on_conflict;
+        // Join the batch open in the caller's context, if any.
+        obj.batch_id = current_batch_id(py)?;
 
         // Check for internal options in kwargs (used by JobBuilder.set())
         // These are prefixed with _ and will be filtered out from job arguments
@@ -2362,7 +2609,7 @@ impl PyQuebec {
             let obj_clone = obj.clone();
             let enqueue_result = py
                 .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}")));
+                .map_err(enqueue_error_to_py);
 
             let job_id_result;
             match enqueue_result {
@@ -2400,7 +2647,7 @@ impl PyQuebec {
             let obj_clone = obj.clone();
             let job = py
                 .detach(|| self.block_on(async move { quebec.perform_later(obj_clone).await }))
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}")))?;
+                .map_err(enqueue_error_to_py)?;
             obj.id.replace(job.id);
             debug!("Job queued in {:?}: {:?}", start_time.elapsed(), obj);
 
@@ -2429,6 +2676,10 @@ impl PyQuebec {
     ) -> PyResult<Vec<ActiveJob>> {
         let start_time = Instant::now();
 
+        // Bulk enqueue bypasses per-job enqueue, so batch membership is
+        // captured here: the batch open now wins over one captured at build().
+        let context_batch_id = current_batch_id(py)?;
+
         // Phase 1 (GIL held): extract everything from Python JobDescriptor objects
         let mut prepared: Vec<PreparedJob> = Vec::with_capacity(descriptors.len());
         for item in descriptors.iter() {
@@ -2436,159 +2687,15 @@ impl PyQuebec {
             let py_args = item.getattr("args")?;
             let py_kwargs = item.getattr("kwargs")?;
             let py_options = item.getattr("options")?;
-
-            // Extract class attributes (same as perform_later)
-            let class_name = job_class.cast::<PyType>()?.qualname()?.to_string();
-
-            let args_bound = py_args.cast::<PyTuple>()?;
-            let kwargs_bound = py_kwargs.cast::<PyDict>()?;
-
-            let queue_name = match crate::utils::lookup_class_queue(&job_class, py)? {
-                Some((attr, _)) if attr.is_callable() => {
-                    // Filter out internal _-prefixed kwargs for consistency with perform_later
-                    let filtered = PyDict::new(py);
-                    for (key, value) in kwargs_bound.iter() {
-                        if let Ok(key_str) = key.extract::<String>() {
-                            if !is_job_builder_internal_kwarg(&key_str) {
-                                filtered.set_item(key, value)?;
-                            }
-                        }
-                    }
-                    let kwargs_arg: Option<&Bound<'_, PyDict>> = if filtered.is_empty() {
-                        None
-                    } else {
-                        Some(&filtered)
-                    };
-                    let result = attr.call(args_bound.clone(), kwargs_arg)?;
-                    let name = result.extract::<String>()?;
-                    if name.is_empty() {
-                        "default".to_string()
-                    } else {
-                        name
-                    }
-                }
-                Some((attr, attr_name)) => {
-                    crate::utils::extract_queue_name_attr(&job_class, &attr, attr_name)?
-                }
-                None => "default".to_string(),
-            };
-
-            let priority = crate::utils::extract_class_priority(&job_class, py)?;
-
-            // Apply option overrides
-            let options = py_options.cast::<PyDict>()?;
-            let queue_name = options
-                .get_item("queue")?
-                .and_then(|v| v.extract::<String>().ok())
-                .unwrap_or(queue_name);
-            let priority = options
-                .get_item("priority")?
-                .and_then(|v| v.extract::<i32>().ok())
-                .unwrap_or(priority);
-
-            // Calculate scheduled_at from wait/wait_until options
-            let scheduled_at = resolve_scheduled_at(py, &options)?;
-
-            // Serialize args/kwargs to JSON (reuse perform_later logic)
-            let args_json = crate::utils::python_object(&args_bound).into_json()?;
-
-            let kwargs_json = if kwargs_bound.is_empty() {
-                None
-            } else {
-                Some(crate::utils::python_object(&kwargs_bound).into_json()?)
-            };
-
-            let mut arguments_array = if let Value::Array(arr) = args_json {
-                arr
-            } else {
-                vec![]
-            };
-
-            if let Some(Value::Object(kwargs_map)) = &kwargs_json {
-                let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
-                    .iter()
-                    .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                if !real_kwargs.is_empty() {
-                    real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
-                    arguments_array.push(Value::Object(real_kwargs));
-                }
-            }
-
-            let job_id = crate::utils::generate_job_id();
-
-            let job_data = serde_json::json!({
-                "job_class": class_name,
-                "job_id": job_id,
-                "queue_name": queue_name,
-                "priority": priority,
-                "arguments": arguments_array,
-                "continuation": {},
-                "resumptions": 0
-            });
-
-            let arguments = serde_json::to_string(&job_data).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Failed to serialize job data: {e}"
-                ))
-            })?;
-
-            // Resolve concurrency (if registered)
-            let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
-                if self.worker.ctx.has_concurrency_control(&class_name) {
-                    if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
-                        let kwargs_opt = if kwargs_bound.is_empty() {
-                            None
-                        } else {
-                            Some(kwargs_bound)
-                        };
-                        let constraint = runnable
-                            .get_concurrency_constraint(Some(args_bound), kwargs_opt)
-                            .map_err(|e| {
-                                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                    "Failed to get concurrency info: {e:?}"
-                                ))
-                            })?;
-                        match constraint {
-                            Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
-                            None => (None, None, runnable.concurrency_on_conflict),
-                        }
-                    } else {
-                        (None, None, ConcurrencyConflict::default())
-                    }
-                } else {
-                    (None, None, ConcurrencyConflict::default())
-                };
-
-            // Note: perform_all_later does NOT run enqueue callbacks, matching
-            // ActiveJob's documented behavior: "Push many jobs onto the queue at
-            // once without running enqueue callbacks."
-
-            // QUEBEC_FORCE_OVERRIDE_QUEUE — last word, wins over class config
-            // and per-descriptor options. Applied here (after `arguments`
-            // serialization) so the persisted queue_name column and the
-            // ActiveJob returned to Python use the override, while the inner
-            // `arguments` JSON keeps the original queue_name as an audit
-            // trail — matching the single-enqueue path's behaviour.
-            let queue_name = self
-                .worker
-                .ctx
-                .force_override_queue
-                .clone()
-                .unwrap_or(queue_name);
-
-            prepared.push(PreparedJob {
-                class_name,
-                queue_name,
-                priority,
-                active_job_id: job_id,
-                arguments,
-                scheduled_at,
-                concurrency_key,
-                concurrency_limit,
-                concurrency_on_conflict,
-            });
+            let mut job = self.prepare_descriptor(
+                py,
+                &job_class,
+                py_args.cast::<PyTuple>()?,
+                py_kwargs.cast::<PyDict>()?,
+                py_options.cast::<PyDict>()?,
+            )?;
+            job.batch_id = context_batch_id.or(job.batch_id);
+            prepared.push(job);
         }
 
         // Phase 2 (GIL released): perform database operations
@@ -2601,7 +2708,7 @@ impl PyQuebec {
             })
             .map_err(|e| {
                 error!("perform_all_later error: {:?}", e);
-                pyo3::exceptions::PyRuntimeError::new_err(format!("Error: {e:?}"))
+                enqueue_error_to_py(e)
             })?;
 
         let now = chrono::Utc::now().naive_utc();
@@ -2625,6 +2732,8 @@ impl PyQuebec {
                 concurrency_on_conflict: p.concurrency_on_conflict,
                 created_at: Some(model.created_at),
                 updated_at: Some(model.updated_at),
+                batch_id: p.batch_id,
+                callback_batch_id: None,
             })
             .collect();
 
@@ -2634,6 +2743,116 @@ impl PyQuebec {
             start_time.elapsed()
         );
         Ok(active_jobs)
+    }
+
+    /// Create a batch row with its callbacks serialized. Internal: the
+    /// Python `Quebec.batch()` wrapper builds the `Batch` object around it.
+    #[pyo3(signature = (description=None, on_finish=None, on_success=None, on_failure=None, metadata=None))]
+    fn _batch_create(
+        &self,
+        py: Python<'_>,
+        description: Option<String>,
+        on_finish: Option<Bound<'_, PyAny>>,
+        on_success: Option<Bound<'_, PyAny>>,
+        on_failure: Option<Bound<'_, PyAny>>,
+        metadata: Option<String>,
+    ) -> PyResult<crate::entities::quebec_batches::Model> {
+        let on_finish = on_finish
+            .map(|cb| self.serialize_callback(py, &cb))
+            .transpose()?;
+        let on_success = on_success
+            .map(|cb| self.serialize_callback(py, &cb))
+            .transpose()?;
+        let on_failure = on_failure
+            .map(|cb| self.serialize_callback(py, &cb))
+            .transpose()?;
+        let active_job_batch_id = uuid::Uuid::new_v4().to_string();
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                crate::query_builder::batches::insert(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &active_job_batch_id,
+                    description.as_deref(),
+                    on_finish.as_deref(),
+                    on_success.as_deref(),
+                    on_failure.as_deref(),
+                    metadata.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Failed to create batch: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    /// Mark a batch as started (all its initial jobs are enqueued) and run
+    /// the completion check, which finishes an empty batch immediately.
+    /// Returns whether the batch finished in this call.
+    fn _batch_start(&self, py: Python<'_>, batch_id: i64) -> PyResult<bool> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                crate::batch::start(&ctx, db.as_ref(), batch_id)
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to start batch {batch_id}: {e}"
+                        ))
+                    })
+            })
+        })
+    }
+
+    /// Load a batch by id: `(row, pending_jobs, live_failed_jobs)` or None.
+    fn _batch_find(
+        &self,
+        py: Python<'_>,
+        batch_id: i64,
+    ) -> PyResult<Option<(crate::entities::quebec_batches::Model, i64, i64)>> {
+        let ctx = self.ctx.clone();
+        py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                let batch = crate::query_builder::batches::find_by_id(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    batch_id,
+                )
+                .await
+                .map_err(batch_lookup_error)?;
+                batch_with_live_counts(&ctx, db.as_ref(), batch).await
+            })
+        })
+    }
+
+    /// Load a batch by its `active_job_batch_id` (the provider-agnostic UUID).
+    fn _batch_find_by_uuid(
+        &self,
+        py: Python<'_>,
+        active_job_batch_id: &str,
+    ) -> PyResult<Option<(crate::entities::quebec_batches::Model, i64, i64)>> {
+        let ctx = self.ctx.clone();
+        let uuid = active_job_batch_id.to_string();
+        py.detach(|| {
+            self.block_on(async move {
+                let db = require_batches(&ctx).await?;
+                let batch = crate::query_builder::batches::find_by_active_job_batch_id(
+                    db.as_ref(),
+                    &ctx.table_config,
+                    &uuid,
+                )
+                .await
+                .map_err(batch_lookup_error)?;
+                batch_with_live_counts(&ctx, db.as_ref(), batch).await
+            })
+        })
     }
 
     fn __repr__(&self) -> PyResult<String> {
@@ -3220,30 +3439,33 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    Box::pin(async move {
-                        let failed = crate::query_builder::failed_executions::find_by_job_id(
-                            txn,
-                            &table_config,
-                            job_id,
-                        )
-                        .await?;
-                        match failed {
-                            Some(model) => {
-                                model.discard(txn, &table_config).await?;
-                                Ok(true)
+                let (discarded, released) = db
+                    .transaction::<_, (bool, Option<i64>), sea_orm::DbErr>(|txn| {
+                        let table_config = table_config.clone();
+                        Box::pin(async move {
+                            let failed = crate::query_builder::failed_executions::find_by_job_id(
+                                txn,
+                                &table_config,
+                                job_id,
+                            )
+                            .await?;
+                            match failed {
+                                Some(model) => {
+                                    let released = model.discard(txn, &table_config).await?;
+                                    Ok((true, released))
+                                }
+                                None => Ok((false, None)),
                             }
-                            None => Ok(false),
-                        }
+                        })
                     })
-                })
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to discard job {job_id}: {e}"
-                    ))
-                })
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to discard job {job_id}: {e}"
+                        ))
+                    })?;
+                crate::core::finish_released_batches(&self.ctx, &db, released).await;
+                Ok(discarded)
             })
         })
     }
@@ -3346,31 +3568,34 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    let class_name = class_name.clone();
-                    let queue_name = queue_name.clone();
-                    let error_like = error_like.clone();
-                    Box::pin(async move {
-                        FailedExecutionEntity
-                            .discard_all(
-                                txn,
-                                &table_config,
-                                class_name.as_deref(),
-                                queue_name.as_deref(),
-                                since,
-                                until,
-                                error_like.as_deref(),
-                            )
-                            .await
+                let (count, released) = db
+                    .transaction::<_, (u64, Vec<i64>), sea_orm::DbErr>(|txn| {
+                        let table_config = table_config.clone();
+                        let class_name = class_name.clone();
+                        let queue_name = queue_name.clone();
+                        let error_like = error_like.clone();
+                        Box::pin(async move {
+                            FailedExecutionEntity
+                                .discard_all(
+                                    txn,
+                                    &table_config,
+                                    class_name.as_deref(),
+                                    queue_name.as_deref(),
+                                    since,
+                                    until,
+                                    error_like.as_deref(),
+                                )
+                                .await
+                        })
                     })
-                })
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to discard all failed jobs: {e}"
-                    ))
-                })
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to discard all failed jobs: {e}"
+                        ))
+                    })?;
+                crate::core::finish_released_batches(&self.ctx, &db, released).await;
+                Ok(count)
             })
         })
     }
@@ -3640,29 +3865,38 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    Box::pin(async move {
-                        let rows = crate::query_builder::blocked_executions::delete_by_job_id(
-                            txn,
-                            &table_config,
-                            job_id,
-                        )
-                        .await?;
-                        if rows == 0 {
-                            return Ok(false);
-                        }
-                        crate::query_builder::jobs::delete_by_id(txn, &table_config, job_id)
+                let ctx = self.ctx.clone();
+                let (cancelled, released) = db
+                    .transaction::<_, (bool, Option<i64>), sea_orm::DbErr>(|txn| {
+                        let table_config = table_config.clone();
+                        let ctx = ctx.clone();
+                        Box::pin(async move {
+                            let rows = crate::query_builder::blocked_executions::delete_by_job_id(
+                                txn,
+                                &table_config,
+                                job_id,
+                            )
                             .await?;
-                        Ok(true)
+                            if rows == 0 {
+                                return Ok((false, None));
+                            }
+                            // Release before the delete: the FK cascade would
+                            // drop the tracking row without telling us which
+                            // batch to re-check.
+                            let released = crate::batch::release_job(&ctx, txn, job_id).await?;
+                            crate::query_builder::jobs::delete_by_id(txn, &table_config, job_id)
+                                .await?;
+                            Ok((true, released))
+                        })
                     })
-                })
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to cancel blocked job {job_id}: {e}"
-                    ))
-                })
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to cancel blocked job {job_id}: {e}"
+                        ))
+                    })?;
+                crate::core::finish_released_batches(&self.ctx, &db, released).await;
+                Ok(cancelled)
             })
         })
     }
@@ -3756,29 +3990,36 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    Box::pin(async move {
-                        let rows = crate::query_builder::scheduled_executions::delete_by_job_id(
-                            txn,
-                            &table_config,
-                            job_id,
-                        )
-                        .await?;
-                        if rows == 0 {
-                            return Ok(false);
-                        }
-                        crate::query_builder::jobs::mark_finished(txn, &table_config, job_id)
-                            .await?;
-                        Ok(true)
+                let ctx = self.ctx.clone();
+                let (cancelled, released) = db
+                    .transaction::<_, (bool, Option<i64>), sea_orm::DbErr>(|txn| {
+                        let table_config = table_config.clone();
+                        let ctx = ctx.clone();
+                        Box::pin(async move {
+                            let rows =
+                                crate::query_builder::scheduled_executions::delete_by_job_id(
+                                    txn,
+                                    &table_config,
+                                    job_id,
+                                )
+                                .await?;
+                            if rows == 0 {
+                                return Ok((false, None));
+                            }
+                            crate::query_builder::jobs::mark_finished(txn, &table_config, job_id)
+                                .await?;
+                            let released = crate::batch::release_job(&ctx, txn, job_id).await?;
+                            Ok((true, released))
+                        })
                     })
-                })
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to cancel scheduled job {job_id}: {e}"
-                    ))
-                })
+                    .await
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to cancel scheduled job {job_id}: {e}"
+                        ))
+                    })?;
+                crate::core::finish_released_batches(&self.ctx, &db, released).await;
+                Ok(cancelled)
             })
         })
     }
@@ -4068,6 +4309,11 @@ pub struct ActiveJob {
     pub concurrency_on_conflict: crate::context::ConcurrencyConflict,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
+    /// Batch this job is a member of (Solid Queue `jobs.batch_id`).
+    pub batch_id: Option<i64>,
+    /// Set on batch callback jobs only: the batch whose completion enqueued
+    /// them. Callbacks are not members of that batch.
+    pub callback_batch_id: Option<i64>,
 }
 
 #[pymethods]
@@ -4096,12 +4342,24 @@ impl ActiveJob {
             concurrency_on_conflict: crate::context::ConcurrencyConflict::default(),
             created_at: None,
             updated_at: None,
+            batch_id: None,
+            callback_batch_id: None,
         }
     }
 
     #[getter]
     pub fn get_id(&self) -> Option<i64> {
         self.id
+    }
+
+    #[getter]
+    pub fn get_batch_id(&self) -> Option<i64> {
+        self.batch_id
+    }
+
+    #[getter]
+    pub fn get_callback_batch_id(&self) -> Option<i64> {
+        self.callback_batch_id
     }
 
     #[setter]
@@ -4272,6 +4530,50 @@ async fn require_recurring_pause(
     Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
         "Pausing recurring tasks is not enabled: {reason}"
     )))
+}
+
+/// A connection, once the batches schema is confirmed present; a fresh probe
+/// so an API call made before `create_tables()` does not stay refused.
+async fn require_batches(ctx: &Arc<AppContext>) -> PyResult<Arc<sea_orm::DatabaseConnection>> {
+    let db = ctx.get_db().await.map_err(|e| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("Database connection failed: {e}"))
+    })?;
+    ctx.forget_batches_probe();
+    if ctx.ensure_batches(db.as_ref()).await {
+        return Ok(db);
+    }
+    Err(pyo3::exceptions::PyRuntimeError::new_err(
+        "The batches schema is not installed: run Quebec.create_tables(), or on a \
+         Rails-managed database the Solid Queue `add_batches_to_solid_queue` migration",
+    ))
+}
+
+fn batch_lookup_error(e: sea_orm::DbErr) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to load batch: {e}"))
+}
+
+/// Pair a batch row with the live counts its Python accessors derive
+/// progress from while it is unfinished: outstanding tracking rows and
+/// currently failed jobs.
+async fn batch_with_live_counts(
+    ctx: &AppContext,
+    db: &sea_orm::DatabaseConnection,
+    batch: Option<crate::entities::quebec_batches::Model>,
+) -> PyResult<Option<(crate::entities::quebec_batches::Model, i64, i64)>> {
+    let Some(batch) = batch else {
+        return Ok(None);
+    };
+    if batch.finished_at.is_some() {
+        return Ok(Some((batch, 0, 0)));
+    }
+    let pending =
+        crate::query_builder::batch_executions::count_for_batch(db, &ctx.table_config, batch.id)
+            .await
+            .map_err(batch_lookup_error)?;
+    let failed = crate::query_builder::batches::count_failed_jobs(db, &ctx.table_config, batch.id)
+        .await
+        .map_err(batch_lookup_error)?;
+    Ok(Some((batch, pending, failed)))
 }
 
 /// `LookupError` unless a recurring task with this key exists.

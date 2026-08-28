@@ -133,7 +133,7 @@ impl Dispatcher {
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
 
                     // Dispatch scheduled jobs in their own transaction.
-                    let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
+                    let transaction_result = polling_db.transaction::<_, (std::collections::HashSet<String>, Vec<i64>), DbErr>(|txn| {
                         Box::pin(async move {
                           // Dispatch scheduled jobs
                           // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
@@ -147,13 +147,15 @@ impl Dispatcher {
 
                           if scheduled_executions.is_err() {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
-                              return Ok(std::collections::HashSet::new());
+                              return Ok((std::collections::HashSet::new(), Vec::new()));
                           }
                           let scheduled_executions = scheduled_executions?;
                           let size = scheduled_executions.len();
 
                           // Collect queue names for NOTIFY
                           let mut notified_queues = std::collections::HashSet::new();
+                          // Batched jobs discarded on promotion, re-checked after commit.
+                          let mut released_batches: Vec<i64> = Vec::new();
 
                           // Batch fetch all jobs at once (eliminates N+1)
                           let job_ids: Vec<i64> = scheduled_executions.iter().map(|se| se.job_id).collect();
@@ -267,6 +269,14 @@ impl Dispatcher {
                                               job.id,
                                           )
                                           .await?;
+                                          released_batches.extend(
+                                              crate::batch::release_batched_job(
+                                                  txn,
+                                                  &ctx.table_config,
+                                                  &job,
+                                              )
+                                              .await?,
+                                          );
                                       }
                                       ConcurrencyConflict::Block => {
                                           let now = chrono::Utc::now().naive_utc();
@@ -305,7 +315,7 @@ impl Dispatcher {
                               info!("Dispatch scheduled jobs size: {}", size);
                           }
 
-                          Ok(notified_queues)
+                          Ok((notified_queues, released_batches))
                         })
                     })
                     .instrument(tracing::info_span!("polling", component = "dispatcher"))
@@ -313,7 +323,8 @@ impl Dispatcher {
 
                     // Send NOTIFY for each unique queue after transaction commits.
                     // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
-                    let Ok(queues) = transaction_result else { continue };
+                    let Ok((queues, released_batches)) = transaction_result else { continue };
+                    crate::core::finish_released_batches(&self.ctx, &polling_db, released_batches).await;
 
                     for queue_name in queues {
                         if !crate::notify::should_send_notify(&self.ctx, &queue_name) {

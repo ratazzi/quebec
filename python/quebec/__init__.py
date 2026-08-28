@@ -2,8 +2,10 @@ from .quebec import *  # NOQA
 from . import quebec
 from . import sqlalchemy  # NOQA
 from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
+from .quebec import BatchAlreadyFinished
 from .quebec import Continuable as _RustContinuable
 from .quebec import StepContext, StepContextManager
+import json
 import logging
 import os
 import time
@@ -13,6 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Type, Any, Optional, Union, Generator, Callable
 from .logger import JobContext, job_context_var
+from .context import current_batch_id
 
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
@@ -196,7 +199,7 @@ class JobBuilder:
 
     def build(self, *args, **kwargs) -> "JobDescriptor":
         """Create a JobDescriptor with configured options (for bulk enqueue)."""
-        return JobDescriptor(self.job_class, args, kwargs, dict(self.options))
+        return JobDescriptor(self.job_class, args, kwargs, _capture_batch(self.options))
 
     def perform_later(self, *args, **kwargs) -> "ActiveJob":
         """Enqueue the job with configured options.
@@ -236,6 +239,218 @@ class JobBuilder:
                     f"the first argument to perform_later."
                 )
         return self.job_class.perform_later(qc, *args, **kwargs)
+
+
+def _capture_batch(options: dict) -> dict:
+    """Seed a descriptor's options with the batch open right now, so a job
+    built inside ``with qc.batch()`` still joins it when enqueued later."""
+    options = dict(options)
+    batch_id = current_batch_id.get()
+    if batch_id is not None and "batch_id" not in options:
+        options["batch_id"] = batch_id
+    return options
+
+
+class Batch:
+    """A group of jobs tracked together (Solid Queue batches).
+
+    Create one with :meth:`Quebec.batch`; every job enqueued inside the
+    ``with`` block joins it. Leaving the block starts the batch, and when its
+    last job reaches a terminal state the ``on_success`` / ``on_failure`` and
+    ``on_finish`` callback jobs are enqueued. Add more jobs later, from
+    anywhere (including one of its own jobs), with ``with batch.enqueue():``.
+
+    Counters follow Solid Queue: ``total_jobs`` counts logical jobs (a retry
+    is not a new job), discarded jobs count as completed, and a manual retry
+    of a failed job does not rejoin its batch.
+    """
+
+    def __init__(self, qc, record, pending_jobs: int = 0, live_failed_jobs: int = 0):
+        self._qc = qc
+        self._record = record
+        self._pending_jobs = pending_jobs
+        self._live_failed_jobs = live_failed_jobs
+        self._tokens: list = []
+
+    def __repr__(self) -> str:
+        return (
+            f"<Batch id={self.id} status={self.status!r} total_jobs={self.total_jobs}>"
+        )
+
+    # Row attributes
+    @property
+    def id(self) -> int:
+        return self._record.id
+
+    @property
+    def active_job_batch_id(self) -> Optional[str]:
+        return self._record.active_job_batch_id
+
+    @property
+    def description(self) -> Optional[str]:
+        return self._record.description
+
+    @property
+    def metadata(self) -> dict:
+        raw = self._record.metadata
+        return json.loads(raw) if raw else {}
+
+    @property
+    def total_jobs(self) -> int:
+        return self._record.total_jobs
+
+    @property
+    def enqueued_at(self) -> Optional[datetime]:
+        return self._record.enqueued_at
+
+    @property
+    def finished_at(self) -> Optional[datetime]:
+        return self._record.finished_at
+
+    @property
+    def failed_at(self) -> Optional[datetime]:
+        return self._record.failed_at
+
+    @property
+    def created_at(self) -> datetime:
+        return self._record.created_at
+
+    @property
+    def updated_at(self) -> datetime:
+        return self._record.updated_at
+
+    # Status
+    @property
+    def finished(self) -> bool:
+        return self.finished_at is not None
+
+    @property
+    def failed(self) -> bool:
+        return self.failed_at is not None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.finished and not self.failed
+
+    @property
+    def enqueued(self) -> bool:
+        return self.enqueued_at is not None
+
+    @property
+    def status(self) -> str:
+        """``"pending"``, ``"enqueued"``, ``"completed"`` or ``"failed"``."""
+        if self.finished:
+            return "failed" if self.failed else "completed"
+        return "enqueued" if self.enqueued else "pending"
+
+    # Progress. Live while unfinished, stored columns once finished.
+    @property
+    def pending_jobs(self) -> int:
+        """Outstanding attempts (a retry and its previous attempt may briefly
+        both count, so this clamps the derived counters)."""
+        return 0 if self.finished else self._pending_jobs
+
+    @property
+    def failed_jobs(self) -> int:
+        return self._record.failed_jobs if self.finished else self._live_failed_jobs
+
+    @property
+    def completed_jobs(self) -> int:
+        if self.finished:
+            return self._record.completed_jobs
+        return max(self.total_jobs - self.pending_jobs - self.failed_jobs, 0)
+
+    @property
+    def progress_percentage(self) -> float:
+        if self.total_jobs == 0:
+            return 0.0
+        done = max(self.total_jobs - self.pending_jobs, 0)
+        return round(done * 100.0 / self.total_jobs, 2)
+
+    def reload(self) -> "Batch":
+        """Re-read the row and live counters from the database."""
+        found = self._qc._batch_find(self.id)
+        if found is None:
+            raise LookupError(f"Batch {self.id} no longer exists")
+        self._record, self._pending_jobs, self._live_failed_jobs = found
+        return self
+
+    # Adding jobs
+    def enqueue(self) -> "Batch":
+        """Context manager that makes enqueued jobs join this batch::
+
+            with batch.enqueue():
+                MoreWork.perform_later(qc, item)
+
+        Raises :class:`BatchAlreadyFinished` if the batch has already
+        finished (an enqueue racing with completion raises the same error
+        from ``perform_later`` itself).
+        """
+        self.reload()
+        if self.finished:
+            raise BatchAlreadyFinished(
+                f"Can't add jobs to batch {self.id}: it has already finished"
+            )
+        return self
+
+    def __enter__(self) -> "Batch":
+        self._tokens.append(current_batch_id.set(self.id))
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        current_batch_id.reset(self._tokens.pop())
+        # Start even when the block raised: the jobs already enqueued will run
+        # regardless, so the batch should track them to completion rather than
+        # sit unstarted until the dispatcher sweep picks it up.
+        self._qc._batch_start(self.id)
+        self.reload()
+
+
+def _quebec_batch(
+    self,
+    *,
+    description: Optional[str] = None,
+    on_finish=None,
+    on_success=None,
+    on_failure=None,
+    metadata: Optional[dict] = None,
+    **extra_metadata,
+) -> Batch:
+    """Create a batch. Use as a context manager::
+
+        with qc.batch(description="import", on_finish=ReportJob) as batch:
+            for row in rows:
+                ImportRowJob.perform_later(qc, row)
+
+    Callbacks are a job class or a descriptor from ``build()`` (so
+    ``ReportJob.set(queue="reports").build(arg)`` works); they are serialized
+    now and enqueued when the batch finishes. ``on_success`` fires only if no
+    job failed, ``on_failure`` if any did, ``on_finish`` either way. Any extra
+    keyword arguments are merged into ``metadata``.
+    """
+    merged = {**(metadata or {}), **extra_metadata}
+    record = self._batch_create(
+        description,
+        on_finish,
+        on_success,
+        on_failure,
+        json.dumps(merged) if merged else None,
+    )
+    return Batch(self, record)
+
+
+def _quebec_find_batch(self, batch_id: int) -> Optional[Batch]:
+    """Load a batch by id, or None."""
+    found = self._batch_find(batch_id)
+    return Batch(self, *found) if found is not None else None
+
+
+def _quebec_find_batch_by_active_job_batch_id(
+    self, active_job_batch_id: str
+) -> Optional[Batch]:
+    """Load a batch by its provider-agnostic UUID, or None."""
+    found = self._batch_find_by_uuid(active_job_batch_id)
+    return Batch(self, *found) if found is not None else None
 
 
 class NoNewOverrideMeta(type):
@@ -292,7 +507,31 @@ class BaseClass(ActiveJob, metaclass=NoNewOverrideMeta):
             jobs = [MyJob.build(i) for i in range(10000)]
             qc.perform_all_later(jobs)
         """
-        return JobDescriptor(cls, args, kwargs, {})
+        return JobDescriptor(cls, args, kwargs, _capture_batch({}))
+
+    @property
+    def batch_id(self) -> Optional[int]:
+        """Id of the batch this job belongs to, or None."""
+        return getattr(self, "_batch_id", None)
+
+    @property
+    def batch(self) -> Optional["Batch"]:
+        """The batch this job runs for: its own batch for a member job, the
+        finished batch for a callback job. None outside batches."""
+        batch_id = getattr(self, "_callback_batch_id", None) or self.batch_id
+        if batch_id is None:
+            return None
+        cached = getattr(self, "_batch_cache", None)
+        if cached is not None and cached.id == batch_id:
+            return cached
+        qc = getattr(type(self), "quebec", None)
+        if qc is None:
+            raise TypeError(
+                f"{type(self).__qualname__} is not registered with a Quebec instance"
+            )
+        loaded = qc.find_batch(batch_id)
+        self._batch_cache = loaded
+        return loaded
 
     @classmethod
     def set(
@@ -853,6 +1092,9 @@ def _quebec_discover_jobs(
 
 
 # Attach methods to Quebec class
+Quebec.batch = _quebec_batch
+Quebec.find_batch = _quebec_find_batch
+Quebec.find_batch_by_active_job_batch_id = _quebec_find_batch_by_active_job_batch_id
 Quebec.start = _quebec_start
 Quebec.wait = _quebec_wait
 Quebec.run = _quebec_run
