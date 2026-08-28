@@ -49,6 +49,9 @@ impl Dispatcher {
         // Clamp to >= 1s: a zero period would panic tokio's interval (same
         // guard as the worker's cleanup_interval).
         let maintenance_enabled = self.ctx.dispatcher_concurrency_maintenance;
+        // Batch maintenance shares the same timer (Solid Queue parity).
+        let batch_maintenance = self.ctx.dispatcher_batch_maintenance;
+        let mut batch_schema_warned = false;
         let mut maintenance_interval = tokio::time::interval(
             self.ctx
                 .dispatcher_concurrency_maintenance_interval
@@ -91,38 +94,60 @@ impl Dispatcher {
                 // semaphore and unblocks the next job directly (after_executed),
                 // so this sweep only reclaims semaphores whose holder crashed.
                 // Skipped entirely when `concurrency_maintenance: false`.
-                _ = maintenance_interval.tick(), if maintenance_enabled => {
+                _ = maintenance_interval.tick(), if maintenance_enabled || batch_maintenance => {
                     let Ok(maintenance_db) = self.ctx.get_db().await.inspect_err(|e| {
-                        warn!("Failed to get DB for concurrency maintenance: {}", e);
+                        warn!("Failed to get DB for maintenance: {}", e);
                     }) else { continue };
                     let ctx = self.ctx.clone();
 
-                    // Clean up expired semaphores (matches Solid Queue's
-                    // `expire_semaphores`). Solid Queue runs expire + unblock in
-                    // a single maintenance task, so a failed expire aborts the
-                    // task before unblock runs — mirror that by skipping unblock
-                    // when expire fails.
-                    let expire_ok =
-                        match query_builder::semaphores::delete_expired(&*maintenance_db, &ctx.table_config).await {
-                            Ok(n) => {
-                                if n > 0 {
-                                    info!("Cleaned up {} expired semaphores", n);
+                    if maintenance_enabled {
+                        // Clean up expired semaphores (matches Solid Queue's
+                        // `expire_semaphores`). Solid Queue runs expire + unblock in
+                        // a single maintenance task, so a failed expire aborts the
+                        // task before unblock runs — mirror that by skipping unblock
+                        // when expire fails.
+                        let expire_ok =
+                            match query_builder::semaphores::delete_expired(&*maintenance_db, &ctx.table_config).await {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        info!("Cleaned up {} expired semaphores", n);
+                                    }
+                                    true
                                 }
-                                true
-                            }
-                            Err(e) => {
-                                warn!("Error cleaning up expired semaphores: {:?}", e);
-                                false
-                            }
-                        };
+                                Err(e) => {
+                                    warn!("Error cleaning up expired semaphores: {:?}", e);
+                                    false
+                                }
+                            };
 
-                    // Unblock jobs with expired concurrency keys — one transaction
-                    // per key, matching Solid Queue's `BlockedExecution.unblock`.
-                    if expire_ok {
-                        if let Err(e) =
-                            Self::unblock_blocked_executions(&maintenance_db, &ctx, batch_size).await
-                        {
-                            warn!("Error unblocking blocked executions: {:?}", e);
+                        // Unblock jobs with expired concurrency keys — one transaction
+                        // per key, matching Solid Queue's `BlockedExecution.unblock`.
+                        if expire_ok {
+                            if let Err(e) =
+                                Self::unblock_blocked_executions(&maintenance_db, &ctx, batch_size).await
+                            {
+                                warn!("Error unblocking blocked executions: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Batch sweep (Solid Queue's `Batch.sweep_stalled`), skipped
+                    // quietly while the batches schema is absent.
+                    if batch_maintenance {
+                        if ctx.ensure_batches(maintenance_db.as_ref()).await {
+                            if let Err(e) = crate::batch::sweep_stalled(
+                                &ctx,
+                                &maintenance_db,
+                                std::time::Duration::from_secs(300),
+                                batch_size,
+                            )
+                            .await
+                            {
+                                warn!("Error sweeping stalled batches: {:?}", e);
+                            }
+                        } else if !batch_schema_warned {
+                            batch_schema_warned = true;
+                            info!("Batch maintenance is on but the batches schema is not installed; skipping the sweep");
                         }
                     }
                 }

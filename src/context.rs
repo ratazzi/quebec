@@ -406,6 +406,10 @@ pub struct AppContext {
     /// Whether the dispatcher runs concurrency maintenance (expiring stale
     /// semaphores + unblocking blocked jobs) each polling cycle. Default true.
     pub dispatcher_concurrency_maintenance: bool,
+    /// Sweep stalled batches on the dispatcher's maintenance timer (Solid
+    /// Queue's `batch_maintenance`, default on). Disable when no batches are
+    /// used or when only some of several dispatchers should do maintenance.
+    pub dispatcher_batch_maintenance: bool,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
     /// Optional worker RSS soft limit. When set, a worker that stays above the
@@ -954,6 +958,9 @@ impl AppContext {
             if let Some(v) = get_bool("recurring_pause") {
                 ctx.recurring_pause = v;
             }
+            if let Some(v) = get_bool("dispatcher_batch_maintenance") {
+                ctx.dispatcher_batch_maintenance = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -1162,6 +1169,7 @@ impl AppContext {
             has_explicit_dispatcher_batch_size: false,
             has_explicit_dispatcher_maintenance: false,
             dispatcher_concurrency_maintenance: true,
+            dispatcher_batch_maintenance: true,
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
             worker_max_rss_bytes: None,
@@ -1355,6 +1363,7 @@ impl AppContext {
             has_explicit_dispatcher_batch_size: self.has_explicit_dispatcher_batch_size,
             has_explicit_dispatcher_maintenance: self.has_explicit_dispatcher_maintenance,
             dispatcher_concurrency_maintenance: self.dispatcher_concurrency_maintenance,
+            dispatcher_batch_maintenance: self.dispatcher_batch_maintenance,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
             worker_max_rss_bytes: self.worker_max_rss_bytes,

@@ -201,6 +201,9 @@ fn apply_dispatcher_cfg_to(
     if let Some(enabled) = dispatcher_cfg.concurrency_maintenance {
         ctx.dispatcher_concurrency_maintenance = enabled;
     }
+    if let Some(enabled) = dispatcher_cfg.batch_maintenance {
+        ctx.dispatcher_batch_maintenance = enabled;
+    }
     Ok(())
 }
 
@@ -1087,6 +1090,9 @@ impl PyQuebec {
                     }
                     if let Some(enabled) = dispatcher.concurrency_maintenance {
                         _ctx.dispatcher_concurrency_maintenance = enabled;
+                    }
+                    if let Some(enabled) = dispatcher.batch_maintenance {
+                        _ctx.dispatcher_batch_maintenance = enabled;
                     }
                 }
             }
@@ -2106,6 +2112,12 @@ impl PyQuebec {
     #[pyo3(name = "_dispatcher_concurrency_maintenance")]
     fn dispatcher_concurrency_maintenance(&self) -> bool {
         self.ctx.dispatcher_concurrency_maintenance
+    }
+
+    /// Test-only: the resolved dispatcher batch-maintenance flag.
+    #[pyo3(name = "_dispatcher_batch_maintenance")]
+    fn dispatcher_batch_maintenance(&self) -> bool {
+        self.ctx.dispatcher_batch_maintenance
     }
 
     /// Read `workers`/`dispatchers` from the loaded queue.yml and return a plan
