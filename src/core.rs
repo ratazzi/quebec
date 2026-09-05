@@ -23,6 +23,7 @@ pub struct PreparedJob {
     pub scheduled_at: Option<chrono::NaiveDateTime>,
     pub concurrency_key: Option<String>,
     pub concurrency_limit: Option<i32>,
+    pub concurrency_duration: Option<chrono::Duration>,
     pub concurrency_on_conflict: ConcurrencyConflict,
 }
 
@@ -213,7 +214,7 @@ async fn route_job(
             table_config,
             concurrency_key.to_string(),
             job.concurrency_limit.unwrap_or(1),
-            None,
+            job.concurrency_duration,
         )
         .await?;
 
@@ -225,7 +226,7 @@ async fn route_job(
                 job,
                 concurrency_key,
                 now,
-                concurrency_duration,
+                job.concurrency_duration.unwrap_or(concurrency_duration),
             )
             .await;
         }
@@ -358,6 +359,7 @@ async fn enqueue_all_jobs(
                 finished_at: None,
                 concurrency_key: prepared.concurrency_key.clone(),
                 concurrency_limit: prepared.concurrency_limit,
+                concurrency_duration: prepared.concurrency_duration,
                 concurrency_on_conflict: prepared.concurrency_on_conflict,
                 created_at: None,
                 updated_at: None,
