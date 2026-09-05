@@ -3601,6 +3601,24 @@ impl Worker {
                 .any(|prefix| queue_name.starts_with(prefix))
     }
 
+    /// Receive buffered notifications before disabling a closed listener.
+    /// Waiting here leaves polling, heartbeat and shutdown branches active.
+    async fn receive_notify(
+        notify_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
+    ) -> Option<String> {
+        if let Some(rx) = notify_rx.as_mut() {
+            if let Some(message) = rx.recv().await {
+                return Some(message);
+            }
+            // LISTEN exhausted its retry budget and dropped the sender.
+            // Leaving the closed receiver installed would make this select
+            // branch immediately ready on every iteration and spin the CPU.
+            *notify_rx = None;
+            warn!("LISTEN channel closed; falling back to polling");
+        }
+        std::future::pending().await
+    }
+
     /// Drain pending notify messages from the channel, return count drained
     fn drain_pending_notifies(
         notify_rx: &mut Option<tokio::sync::mpsc::Receiver<String>>,
@@ -4885,14 +4903,7 @@ impl Worker {
                     return Ok(());
                 }
                 // Handle real PostgreSQL NOTIFY messages for immediate job processing
-                notify_msg = async {
-                    if let Some(ref mut rx) = notify_rx {
-                        rx.recv().await
-                    } else {
-                        // If no LISTEN is active, this branch will never be taken
-                        std::future::pending().await
-                    }
-                } => {
+                notify_msg = Self::receive_notify(&mut notify_rx) => {
                     if let Some(msg) = notify_msg {
                         if self.should_handle_notify(&msg) {
                             let total_notifies = 1 + Self::drain_pending_notifies(&mut notify_rx);
@@ -5324,8 +5335,79 @@ impl ProcessTrait for Worker {
 
 #[cfg(test)]
 mod tests {
-    use super::reported_worker_rss_bytes;
+    use super::{reported_worker_rss_bytes, Worker};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn notify_receiver_closed_waits_for_other_worker_events() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut receiver = Some(rx);
+        drop(tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            Worker::receive_notify(&mut receiver),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "closed receiver must not complete the select branch"
+        );
+        assert!(receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn notify_receiver_drains_buffer_before_disabling() {
+        let (tx, rx) = mpsc::channel(2);
+        tx.try_send("first".to_string()).unwrap();
+        tx.try_send("second".to_string()).unwrap();
+        drop(tx);
+        let mut receiver = Some(rx);
+
+        assert_eq!(
+            Worker::receive_notify(&mut receiver).await.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            Worker::receive_notify(&mut receiver).await.as_deref(),
+            Some("second")
+        );
+        let result = tokio::time::timeout(
+            Duration::from_millis(20),
+            Worker::receive_notify(&mut receiver),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(receiver.is_none());
+    }
+
+    #[tokio::test]
+    async fn notify_receiver_idle_wait_can_be_cancelled_without_losing_messages() {
+        let (tx, rx) = mpsc::channel(1);
+        let mut receiver = Some(rx);
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            Worker::receive_notify(&mut receiver),
+        )
+        .await
+        .is_err());
+        assert!(receiver.is_some());
+        tx.try_send("default".to_string()).unwrap();
+        assert_eq!(
+            Worker::receive_notify(&mut receiver).await.as_deref(),
+            Some("default")
+        );
+
+        let mut unavailable = None;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            Worker::receive_notify(&mut unavailable),
+        )
+        .await
+        .is_err());
+    }
 
     #[test]
     fn reported_worker_rss_updates_cache_from_current_sample() {
