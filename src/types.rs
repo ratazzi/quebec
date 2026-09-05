@@ -2158,36 +2158,37 @@ impl PyQuebec {
         let instance = bound.call0()?;
 
         // Check if this job class has concurrency control without needing GIL
-        let (concurrency_key, concurrency_limit, concurrency_duration, concurrency_on_conflict) = if self
-            .worker
-            .ctx
-            .has_concurrency_control(&class_name.to_string())
-        {
-            let runnable = self
+        let (concurrency_key, concurrency_limit, concurrency_duration, concurrency_on_conflict) =
+            if self
                 .worker
                 .ctx
-                .get_runnable(&class_name.to_string())
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get runnable: {e:?}"
-                    ))
-                })?;
+                .has_concurrency_control(&class_name.to_string())
+            {
+                let runnable = self
+                    .worker
+                    .ctx
+                    .get_runnable(&class_name.to_string())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get runnable: {e:?}"
+                        ))
+                    })?;
 
-            let constraint = runnable
-                .get_concurrency_constraint(Some(args), kwargs)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get concurrency info: {e:?}"
-                    ))
-                })?;
+                let constraint = runnable
+                    .get_concurrency_constraint(Some(args), kwargs)
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get concurrency info: {e:?}"
+                        ))
+                    })?;
 
-            match constraint {
-                Some(c) => (Some(c.key), Some(c.limit), c.duration, c.on_conflict),
-                None => (None, None, None, runnable.concurrency_on_conflict),
-            }
-        } else {
-            (None, None, None, ConcurrencyConflict::default())
-        };
+                match constraint {
+                    Some(c) => (Some(c.key), Some(c.limit), c.duration, c.on_conflict),
+                    None => (None, None, None, runnable.concurrency_on_conflict),
+                }
+            } else {
+                (None, None, None, ConcurrencyConflict::default())
+            };
 
         // Convert Python args and kwargs to JSON for job arguments storage
         let args_json = crate::utils::python_object(&args).into_json()?;
