@@ -68,7 +68,9 @@ impl Dispatcher {
                     let Ok(heartbeat_db) = self.ctx.get_db().await.inspect_err(|e| {
                         warn!("Failed to get DB for heartbeat: {}", e);
                     }) else { continue };
-                    self.heartbeat(&heartbeat_db, &process).await?;
+                    if let Err(e) = self.heartbeat(&heartbeat_db, &process).await {
+                        warn!("Failed to flush dispatcher heartbeat: {}", e);
+                    }
                 }
                 // Detect supervisor death: if our ppid changed we were reparented.
                 _ = parent_check_interval.tick(), if supervised => {
