@@ -350,7 +350,7 @@ pub struct PyQuebec {
 
 /// Kwargs injected by `JobBuilder.set()` (queue / priority / scheduled_at
 /// overrides). They are consumed by the enqueue path and must be stripped from
-/// the job's serialized arguments and from any user `queue` callable. Only
+/// the job's serialized arguments and user `queue` / `concurrency_key` callables. Only
 /// these exact keys are reserved — a user kwarg that merely starts with `_`
 /// (e.g. `_id`, `_type`, `_meta`) is a real argument and must pass through to
 /// `perform()`.
@@ -2174,8 +2174,22 @@ impl PyQuebec {
                         ))
                     })?;
 
+                // Builder options configure enqueueing, not the user's key.
+                // Preserve real kwargs such as `_id`; only strip reserved keys.
+                let constraint_kwargs = kwargs
+                    .map(|kwargs| {
+                        let filtered = PyDict::new(py);
+                        for (key, value) in kwargs.iter() {
+                            if !is_job_builder_internal_kwarg(&key.extract::<String>()?) {
+                                filtered.set_item(key, value)?;
+                            }
+                        }
+                        Ok::<_, PyErr>(filtered)
+                    })
+                    .transpose()?;
+
                 let constraint = runnable
-                    .get_concurrency_constraint(Some(args), kwargs)
+                    .get_concurrency_constraint(Some(args), constraint_kwargs.as_ref())
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
                             "Failed to get concurrency info: {e:?}"
