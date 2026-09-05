@@ -1,4 +1,5 @@
 use crate::context::{ConcurrencyConstraint, TableConfig};
+use crate::query_builder::quote_identifier;
 use chrono::NaiveDateTime;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
@@ -14,27 +15,28 @@ where
 {
     let now = chrono::Utc::now().naive_utc();
     let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2)); // Default to 2 minutes
+    let key_col = quote_identifier(db.get_database_backend(), "key");
 
     // First, try to create a new semaphore (attempt_creation)
     let create_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres => {
             format!(
-                "INSERT INTO {} (key, value, expires_at, created_at, updated_at) \
+                "INSERT INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (key) DO NOTHING",
+             ON CONFLICT ({key_col}) DO NOTHING",
                 table_config.semaphores
             )
         }
         DatabaseBackend::Sqlite => {
             format!(
-                "INSERT OR IGNORE INTO {} (key, value, expires_at, created_at, updated_at) \
+                "INSERT OR IGNORE INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
                 table_config.semaphores
             )
         }
         DatabaseBackend::MySql => {
             format!(
-                "INSERT IGNORE INTO {} (key, value, expires_at, created_at, updated_at) \
+                "INSERT IGNORE INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
                 table_config.semaphores
             )
@@ -75,7 +77,7 @@ where
              value = value - 1, \
              expires_at = $2, \
              updated_at = $3 \
-             WHERE key = $1 AND value > 0",
+             WHERE {key_col} = $1 AND value > 0",
                 table_config.semaphores
             )
         }
@@ -85,7 +87,7 @@ where
              value = value - 1, \
              expires_at = ?, \
              updated_at = ? \
-             WHERE key = ? AND value > 0",
+             WHERE {key_col} = ? AND value > 0",
                 table_config.semaphores
             )
         }
@@ -95,7 +97,7 @@ where
              value = value - 1, \
              expires_at = ?, \
              updated_at = ? \
-             WHERE key = ? AND value > 0",
+             WHERE {key_col} = ? AND value > 0",
                 table_config.semaphores
             )
         }
@@ -165,6 +167,7 @@ where
 {
     let now = chrono::Utc::now().naive_utc();
     let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let key_col = quote_identifier(db.get_database_backend(), "key");
 
     // Try to increment the semaphore value if below max (limit)
     // value ranges from 0 to limit, where limit means all slots are free
@@ -176,7 +179,7 @@ where
              value = value + 1, \
              expires_at = $2, \
              updated_at = $3 \
-             WHERE key = $1 AND value < $4",
+             WHERE {key_col} = $1 AND value < $4",
                 table_config.semaphores
             )
         }
@@ -186,7 +189,7 @@ where
              value = value + 1, \
              expires_at = ?, \
              updated_at = ? \
-             WHERE key = ? AND value < ?",
+             WHERE {key_col} = ? AND value < ?",
                 table_config.semaphores
             )
         }
@@ -238,7 +241,7 @@ where
                 "UPDATE {} SET \
              expires_at = $2, \
              updated_at = $3 \
-             WHERE key = $1",
+             WHERE {key_col} = $1",
                 table_config.semaphores
             )
         }
@@ -247,7 +250,7 @@ where
                 "UPDATE {} SET \
              expires_at = ?, \
              updated_at = ? \
-             WHERE key = ?",
+             WHERE {key_col} = ?",
                 table_config.semaphores
             )
         }
@@ -438,19 +441,20 @@ where
 {
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
+    let key_col = quote_identifier(backend, "key");
     let sql = match backend {
         DatabaseBackend::Postgres => format!(
-            "INSERT INTO {table} (key, value, expires_at, created_at, updated_at) \
+            "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES ($1, 1, $2, $3, $3) \
-             ON CONFLICT (key) DO UPDATE SET value = {table}.value + 1, updated_at = $3"
+             ON CONFLICT ({key_col}) DO UPDATE SET value = {table}.value + 1, updated_at = $3"
         ),
         DatabaseBackend::Sqlite => format!(
-            "INSERT INTO {table} (key, value, expires_at, created_at, updated_at) \
+            "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, 1, ?, ?, ?) \
-             ON CONFLICT(key) DO UPDATE SET value = value + 1, updated_at = excluded.updated_at"
+             ON CONFLICT({key_col}) DO UPDATE SET value = value + 1, updated_at = excluded.updated_at"
         ),
         DatabaseBackend::MySql => format!(
-            "INSERT INTO {table} (key, value, expires_at, created_at, updated_at) \
+            "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, 1, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE value = value + 1, updated_at = VALUES(updated_at)"
         ),
@@ -477,12 +481,13 @@ where
 {
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
+    let key_col = quote_identifier(backend, "key");
     let sql = match backend {
         DatabaseBackend::Postgres => {
-            format!("SELECT key, value FROM {table} WHERE key IN ($1, $2)")
+            format!("SELECT {key_col}, value FROM {table} WHERE {key_col} IN ($1, $2)")
         }
         DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
-            format!("SELECT key, value FROM {table} WHERE key IN (?, ?)")
+            format!("SELECT {key_col}, value FROM {table} WHERE {key_col} IN (?, ?)")
         }
     };
     let rows = db
@@ -513,10 +518,13 @@ where
 {
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
+    let key_col = quote_identifier(backend, "key");
     let sql = match backend {
-        DatabaseBackend::Postgres => format!("UPDATE {table} SET value = value - 1 WHERE key = $1"),
+        DatabaseBackend::Postgres => {
+            format!("UPDATE {table} SET value = value - 1 WHERE {key_col} = $1")
+        }
         DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
-            format!("UPDATE {table} SET value = value - 1 WHERE key = ?")
+            format!("UPDATE {table} SET value = value - 1 WHERE {key_col} = ?")
         }
     };
     db.execute(Statement::from_sql_and_values(
