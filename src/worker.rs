@@ -908,10 +908,15 @@ impl Runnable {
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
                 let last_dict = last.cast::<pyo3::types::PyDict>()?;
-                if last_dict.contains("_quebec_kwargs")? {
+                if last_dict.contains("_quebec_kwargs")?
+                    || last_dict.contains("_aj_ruby2_keywords")?
+                {
                     for (key, value) in last_dict {
                         let key_str: String = key.extract()?;
-                        if key_str == "_quebec_kwargs" || key_str == "_aj_symbol_keys" {
+                        if key_str == "_quebec_kwargs"
+                            || key_str == "_aj_symbol_keys"
+                            || key_str == "_aj_ruby2_keywords"
+                        {
                             continue;
                         }
                         kwargs.set_item(key, value)?;
