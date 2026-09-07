@@ -27,3 +27,8 @@ job_context_var: contextvars.ContextVar[JobContext] = contextvars.ContextVar(
 current_batch_id: contextvars.ContextVar["int | None"] = contextvars.ContextVar(
     "quebec_current_batch_id", default=None
 )
+
+# The native enqueue transaction shared by nested batch contexts.
+current_batch_transaction = contextvars.ContextVar(
+    "quebec_batch_transaction", default=None
+)

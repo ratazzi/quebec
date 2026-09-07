@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import List, Type, Any, Optional, Union, Generator, Callable
 from .logger import JobContext, job_context_var
-from .context import current_batch_id
+from .context import current_batch_id, current_batch_transaction
 
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
@@ -263,14 +263,45 @@ class Batch:
     Counters follow Solid Queue: ``total_jobs`` counts logical jobs (a retry
     is not a new job), discarded jobs count as completed, and a manual retry
     of a failed job does not rejoin its batch.
+
+    Nested contexts for the same Quebec instance share a database transaction.
+    Jobs become visible and batches start after the outermost successful exit;
+    an exception escaping the outermost block body rolls back its enqueues.
+    There are no savepoints: a caught inner error keeps its enqueues, but its
+    batch remains pending until a later successful enqueue context or sweep.
+    Post-commit errors are reported after all pending completion checks run;
+    they do not undo committed enqueues.
+    SQLite holds its single connection while the context is open; do not wait
+    for other threads using the same instance (thread pools do not inherit
+    these ContextVars). A new batch is
+    persisted on first entry (or earlier if its record is explicitly inspected).
     """
 
-    def __init__(self, qc, record, pending_jobs: int = 0, live_failed_jobs: int = 0):
+    def __init__(
+        self,
+        qc,
+        record=None,
+        pending_jobs: int = 0,
+        live_failed_jobs: int = 0,
+        *,
+        creation=None,
+    ):
         self._qc = qc
-        self._record = record
+        self._record_data = record
+        self._creation = creation
         self._pending_jobs = pending_jobs
         self._live_failed_jobs = live_failed_jobs
         self._tokens: list = []
+
+    @property
+    def _record(self):
+        if self._record_data is None:
+            self._record_data = self._qc._batch_create(*self._creation)
+        return self._record_data
+
+    @_record.setter
+    def _record(self, value):
+        self._record_data = value
 
     def __repr__(self) -> str:
         return (
@@ -394,16 +425,43 @@ class Batch:
         return self
 
     def __enter__(self) -> "Batch":
-        self._tokens.append(current_batch_id.set(self.id))
+        transaction, owner = self._qc._batch_begin()
+        token = current_batch_transaction.set(transaction)
+        try:
+            if self._record_data is not None and self._creation is not None:
+                found = self._qc._batch_find_by_uuid(
+                    self._record_data.active_job_batch_id
+                )
+                if found is None:
+                    # A prior transaction rolled this newly-created batch back.
+                    self._record_data = None
+            if self._record.finished_at is not None:
+                raise BatchAlreadyFinished(f"Can't enqueue finished batch {self.id}")
+            batch_token = current_batch_id.set(self.id)
+        except BaseException:
+            current_batch_transaction.reset(token)
+            if owner:
+                self._qc._batch_end(transaction, False)
+            raise
+        self._tokens.append((batch_token, token, transaction, owner))
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        current_batch_id.reset(self._tokens.pop())
-        # Start even when the block raised: the jobs already enqueued will run
-        # regardless, so the batch should track them to completion rather than
-        # sit unstarted until the dispatcher sweep picks it up.
-        self._qc._batch_start(self.id)
-        self.reload()
+        batch_token, token, transaction, owner = self._tokens.pop()
+        commit = False
+        try:
+            if exc_type is None:
+                self._qc._batch_start(self.id)
+                commit = True
+        finally:
+            try:
+                current_batch_id.reset(batch_token)
+                current_batch_transaction.reset(token)
+            finally:
+                if owner:
+                    self._qc._batch_end(transaction, commit)
+        if exc_type is None:
+            self.reload()
 
 
 def _quebec_batch(
@@ -424,19 +482,20 @@ def _quebec_batch(
 
     Callbacks are a job class or a descriptor from ``build()`` (so
     ``ReportJob.set(queue="reports").build(arg)`` works); they are serialized
-    now and enqueued when the batch finishes. ``on_success`` fires only if no
+    when the batch is persisted and enqueued when it finishes. ``on_success`` fires only if no
     job failed, ``on_failure`` if any did, ``on_finish`` either way. Any extra
     keyword arguments are merged into ``metadata``.
     """
     merged = {**(metadata or {}), **extra_metadata}
-    record = self._batch_create(
+    self._batch_validate()
+    creation = (
         description,
         on_finish,
         on_success,
         on_failure,
         json.dumps(merged) if merged else None,
     )
-    return Batch(self, record)
+    return Batch(self, creation=creation)
 
 
 def _quebec_find_batch(self, batch_id: int) -> Optional[Batch]:

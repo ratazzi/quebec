@@ -512,16 +512,15 @@ def test_nested_context_is_restored(env) -> None:
     assert current_batch_id.get() is None
 
 
-def test_exception_inside_block_still_starts_batch(env) -> None:
+def test_exception_inside_block_rolls_back_batch(env) -> None:
     qc = env["qc"]
     with pytest.raises(RuntimeError, match="boom"):
         with qc.batch() as batch:
             Record.perform_later(qc, "before boom")
             raise RuntimeError("boom")
     assert current_batch_id.get() is None
-    assert batch.status == "enqueued"
-    _drain(qc)
-    assert batch.reload().succeeded
+    assert _count(env, "jobs") == 0
+    assert _count(env, "batches") == 0
 
 
 def test_callback_options_are_honoured(env) -> None:

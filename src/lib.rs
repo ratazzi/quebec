@@ -1,5 +1,7 @@
 #[cfg(feature = "python")]
 mod batch;
+#[cfg(feature = "python")]
+mod batch_transaction;
 mod config;
 pub mod context;
 pub mod continuation;

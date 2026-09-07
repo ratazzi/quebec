@@ -17,14 +17,15 @@
 //!   already finished and the enqueue is refused with
 //!   [`BatchAlreadyFinished`].
 //!
-//! Callback jobs are serialized once at batch creation (with the GIL, so the
-//! job class's queue / priority / concurrency settings can be read) and
-//! enqueued here without touching Python.
+//! Callback arguments and routing options are serialized at batch creation.
+//! At completion, their enqueue hooks and concurrency constraints run against
+//! the callback instance, sharing the finishing transaction.
 
 use std::sync::Arc;
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
+use pyo3::prelude::*;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, DbErr, TransactionTrait};
 use tracing::{debug, info, warn};
 
@@ -167,27 +168,33 @@ pub async fn try_finish(
         return Ok(false);
     }
 
-    let ctx_for_txn = ctx.clone();
-    let outcome = db
-        .transaction::<_, Option<Vec<String>>, DbErr>(|txn| {
-            let ctx = ctx_for_txn.clone();
-            Box::pin(async move { finalize(txn, &ctx, batch_id).await })
-        })
-        .await;
+    let transaction =
+        crate::batch_transaction::TransactionState::new(ctx.clone(), db.begin().await?);
+    let txn = transaction.connection()?;
+    let outcome = finalize(&txn, ctx, batch_id, &transaction).await;
+    drop(txn);
 
     let queues = match outcome {
-        Ok(Some(queues)) => queues,
-        Ok(None) => return Ok(false),
-        Err(sea_orm::TransactionError::Transaction(DbErr::Custom(ref m)))
-            if m == FINISH_RECHECK_MARKER =>
-        {
+        Ok(Some(queues)) => {
+            transaction.clone().finish(true).await?;
+            queues
+        }
+        Ok(None) => {
+            transaction.finish(false).await?;
+            return Ok(false);
+        }
+        Err(DbErr::Custom(ref m)) if m == FINISH_RECHECK_MARKER => {
+            transaction.finish(false).await?;
             debug!(
                 batch_id,
                 "batch: completion re-check found new work, not finishing"
             );
             return Ok(false);
         }
-        Err(e) => return Err(QuebecError::from(e)),
+        Err(e) => {
+            transaction.finish(false).await?;
+            return Err(QuebecError::from(e));
+        }
     };
 
     for queue_name in &queues {
@@ -209,6 +216,7 @@ async fn finalize(
     txn: &sea_orm::DatabaseTransaction,
     ctx: &Arc<AppContext>,
     batch_id: i64,
+    transaction: &Arc<crate::batch_transaction::TransactionState>,
 ) -> std::result::Result<Option<Vec<String>>, DbErr> {
     let table_config = &ctx.table_config;
     let now = chrono::Utc::now().naive_utc();
@@ -256,7 +264,9 @@ async fn finalize(
         .into_iter()
         .flatten()
     {
-        if let Some(queue) = enqueue_callback(txn, ctx, batch_id, callback, now).await? {
+        if let Some(queue) =
+            enqueue_callback(txn, ctx, batch_id, callback, now, transaction).await?
+        {
             queues.push(queue);
         }
     }
@@ -279,11 +289,68 @@ async fn enqueue_callback(
     batch_id: i64,
     serialized: &str,
     now: chrono::NaiveDateTime,
+    transaction: &Arc<crate::batch_transaction::TransactionState>,
 ) -> std::result::Result<Option<String>, DbErr> {
     let job = deserialize_callback(ctx, serialized, batch_id, now)?;
     let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
-    let (model, destination, _) = crate::core::enqueue_job(txn, ctx, &job, duration).await?;
+    let registered = ctx
+        .runnables
+        .read()
+        .map_err(|e| DbErr::Custom(format!("Failed to read callback registry: {e}")))?
+        .contains_key(&job.class_name);
+    if !registered {
+        warn!(
+            batch_id,
+            class_name = %job.class_name,
+            "Callback class is not registered; enqueueing serialized callback without \
+             Python hooks or recomputing concurrency constraints"
+        );
+        let (model, destination, _) = crate::core::enqueue_job(txn, ctx, &job, duration).await?;
+        return Ok(destination.should_notify().then(|| model.queue_name));
+    }
+    let prepared = Python::attach(|py| {
+        crate::batch_transaction::with_current(py, transaction.clone(), || {
+            prepare_callback(py, ctx, job)
+        })
+    })
+    .map_err(|e| {
+        DbErr::Custom(format!(
+            "batch {batch_id}: callback preparation failed: {e}"
+        ))
+    })?;
+    let Some((job, instance, around, after_enqueue)) = prepared else {
+        return Ok(None);
+    };
+    let result = crate::core::enqueue_job(txn, ctx, &job, duration).await;
+    Python::attach(|py| {
+        crate::batch_transaction::with_current(py, transaction.clone(), || {
+            match &result {
+                Ok((model, _, _)) => {
+                    instance.bind(py).cast::<ActiveJob>()?.borrow_mut().id = Some(model.id);
+                    if let Some(around) = &around {
+                        if let Err(e) = around.bind(py).call_method0("__next__") {
+                            if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    if after_enqueue {
+                        instance.bind(py).call_method0("after_enqueue")?;
+                    }
+                }
+                Err(error) => {
+                    if let Some(around) = &around {
+                        let error = pyo3::exceptions::PyRuntimeError::new_err(error.to_string());
+                        let _ = around.bind(py).call_method1("throw", (error.value(py),));
+                    }
+                }
+            }
+            Ok(())
+        })
+    })
+    .map_err(|e| DbErr::Custom(format!("batch {batch_id}: callback hook failed: {e}")))?;
+    let (model, destination, _) = result?;
     debug!(
         batch_id,
         job_id = model.id,
@@ -294,9 +361,85 @@ async fn enqueue_callback(
     Ok(destination.should_notify().then(|| model.queue_name))
 }
 
-/// Rebuild an [`ActiveJob`] from the ActiveJob-shaped JSON stored in a
-/// batch's `on_*` column. The stored `arguments` array is re-wrapped into the
-/// inner job envelope the worker's argument parser expects.
+/// Run the pre-enqueue half of a callback and resolve its current constraint.
+fn prepare_callback(
+    py: Python<'_>,
+    ctx: &Arc<AppContext>,
+    job: ActiveJob,
+) -> PyResult<Option<(ActiveJob, Py<PyAny>, Option<Py<PyAny>>, bool)>> {
+    let runnable = ctx
+        .get_runnable(&job.class_name)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    let instance = runnable.handler.bind(py).call0()?;
+    *instance.cast::<ActiveJob>()?.borrow_mut() = job;
+    let callback_batch_id = instance.cast::<ActiveJob>()?.borrow().callback_batch_id;
+    instance.setattr("_callback_batch_id", callback_batch_id)?;
+    instance.setattr("_batch_id", py.None())?;
+
+    if runnable.hooks.before_enqueue {
+        if let Err(e) = instance.call_method0("before_enqueue") {
+            if e.is_instance_of::<crate::context::AbortEnqueue>(py) {
+                return Ok(None);
+            }
+            return Err(e);
+        }
+    }
+    let around = if runnable.hooks.around_enqueue {
+        let generator = instance.call_method0("around_enqueue")?;
+        match generator.call_method0("__next__") {
+            Ok(_) => Some(generator.unbind()),
+            Err(e)
+                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py)
+                    || e.is_instance_of::<crate::context::AbortEnqueue>(py) =>
+            {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+
+    let prepared = (|| -> PyResult<ActiveJob> {
+        let mut job = instance.cast::<ActiveJob>()?.borrow().clone();
+        let data: serde_json::Value = serde_json::from_str(&job.arguments).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid callback arguments: {e}"))
+        })?;
+        let (args, kwargs) = crate::worker::Runnable::parse_job_arguments_from_json(py, &data)?;
+        let constraint = runnable
+            .get_concurrency_constraint_on(
+                Some(args.bind(py)),
+                Some(kwargs.bind(py)),
+                Some(instance.clone().unbind()),
+            )
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Active Job stores class/arguments, not a frozen semaphore constraint.
+        job.concurrency_key = constraint.as_ref().map(|c| c.key.clone());
+        job.concurrency_limit = constraint.as_ref().map(|c| c.limit);
+        job.concurrency_on_conflict =
+            constraint.map_or(runnable.concurrency_on_conflict, |c| c.on_conflict);
+        job.batch_id = None;
+        Ok(job)
+    })();
+    let job = match prepared {
+        Ok(job) => job,
+        Err(error) => {
+            if let Some(around) = &around {
+                let _ = around.bind(py).call_method1("throw", (error.value(py),));
+            }
+            return Err(error);
+        }
+    };
+    Ok(Some((
+        job,
+        instance.unbind(),
+        around,
+        runnable.hooks.after_enqueue,
+    )))
+}
+
+/// Rebuild the Active Job envelope, accepting Rails' zoned timestamps and
+/// legacy Quebec timestamps without a zone.
 fn deserialize_callback(
     ctx: &AppContext,
     serialized: &str,
@@ -315,11 +458,20 @@ fn deserialize_callback(
         queue_name = force_q.to_string();
     }
     let priority = data.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let scheduled_at = data
-        .get("scheduled_at")
-        .filter(|v| !v.is_null())
-        .and_then(|v| serde_json::from_value::<chrono::NaiveDateTime>(v.clone()).ok())
-        .unwrap_or(now);
+    let scheduled_at = match data.get("scheduled_at").filter(|v| !v.is_null()) {
+        None => now,
+        Some(value) => value
+            .as_str()
+            .and_then(|text| {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .ok()
+                    .map(|dt| dt.naive_utc())
+                    .or_else(|| serde_json::from_value::<chrono::NaiveDateTime>(value.clone()).ok())
+            })
+            .ok_or_else(|| {
+                DbErr::Custom(format!("batch {batch_id}: invalid callback scheduled_at"))
+            })?,
+    };
     let arguments = data
         .get("arguments")
         .cloned()

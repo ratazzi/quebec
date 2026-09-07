@@ -59,9 +59,20 @@ impl Quebec {
     pub async fn perform_all_later(
         &self,
         jobs: Arc<Vec<PreparedJob>>,
+        transaction: Option<Arc<crate::batch_transaction::TransactionState>>,
     ) -> Result<Vec<quebec_jobs::Model>> {
         if jobs.is_empty() {
             return Ok(vec![]);
+        }
+
+        if let Some(transaction) = transaction {
+            let txn = transaction.connection()?;
+            let duration = chrono::Duration::from_std(self.ctx.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            let (models, queues, released) =
+                enqueue_all_jobs(&txn, &self.ctx, &jobs, duration).await?;
+            transaction.after_enqueue(queues, released);
+            return Ok(models);
         }
 
         let db = self.ctx.get_db().await?;
@@ -95,7 +106,25 @@ impl Quebec {
         Ok(job_models)
     }
 
-    pub async fn perform_later(&self, job: ActiveJob) -> Result<quebec_jobs::Model> {
+    pub async fn perform_later(
+        &self,
+        job: ActiveJob,
+        transaction: Option<Arc<crate::batch_transaction::TransactionState>>,
+    ) -> Result<quebec_jobs::Model> {
+        if let Some(transaction) = transaction {
+            let txn = transaction.connection()?;
+            let duration = chrono::Duration::from_std(self.ctx.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            let (model, destination, released) =
+                enqueue_job(&txn, &self.ctx, &job, duration).await?;
+            transaction.after_enqueue(
+                destination
+                    .should_notify()
+                    .then(|| model.queue_name.clone()),
+                released,
+            );
+            return Ok(model);
+        }
         let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
         trace!("job: {:?}", job);

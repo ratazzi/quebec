@@ -223,9 +223,25 @@ impl Runnable {
         T: crate::utils::IntoPython,
         K: crate::utils::IntoPython,
     {
+        self.get_concurrency_constraint_on(args, kwargs, None)
+    }
+
+    pub(crate) fn get_concurrency_constraint_on<T, K>(
+        &self,
+        args: Option<T>,
+        kwargs: Option<K>,
+        instance: Option<Py<PyAny>>,
+    ) -> Result<Option<ConcurrencyConstraint>>
+    where
+        T: crate::utils::IntoPython,
+        K: crate::utils::IntoPython,
+    {
         Python::attach(|py| {
             let bound = self.handler.bind(py);
-            let instance = bound.call0()?;
+            let instance = match instance {
+                Some(instance) => instance.into_bound(py),
+                None => bound.call0()?,
+            };
 
             // Check if the instance has a concurrency_key method (not just the property)
             if !instance.hasattr("concurrency_key")? {
@@ -740,7 +756,7 @@ impl Runnable {
         });
 
         // Parse task parameters from original args (without continuation metadata)
-        let (args, kwargs) = self.parse_job_arguments_from_json(py, &original_args)?;
+        let (args, kwargs) = Self::parse_job_arguments_from_json(py, &original_args)?;
 
         // Create Python instance and invoke
         let bound = self.handler.bind(py);
@@ -866,8 +882,7 @@ impl Runnable {
     }
 
     /// Parse job arguments from JSON value (used for continuation support)
-    fn parse_job_arguments_from_json(
-        &self,
+    pub(crate) fn parse_job_arguments_from_json(
         py: Python,
         json_args: &serde_json::Value,
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
