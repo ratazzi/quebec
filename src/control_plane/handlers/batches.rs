@@ -325,6 +325,7 @@ impl ControlPlane {
                         WHEN EXISTS (SELECT 1 FROM {fe} WHERE job_id = j.id) THEN 'failed'
                         WHEN EXISTS (SELECT 1 FROM {ce} WHERE job_id = j.id) THEN 'processing'
                         WHEN EXISTS (SELECT 1 FROM {se} WHERE job_id = j.id) THEN 'scheduled'
+                        WHEN EXISTS (SELECT 1 FROM {be} WHERE job_id = j.id) THEN 'blocked'
                         WHEN j.finished_at IS NOT NULL THEN 'finished'
                         ELSE 'pending'
                     END AS status
@@ -334,6 +335,7 @@ impl ControlPlane {
                 fe = tc.failed_executions,
                 ce = tc.claimed_executions,
                 se = tc.scheduled_executions,
+                be = tc.blocked_executions,
                 ids = placeholders.join(", "),
             ));
             let values: Vec<Value> = active_job_ids
