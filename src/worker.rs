@@ -1407,6 +1407,18 @@ impl Execution {
                     "Job `{class_name}' started"
                 );
             }
+            // USDT probe (Linux, SystemTap SDT): a nop unless a tracer attaches.
+            // Strings are (ptr, len) pairs — read with `str(argN, argN+1)`.
+            probe::probe!(
+                quebec,
+                job_start,
+                jid.as_ptr(),
+                jid.len(),
+                class_name.as_ptr(),
+                class_name.len(),
+                job.queue_name.as_ptr(),
+                job.queue_name.len()
+            );
             let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
@@ -1542,9 +1554,23 @@ impl Execution {
         }
         .await;
 
+        let jid = job.active_job_id.as_deref().unwrap_or_default();
+        // USDT probe: counters are -1 when unavailable (non-Linux).
+        probe::probe!(
+            quebec,
+            job_end,
+            jid.as_ptr(),
+            jid.len(),
+            class_name.as_ptr(),
+            class_name.len(),
+            result.is_ok() as u8,
+            elapsed.as_nanos() as u64,
+            minflt.map_or(-1, |v| v as i64),
+            new_rss_bytes.map_or(-1, |v| v as i64)
+        );
         crate::job_metrics::aggregator().observe(
             &class_name,
-            job.active_job_id.as_deref().unwrap_or_default(),
+            jid,
             result.is_ok(),
             duration_ms,
             minflt,

@@ -1,0 +1,47 @@
+// Exact per-job peak of anonymous RSS, attributed to the job class, using the
+// kernel's rss_stat tracepoint inside the window opened/closed by Quebec's
+// USDT probes. Unlike the built-in minflt metric this sees reused memory and
+// reports a real peak, but it needs root (or CAP_BPF) and Linux >= 5.5.
+//
+//   sudo bpftrace job_memory_peak.bt /path/to/site-packages/quebec/quebec.abi3.so
+//
+// rss_stat reports the mm's running total for one counter; the delta is charged
+// to the thread that triggered the update, which is approximate when several
+// jobs allocate at the same instant.
+
+usdt:$1:quebec:job_start
+{
+  @class[tid] = str(arg2, arg3);
+  @rss[tid] = 0;
+  @peak[tid] = 0;
+}
+
+tracepoint:kmem:rss_stat
+/args.member == 1/
+{
+  if (@prev[args.mm_id] != 0 && @class[tid] != "") {
+    @rss[tid] += args.size - @prev[args.mm_id];
+    if (@rss[tid] > @peak[tid]) {
+      @peak[tid] = @rss[tid];
+    }
+  }
+  @prev[args.mm_id] = args.size;
+}
+
+usdt:$1:quebec:job_end
+/@class[tid] != ""/
+{
+  @peak_mb[@class[tid]] = hist((uint64)@peak[tid] / 1048576);
+  @peak_max_mb[@class[tid]] = max((uint64)@peak[tid] / 1048576);
+  delete(@class[tid]);
+  delete(@rss[tid]);
+  delete(@peak[tid]);
+}
+
+END
+{
+  clear(@class);
+  clear(@rss);
+  clear(@peak);
+  clear(@prev);
+}

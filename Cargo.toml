@@ -88,6 +88,7 @@ proctitle = "0.1.1"
 libc = "0.2"
 moka = { version = "0.12.15", features = ["future"] }
 csv = "1.4.0"
+probe = "0.5.2"
 
 # systemd sd_notify(3) integration. unix-only crate (UnixDatagram +
 # CLOCK_MONOTONIC), so gate it off Windows wheel builds; src/systemd.rs

@@ -450,6 +450,8 @@ This sets `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD` to the value via `mallopt` (
 
 Costs extra `mmap` calls and page faults for those sizes (roughly 0.1–0.2 ms per 8 MiB) and lowers RSS as a side effect. Memory recycled inside pymalloc's arenas stays invisible either way. glibc only; ignored with a warning elsewhere.
 
+**USDT probes.** On Linux the extension module carries two SystemTap SDT probes, `quebec:job_start` and `quebec:job_end` (jid, class, queue, status, duration, and the fault counters as arguments). They are a single `nop` until a tracer attaches, and let external tools such as bpftrace attribute anything the kernel can see — including exact per-job peak RSS — to a job class. See [`examples/bpftrace/`](examples/bpftrace/) for ready-made scripts and the argument layout.
+
 ### Per-Queue Concurrency (experimental)
 
 Cap how many jobs run concurrently across the cluster for specific queues, independent of per-class `concurrency_key`:
