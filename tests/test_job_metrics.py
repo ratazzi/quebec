@@ -170,3 +170,27 @@ def test_per_class_summary_aggregates_in_process(qc) -> None:
     qc.log_job_metrics_summary()
     assert qc.job_metrics_summary(reset=True)["AllocatingJob"]["count"] == 2
     assert qc.job_metrics_summary() == {}
+
+
+def test_malloc_mmap_threshold_env_applies_at_construction(
+    sqlite_url, test_prefix, monkeypatch
+) -> None:
+    monkeypatch.setenv("QUEBEC_MALLOC_MMAP_THRESHOLD", str(1 << 20))
+    qc = quebec.Quebec(sqlite_url, table_name_prefix=test_prefix)
+    try:
+        assert qc.create_tables() is True
+        qc.register_job(AllocatingJob)
+        faults = []
+        for _ in range(3):
+            AllocatingJob.perform_later(qc, 8)
+            faults.append(_run_one(qc).metric.minflt)
+    finally:
+        qc.close()
+
+    if LINUX:
+        # With glibc's dynamic threshold an 8 MiB buffer is served from the
+        # arena heap and reused without new faults once one has been freed;
+        # pinned at 1 MiB every run is a fresh mapping and faults again.
+        assert all(f >= 128 for f in faults), faults
+    else:
+        assert faults == [None, None, None]

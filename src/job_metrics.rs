@@ -129,6 +129,67 @@ fn calibrate_fault_granularity() -> Option<u64> {
     None
 }
 
+/// Env var holding a fixed glibc `M_MMAP_THRESHOLD` in bytes.
+pub const MALLOC_MMAP_THRESHOLD_ENV: &str = "QUEBEC_MALLOC_MMAP_THRESHOLD";
+
+/// "Accurate mode" for the page-fault metric: pin glibc's malloc thresholds.
+///
+/// By default glibc raises its mmap threshold dynamically (up to 32 MiB) after
+/// the first free of an mmap'd chunk, so later mid-sized buffers come from the
+/// arena heap and are reused without new page faults, which hides them from
+/// `minflt`. Pinning `M_MMAP_THRESHOLD` makes every allocation of `n` bytes or
+/// more a fresh mapping; pinning `M_TRIM_THRESHOLD` to the same value makes
+/// `free` give heap top back to the kernel instead of keeping it for reuse,
+/// and one `malloc_trim(0)` releases what is already free so the change takes
+/// effect immediately rather than after the next free. Costs extra mmap calls
+/// and faults for those sizes; lowers RSS as a side effect. glibc only; a
+/// no-op (with a warning) elsewhere. Reads [`MALLOC_MMAP_THRESHOLD_ENV`];
+/// safe to call repeatedly.
+pub fn apply_malloc_tuning() {
+    let Some(raw) = std::env::var_os(MALLOC_MMAP_THRESHOLD_ENV) else {
+        return;
+    };
+    let Some(bytes) = raw.to_str().and_then(|v| v.trim().parse::<u64>().ok()) else {
+        warn!("{MALLOC_MMAP_THRESHOLD_ENV}={raw:?} is not a byte count, ignoring");
+        return;
+    };
+    pin_malloc_thresholds(bytes);
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn pin_malloc_thresholds(bytes: u64) {
+    let Ok(value) = libc::c_int::try_from(bytes) else {
+        warn!("{MALLOC_MMAP_THRESHOLD_ENV}={bytes} does not fit mallopt's int, ignoring");
+        return;
+    };
+    // SAFETY: mallopt/malloc_trim only adjust allocator parameters and release
+    // free pages; they take no pointers from us.
+    let ok = unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, value) == 1
+            && libc::mallopt(libc::M_TRIM_THRESHOLD, value) == 1
+    };
+    if ok {
+        unsafe { libc::malloc_trim(0) };
+        info!(
+            bytes,
+            "glibc M_MMAP_THRESHOLD and M_TRIM_THRESHOLD pinned (dynamic adjustment off)"
+        );
+    } else {
+        warn!(
+            bytes,
+            "mallopt rejected the value (glibc caps M_MMAP_THRESHOLD at HEAP_MAX_SIZE/2, 32 MiB on 64-bit)"
+        );
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn pin_malloc_thresholds(bytes: u64) {
+    warn!(
+        bytes,
+        "{MALLOC_MMAP_THRESHOLD_ENV} only applies to glibc on Linux, ignoring"
+    );
+}
+
 /// One finished job, as written to the CSV file.
 #[derive(Clone, Debug, Serialize)]
 pub struct JobRecord {

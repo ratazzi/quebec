@@ -440,6 +440,16 @@ Quebec also keeps per-class aggregates in process (count, failures, average and 
 
 Rows are handed to a writer thread through a bounded queue and flushed every 5 seconds; if the writer falls behind, rows are dropped rather than blocking jobs, and the drop count is logged when the recording stops. On non-Linux platforms the recorder still works but the fault columns are empty.
 
+**Accurate mode (glibc).** The under-reporting above comes from glibc's dynamic mmap threshold: after the first free of an mmap'd chunk it serves buffers up to 32 MiB from its heap, where they are reused without new faults. Pin the thresholds and every allocation at or above the value becomes a fresh mapping that is returned on free and faulted again next time:
+
+```bash
+QUEBEC_MALLOC_MMAP_THRESHOLD=1048576   # bytes; applied when Quebec() is constructed
+```
+
+This sets `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD` to the value via `mallopt` (which also switches off the dynamic adjustment) and calls `malloc_trim(0)` once so memory already sitting free in the heap is released immediately.
+
+Costs extra `mmap` calls and page faults for those sizes (roughly 0.1–0.2 ms per 8 MiB) and lowers RSS as a side effect. Memory recycled inside pymalloc's arenas stays invisible either way. glibc only; ignored with a warning elsewhere.
+
 ### Per-Queue Concurrency (experimental)
 
 Cap how many jobs run concurrently across the cluster for specific queues, independent of per-class `concurrency_key`:

@@ -523,6 +523,7 @@ impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
+        crate::job_metrics::apply_malloc_tuning();
         let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {e}"))
         })?;
