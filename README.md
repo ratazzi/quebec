@@ -403,6 +403,41 @@ WantedBy=multi-user.target
 
 Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker. If you'd rather not have planned recycles show up as failures (in `systemctl status` or the start-limit counter), add `SuccessExitStatus=75` together with `RestartForceExitStatus=75` — the former keeps 75 out of the failure tally, the latter still forces the restart.
 
+### Per-Job Memory Metrics (Linux)
+
+Process RSS is shared by every thread, so it cannot tell you *which* job is eating memory. The one counter the kernel keeps per thread is the page-fault count, and each job runs on a single thread, so Quebec records `getrusage(RUSAGE_THREAD).ru_minflt` across `perform()`. Multiplied by the machine's fault granularity (calibrated once at startup: 4 KiB on a plain kernel, 16 KiB or more with fault-around / mTHP) it gives the **new resident memory the job caused**. Concurrent jobs do not disturb each other's numbers. The cost is two `getrusage` calls per job, so it is always on.
+
+The figure is not a working set: memory recycled from glibc arenas or pymalloc pools is not counted again, so a warmed-up worker under-reports mid-sized (128 KiB – 32 MiB) allocations that glibc keeps on its heap. Use it to rank job classes and spot regressions, not as a byte-exact peak.
+
+The counters appear on every `job.completed` log line (`minflt`, `new_rss_kb`) and on `execution.metric` (`minflt`, `new_rss_bytes`). For offline analysis, record one CSV row per finished job to a file:
+
+```bash
+kill -USR2 <worker pid>   # start recording; send again to stop
+```
+
+or from code: `qc.start_job_metrics(path=None)`, `qc.stop_job_metrics()`, `qc.toggle_job_metrics()`, `qc.job_metrics_path`. Under the fork supervisor the signal is forwarded to every worker child, and each child writes its own file. Columns:
+
+```
+ts_ms,pid,tid,jid,class,queue,status,duration_ms,minflt,majflt,new_rss_kb,proc_rss_kb,active_jobs
+```
+
+`proc_rss_kb` is the process RSS at job end and `active_jobs` how many jobs this process was running at that moment, so you can also see which job mix was present when the process was at its largest. Aggregate with whatever reads CSV, e.g.
+
+```sql
+select class, count(*), max(new_rss_kb), quantile_cont(new_rss_kb, 0.95)
+from 'quebec-job-metrics-*.csv' group by class order by 3 desc;
+```
+
+Environment variables:
+
+```bash
+QUEBEC_JOB_METRICS_DIR=/var/log/quebec   # output dir for SIGUSR2 recordings (default: OS temp dir)
+QUEBEC_JOB_METRICS_MAX_ROWS=100000       # recording stops itself after this many rows
+QUEBEC_JOB_METRICS_MAX_SECONDS=3600      # ...or after this long
+```
+
+Rows are handed to a writer thread through a bounded queue and flushed every 5 seconds; if the writer falls behind, rows are dropped rather than blocking jobs, and the drop count is logged when the recording stops. On non-Linux platforms the recorder still works but the fault columns are empty.
+
 ### Per-Queue Concurrency (experimental)
 
 Cap how many jobs run concurrently across the cluster for specific queues, independent of per-class `concurrency_key`:

@@ -20,6 +20,8 @@ All configuration via environment variables:
     QUEBEC_LOG_FORMAT       — structlog format: console, json, logfmt (default: console)
     QUEBEC_DISCOVER_ON_ERROR — how discover_jobs handles submodule ImportError:
                               "raise" (default) or "warn"
+    QUEBEC_JOB_METRICS_DIR  — where SIGUSR2 per-job metrics CSV recordings go
+                              (default: OS temp dir)
 
     Other QUEBEC_* env vars (pool, polling, etc.) are handled by the Rust core.
 """
