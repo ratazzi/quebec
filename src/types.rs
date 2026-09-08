@@ -2842,13 +2842,57 @@ impl PyQuebec {
     }
 
     /// Start if idle, stop if recording — what `SIGUSR2` does. Returns the
-    /// stop summary when it stopped, `None` when it started.
+    /// stop summary when it stopped, `None` when it started. Stopping also
+    /// logs the per-class summary (see `log_job_metrics_summary`).
     fn toggle_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        crate::job_metrics::recorder()
+        let stopped = crate::job_metrics::recorder()
             .toggle()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
-            .map(|s| job_metrics_summary(py, &s))
-            .transpose()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        if stopped.is_some() {
+            crate::job_metrics::aggregator().log_summary();
+        }
+        stopped.map(|s| job_metrics_summary(py, &s)).transpose()
+    }
+
+    /// Per-class aggregates since startup (or the last reset), as
+    /// `{class: {count, failed, duration_ms: {avg, max}, new_rss_kb: {avg,
+    /// p50, p95, max, max_jid}, minflt_sum}}`. `reset=True` clears them after
+    /// reading.
+    #[pyo3(signature = (reset=false))]
+    fn job_metrics_summary<'py>(
+        &self,
+        py: Python<'py>,
+        reset: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let aggregator = crate::job_metrics::aggregator();
+        let out = PyDict::new(py);
+        for (class, s) in aggregator.snapshot() {
+            let duration = PyDict::new(py);
+            duration.set_item("avg", s.duration_ms_avg())?;
+            duration.set_item("max", s.duration_ms_max)?;
+            let rss = PyDict::new(py);
+            rss.set_item("avg", s.new_rss_kb_avg())?;
+            rss.set_item("p50", s.new_rss_kb_percentile(0.5))?;
+            rss.set_item("p95", s.new_rss_kb_percentile(0.95))?;
+            rss.set_item("max", s.new_rss_kb_max)?;
+            rss.set_item("max_jid", s.new_rss_kb_max_jid.as_str())?;
+            let entry = PyDict::new(py);
+            entry.set_item("count", s.count)?;
+            entry.set_item("failed", s.failed)?;
+            entry.set_item("duration_ms", duration)?;
+            entry.set_item("new_rss_kb", rss)?;
+            entry.set_item("minflt_sum", s.minflt_sum)?;
+            out.set_item(class, entry)?;
+        }
+        if reset {
+            aggregator.reset();
+        }
+        Ok(out)
+    }
+
+    /// Write one `job_metrics.summary` log line per class.
+    fn log_job_metrics_summary(&self) {
+        crate::job_metrics::aggregator().log_summary();
     }
 
     /// Path of the running job metrics recording, or `None`.

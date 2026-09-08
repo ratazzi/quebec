@@ -132,3 +132,38 @@ def test_recorder_stops_at_row_limit(qc, tmp_path, monkeypatch) -> None:
 
     with path.open(newline="") as f:
         assert len(list(csv.DictReader(f))) == 1
+
+
+def test_per_class_summary_aggregates_in_process(qc) -> None:
+    qc.register_job(AllocatingJob)
+    qc.register_job(FailingJob)
+    qc.job_metrics_summary(reset=True)  # other tests in this process
+
+    AllocatingJob.perform_later(qc, 8)
+    AllocatingJob.perform_later(qc, 1)
+    FailingJob.perform_later(qc)
+    for _ in range(3):
+        _run_one(qc)
+
+    summary = qc.job_metrics_summary()
+    assert set(summary) == {"AllocatingJob", "FailingJob"}
+    alloc = summary["AllocatingJob"]
+    assert alloc["count"] == 2 and alloc["failed"] == 0
+    assert alloc["duration_ms"]["max"] >= alloc["duration_ms"]["avg"] > 0
+    failing = summary["FailingJob"]
+    assert failing["count"] == 1 and failing["failed"] == 1
+    assert set(failing) == {"count", "failed", "duration_ms", "new_rss_kb", "minflt_sum"}
+    assert set(failing["new_rss_kb"]) == {"avg", "p50", "p95", "max", "max_jid"}
+    rss = alloc["new_rss_kb"]
+    if LINUX:
+        assert rss["max"] >= 8 << 10
+        assert rss["p95"] >= rss["p50"] >= 1
+        assert rss["max"] <= rss["p95"]  # p95 is the bucket's upper bound
+        assert len(rss["max_jid"]) > 0
+        assert alloc["minflt_sum"] >= 128
+    else:
+        assert rss == {"avg": 0, "p50": 0, "p95": 0, "max": 0, "max_jid": ""}
+
+    qc.log_job_metrics_summary()
+    assert qc.job_metrics_summary(reset=True)["AllocatingJob"]["count"] == 2
+    assert qc.job_metrics_summary() == {}

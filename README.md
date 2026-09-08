@@ -436,6 +436,8 @@ QUEBEC_JOB_METRICS_MAX_ROWS=100000       # recording stops itself after this man
 QUEBEC_JOB_METRICS_MAX_SECONDS=3600      # ...or after this long
 ```
 
+Quebec also keeps per-class aggregates in process (count, failures, average and max duration, average / p50 / p95 / max of `new_rss_kb` with the jid of the largest job) since startup. `qc.job_metrics_summary(reset=False)` returns them as a dict, `qc.log_job_metrics_summary()` writes one `job_metrics.summary` log line per class, and stopping a recording with `SIGUSR2` logs them too. Percentiles come from a log2 histogram, so they are the upper bound of the bucket, not exact.
+
 Rows are handed to a writer thread through a bounded queue and flushed every 5 seconds; if the writer falls behind, rows are dropped rather than blocking jobs, and the drop count is logged when the recording stops. On non-Linux platforms the recorder still works but the fault columns are empty.
 
 ### Per-Queue Concurrency (experimental)

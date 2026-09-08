@@ -15,6 +15,7 @@
 //! Linux-only; the recorder itself works everywhere and leaves those columns
 //! empty elsewhere.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
@@ -386,5 +387,183 @@ impl Recorder {
             rows,
             dropped,
         })
+    }
+}
+
+/// Number of log2 buckets in [`ClassStats::new_rss_kb_hist`]: bucket 0 holds
+/// 0 KiB, bucket `i` holds `[2^(i-1), 2^i)` KiB, the last bucket everything
+/// above 2^(HIST_BUCKETS-2) KiB (≈ 2 TiB).
+pub const HIST_BUCKETS: usize = 32;
+
+/// Running aggregates for one job class, kept in-process since startup (or
+/// the last reset). Cheap enough to be always on: one mutex + hash lookup per
+/// finished job.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ClassStats {
+    pub count: u64,
+    pub failed: u64,
+    pub duration_ms_sum: f64,
+    pub duration_ms_max: f64,
+    pub minflt_sum: u64,
+    pub new_rss_kb_sum: u64,
+    pub new_rss_kb_max: u64,
+    /// Job id (`jid`) of the job that set `new_rss_kb_max`.
+    pub new_rss_kb_max_jid: String,
+    pub new_rss_kb_hist: [u64; HIST_BUCKETS],
+}
+
+fn hist_bucket(kb: u64) -> usize {
+    if kb == 0 {
+        0
+    } else {
+        ((u64::BITS - kb.leading_zeros()) as usize).min(HIST_BUCKETS - 1)
+    }
+}
+
+/// Upper bound (KiB) of a histogram bucket.
+fn hist_upper_kb(bucket: usize) -> u64 {
+    if bucket == 0 {
+        0
+    } else {
+        1u64 << bucket
+    }
+}
+
+impl ClassStats {
+    fn observe(
+        &mut self,
+        jid: &str,
+        ok: bool,
+        duration_ms: f64,
+        minflt: Option<u64>,
+        new_rss_kb: Option<u64>,
+    ) {
+        self.count += 1;
+        if !ok {
+            self.failed += 1;
+        }
+        self.duration_ms_sum += duration_ms;
+        self.duration_ms_max = self.duration_ms_max.max(duration_ms);
+        self.minflt_sum += minflt.unwrap_or(0);
+        if let Some(kb) = new_rss_kb {
+            self.new_rss_kb_sum += kb;
+            self.new_rss_kb_hist[hist_bucket(kb)] += 1;
+            if kb > self.new_rss_kb_max || self.new_rss_kb_max_jid.is_empty() {
+                self.new_rss_kb_max = kb;
+                self.new_rss_kb_max_jid = jid.to_string();
+            }
+        }
+    }
+
+    pub fn duration_ms_avg(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.duration_ms_sum / self.count as f64
+        }
+    }
+
+    pub fn new_rss_kb_avg(&self) -> u64 {
+        self.new_rss_kb_sum.checked_div(self.count).unwrap_or(0)
+    }
+
+    /// Approximate percentile of `new_rss_kb` from the log2 histogram: the
+    /// upper bound of the bucket containing the `q`-th sample (0.0..=1.0).
+    pub fn new_rss_kb_percentile(&self, q: f64) -> u64 {
+        let total: u64 = self.new_rss_kb_hist.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = ((total as f64) * q.clamp(0.0, 1.0)).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (bucket, n) in self.new_rss_kb_hist.iter().enumerate() {
+            seen += n;
+            if seen >= target {
+                return hist_upper_kb(bucket);
+            }
+        }
+        hist_upper_kb(HIST_BUCKETS - 1)
+    }
+}
+
+/// Process-wide per-class aggregates.
+#[derive(Default)]
+pub struct Aggregator {
+    classes: Mutex<HashMap<String, ClassStats>>,
+}
+
+pub fn aggregator() -> &'static Aggregator {
+    static AGGREGATOR: OnceLock<Aggregator> = OnceLock::new();
+    AGGREGATOR.get_or_init(Aggregator::default)
+}
+
+impl Aggregator {
+    pub fn observe(
+        &self,
+        class: &str,
+        jid: &str,
+        ok: bool,
+        duration_ms: f64,
+        minflt: Option<u64>,
+        new_rss_kb: Option<u64>,
+    ) {
+        let mut classes = self.classes.lock().unwrap_or_else(|e| e.into_inner());
+        classes.entry(class.to_string()).or_default().observe(
+            jid,
+            ok,
+            duration_ms,
+            minflt,
+            new_rss_kb,
+        );
+    }
+
+    /// Copy of all class stats, largest `new_rss_kb_max` first.
+    pub fn snapshot(&self) -> Vec<(String, ClassStats)> {
+        let classes = self.classes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = classes
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.new_rss_kb_max
+                .cmp(&a.1.new_rss_kb_max)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
+    }
+
+    pub fn reset(&self) {
+        self.classes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// One `job_metrics.summary` log line per class.
+    pub fn log_summary(&self) {
+        let snapshot = self.snapshot();
+        if snapshot.is_empty() {
+            info!(
+                event = "job_metrics.summary",
+                "Job metrics summary: no jobs finished yet"
+            );
+            return;
+        }
+        for (class, s) in snapshot {
+            info!(
+                event = "job_metrics.summary",
+                class = %class,
+                count = s.count,
+                failed = s.failed,
+                duration_avg_ms = s.duration_ms_avg(),
+                duration_max_ms = s.duration_ms_max,
+                new_rss_avg_kb = s.new_rss_kb_avg(),
+                new_rss_p50_kb = s.new_rss_kb_percentile(0.5),
+                new_rss_p95_kb = s.new_rss_kb_percentile(0.95),
+                new_rss_max_kb = s.new_rss_kb_max,
+                new_rss_max_jid = %s.new_rss_kb_max_jid,
+                "Job metrics summary for `{class}'"
+            );
+        }
     }
 }

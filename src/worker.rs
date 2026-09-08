@@ -1542,6 +1542,14 @@ impl Execution {
         }
         .await;
 
+        crate::job_metrics::aggregator().observe(
+            &class_name,
+            job.active_job_id.as_deref().unwrap_or_default(),
+            result.is_ok(),
+            duration_ms,
+            minflt,
+            new_rss_kb,
+        );
         let recorder = crate::job_metrics::recorder();
         if recorder.is_active() {
             recorder.record(crate::job_metrics::JobRecord {
