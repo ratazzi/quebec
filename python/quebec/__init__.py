@@ -1,6 +1,5 @@
 from .quebec import *  # NOQA
 from . import quebec
-from . import sqlalchemy  # NOQA
 from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
 from .quebec import Continuable as _RustContinuable
 from .quebec import StepContext, StepContextManager
@@ -18,6 +17,17 @@ from .logger import JobContext, job_context_var
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
     __all__ = quebec.__all__
+
+
+def __getattr__(name):
+    # sqlalchemy is an optional dependency; import the submodule lazily so that
+    # `import quebec` works without it installed.
+    if name == "sqlalchemy":
+        import importlib
+
+        return importlib.import_module(f"{__name__}.sqlalchemy")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 logger = logging.getLogger(__name__)
 
