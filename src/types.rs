@@ -1750,7 +1750,7 @@ impl PyQuebec {
         py.detach(|| {
             self.rt.block_on(async move {
                 let sup = crate::supervisor::Supervisor::new(ctx);
-                sup.fail_claimed_by_process_id(process_id)
+                sup.fail_claimed_by_process_id(process_id, None)
                     .await
                     .map_err(|e| {
                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -1762,22 +1762,27 @@ impl PyQuebec {
     }
 
     /// Supervisor: same as above but looks up by (pid, hostname). Returns 0 if
-    /// no such row exists.
+    /// no such row exists. `reason` replaces the generic "crashed" error text
+    /// recorded on each failed execution; `None` keeps the default wording.
+    #[pyo3(signature = (pid, hostname, reason=None))]
     fn supervisor_fail_claimed_by_pid(
         &self,
         py: Python<'_>,
         pid: i32,
         hostname: String,
+        reason: Option<String>,
     ) -> PyResult<u64> {
         let ctx = self.ctx.clone();
         py.detach(|| {
             self.rt.block_on(async move {
                 let sup = crate::supervisor::Supervisor::new(ctx);
-                sup.fail_claimed_by_pid(pid, &hostname).await.map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "fail_claimed_by_pid failed: {e}"
-                    ))
-                })
+                sup.fail_claimed_by_pid(pid, &hostname, reason.as_deref())
+                    .await
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                            "fail_claimed_by_pid failed: {e}"
+                        ))
+                    })
             })
         })
     }
