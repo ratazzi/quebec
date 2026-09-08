@@ -1170,10 +1170,17 @@ pub struct Metric {
     success: bool,
     duration: tokio::time::Duration,
     delay: tokio::time::Duration,
-    /// Minor page faults taken by the job thread during perform() (Linux only).
-    minflt: Option<u64>,
-    /// `minflt` × fault granularity: new resident memory caused by the job.
-    new_rss_bytes: Option<u64>,
+    /// Minor page faults taken by the job's native thread during perform().
+    minor_faults: Option<u64>,
+    /// Major page faults taken by the job's native thread during perform().
+    major_faults: Option<u64>,
+    /// Process-wide RSS samples around the job window.
+    process_rss_start_bytes: Option<u64>,
+    process_rss_peak_bytes: Option<u64>,
+    process_rss_end_bytes: Option<u64>,
+    process_rss_peak_delta_bytes: Option<u64>,
+    /// True when this supervised worker could run only this job in the window.
+    process_rss_single_job: bool,
 }
 
 #[pymethods]
@@ -1188,20 +1195,62 @@ impl Metric {
         self.delay
     }
 
+    /// Minor page faults taken by the native job thread.
     #[getter]
-    fn get_minflt(&self) -> Option<u64> {
-        self.minflt
+    fn get_minor_faults(&self) -> Option<u64> {
+        self.minor_faults
     }
 
+    /// Major page faults taken by the native job thread.
     #[getter]
-    fn get_new_rss_bytes(&self) -> Option<u64> {
-        self.new_rss_bytes
+    fn get_major_faults(&self) -> Option<u64> {
+        self.major_faults
+    }
+
+    /// Process RSS at the start of the job window.
+    #[getter]
+    fn get_process_rss_start_bytes(&self) -> Option<u64> {
+        self.process_rss_start_bytes
+    }
+
+    /// Highest sampled process RSS during the job window.
+    #[getter]
+    fn get_process_rss_peak_bytes(&self) -> Option<u64> {
+        self.process_rss_peak_bytes
+    }
+
+    /// Process RSS at the end of the job window.
+    #[getter]
+    fn get_process_rss_end_bytes(&self) -> Option<u64> {
+        self.process_rss_end_bytes
+    }
+
+    /// Sampled process RSS peak minus the job-start process RSS.
+    #[getter]
+    fn get_process_rss_peak_delta_bytes(&self) -> Option<u64> {
+        self.process_rss_peak_delta_bytes
+    }
+
+    /// Whether the process RSS window is attributable to this job.
+    #[getter]
+    fn get_process_rss_single_job(&self) -> bool {
+        self.process_rss_single_job
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "Metric(id={}, success={}, duration={:?}, delay={:?}, minflt={:?}, new_rss_bytes={:?})",
-            self.id, self.success, self.duration, self.delay, self.minflt, self.new_rss_bytes
+            "Metric(id={}, success={}, duration={:?}, delay={:?}, minor_faults={:?}, major_faults={:?}, process_rss_start_bytes={:?}, process_rss_peak_bytes={:?}, process_rss_end_bytes={:?}, process_rss_peak_delta_bytes={:?}, process_rss_single_job={})",
+            self.id,
+            self.success,
+            self.duration,
+            self.delay,
+            self.minor_faults,
+            self.major_faults,
+            self.process_rss_start_bytes,
+            self.process_rss_peak_bytes,
+            self.process_rss_end_bytes,
+            self.process_rss_peak_delta_bytes,
+            self.process_rss_single_job,
         )
     }
 }
@@ -1245,6 +1294,8 @@ pub struct Execution {
     idle_notify: Option<Arc<tokio::sync::Notify>>,
     /// Page-fault counters of the job thread when perform() started (Linux only).
     faults_at_start: Option<crate::job_metrics::ThreadFaults>,
+    /// Process RSS sampling window covering perform().
+    rss_window: Option<crate::job_metrics::ProcessRssWindow>,
 }
 
 impl Drop for Execution {
@@ -1323,6 +1374,7 @@ impl Execution {
             started_at: None,
             idle_notify: None,
             faults_at_start: None,
+            rss_window: None,
         }
     }
 
@@ -1356,23 +1408,19 @@ impl Execution {
         let _in_flight =
             crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 
-        self.timer = Instant::now();
-        // Calibrate before sampling so the first job doesn't count the
-        // calibration's own faults. perform() runs on this thread (block_on),
-        // so the end sample in after_executed reads the same counters.
-        let _ = crate::job_metrics::fault_granularity();
-        self.faults_at_start = crate::job_metrics::thread_faults();
+        let supervised = self
+            .ctx
+            .supervisor_pid
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        let rss_single_job =
+            supervised && (self.ctx.worker_threads == 1 || self.runnable.exclusive);
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
         let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
         let delay_ms = (now - target).to_std().unwrap_or_default().as_secs_f64() * 1000.0;
         let mut job = self.job.clone();
         let jid = job.active_job_id.clone().unwrap_or_default();
-        let supervised = self
-            .ctx
-            .supervisor_pid
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != 0;
         let span = tracing::info_span!(
             "runner",
             queue = job.queue_name,
@@ -1419,6 +1467,12 @@ impl Execution {
                 job.queue_name.as_ptr(),
                 job.queue_name.len()
             );
+            self.rss_window = self.ctx.job_metrics.rss_sampler().begin(rss_single_job);
+            // `perform()` runs synchronously on this native thread, so the end
+            // sample in `after_executed` reads the same thread counters. Start
+            // after RSS setup so sampler bookkeeping is not charged to the job.
+            self.faults_at_start = crate::job_metrics::thread_faults();
+            self.timer = Instant::now();
             let invoke_result = self.runnable.invoke(&mut job, cancellation_token);
             // Move retry information from runnable to execution
             if let Some(retry_info) = self.runnable.retry_info.take() {
@@ -1507,11 +1561,26 @@ impl Execution {
             .faults_at_start
             .take()
             .and_then(|start| crate::job_metrics::thread_faults().map(|end| end.since(start)));
-        let minflt = faults.map(|f| f.minflt);
-        let majflt = faults.map(|f| f.majflt);
-        let new_rss_bytes =
-            minflt.and_then(|n| crate::job_metrics::fault_granularity().map(|g| n * g));
-        let new_rss_kb = new_rss_bytes.map(|b| b / 1024);
+        let minor_faults = faults.map(|f| f.minflt);
+        let major_faults = faults.map(|f| f.majflt);
+        let rss = self
+            .rss_window
+            .take()
+            .and_then(|window| self.ctx.job_metrics.rss_sampler().finish(window));
+        let process_rss_start_bytes = rss.map(|sample| sample.start_bytes);
+        let process_rss_peak_bytes = rss.map(|sample| sample.peak_bytes);
+        let process_rss_end_bytes = rss.map(|sample| sample.end_bytes);
+        let process_rss_peak_delta_bytes = rss.map(|sample| sample.peak_delta_bytes());
+        let process_rss_single_job = rss.is_some_and(|sample| sample.single_job);
+        let process_rss_start_kb = process_rss_start_bytes.map(|bytes| bytes / 1024);
+        let process_rss_peak_kb = process_rss_peak_bytes.map(|bytes| bytes / 1024);
+        let process_rss_end_kb = process_rss_end_bytes.map(|bytes| bytes / 1024);
+        let process_rss_peak_delta_kb = process_rss_peak_delta_bytes.map(|bytes| bytes / 1024);
+        let attributed_rss_peak_delta_kb = if process_rss_single_job {
+            process_rss_peak_delta_kb
+        } else {
+            None
+        };
         async {
             if result.is_ok() {
                 info!(
@@ -1521,8 +1590,13 @@ impl Execution {
                     class_name = %self.runnable.class_name,
                     duration_ms,
                     delay_ms,
-                    minflt,
-                    new_rss_kb,
+                    minor_faults,
+                    major_faults,
+                    process_rss_start_kb,
+                    process_rss_peak_kb,
+                    process_rss_end_kb,
+                    process_rss_peak_delta_kb,
+                    process_rss_single_job,
                     "Job `{}' executed in: {}",
                     self.runnable.class_name,
                     format!("{elapsed:?}").bright_purple(),
@@ -1535,8 +1609,13 @@ impl Execution {
                     class_name = %self.runnable.class_name,
                     duration_ms,
                     delay_ms,
-                    minflt,
-                    new_rss_kb,
+                    minor_faults,
+                    major_faults,
+                    process_rss_start_kb,
+                    process_rss_peak_kb,
+                    process_rss_end_kb,
+                    process_rss_peak_delta_kb,
+                    process_rss_single_job,
                     "Job `{}' failed in: {:?}",
                     self.runnable.class_name, elapsed
                 );
@@ -1547,15 +1626,22 @@ impl Execution {
                 success: result.is_ok(),
                 duration: elapsed,
                 delay,
-                minflt,
-                new_rss_bytes,
+                minor_faults,
+                major_faults,
+                process_rss_start_bytes,
+                process_rss_peak_bytes,
+                process_rss_end_bytes,
+                process_rss_peak_delta_bytes,
+                process_rss_single_job,
             };
             self.metric = Some(metric);
         }
         .await;
 
         let jid = job.active_job_id.as_deref().unwrap_or_default();
-        // USDT probe: counters are -1 when unavailable (non-Linux).
+        // USDT probe: RSS delta is -1 unless the process was dedicated to this
+        // job, so consumers cannot accidentally aggregate shared-process data
+        // as if it were per-job memory.
         probe::probe!(
             quebec,
             job_end,
@@ -1565,18 +1651,25 @@ impl Execution {
             class_name.len(),
             result.is_ok() as u8,
             elapsed.as_nanos() as u64,
-            minflt.map_or(-1, |v| v as i64),
-            new_rss_bytes.map_or(-1, |v| v as i64)
+            minor_faults.map_or(-1, |v| v as i64),
+            if process_rss_single_job {
+                process_rss_peak_delta_bytes.map_or(-1, |v| v as i64)
+            } else {
+                -1
+            }
         );
-        crate::job_metrics::aggregator().observe(
-            &class_name,
-            jid,
-            result.is_ok(),
-            duration_ms,
-            minflt,
-            new_rss_kb,
-        );
-        let recorder = crate::job_metrics::recorder();
+        self.ctx
+            .job_metrics
+            .aggregator()
+            .observe(&crate::job_metrics::JobObservation {
+                class: &class_name,
+                jid,
+                ok: result.is_ok(),
+                duration_ms,
+                minor_faults,
+                rss_peak_delta_kb: attributed_rss_peak_delta_kb,
+            });
+        let recorder = self.ctx.job_metrics.recorder();
         if recorder.is_active() {
             recorder.record(crate::job_metrics::JobRecord {
                 ts_ms: chrono::Utc::now().timestamp_millis(),
@@ -1587,10 +1680,13 @@ impl Execution {
                 queue: job.queue_name.clone(),
                 status: if result.is_ok() { "executed" } else { "failed" },
                 duration_ms: (duration_ms * 1000.0).round() / 1000.0,
-                minflt,
-                majflt,
-                new_rss_kb,
-                proc_rss_kb: crate::memory::current_rss_bytes().map(|b| b / 1024),
+                minor_faults,
+                major_faults,
+                process_rss_start_kb,
+                process_rss_peak_kb,
+                process_rss_end_kb,
+                process_rss_peak_delta_kb,
+                process_rss_single_job,
                 active_jobs: self.ctx.ledger_active_count(),
             });
         }

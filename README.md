@@ -405,11 +405,29 @@ Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as 
 
 ### Per-Job Memory Metrics (Linux)
 
-Process RSS is shared by every thread, so it cannot tell you *which* job is eating memory. The one counter the kernel keeps per thread is the page-fault count, and each job runs on a single thread, so Quebec records `getrusage(RUSAGE_THREAD).ru_minflt` across `perform()`. Multiplied by the machine's fault granularity (calibrated once at startup: 4 KiB on a plain kernel, 16 KiB or more with fault-around / mTHP) it gives the **new resident memory the job caused**. Concurrent jobs do not disturb each other's numbers. The cost is two `getrusage` calls per job, so it is always on.
+Quebec observes two different Linux signals during `perform()`:
 
-The figure is not a working set: memory recycled from glibc arenas or pymalloc pools is not counted again, so a warmed-up worker under-reports mid-sized (128 KiB – 32 MiB) allocations that glibc keeps on its heap. Use it to rank job classes and spot regressions, not as a byte-exact peak.
+- `minor_faults` / `major_faults` are native-thread activity counters from
+  `getrusage(RUSAGE_THREAD)`. They are useful when investigating allocation and
+  I/O behaviour, but are not converted to bytes and are not RSS.
+- Process RSS is read at job start and end and sampled every 100 ms in between.
+  This produces `process_rss_start`, `process_rss_peak`, `process_rss_end`, and
+  `process_rss_peak_delta`. Shorter-lived peaks may fall between samples.
 
-The counters appear on every `job.completed` log line (`minflt`, `new_rss_kb`) and on `execution.metric` (`minflt`, `new_rss_bytes`). For offline analysis, record one CSV row per finished job to a file:
+RSS belongs to the process, not a thread. Quebec marks a window
+`process_rss_single_job=true` only in a supervisor-managed worker where either
+`threads: 1` or the job is `exclusive`. Only those single-job windows enter the
+per-class RSS aggregate. Other windows remain useful as process context but are
+not presented as memory attributable to one job. Allocations in subprocesses are
+not included in the worker's RSS. Even a single-job window is a sampled process
+envelope: allocator reuse and worker-runtime activity can still affect it.
+
+These are observability metrics, not enforcement. Use a separate cgroup per
+worker process with `memory.high` / `memory.max` when one job must not exhaust
+the host.
+
+The observations appear on every `job.completed` log line and on
+`execution.metric`. For offline analysis, record one CSV row per finished job:
 
 ```bash
 kill -USR2 <worker pid>   # start recording; send again to stop
@@ -418,14 +436,18 @@ kill -USR2 <worker pid>   # start recording; send again to stop
 or from code: `qc.start_job_metrics(path=None)`, `qc.stop_job_metrics()`, `qc.toggle_job_metrics()`, `qc.job_metrics_path`. Under the fork supervisor the signal is forwarded to every worker child, and each child writes its own file. Columns:
 
 ```
-ts_ms,pid,tid,jid,class,queue,status,duration_ms,minflt,majflt,new_rss_kb,proc_rss_kb,active_jobs
+ts_ms,pid,tid,jid,class,queue,status,duration_ms,minor_faults,major_faults,process_rss_start_kb,process_rss_peak_kb,process_rss_end_kb,process_rss_peak_delta_kb,process_rss_single_job,active_jobs
 ```
 
-`proc_rss_kb` is the process RSS at job end and `active_jobs` how many jobs this process was running at that moment, so you can also see which job mix was present when the process was at its largest. Aggregate with whatever reads CSV, e.g.
+`active_jobs` shows how many jobs the process owned when the row was recorded.
+Aggregate attributable samples with whatever reads CSV, e.g.
 
 ```sql
-select class, count(*), max(new_rss_kb), quantile_cont(new_rss_kb, 0.95)
-from 'quebec-job-metrics-*.csv' group by class order by 3 desc;
+select class, count(*), max(process_rss_peak_delta_kb),
+       quantile_cont(process_rss_peak_delta_kb, 0.95)
+from 'quebec-job-metrics-*.csv'
+where process_rss_single_job = true
+group by class order by 3 desc;
 ```
 
 Environment variables:
@@ -436,21 +458,26 @@ QUEBEC_JOB_METRICS_MAX_ROWS=100000       # recording stops itself after this man
 QUEBEC_JOB_METRICS_MAX_SECONDS=3600      # ...or after this long
 ```
 
-Quebec also keeps per-class aggregates in process (count, failures, average and max duration, average / p50 / p95 / max of `new_rss_kb` with the jid of the largest job) since startup. `qc.job_metrics_summary(reset=False)` returns them as a dict, `qc.log_job_metrics_summary()` writes one `job_metrics.summary` log line per class, and stopping a recording with `SIGUSR2` logs them too. Percentiles come from a log2 histogram, so they are the upper bound of the bucket, not exact.
+Each Quebec instance also keeps per-class aggregates since startup: count,
+failures, duration, thread faults, and average / p50 / p95 / max of single-job
+`process_rss_peak_delta_kb` samples with the jid of the largest job.
+`qc.job_metrics_summary(reset=False)` returns them as a dict;
+`reset=True` takes and clears the current snapshot atomically.
+`qc.log_job_metrics_summary()` writes one `job_metrics.summary` log line per
+class, and stopping a recording with `SIGUSR2` logs them too. Percentiles come
+from a log2 histogram, so they are bucket upper bounds rather than exact values.
 
-Rows are handed to a writer thread through a bounded queue and flushed every 5 seconds; if the writer falls behind, rows are dropped rather than blocking jobs, and the drop count is logged when the recording stops. On non-Linux platforms the recorder still works but the fault columns are empty.
+Rows are handed to a writer thread through a bounded queue and flushed every 5
+seconds. If the writer falls behind, rows are dropped rather than blocking jobs.
+When a row/time limit automatically ends a recording, writer draining and file
+flush happen on a background reaper instead of the job completion path.
 
-**Accurate mode (glibc).** The under-reporting above comes from glibc's dynamic mmap threshold: after the first free of an mmap'd chunk it serves buffers up to 32 MiB from its heap, where they are reused without new faults. Pin the thresholds and every allocation at or above the value becomes a fresh mapping that is returned on free and faulted again next time:
-
-```bash
-QUEBEC_MALLOC_MMAP_THRESHOLD=1048576   # bytes; applied when Quebec() is constructed
-```
-
-This sets `M_MMAP_THRESHOLD` and `M_TRIM_THRESHOLD` to the value via `mallopt` (which also switches off the dynamic adjustment) and calls `malloc_trim(0)` once so memory already sitting free in the heap is released immediately.
-
-Costs extra `mmap` calls and page faults for those sizes (roughly 0.1–0.2 ms per 8 MiB) and lowers RSS as a side effect. Memory recycled inside pymalloc's arenas stays invisible either way. glibc only; ignored with a warning elsewhere.
-
-**USDT probes.** On Linux the extension module carries two SystemTap SDT probes, `quebec:job_start` and `quebec:job_end` (jid, class, queue, status, duration, and the fault counters as arguments). They are a single `nop` until a tracer attaches, and let external tools such as bpftrace attribute anything the kernel can see — including exact per-job peak RSS — to a job class. See [`examples/bpftrace/`](examples/bpftrace/) for ready-made scripts and the argument layout.
+**USDT probes.** The Linux extension module carries `quebec:job_start` and
+`quebec:job_end`. They are a single `nop` until a tracer attaches. The end probe
+exports the minor-fault delta and the sampled RSS peak delta; the RSS argument is
+`-1` unless `process_rss_single_job` is true. `job_start` exports jid, class,
+and queue as pointer/length pairs. `job_end` exports jid, class, success,
+duration nanoseconds, minor faults, and the attributable RSS peak delta.
 
 ### Per-Queue Concurrency (experimental)
 

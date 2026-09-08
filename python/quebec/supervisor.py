@@ -225,6 +225,22 @@ class Supervisor:
     # -- internals --------------------------------------------------------
 
     def _install_signal_handlers(self) -> None:
+        def forward_to_workers(forwarded_signal, label):
+            for pid, info in list(self._children.items()):
+                if info.role != ROLE_WORKER:
+                    continue
+                try:
+                    os.kill(pid, forwarded_signal)
+                except ProcessLookupError:
+                    pass
+                except OSError as error:
+                    logger.warning(
+                        "Failed to forward %s to worker pid=%d: %s",
+                        label,
+                        pid,
+                        error,
+                    )
+
         def graceful(signum, _frame):
             logger.info("Supervisor received signal %d", signum)
             self._stopping = True
@@ -251,17 +267,7 @@ class Supervisor:
                 "to worker children",
                 signum,
             )
-            for pid, info in list(self._children.items()):
-                if info.role != ROLE_WORKER:
-                    continue
-                try:
-                    os.kill(pid, signal.SIGUSR1)
-                except ProcessLookupError:
-                    pass
-                except OSError as e:
-                    logger.warning(
-                        "Failed to forward quiet to worker pid=%d: %s", pid, e
-                    )
+            forward_to_workers(signal.SIGUSR1, "quiet")
 
         # SIGUSR2 toggles per-job metrics recording; only workers execute
         # jobs, so forward it to them (each writes its own CSV file).
@@ -271,17 +277,7 @@ class Supervisor:
                 "(SIGUSR2) to worker children",
                 signum,
             )
-            for pid, info in list(self._children.items()):
-                if info.role != ROLE_WORKER:
-                    continue
-                try:
-                    os.kill(pid, signal.SIGUSR2)
-                except ProcessLookupError:
-                    pass
-                except OSError as e:
-                    logger.warning(
-                        "Failed to forward SIGUSR2 to worker pid=%d: %s", pid, e
-                    )
+            forward_to_workers(signal.SIGUSR2, "SIGUSR2")
 
         signal.signal(signal.SIGTERM, graceful)
         signal.signal(signal.SIGINT, graceful)

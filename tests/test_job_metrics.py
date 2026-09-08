@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import sys
+import time
 
 import pytest
 import quebec
@@ -12,10 +13,12 @@ LINUX = sys.platform.startswith("linux")
 
 
 class AllocatingJob(quebec.BaseClass):
-    def perform(self, mb: int) -> None:
+    def perform(self, mb: int, hold_ms: int = 0) -> None:
         buf = bytearray(mb << 20)
         for i in range(0, len(buf), 4096):
             buf[i] = 1
+        if hold_ms:
+            time.sleep(hold_ms / 1000)
 
 
 class FailingJob(quebec.BaseClass):
@@ -32,21 +35,59 @@ def _run_one(qc):
     return execution
 
 
-def test_metric_exposes_page_faults(qc) -> None:
+def test_metric_exposes_faults_and_process_rss_context(qc) -> None:
     qc.register_job(AllocatingJob)
     AllocatingJob.perform_later(qc, 40)
     execution = _run_one(qc)
     metric = execution.metric
 
     if LINUX:
-        # 40 MiB is above glibc's 32 MiB dynamic mmap threshold, so it is a fresh
-        # mapping whatever ran before; touched page by page it takes at least
-        # 40 MiB / 64 KiB faults even with the largest fault-around granularity.
-        assert metric.minflt >= 640
-        assert metric.new_rss_bytes >= 40 << 20
+        assert metric.minor_faults > 0
+        assert metric.major_faults >= 0
+        assert metric.process_rss_peak_bytes >= metric.process_rss_start_bytes > 0
+        assert metric.process_rss_peak_bytes >= metric.process_rss_end_bytes > 0
+        assert metric.process_rss_peak_delta_bytes == (
+            metric.process_rss_peak_bytes - metric.process_rss_start_bytes
+        )
+        # This fixture is a standalone process, not a dedicated supervisor child.
+        assert metric.process_rss_single_job is False
     else:
-        assert metric.minflt is None
-        assert metric.new_rss_bytes is None
+        assert metric.minor_faults is None
+        assert metric.major_faults is None
+        assert metric.process_rss_start_bytes is None
+        assert metric.process_rss_peak_bytes is None
+        assert metric.process_rss_end_bytes is None
+        assert metric.process_rss_peak_delta_bytes is None
+        assert metric.process_rss_single_job is False
+
+
+@pytest.mark.skipif(not LINUX, reason="Linux RSS sampling")
+def test_supervised_single_thread_worker_attributes_rss(
+    sqlite_url, test_prefix
+) -> None:
+    qc = quebec.Quebec(
+        sqlite_url,
+        table_name_prefix=test_prefix,
+        worker_threads=1,
+    )
+    try:
+        assert qc.create_tables() is True
+        qc.watch_parent_pid()  # mark this process as a supervisor worker in the test
+        qc.register_job(AllocatingJob)
+        qc.job_metrics_summary(reset=True)
+
+        AllocatingJob.perform_later(qc, 40, 250)
+        metric = _run_one(qc).metric
+
+        assert metric.process_rss_single_job is True
+        assert metric.process_rss_peak_delta_bytes >= 32 << 20
+        memory = qc.job_metrics_summary()["AllocatingJob"][
+            "process_rss_peak_delta_kb"
+        ]
+        assert memory["samples"] == 1
+        assert memory["max"] >= 32 << 10
+    finally:
+        qc.close()
 
 
 def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
@@ -60,7 +101,7 @@ def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
     with pytest.raises(RuntimeError):
         qc.start_job_metrics(str(tmp_path / "other.csv"))
 
-    AllocatingJob.perform_later(qc, 40)
+    AllocatingJob.perform_later(qc, 40, 150)
     FailingJob.perform_later(qc)
     _run_one(qc)
     _run_one(qc)
@@ -83,24 +124,31 @@ def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
         "queue",
         "status",
         "duration_ms",
-        "minflt",
-        "majflt",
-        "new_rss_kb",
-        "proc_rss_kb",
+        "minor_faults",
+        "major_faults",
+        "process_rss_start_kb",
+        "process_rss_peak_kb",
+        "process_rss_end_kb",
+        "process_rss_peak_delta_kb",
+        "process_rss_single_job",
         "active_jobs",
     ]
     first = rows[0]
     assert first["queue"] == "default"
     assert len(first["jid"]) > 0
     assert float(first["duration_ms"]) >= 0
-    assert int(first["proc_rss_kb"]) > 0
+    assert first["process_rss_single_job"] == "false"
     if LINUX:
-        assert int(first["minflt"]) >= 640
-        assert int(first["new_rss_kb"]) >= 40 << 10
+        assert int(first["minor_faults"]) > 0
+        assert int(first["process_rss_start_kb"]) > 0
+        assert int(first["process_rss_peak_kb"]) >= int(
+            first["process_rss_start_kb"]
+        )
+        assert int(first["process_rss_end_kb"]) > 0
         assert int(first["tid"]) > 0
     else:
-        assert first["minflt"] == ""
-        assert first["new_rss_kb"] == ""
+        assert first["minor_faults"] == ""
+        assert first["process_rss_start_kb"] == ""
 
 
 def test_toggle_starts_then_stops(qc, tmp_path, monkeypatch) -> None:
@@ -131,8 +179,14 @@ def test_recorder_stops_at_row_limit(qc, tmp_path, monkeypatch) -> None:
     _run_one(qc)
     assert qc.stop_job_metrics() is None
 
-    with path.open(newline="") as f:
-        assert len(list(csv.DictReader(f))) == 1
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with path.open(newline="") as f:
+            if len(list(csv.DictReader(f))) == 1:
+                break
+        time.sleep(0.01)
+    else:
+        pytest.fail("background metrics writer did not flush the row")
 
 
 def test_per_class_summary_aggregates_in_process(qc) -> None:
@@ -153,44 +207,65 @@ def test_per_class_summary_aggregates_in_process(qc) -> None:
     assert alloc["duration_ms"]["max"] >= alloc["duration_ms"]["avg"] > 0
     failing = summary["FailingJob"]
     assert failing["count"] == 1 and failing["failed"] == 1
-    assert set(failing) == {"count", "failed", "duration_ms", "new_rss_kb", "minflt_sum"}
-    assert set(failing["new_rss_kb"]) == {"avg", "p50", "p95", "max", "max_jid"}
-    rss = alloc["new_rss_kb"]
+    assert set(failing) == {
+        "count",
+        "failed",
+        "duration_ms",
+        "minor_faults",
+        "process_rss_peak_delta_kb",
+    }
+    assert set(failing["minor_faults"]) == {"samples", "sum"}
+    assert set(failing["process_rss_peak_delta_kb"]) == {
+        "samples",
+        "avg",
+        "p50",
+        "p95",
+        "max",
+        "max_jid",
+    }
+    rss = alloc["process_rss_peak_delta_kb"]
     if LINUX:
-        assert rss["max"] >= 40 << 10
-        # p95 of two samples is the bucket holding the 40 MiB job; percentiles
-        # are bucket upper bounds. The 1 MiB job may be served from reused heap
-        # pages (0 faults), so p50 is only known to be >= 0.
-        assert rss["p95"] >= rss["max"] >= rss["p50"] >= 0
-        assert len(rss["max_jid"]) > 0
-        assert alloc["minflt_sum"] >= 640
+        assert alloc["minor_faults"]["samples"] == 2
+        assert alloc["minor_faults"]["sum"] > 0
     else:
-        assert rss == {"avg": 0, "p50": 0, "p95": 0, "max": 0, "max_jid": ""}
+        assert alloc["minor_faults"] == {"samples": 0, "sum": 0}
+
+    # Standalone workers deliberately do not claim process RSS attribution.
+    assert rss == {
+        "samples": 0,
+        "avg": None,
+        "p50": None,
+        "p95": None,
+        "max": None,
+        "max_jid": None,
+    }
 
     qc.log_job_metrics_summary()
     assert qc.job_metrics_summary(reset=True)["AllocatingJob"]["count"] == 2
     assert qc.job_metrics_summary() == {}
 
 
-def test_malloc_mmap_threshold_env_applies_at_construction(
-    sqlite_url, test_prefix, monkeypatch
-) -> None:
-    monkeypatch.setenv("QUEBEC_MALLOC_MMAP_THRESHOLD", str(1 << 20))
-    qc = quebec.Quebec(sqlite_url, table_name_prefix=test_prefix)
+def test_metrics_state_is_per_quebec_instance(sqlite_url, tmp_path) -> None:
+    qc1 = quebec.Quebec(sqlite_url, table_name_prefix="metrics_one")
+    qc2 = quebec.Quebec(sqlite_url, table_name_prefix="metrics_two")
     try:
-        assert qc.create_tables() is True
-        qc.register_job(AllocatingJob)
-        faults = []
-        for _ in range(3):
-            AllocatingJob.perform_later(qc, 8)
-            faults.append(_run_one(qc).metric.minflt)
-    finally:
-        qc.close()
+        assert qc1.create_tables() is True
+        assert qc2.create_tables() is True
+        qc1.register_job(AllocatingJob)
+        qc2.register_job(FailingJob)
 
-    if LINUX:
-        # With glibc's dynamic threshold an 8 MiB buffer is served from the
-        # arena heap and reused without new faults once one has been freed;
-        # pinned at 1 MiB every run is a fresh mapping and faults again.
-        assert all(f >= 128 for f in faults), faults
-    else:
-        assert faults == [None, None, None]
+        assert qc1.start_job_metrics(str(tmp_path / "one.csv"))
+        assert qc2.start_job_metrics(str(tmp_path / "two.csv"))
+
+        AllocatingJob.perform_later(qc1, 1)
+        FailingJob.perform_later(qc2)
+        _run_one(qc1)
+        _run_one(qc2)
+
+        assert set(qc1.job_metrics_summary()) == {"AllocatingJob"}
+        assert set(qc2.job_metrics_summary()) == {"FailingJob"}
+        assert qc1.stop_job_metrics()["rows"] == 1
+        assert qc2.stop_job_metrics()["rows"] == 1
+    finally:
+        qc1.close()
+        qc2.close()

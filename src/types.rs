@@ -244,8 +244,16 @@ fn signal_handler(
         // SIGUSR2 toggles the per-job metrics CSV recording (see job_metrics.rs).
         if signum == libc::SIGUSR2 {
             info!("Received SIGUSR2, toggling job metrics recording");
-            if let Err(e) = quebec.bind(py).call_method0("toggle_job_metrics") {
-                error!("Error toggling job metrics: {:?}", e);
+            match quebec.bind(py).cast::<PyQuebec>() {
+                Ok(qc) => {
+                    let qc = qc.borrow();
+                    match qc.ctx.job_metrics.recorder().toggle_in_background() {
+                        Ok(true) => qc.ctx.job_metrics.aggregator().log_summary(),
+                        Ok(false) => {}
+                        Err(error) => error!("Error toggling job metrics: {:?}", error),
+                    }
+                }
+                Err(error) => error!("Invalid Quebec signal target: {:?}", error),
             }
             return Ok(());
         }
@@ -523,7 +531,6 @@ impl PyQuebec {
     #[pyo3(signature = (url, **kwargs))]
     #[new]
     fn new(url: String, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        crate::job_metrics::apply_malloc_tuning();
         let dsn = crate::database_url::DatabaseUrl::parse(&url).map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid database URL: {e}"))
         })?;
@@ -2827,7 +2834,9 @@ impl PyQuebec {
     /// Returns the path. Raises if a recording is already running.
     #[pyo3(signature = (path=None))]
     fn start_job_metrics(&self, path: Option<std::path::PathBuf>) -> PyResult<String> {
-        crate::job_metrics::recorder()
+        self.ctx
+            .job_metrics
+            .recorder()
             .start(path.as_deref())
             .map(|p| p.display().to_string())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
@@ -2836,7 +2845,9 @@ impl PyQuebec {
     /// Stop the job metrics recording. Returns `{"path", "rows", "dropped"}`,
     /// or `None` when nothing was recording.
     fn stop_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        crate::job_metrics::recorder()
+        self.ctx
+            .job_metrics
+            .recorder()
             .stop()
             .map(|s| job_metrics_summary(py, &s))
             .transpose()
@@ -2846,60 +2857,67 @@ impl PyQuebec {
     /// stop summary when it stopped, `None` when it started. Stopping also
     /// logs the per-class summary (see `log_job_metrics_summary`).
     fn toggle_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let stopped = crate::job_metrics::recorder()
+        let stopped = self
+            .ctx
+            .job_metrics
+            .recorder()
             .toggle()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         if stopped.is_some() {
-            crate::job_metrics::aggregator().log_summary();
+            self.ctx.job_metrics.aggregator().log_summary();
         }
         stopped.map(|s| job_metrics_summary(py, &s)).transpose()
     }
 
     /// Per-class aggregates since startup (or the last reset), as
-    /// `{class: {count, failed, duration_ms: {avg, max}, new_rss_kb: {avg,
-    /// p50, p95, max, max_jid}, minflt_sum}}`. `reset=True` clears them after
-    /// reading.
+    /// `{class: {count, failed, duration_ms, minor_faults,
+    /// process_rss_peak_delta_kb}}`. RSS aggregates contain only single-job
+    /// windows (`threads=1` or exclusive jobs). `reset=True` atomically takes
+    /// and clears the current values.
     #[pyo3(signature = (reset=false))]
     fn job_metrics_summary<'py>(
         &self,
         py: Python<'py>,
         reset: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let aggregator = crate::job_metrics::aggregator();
+        let aggregator = self.ctx.job_metrics.aggregator();
         let out = PyDict::new(py);
-        for (class, s) in aggregator.snapshot() {
+        for (class, s) in aggregator.snapshot(reset) {
             let duration = PyDict::new(py);
             duration.set_item("avg", s.duration_ms_avg())?;
             duration.set_item("max", s.duration_ms_max)?;
             let rss = PyDict::new(py);
-            rss.set_item("avg", s.new_rss_kb_avg())?;
-            rss.set_item("p50", s.new_rss_kb_percentile(0.5))?;
-            rss.set_item("p95", s.new_rss_kb_percentile(0.95))?;
-            rss.set_item("max", s.new_rss_kb_max)?;
-            rss.set_item("max_jid", s.new_rss_kb_max_jid.as_str())?;
+            rss.set_item("samples", s.rss_samples)?;
+            rss.set_item("avg", s.rss_peak_delta_kb_avg())?;
+            rss.set_item("p50", s.rss_peak_delta_kb_percentile(0.5))?;
+            rss.set_item("p95", s.rss_peak_delta_kb_percentile(0.95))?;
+            rss.set_item("max", s.rss_peak_delta_kb_max())?;
+            rss.set_item("max_jid", s.rss_peak_delta_kb_max_jid())?;
+            let faults = PyDict::new(py);
+            faults.set_item("samples", s.fault_samples)?;
+            faults.set_item("sum", s.minor_faults_sum)?;
             let entry = PyDict::new(py);
             entry.set_item("count", s.count)?;
             entry.set_item("failed", s.failed)?;
             entry.set_item("duration_ms", duration)?;
-            entry.set_item("new_rss_kb", rss)?;
-            entry.set_item("minflt_sum", s.minflt_sum)?;
+            entry.set_item("minor_faults", faults)?;
+            entry.set_item("process_rss_peak_delta_kb", rss)?;
             out.set_item(class, entry)?;
-        }
-        if reset {
-            aggregator.reset();
         }
         Ok(out)
     }
 
     /// Write one `job_metrics.summary` log line per class.
     fn log_job_metrics_summary(&self) {
-        crate::job_metrics::aggregator().log_summary();
+        self.ctx.job_metrics.aggregator().log_summary();
     }
 
     /// Path of the running job metrics recording, or `None`.
     #[getter]
     fn job_metrics_path(&self) -> Option<String> {
-        crate::job_metrics::recorder()
+        self.ctx
+            .job_metrics
+            .recorder()
             .current_path()
             .map(|p| p.display().to_string())
     }
