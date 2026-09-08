@@ -149,6 +149,69 @@ fn slot_to_entry<T>(
     None
 }
 
+#[cfg(feature = "python")]
+fn size_spec_parsed(
+    field: &str,
+    spec: Option<&crate::config::SizeSpec>,
+) -> Option<crate::config::SizeValue> {
+    let spec = spec?;
+    let parsed = crate::config::parse_size(spec.as_str());
+    if parsed.is_none() {
+        tracing::warn!(
+            "queue.yml {}: cannot parse memory size {:?}; ignoring this field",
+            field,
+            spec.as_str()
+        );
+    }
+    parsed
+}
+
+/// Export a size field to Python as one of three states: absent (`None`),
+/// explicitly unlimited (the string `"max"`), or a byte count. Collapsing the
+/// first two would make `memory_max: max` look unset, which would then derive
+/// a hard limit from `memory_recycle_at` and switch swap off — the opposite
+/// of what the config asked for.
+#[cfg(feature = "python")]
+fn size_spec_item<'py>(
+    py: Python<'py>,
+    field: &str,
+    spec: Option<&crate::config::SizeSpec>,
+) -> PyResult<Bound<'py, PyAny>> {
+    use pyo3::IntoPyObject;
+    match size_spec_parsed(field, spec) {
+        Some(crate::config::SizeValue::Bytes(n)) => Ok(n.into_pyobject(py)?.into_any()),
+        Some(crate::config::SizeValue::Max) => Ok("max".into_pyobject(py)?.into_any()),
+        None => Ok(py.None().into_bound(py)),
+    }
+}
+
+/// Build one slot's cgroup limit dict. `default_max_rss` is the process-wide
+/// `worker_max_rss_mb` (constructor/env), used when the yml entry omits
+/// `memory_recycle_at`.
+#[cfg(feature = "python")]
+fn limits_dict<'py>(
+    py: Python<'py>,
+    memory_max: Option<&crate::config::SizeSpec>,
+    memory_high: Option<&crate::config::SizeSpec>,
+    memory_swap_max: Option<&crate::config::SizeSpec>,
+    memory_oom_group: Option<bool>,
+    worker_max_rss_bytes: Option<u64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("memory_max", size_spec_item(py, "memory_max", memory_max)?)?;
+    d.set_item(
+        "memory_high",
+        size_spec_item(py, "memory_high", memory_high)?,
+    )?;
+    d.set_item(
+        "memory_swap_max",
+        size_spec_item(py, "memory_swap_max", memory_swap_max)?,
+    )?;
+    d.set_item("memory_oom_group", memory_oom_group)?;
+    d.set_item("worker_max_rss_bytes", worker_max_rss_bytes)?;
+    Ok(d)
+}
+
 /// Apply a `WorkerConfig` to a freshly owned `AppContext`. Callers are
 /// responsible for re-wrapping the context in `Arc` once mutation is done.
 fn apply_worker_cfg_to(
@@ -166,6 +229,20 @@ fn apply_worker_cfg_to(
     if let Some(polling_interval) = worker_cfg.polling_interval {
         ctx.worker_polling_interval =
             secs_to_duration("worker polling_interval", polling_interval)?;
+    }
+    match worker_cfg.recycle_threshold() {
+        // Absent: leave whatever the constructor/env set.
+        crate::config::RecycleThreshold::Inherit => {}
+        crate::config::RecycleThreshold::Disabled => ctx.worker_max_rss_bytes = None,
+        crate::config::RecycleThreshold::Bytes(bytes) => ctx.worker_max_rss_bytes = Some(bytes),
+        crate::config::RecycleThreshold::Invalid => warn!(
+            "queue.yml memory_recycle_at: cannot parse {:?}; ignoring this field",
+            worker_cfg
+                .memory_recycle_at
+                .as_ref()
+                .map(|s| s.as_str())
+                .unwrap_or("")
+        ),
     }
     if worker_cfg.queues.is_some() {
         ctx.worker_queues = worker_cfg.queues.clone();
@@ -1908,6 +1985,84 @@ impl PyQuebec {
             dict.set_item("scheduler", 1u32)?;
         }
         Ok(Some(dict.into()))
+    }
+
+    /// Read `workers`/`dispatchers` from the loaded queue.yml and return the
+    /// cgroup memory limits expanded per supervisor slot, in the same slot
+    /// order `apply_worker_config` / `apply_dispatcher_config` use.
+    ///
+    /// Shape: `{"worker": [{...}, ...], "dispatcher": [{...}, ...],
+    /// "default_worker_max_rss_bytes": int | None}`. Each slot dict carries
+    /// already-parsed byte counts; `None` means "not configured" (an explicit
+    /// `max` and an unparseable value both collapse to `None`, the latter
+    /// after a warning). Deriving `memory_max` from the recycle threshold
+    /// happens on the Python side, because it must only run once the cgroup
+    /// probe has succeeded.
+    fn supervisor_resource_limits_from_config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let out = PyDict::new(py);
+        let default_max_rss = self.ctx.worker_max_rss_bytes;
+        out.set_item("default_worker_max_rss_bytes", default_max_rss)?;
+
+        let env = std::env::var("QUEBEC_ENV").ok();
+        let Some(config) = crate::config::QueueConfig::find(env.as_deref()).ok() else {
+            return Ok(out.into());
+        };
+
+        if let Some(workers) = config.workers.as_ref() {
+            let items = PyList::empty(py);
+            for w in workers {
+                // Same three-state rule as apply_worker_cfg_to: only an
+                // absent key inherits the constructor/env value. Falling back
+                // on an explicit `max` would derive a memory.max here while
+                // the child has its soft recycle switched off.
+                let max_rss = match w.recycle_threshold() {
+                    crate::config::RecycleThreshold::Inherit => default_max_rss,
+                    crate::config::RecycleThreshold::Disabled => None,
+                    crate::config::RecycleThreshold::Bytes(bytes) => Some(bytes),
+                    crate::config::RecycleThreshold::Invalid => {
+                        warn!(
+                            "queue.yml memory_recycle_at: cannot parse {:?}; \
+                             falling back to worker_max_rss_mb",
+                            w.memory_recycle_at
+                                .as_ref()
+                                .map(|s| s.as_str())
+                                .unwrap_or("")
+                        );
+                        default_max_rss
+                    }
+                };
+                for _ in 0..w.processes.unwrap_or(1) {
+                    items.append(limits_dict(
+                        py,
+                        w.memory_max.as_ref(),
+                        w.memory_high.as_ref(),
+                        w.memory_swap_max.as_ref(),
+                        w.memory_oom_group,
+                        max_rss,
+                    )?)?;
+                }
+            }
+            out.set_item("worker", items)?;
+        }
+
+        if let Some(dispatchers) = config.dispatchers.as_ref() {
+            let items = PyList::empty(py);
+            for d in dispatchers {
+                for _ in 0..d.processes.unwrap_or(1) {
+                    items.append(limits_dict(
+                        py,
+                        d.memory_max.as_ref(),
+                        d.memory_high.as_ref(),
+                        d.memory_swap_max.as_ref(),
+                        d.memory_oom_group,
+                        None,
+                    )?)?;
+                }
+            }
+            out.set_item("dispatcher", items)?;
+        }
+
+        Ok(out.into())
     }
 
     /// Apply the Nth worker configuration from the loaded queue.yml, overriding
