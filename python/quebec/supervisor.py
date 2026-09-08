@@ -263,11 +263,32 @@ class Supervisor:
                         "Failed to forward quiet to worker pid=%d: %s", pid, e
                     )
 
+        # SIGUSR2 toggles per-job metrics recording; only workers execute
+        # jobs, so forward it to them (each writes its own CSV file).
+        def job_metrics(signum, _frame):
+            logger.info(
+                "Supervisor received signal %d, forwarding job metrics toggle "
+                "(SIGUSR2) to worker children",
+                signum,
+            )
+            for pid, info in list(self._children.items()):
+                if info.role != ROLE_WORKER:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGUSR2)
+                except ProcessLookupError:
+                    pass
+                except OSError as e:
+                    logger.warning(
+                        "Failed to forward SIGUSR2 to worker pid=%d: %s", pid, e
+                    )
+
         signal.signal(signal.SIGTERM, graceful)
         signal.signal(signal.SIGINT, graceful)
         signal.signal(signal.SIGQUIT, immediate)
         # SIGUSR1 is the always-on quiet trigger.
         signal.signal(signal.SIGUSR1, quiet)
+        signal.signal(signal.SIGUSR2, job_metrics)
         # In an interactive terminal Ctrl-Z must keep its shell-job-control
         # meaning, so only intercept SIGTSTP when stdin isn't a tty (daemon /
         # systemd / docker / nohup).

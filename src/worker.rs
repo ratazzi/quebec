@@ -1170,6 +1170,10 @@ pub struct Metric {
     success: bool,
     duration: tokio::time::Duration,
     delay: tokio::time::Duration,
+    /// Minor page faults taken by the job thread during perform() (Linux only).
+    minflt: Option<u64>,
+    /// `minflt` × fault granularity: new resident memory caused by the job.
+    new_rss_bytes: Option<u64>,
 }
 
 #[pymethods]
@@ -1184,10 +1188,20 @@ impl Metric {
         self.delay
     }
 
+    #[getter]
+    fn get_minflt(&self) -> Option<u64> {
+        self.minflt
+    }
+
+    #[getter]
+    fn get_new_rss_bytes(&self) -> Option<u64> {
+        self.new_rss_bytes
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "Metric(id={}, success={}, duration={:?}, delay={:?})",
-            self.id, self.success, self.duration, self.delay
+            "Metric(id={}, success={}, duration={:?}, delay={:?}, minflt={:?}, new_rss_bytes={:?})",
+            self.id, self.success, self.duration, self.delay, self.minflt, self.new_rss_bytes
         )
     }
 }
@@ -1229,6 +1243,8 @@ pub struct Execution {
     pub(crate) started_at: Option<chrono::NaiveDateTime>,
     /// Direct reference to idle notifier - avoids RwLock access in async context
     idle_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Page-fault counters of the job thread when perform() started (Linux only).
+    faults_at_start: Option<crate::job_metrics::ThreadFaults>,
 }
 
 impl Drop for Execution {
@@ -1306,6 +1322,7 @@ impl Execution {
             continuation_info: None,
             started_at: None,
             idle_notify: None,
+            faults_at_start: None,
         }
     }
 
@@ -1340,6 +1357,11 @@ impl Execution {
             crate::context::InFlightGuard::new(self.ctx.claim_ledger.clone(), self.claimed.id);
 
         self.timer = Instant::now();
+        // Calibrate before sampling so the first job doesn't count the
+        // calibration's own faults. perform() runs on this thread (block_on),
+        // so the end sample in after_executed reads the same counters.
+        let _ = crate::job_metrics::fault_granularity();
+        self.faults_at_start = crate::job_metrics::thread_faults();
         let now = chrono::Utc::now().naive_utc();
         self.started_at = Some(now);
         let target = self.job.scheduled_at.unwrap_or(self.job.created_at);
@@ -1469,6 +1491,15 @@ impl Execution {
             })
             .unwrap_or_default();
         let delay_ms = delay.as_secs_f64() * 1000.0;
+        let faults = self
+            .faults_at_start
+            .take()
+            .and_then(|start| crate::job_metrics::thread_faults().map(|end| end.since(start)));
+        let minflt = faults.map(|f| f.minflt);
+        let majflt = faults.map(|f| f.majflt);
+        let new_rss_bytes =
+            minflt.and_then(|n| crate::job_metrics::fault_granularity().map(|g| n * g));
+        let new_rss_kb = new_rss_bytes.map(|b| b / 1024);
         async {
             if result.is_ok() {
                 info!(
@@ -1478,6 +1509,8 @@ impl Execution {
                     class_name = %self.runnable.class_name,
                     duration_ms,
                     delay_ms,
+                    minflt,
+                    new_rss_kb,
                     "Job `{}' executed in: {}",
                     self.runnable.class_name,
                     format!("{elapsed:?}").bright_purple(),
@@ -1490,6 +1523,8 @@ impl Execution {
                     class_name = %self.runnable.class_name,
                     duration_ms,
                     delay_ms,
+                    minflt,
+                    new_rss_kb,
                     "Job `{}' failed in: {:?}",
                     self.runnable.class_name, elapsed
                 );
@@ -1500,10 +1535,31 @@ impl Execution {
                 success: result.is_ok(),
                 duration: elapsed,
                 delay,
+                minflt,
+                new_rss_bytes,
             };
             self.metric = Some(metric);
         }
         .await;
+
+        let recorder = crate::job_metrics::recorder();
+        if recorder.is_active() {
+            recorder.record(crate::job_metrics::JobRecord {
+                ts_ms: chrono::Utc::now().timestamp_millis(),
+                pid: std::process::id(),
+                tid: crate::job_metrics::native_tid(),
+                jid: job.active_job_id.clone().unwrap_or_default(),
+                class: class_name.clone(),
+                queue: job.queue_name.clone(),
+                status: if result.is_ok() { "executed" } else { "failed" },
+                duration_ms: (duration_ms * 1000.0).round() / 1000.0,
+                minflt,
+                majflt,
+                new_rss_kb,
+                proc_rss_kb: crate::memory::current_rss_bytes().map(|b| b / 1024),
+                active_jobs: self.ctx.ledger_active_count(),
+            });
+        }
 
         let mut db = self.ctx.get_db().await?;
         let failed = result.is_err();

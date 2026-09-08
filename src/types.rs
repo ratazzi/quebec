@@ -204,6 +204,17 @@ fn apply_dispatcher_cfg_to(
     Ok(())
 }
 
+fn job_metrics_summary<'py>(
+    py: Python<'py>,
+    summary: &crate::job_metrics::RecordingSummary,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("path", summary.path.display().to_string())?;
+    dict.set_item("rows", summary.rows)?;
+    dict.set_item("dropped", summary.dropped)?;
+    Ok(dict)
+}
+
 #[pyfunction]
 fn signal_handler(
     py: Python<'_>,
@@ -227,6 +238,14 @@ fn signal_handler(
             info!("Received {}, entering quiet mode (no new jobs)", sname);
             if let Err(e) = quebec.bind(py).call_method0("quiet") {
                 error!("Error calling quiet: {:?}", e);
+            }
+            return Ok(());
+        }
+        // SIGUSR2 toggles the per-job metrics CSV recording (see job_metrics.rs).
+        if signum == libc::SIGUSR2 {
+            info!("Received SIGUSR2, toggling job metrics recording");
+            if let Err(e) = quebec.bind(py).call_method0("toggle_job_metrics") {
+                error!("Error toggling job metrics: {:?}", e);
             }
             return Ok(());
         }
@@ -2710,10 +2729,13 @@ impl PyQuebec {
         // (no controlling tty), SIGTSTP also enters quiet mode.
         use std::io::IsTerminal;
         let stdin_is_tty = std::io::stdin().is_terminal();
+        // SIGUSR2 toggles per-job metrics recording (SIGUSR1 is taken by quiet).
         let signals: &[&str] = if stdin_is_tty {
-            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGUSR1"]
+            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGUSR1", "SIGUSR2"]
         } else {
-            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGTSTP", "SIGUSR1"]
+            &[
+                "SIGINT", "SIGTERM", "SIGQUIT", "SIGTSTP", "SIGUSR1", "SIGUSR2",
+            ]
         };
 
         let mut registered: Vec<&str> = Vec::with_capacity(signals.len());
@@ -2797,6 +2819,44 @@ impl PyQuebec {
     #[getter]
     fn is_quiet(&self) -> bool {
         self.ctx.quiet.is_cancelled()
+    }
+
+    /// Start recording one CSV row per finished job (memory + timing) to
+    /// `path`, or to `$QUEBEC_JOB_METRICS_DIR` / the OS temp dir when omitted.
+    /// Returns the path. Raises if a recording is already running.
+    #[pyo3(signature = (path=None))]
+    fn start_job_metrics(&self, path: Option<std::path::PathBuf>) -> PyResult<String> {
+        crate::job_metrics::recorder()
+            .start(path.as_deref())
+            .map(|p| p.display().to_string())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Stop the job metrics recording. Returns `{"path", "rows", "dropped"}`,
+    /// or `None` when nothing was recording.
+    fn stop_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::job_metrics::recorder()
+            .stop()
+            .map(|s| job_metrics_summary(py, &s))
+            .transpose()
+    }
+
+    /// Start if idle, stop if recording — what `SIGUSR2` does. Returns the
+    /// stop summary when it stopped, `None` when it started.
+    fn toggle_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        crate::job_metrics::recorder()
+            .toggle()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .map(|s| job_metrics_summary(py, &s))
+            .transpose()
+    }
+
+    /// Path of the running job metrics recording, or `None`.
+    #[getter]
+    fn job_metrics_path(&self) -> Option<String> {
+        crate::job_metrics::recorder()
+            .current_path()
+            .map(|p| p.display().to_string())
     }
 
     fn graceful_shutdown(&self, py: Python) -> PyResult<()> {
