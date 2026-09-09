@@ -36,7 +36,7 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
 # One container per scenario, deliberately: the supervisor must be the only
 # process in the container cgroup, otherwise cgroup v2 refuses to enable
 # controllers there. A shared driver process would sit in that same cgroup.
-for scenario in oom no_limits cleanup derive; do
+for scenario in oom no_limits cleanup derive observe rolling_restart placement_failure; do
     note "scenario: $scenario (--cgroupns=private --privileged)"
     if docker run --rm --cgroupns=private --privileged "$IMAGE" run "$scenario"; then
         pass "scenario $scenario"
@@ -44,6 +44,15 @@ for scenario in oom no_limits cleanup derive; do
         fail "scenario $scenario"
     fi
 done
+
+# Phase 2 metrics are read-only, so they must survive the default ro mount
+# with no privileges at all. This is the case Kubernetes actually gives us.
+note "scenario: observe_readonly (no privileges, ro /sys/fs/cgroup)"
+if docker run --rm --cgroupns=private "$IMAGE" run observe_readonly; then
+    pass "scenario observe_readonly"
+else
+    fail "scenario observe_readonly"
+fi
 
 # Degradation: same image, no privileges, so /sys/fs/cgroup is read-only.
 note "degradation: limits configured, cgroup unavailable -> startup error"
@@ -91,12 +100,27 @@ note "degradation: probe reason without privileges"
 docker run --rm --cgroupns=private --entrypoint python3 "$IMAGE" \
     /src/scenarios.py probe
 
-note "rust unit tests (parse_size) on linux"
-docker run --rm --entrypoint cargo "$IMAGE" test --lib config:: 2>&1 | tail -15
+note "rust unit tests (config + memory parsers) on linux"
+docker run --rm --entrypoint cargo "$IMAGE" test --lib -- config:: memory:: 2>&1 | tail -20
 if [ ${PIPESTATUS[0]} -eq 0 ]; then
-    pass "cargo test config::"
+    pass "cargo test config:: memory::"
 else
-    fail "cargo test config::"
+    fail "cargo test config:: memory::"
+fi
+
+# The wheel built inside the image, copied out for running the same build
+# elsewhere (e.g. a tart VM).
+note "extract wheel"
+rm -rf "$REPO_ROOT/tests/docker/cgroup/wheels"
+mkdir -p "$REPO_ROOT/tests/docker/cgroup/wheels"
+CID=$(docker create "$IMAGE")
+if docker cp "$CID:/wheels/." "$REPO_ROOT/tests/docker/cgroup/wheels/" >/dev/null; then
+    docker rm -f "$CID" >/dev/null
+    ls -la "$REPO_ROOT/tests/docker/cgroup/wheels/"
+    pass "wheel extracted to tests/docker/cgroup/wheels/"
+else
+    docker rm -f "$CID" >/dev/null
+    fail "wheel extraction"
 fi
 
 note "result"
