@@ -56,8 +56,74 @@ pub fn build_runtime_metadata_with_memory(
     recycle_reason: Option<&str>,
     rss_bytes: Option<u64>,
 ) -> Option<String> {
+    build_runtime_metadata_full(quiet, recycle_reason, rss_bytes, None)
+}
+
+/// Read-only cgroup v2 counters attached to a heartbeat. Every field is
+/// optional: a non-cgroup host reports none, an older kernel has no
+/// `memory.peak`, and `nr_throttled` only appears once the cpu controller is
+/// enabled for the cgroup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CgroupMetrics {
+    pub current_bytes: Option<u64>,
+    pub peak_bytes: Option<u64>,
+    pub memory_max: Option<u64>,
+    pub memory_high: Option<u64>,
+    pub oom_kill: Option<u64>,
+    pub high_events: Option<u64>,
+    pub max_events: Option<u64>,
+    pub cpu_usage_usec: Option<u64>,
+    pub cpu_nr_throttled: Option<u64>,
+}
+
+impl CgroupMetrics {
+    /// Sample this process's own cgroup. Cheap enough to call per heartbeat:
+    /// a handful of small reads under `/sys/fs/cgroup`.
+    pub fn sample() -> Self {
+        // Short-circuit off a cgroup v2 host so a heartbeat does not attempt
+        // half a dozen reads that can only fail.
+        if crate::memory::cgroup_v2_self_path().is_none() {
+            return Self::default();
+        }
+        let events = crate::memory::cgroup_memory_events();
+        let cpu = crate::memory::cgroup_cpu_stat();
+        Self {
+            current_bytes: crate::memory::cgroup_memory_current(),
+            peak_bytes: crate::memory::cgroup_memory_peak(),
+            memory_max: crate::memory::cgroup_memory_max(),
+            memory_high: crate::memory::cgroup_memory_high(),
+            oom_kill: events.map(|e| e.oom_kill),
+            high_events: events.map(|e| e.high),
+            max_events: events.map(|e| e.max),
+            cpu_usage_usec: cpu.map(|c| c.usage_usec),
+            cpu_nr_throttled: cpu.map(|c| c.nr_throttled),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.current_bytes.is_none()
+            && self.peak_bytes.is_none()
+            && self.memory_max.is_none()
+            && self.memory_high.is_none()
+            && self.oom_kill.is_none()
+            && self.cpu_usage_usec.is_none()
+    }
+}
+
+pub fn build_runtime_metadata_full(
+    quiet: bool,
+    recycle_reason: Option<&str>,
+    rss_bytes: Option<u64>,
+    cgroup: Option<CgroupMetrics>,
+) -> Option<String> {
     let revision = process_revision();
-    if !quiet && revision.is_none() && recycle_reason.is_none() && rss_bytes.is_none() {
+    let cgroup = cgroup.filter(|c| !c.is_empty());
+    if !quiet
+        && revision.is_none()
+        && recycle_reason.is_none()
+        && rss_bytes.is_none()
+        && cgroup.is_none()
+    {
         return None;
     }
     let mut obj = serde_json::Map::new();
@@ -80,6 +146,22 @@ pub fn build_runtime_metadata_with_memory(
         let mb = bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024);
         obj.insert("rss_bytes".to_string(), serde_json::Value::from(bytes));
         obj.insert("rss_mb".to_string(), serde_json::Value::from(mb));
+    }
+    if let Some(cgroup) = cgroup {
+        let mut put = |key: &str, value: Option<u64>| {
+            if let Some(value) = value {
+                obj.insert(key.to_string(), serde_json::Value::from(value));
+            }
+        };
+        put("cgroup_current_bytes", cgroup.current_bytes);
+        put("cgroup_peak_bytes", cgroup.peak_bytes);
+        put("cgroup_memory_max", cgroup.memory_max);
+        put("cgroup_memory_high", cgroup.memory_high);
+        put("cgroup_oom_kill", cgroup.oom_kill);
+        put("cgroup_high_events", cgroup.high_events);
+        put("cgroup_max_events", cgroup.max_events);
+        put("cpu_usage_usec", cgroup.cpu_usage_usec);
+        put("cpu_nr_throttled", cgroup.cpu_nr_throttled);
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
 }
