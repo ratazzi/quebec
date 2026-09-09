@@ -48,6 +48,28 @@
         <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span></dd>
         <dt class="text-gray-500">Memory</dt>
         <dd class="{% if worker.memory %}text-gray-900{% else %}text-gray-400{% endif %}">{% if worker.memory %}{{ worker.memory }}{% else %}N/A{% endif %}</dd>
+        {% if worker.cgroup_memory %}
+        <dt class="text-gray-500">cgroup</dt>
+        <dd class="text-gray-900">
+          {% if worker.cgroup_memory_max %}
+            <div class="flex items-center gap-1.5">
+              <span>{{ worker.cgroup_memory }} / {{ worker.cgroup_memory_max }}</span>
+              {% if worker.cgroup_throttled %}
+                <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>
+              {% endif %}
+            </div>
+            <div class="mt-1 h-1.5 w-full rounded-full bg-gray-200" role="progressbar" aria-valuenow="{{ worker.cgroup_memory_pct }}" aria-valuemin="0" aria-valuemax="100">
+              <div class="h-1.5 rounded-full {% if worker.cgroup_memory_pct >= 90 %}bg-red-500{% elif worker.cgroup_memory_pct >= 75 %}bg-yellow-500{% else %}bg-green-500{% endif %}" style="width: {{ worker.cgroup_memory_pct }}%"></div>
+            </div>
+          {% else %}
+            <span>{{ worker.cgroup_memory }}</span>
+            <span class="text-gray-400">/ unlimited</span>
+            {% if worker.cgroup_throttled %}
+              <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>
+            {% endif %}
+          {% endif %}
+        </dd>
+        {% endif %}
       </dl>
     </div>
     {% endfor %}
@@ -67,6 +89,7 @@
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" title="cgroup v2 memory.current against memory.max">cgroup</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
         </tr>
       </thead>
@@ -109,6 +132,28 @@
             {% endif %}
           </td>
           <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
+            {% if worker.cgroup_memory %}
+              <div class="flex items-center gap-1.5 text-sm text-gray-900">
+                <span>{{ worker.cgroup_memory }}</span>
+                {% if worker.cgroup_memory_max %}
+                  <span class="text-gray-400">/ {{ worker.cgroup_memory_max }}</span>
+                {% else %}
+                  <span class="text-gray-400">/ unlimited</span>
+                {% endif %}
+                {% if worker.cgroup_throttled %}
+                  <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>
+                {% endif %}
+              </div>
+              {% if worker.cgroup_memory_max %}
+              <div class="mt-1 h-1.5 w-28 rounded-full bg-gray-200" role="progressbar" aria-valuenow="{{ worker.cgroup_memory_pct }}" aria-valuemin="0" aria-valuemax="100" title="{{ worker.cgroup_memory_pct }}% of memory.max">
+                <div class="h-1.5 rounded-full {% if worker.cgroup_memory_pct >= 90 %}bg-red-500{% elif worker.cgroup_memory_pct >= 75 %}bg-yellow-500{% else %}bg-green-500{% endif %}" style="width: {{ worker.cgroup_memory_pct }}%"></div>
+              </div>
+              {% endif %}
+            {% else %}
+              <div class="text-sm text-gray-400">N/A</div>
+            {% endif %}
+          </td>
+          <td class="px-3 py-3 sm:px-6 sm:py-4 whitespace-nowrap">
             {% if worker.status == "alive" %}
               <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">
                 Active
@@ -132,7 +177,7 @@
 
         {% if workers | length == 0 %}
         <tr>
-          <td colspan="8" class="px-4 py-3 text-sm text-center text-gray-500">No workers found</td>
+          <td colspan="9" class="px-4 py-3 text-sm text-center text-gray-500">No workers found</td>
         </tr>
         {% endif %}
       </tbody>
