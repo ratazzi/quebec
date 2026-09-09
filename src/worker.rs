@@ -29,6 +29,21 @@ use pyo3::types::{PyBool, PyDict, PyList, PyTuple, PyType};
 
 use crate::notify::NotifyManager;
 
+// USDT probes are a no-op on 32-bit x86: the probe crate's inline assembly
+// needs more registers than the target has (see Cargo.toml).
+#[cfg(not(target_arch = "x86"))]
+macro_rules! usdt {
+    ($($t:tt)*) => {
+        probe::probe!($($t)*)
+    };
+}
+#[cfg(target_arch = "x86")]
+macro_rules! usdt {
+    ($provider:ident, $name:ident $(, $arg:expr)* $(,)?) => {{
+        $(let _ = &$arg;)*
+    }};
+}
+
 fn reported_worker_rss_bytes(
     last_rss_bytes: &AtomicU64,
     current_rss_bytes: Option<u64>,
@@ -1457,7 +1472,7 @@ impl Execution {
             }
             // USDT probe (Linux, SystemTap SDT): a nop unless a tracer attaches.
             // Strings are (ptr, len) pairs — read with `str(argN, argN+1)`.
-            probe::probe!(
+            usdt!(
                 quebec,
                 job_start,
                 jid.as_ptr(),
@@ -1642,7 +1657,7 @@ impl Execution {
         // USDT probe: RSS delta is -1 unless the process was dedicated to this
         // job, so consumers cannot accidentally aggregate shared-process data
         // as if it were per-job memory.
-        probe::probe!(
+        usdt!(
             quebec,
             job_end,
             jid.as_ptr(),

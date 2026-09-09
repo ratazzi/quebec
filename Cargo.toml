@@ -88,13 +88,18 @@ proctitle = "0.1.1"
 libc = "0.2"
 moka = { version = "0.12.15", features = ["future"] }
 csv = "1.4.0"
-probe = "0.5.2"
 
 # systemd sd_notify(3) integration. unix-only crate (UnixDatagram +
 # CLOCK_MONOTONIC), so gate it off Windows wheel builds; src/systemd.rs
 # provides a no-op stub on non-unix targets.
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.5.0"
+
+# USDT probes (SystemTap SDT). The probe crate's inline asm runs out of
+# registers on 32-bit x86, so gate it off there; src/worker.rs falls back to
+# a no-op macro on that target.
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+probe = "0.5.2"
 
 [lints.rust]
 dead_code = "warn"
