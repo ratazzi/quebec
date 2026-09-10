@@ -1,11 +1,11 @@
 """A transient heartbeat write failure must not stop scheduled-job dispatch."""
 
 import sqlite3
-import time
+from datetime import datetime, timedelta, timezone
 
 import quebec
 
-from .helpers import wait_until
+from .helpers import observe_sqlite, readonly_connect, wait_until
 
 
 def test_dispatcher_recovers_after_heartbeat_error(temp_db_path, test_prefix):
@@ -22,31 +22,42 @@ def test_dispatcher_recovers_after_heartbeat_error(temp_db_path, test_prefix):
             pass
 
     qc.register_job(ScheduledJob)
-    ScheduledJob.set(wait=3600).perform_later(qc)
-    sql = sqlite3.connect(temp_db_path)
-    try:
-        sql.execute(f"""
-            CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
-            BEGIN SELECT RAISE(FAIL, 'transient heartbeat failure'); END
-        """)
-        sql.commit()
-        qc.spawn_dispatcher()
-        wait_until(
-            lambda: sql.execute(f"SELECT COUNT(*) FROM {test_prefix}_processes").fetchone()[0] == 1,
-            timeout=2,
+    # Falls due only after the injected fault has healed, so the dispatcher has
+    # to survive the failing heartbeats to ever promote it.
+    ScheduledJob.set(wait=2).perform_later(qc)
+
+    # Fail every heartbeat for the first second, then heal on the database
+    # clock. The fault has to expire on its own: dropping the trigger from here
+    # while the dispatcher runs would race Quebec's own writes, because the two
+    # sqlite libraries in this process cannot see each other's file locks.
+    fault_until = datetime.now(timezone.utc) + timedelta(seconds=1)
+    setup = sqlite3.connect(temp_db_path)
+    setup.execute(f"""
+        CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
+        WHEN julianday('now') < julianday('{fault_until:%Y-%m-%d %H:%M:%S.%f}')
+        BEGIN SELECT RAISE(FAIL, 'transient heartbeat failure'); END
+    """)
+    setup.commit()
+    setup.close()
+
+    sql = readonly_connect(temp_db_path)
+
+    def count(table):
+        return observe_sqlite(
+            lambda: sql.execute(
+                f"SELECT COUNT(*) FROM {test_prefix}_{table}"
+            ).fetchone()[0]
         )
-        # Leave the fault active for multiple heartbeat ticks, including the
-        # immediate first tick, then restore writes without restarting anything.
-        time.sleep(0.2)
-        sql.execute("DROP TRIGGER fail_heartbeat")
-        sql.execute(f"UPDATE {test_prefix}_scheduled_executions SET scheduled_at = '2020-01-01 00:00:00'")
-        sql.commit()
+
+    try:
+        qc.spawn_dispatcher()
+        wait_until(lambda: count("processes") == 1, timeout=2)
         wait_until(
-            lambda: sql.execute(f"SELECT COUNT(*) FROM {test_prefix}_ready_executions").fetchone()[0] == 1,
-            timeout=2,
+            lambda: count("ready_executions") == 1,
+            timeout=5,
             message="dispatcher stopped after heartbeat failure",
         )
-        assert sql.execute(f"SELECT COUNT(*) FROM {test_prefix}_scheduled_executions").fetchone()[0] == 0
+        assert count("scheduled_executions") == 0
     finally:
         sql.close()
         qc.close()
