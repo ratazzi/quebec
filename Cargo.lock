@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "quebec"
-version = "0.3.16-beta.1"
+version = "0.3.16-beta.2"
 dependencies = [
  "anyhow",
  "async-stream",
