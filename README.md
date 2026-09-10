@@ -469,8 +469,10 @@ from a log2 histogram, so they are bucket upper bounds rather than exact values.
 
 Rows are handed to a writer thread through a bounded queue and flushed every 5
 seconds. If the writer falls behind, rows are dropped rather than blocking jobs.
-When a row/time limit automatically ends a recording, writer draining and file
-flush happen on a background reaper instead of the job completion path.
+The time limit also stops idle recordings. When a row/time limit automatically
+ends a recording, its writer drains accepted rows and flushes in the background.
+Normal shutdown and `qc.close()` wait for active and already-stopping recordings
+to finish flushing; forced termination can still lose buffered rows.
 
 **USDT probes.** The Linux extension module carries `quebec:job_start` and
 `quebec:job_end`. They are a single `nop` until a tracer attaches. The end probe
@@ -478,6 +480,9 @@ exports the minor-fault delta and the sampled RSS peak delta; the RSS argument i
 `-1` unless `process_rss_single_job` is true. `job_start` exports jid, class,
 and queue as pointer/length pairs. `job_end` exports jid, class, success,
 duration nanoseconds, minor faults, and the attributable RSS peak delta.
+The strings are not NUL-terminated: in bpftrace read them as
+`buf(argN, argN+1)` printed with `%r`, or `str(argN, argN+1 + 1)` (that
+argument is a buffer size, so `str(argN, argN+1)` drops the last character).
 
 ### Per-Queue Concurrency (experimental)
 

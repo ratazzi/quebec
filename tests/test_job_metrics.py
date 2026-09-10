@@ -3,13 +3,94 @@
 from __future__ import annotations
 
 import csv
+import os
+import subprocess
 import sys
+import textwrap
 import time
 
 import pytest
 import quebec
 
 LINUX = sys.platform.startswith("linux")
+
+
+@pytest.mark.parametrize("automatic_stop", [False, True])
+def test_close_flushes_recordings(qc, tmp_path, monkeypatch, automatic_stop):
+    if automatic_stop:
+        monkeypatch.setenv("QUEBEC_JOB_METRICS_MAX_ROWS", "1")
+    qc.register_job(AllocatingJob)
+    path = tmp_path / "close.csv"
+    qc.start_job_metrics(str(path))
+    AllocatingJob.perform_later(qc, 1)
+    _run_one(qc)
+    qc.close()
+    assert qc.job_metrics_path is None
+    with path.open(newline="") as stream:
+        assert len(list(csv.DictReader(stream))) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Unix worker signals")
+@pytest.mark.parametrize("exit_mode", ["sigterm", "signal_stop", "recycle", "fork"])
+def test_worker_exit_flushes_recording(tmp_path, exit_mode):
+    path = tmp_path / "exit.csv"
+    script = textwrap.dedent("""
+        import os, signal, sys, time
+        import quebec
+        qc = quebec.Quebec(
+            sys.argv[1], worker_threads=1,
+            worker_max_rss_mb=1000000,
+            worker_memory_check_interval=0.1,
+        )
+        qc.create_tables()
+        class Job(quebec.BaseClass):
+            def perform(self): pass
+        qc.register_job(Job)
+        mode = sys.argv[3]
+        if mode == "fork":
+            qc.start_job_metrics(sys.argv[2] + ".parent")
+            Job.perform_later(qc)
+            qc.drain_one().perform()
+            pid = os.fork()
+            if pid:
+                qc.stop_job_metrics()
+                _, status = os.waitpid(pid, 0)
+                qc.close()
+                sys.exit(os.waitstatus_to_exitcode(status))
+            qc.reset_after_fork()
+            qc.watch_parent_pid()
+        qc.start_job_metrics(sys.argv[2])
+        Job.perform_later(qc)
+        qc.drain_one().perform()
+        qc.setup_signal_handler()
+        if mode == "recycle":
+            qc._request_worker_memory_recycle(1)
+            qc.spawn_job_claim_poller()
+            time.sleep(15)
+            raise AssertionError("worker failed to recycle")
+        if mode == "signal_stop":
+            os.kill(os.getpid(), signal.SIGUSR2)
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("SIGTERM failed to exit")
+    """)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            f"sqlite:///{tmp_path / 'exit.db'}?mode=rwc",
+            str(path),
+            exit_mode,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+    assert result.returncode == (75 if exit_mode == "recycle" else 0), (
+        result.stdout + result.stderr
+    )
+    with path.open(newline="") as stream:
+        assert len(list(csv.DictReader(stream))) == 1
 
 
 class AllocatingJob(quebec.BaseClass):

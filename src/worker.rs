@@ -5048,6 +5048,8 @@ impl Worker {
                         if self.should_exit_for_worker_memory_recycle(process.id).await {
                             info!("Worker memory recycle drained or timed out; exiting with planned recycle status");
                             self.shutdown_worker_process(&process, std::time::Duration::ZERO).await?;
+                            let metrics = self.ctx.job_metrics.clone();
+                            let _ = tokio::task::spawn_blocking(move || metrics.recorder().stop()).await;
                             std::process::exit(WORKER_MEMORY_RECYCLE_EXIT_CODE);
                         }
                     } else {

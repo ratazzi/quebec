@@ -333,7 +333,8 @@ pub struct RecordingSummary {
 
 #[derive(Debug)]
 struct ActiveRecording {
-    tx: SyncSender<JobRecord>,
+    tx: Option<SyncSender<JobRecord>>,
+    accepting: Arc<AtomicBool>,
     path: PathBuf,
     pid: u32,
     started: Instant,
@@ -344,11 +345,83 @@ struct ActiveRecording {
     writer: Option<JoinHandle<u64>>,
 }
 
-/// Per-Quebec-instance CSV recorder. At most one recording at a time.
 #[derive(Debug, Default)]
-pub struct Recorder {
+struct RecorderState {
+    current: Option<ActiveRecording>,
+    draining: Vec<ActiveRecording>,
+}
+
+#[derive(Debug, Default)]
+struct RecorderInner {
     active: AtomicBool,
-    state: Mutex<Option<ActiveRecording>>,
+    state: Mutex<RecorderState>,
+}
+
+impl RecorderInner {
+    fn take_current(&self, state: &mut RecorderState) -> Option<ActiveRecording> {
+        let mut active = state.current.take()?;
+        self.active.store(false, Ordering::Release);
+        active.accepting.store(false, Ordering::Release);
+        // Disconnect now: the writer drains accepted rows without a reaper.
+        active.tx.take();
+        Some(active)
+    }
+
+    fn retire_current(&self, state: &mut RecorderState, reason: &'static str) -> bool {
+        if let Some(active) = self.take_current(state) {
+            info!(
+                path = %active.path.display(),
+                reason,
+                "Job metrics recording stopped"
+            );
+            state.draining.retain(|a| {
+                a.writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_finished())
+            });
+            state.draining.push(active);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expire(&self, accepting: &Arc<AtomicBool>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // An old writer must never stop a newer recording.
+        if state
+            .current
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(&active.accepting, accepting))
+        {
+            self.retire_current(&mut state, "time limit");
+        }
+    }
+}
+
+/// Per-Quebec-instance CSV recorder. At most one recording at a time.
+#[derive(Debug)]
+pub struct Recorder {
+    inner: Arc<RecorderInner>,
+    owner_pid: u32,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RecorderInner::default()),
+            owner_pid: std::process::id(),
+        }
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        // Never lock or join state inherited from vanished parent threads.
+        if self.owner_pid == std::process::id() {
+            self.stop();
+        }
+    }
 }
 
 const CHANNEL_CAPACITY: usize = 4096;
@@ -389,15 +462,33 @@ pub fn default_output_path() -> PathBuf {
 impl Recorder {
     /// Cheap check for the hot path.
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
+        self.inner.active.load(Ordering::Relaxed)
     }
 
     /// Start writing rows to `path` (or [`default_output_path`]). Returns the
     /// path in use; an error if a recording is already running or the file
     /// cannot be created.
     pub fn start(&self, path: Option<&Path>) -> std::io::Result<PathBuf> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.is_some() {
+        self.start_with_limits(
+            path,
+            env_u64("QUEBEC_JOB_METRICS_MAX_ROWS", DEFAULT_MAX_ROWS),
+            Duration::from_secs(env_u64(
+                "QUEBEC_JOB_METRICS_MAX_SECONDS",
+                DEFAULT_MAX_SECONDS,
+            )),
+            FLUSH_INTERVAL,
+        )
+    }
+
+    fn start_with_limits(
+        &self,
+        path: Option<&Path>,
+        max_rows: u64,
+        max_duration: Duration,
+        flush_interval: Duration,
+    ) -> std::io::Result<PathBuf> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.current.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "job metrics recording already active",
@@ -409,6 +500,12 @@ impl Recorder {
         let file = std::fs::File::create(&path)?;
         let (tx, rx) = sync_channel::<JobRecord>(CHANNEL_CAPACITY);
         let writer_path = path.clone();
+        let started = Instant::now();
+        let accepting = Arc::new(AtomicBool::new(true));
+        let writer_accepting = accepting.clone();
+        let inner = Arc::downgrade(&self.inner);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer_dropped = dropped.clone();
         let writer = std::thread::Builder::new()
             .name("quebec-job-metrics".into())
             .spawn(move || {
@@ -423,42 +520,62 @@ impl Recorder {
                     warn!(path = %writer_path.display(), "job metrics header write failed: {e}");
                 }
                 let mut rows = 0u64;
+                let mut last_flush = Instant::now();
                 loop {
-                    match rx.recv_timeout(FLUSH_INTERVAL) {
+                    let mut wait = flush_interval.saturating_sub(last_flush.elapsed());
+                    if writer_accepting.load(Ordering::Acquire) {
+                        let remaining = max_duration.saturating_sub(started.elapsed());
+                        if remaining.is_zero() {
+                            if let Some(inner) = inner.upgrade() {
+                                inner.expire(&writer_accepting);
+                            }
+                        } else {
+                            wait = wait.min(remaining);
+                        }
+                    }
+                    match rx.recv_timeout(wait) {
                         Ok(record) => match writer.serialize(&record) {
                             Ok(()) => rows += 1,
                             Err(e) => warn!(path = %writer_path.display(), "job metrics write failed: {e}"),
                         },
-                        Err(RecvTimeoutError::Timeout) => {
-                            if let Err(e) = writer.flush() {
-                                warn!(path = %writer_path.display(), "job metrics flush failed: {e}");
-                            }
-                        }
+                        Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                    if last_flush.elapsed() >= flush_interval {
+                        if let Err(e) = writer.flush() {
+                            warn!(path = %writer_path.display(), "job metrics flush failed: {e}");
+                        }
+                        last_flush = Instant::now();
                     }
                 }
                 if let Err(e) = writer.flush() {
                     warn!(path = %writer_path.display(), "job metrics flush failed: {e}");
                 }
+                info!(
+                    path = %writer_path.display(), rows,
+                    dropped = writer_dropped.load(Ordering::Relaxed),
+                    "Job metrics recording finished"
+                );
                 rows
             })?;
-        let max_rows = env_u64("QUEBEC_JOB_METRICS_MAX_ROWS", DEFAULT_MAX_ROWS);
-        let max_duration = Duration::from_secs(env_u64(
-            "QUEBEC_JOB_METRICS_MAX_SECONDS",
-            DEFAULT_MAX_SECONDS,
-        ));
-        *state = Some(ActiveRecording {
-            tx,
+        state.draining.retain(|a| {
+            a.writer
+                .as_ref()
+                .is_some_and(|writer| !writer.is_finished())
+        });
+        state.current = Some(ActiveRecording {
+            tx: Some(tx),
+            accepting,
             path: path.clone(),
             pid: std::process::id(),
-            started: Instant::now(),
+            started,
             max_rows,
             max_duration,
             sent: 0,
-            dropped: Arc::new(AtomicU64::new(0)),
+            dropped,
             writer: Some(writer),
         });
-        self.active.store(true, Ordering::Relaxed);
+        self.inner.active.store(true, Ordering::Relaxed);
         info!(
             path = %path.display(),
             max_rows,
@@ -471,15 +588,26 @@ impl Recorder {
     /// Stop the current recording, flush, and report what was written.
     /// Returns `None` when nothing was recording.
     pub fn stop(&self) -> Option<RecordingSummary> {
-        let active = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let active = state.take();
-            if active.is_some() {
-                self.active.store(false, Ordering::Release);
-            }
-            active
-        }?;
-        Some(Self::finish(active, "stopped"))
+        let (active, draining) = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let active = self.inner.take_current(&mut state);
+            (active, std::mem::take(&mut state.draining))
+        };
+        let summary = active.map(|active| {
+            let summary = Self::finish(active);
+            info!(
+                path = %summary.path.display(),
+                rows = summary.rows,
+                dropped = summary.dropped,
+                reason = "stopped",
+                "Job metrics recording stopped"
+            );
+            summary
+        });
+        for active in draining {
+            Self::finish(active);
+        }
+        summary
     }
 
     /// Start if idle, stop if recording. Used by the `SIGUSR2` handler.
@@ -492,33 +620,22 @@ impl Recorder {
     }
 
     /// Signal-safe-at-the-Python-layer toggle: stopping only disconnects the
-    /// bounded queue and lets a reaper drain/join the writer in the background.
+    /// bounded queue and lets the writer drain in the background. Its handle is
+    /// retained so normal shutdown can still wait for the final flush.
     /// Returns `true` when an active recording was stopped.
     pub fn toggle_in_background(&self) -> std::io::Result<bool> {
         if !self.is_active() {
             self.start(None)?;
             return Ok(false);
         }
-        let active = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let active = state.take();
-            if active.is_some() {
-                self.active.store(false, Ordering::Release);
-            }
-            active
-        };
-        if let Some(active) = active {
-            Self::finish_in_background(active, "stopped by signal");
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(self.inner.retire_current(&mut state, "stopped by signal"))
     }
 
     /// Path of the running recording, if any.
     pub fn current_path(&self) -> Option<PathBuf> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.as_ref().map(|a| a.path.clone())
+        let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current.as_ref().map(|a| a.path.clone())
     }
 
     /// Queue one row. Never blocks the job thread: a full channel drops the
@@ -528,24 +645,29 @@ impl Recorder {
         if !self.is_active() {
             return;
         }
-        let finished = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(active) = state.as_mut() else {
+        {
+            let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(active) = state.current.as_mut() else {
                 return;
             };
             if active.pid != std::process::id() {
                 // Defensive fork guard. AppContext normally creates a fresh
                 // recorder in each child before it can record a job.
-                *state = None;
-                self.active.store(false, Ordering::Release);
+                state.current = None;
+                self.inner.active.store(false, Ordering::Release);
                 return;
             }
-            let reason = match active.tx.try_send(record) {
+            if active.started.elapsed() >= active.max_duration {
+                self.inner.retire_current(&mut state, "time limit");
+                return;
+            }
+            let Some(tx) = &active.tx else {
+                return;
+            };
+            let reason = match tx.try_send(record) {
                 Ok(()) => {
                     active.sent += 1;
-                    (active.sent >= active.max_rows
-                        || active.started.elapsed() >= active.max_duration)
-                        .then_some("limit reached")
+                    (active.sent >= active.max_rows).then_some("limit reached")
                 }
                 Err(TrySendError::Full(_)) => {
                     active.dropped.fetch_add(1, Ordering::Relaxed);
@@ -553,17 +675,13 @@ impl Recorder {
                 }
                 Err(TrySendError::Disconnected(_)) => Some("writer thread gone"),
             };
-            reason.and_then(|reason| {
-                self.active.store(false, Ordering::Release);
-                state.take().map(|active| (active, reason))
-            })
-        };
-        if let Some((active, reason)) = finished {
-            Self::finish_in_background(active, reason);
+            if let Some(reason) = reason {
+                self.inner.retire_current(&mut state, reason);
+            }
         }
     }
 
-    fn finish(mut active: ActiveRecording, reason: &'static str) -> RecordingSummary {
+    fn finish(mut active: ActiveRecording) -> RecordingSummary {
         let dropped = active.dropped.load(Ordering::Relaxed);
         drop(active.tx);
         let rows = active
@@ -571,33 +689,10 @@ impl Recorder {
             .take()
             .and_then(|h| h.join().ok())
             .unwrap_or(0);
-        info!(
-            path = %active.path.display(),
-            rows,
-            dropped,
-            reason,
-            "Job metrics recording stopped"
-        );
         RecordingSummary {
             path: active.path,
             rows,
             dropped,
-        }
-    }
-
-    /// Drain and join a stopped writer away from the job completion path.
-    fn finish_in_background(active: ActiveRecording, reason: &'static str) {
-        let path = active.path.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("quebec-job-metrics-stop".into())
-            .spawn(move || {
-                Self::finish(active, reason);
-            })
-        {
-            // Dropping `active` with the failed closure disconnects the channel;
-            // dropping its JoinHandle detaches the writer, so jobs still never
-            // wait for filesystem I/O here.
-            warn!(%error, path = %path.display(), "Failed to start metrics writer reaper");
         }
     }
 }
@@ -783,7 +878,156 @@ impl Aggregator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Aggregator, JobObservation};
+    use super::{Aggregator, JobObservation, JobRecord, Recorder};
+    use std::time::{Duration, Instant};
+
+    fn record() -> JobRecord {
+        JobRecord {
+            ts_ms: 1,
+            pid: std::process::id(),
+            tid: 1,
+            jid: "jid-1".into(),
+            class: "Job".into(),
+            queue: "default".into(),
+            status: "executed",
+            duration_ms: 1.0,
+            minor_faults: None,
+            major_faults: None,
+            process_rss_start_kb: None,
+            process_rss_peak_kb: None,
+            process_rss_end_kb: None,
+            process_rss_peak_delta_kb: None,
+            process_rss_single_job: false,
+            active_jobs: 1,
+        }
+    }
+
+    fn rows(path: &std::path::Path) -> usize {
+        csv::Reader::from_path(path).unwrap().records().count()
+    }
+
+    #[test]
+    fn continuous_records_are_flushed_before_stopping() {
+        let recorder = Recorder::default();
+        let path = recorder
+            .start_with_limits(
+                None,
+                1000,
+                Duration::from_secs(60),
+                Duration::from_millis(300),
+            )
+            .unwrap();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(750) {
+            recorder.record(record());
+            if rows(&path) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let visible = rows(&path);
+        recorder.stop();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            visible > 0,
+            "continuous traffic must not postpone the flush"
+        );
+    }
+
+    #[test]
+    fn dropping_recorder_drains_pending_rows() {
+        let recorder = Recorder::default();
+        let path = recorder.start(None).unwrap();
+        for _ in 0..100 {
+            recorder.record(record());
+        }
+        drop(recorder);
+        let visible = rows(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(visible, 100);
+    }
+
+    #[test]
+    fn idle_recording_expires_and_can_restart() {
+        let recorder = Recorder::default();
+        let path = recorder
+            .start_with_limits(None, 100, Duration::from_millis(50), Duration::from_secs(5))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while recorder.is_active() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!recorder.is_active());
+        assert_eq!(recorder.current_path(), None);
+        recorder.record(record());
+        assert!(recorder.stop().is_none());
+        assert_eq!(rows(&path), 0);
+        let next = recorder.start(None).unwrap();
+        recorder.record(record());
+        assert_eq!(recorder.stop().unwrap().rows, 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(next).unwrap();
+    }
+
+    #[test]
+    fn close_waits_for_background_stop_and_row_limit() {
+        for signal_stop in [false, true] {
+            let recorder = Recorder::default();
+            let path = recorder
+                .start_with_limits(
+                    None,
+                    if signal_stop { 1000 } else { 100 },
+                    Duration::from_secs(60),
+                    Duration::from_secs(5),
+                )
+                .unwrap();
+            for _ in 0..100 {
+                recorder.record(record());
+            }
+            if signal_stop {
+                assert!(recorder.toggle_in_background().unwrap());
+            }
+            assert!(!recorder.is_active());
+            assert!(recorder.stop().is_none());
+            assert_eq!(rows(&path), 100);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn stale_deadline_cannot_stop_a_new_recording() {
+        let recorder = Recorder::default();
+        let path = recorder.start(None).unwrap();
+        let old_session = recorder
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .accepting
+            .clone();
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                recorder.inner.expire(&old_session);
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                recorder.stop();
+            });
+            barrier.wait();
+        });
+        let next = recorder.start(None).unwrap();
+        recorder.inner.expire(&old_session);
+        assert_eq!(recorder.current_path(), Some(next.clone()));
+        recorder.record(record());
+        assert_eq!(recorder.stop().unwrap().rows, 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(next).unwrap();
+    }
 
     #[test]
     fn missing_rss_samples_stay_unavailable() {

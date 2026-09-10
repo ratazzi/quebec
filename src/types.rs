@@ -1536,6 +1536,7 @@ impl PyQuebec {
                     }
                 }
             });
+            self.ctx.job_metrics.recorder().stop();
         });
         Ok(())
     }
@@ -2845,10 +2846,7 @@ impl PyQuebec {
     /// Stop the job metrics recording. Returns `{"path", "rows", "dropped"}`,
     /// or `None` when nothing was recording.
     fn stop_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.ctx
-            .job_metrics
-            .recorder()
-            .stop()
+        py.detach(|| self.ctx.job_metrics.recorder().stop())
             .map(|s| job_metrics_summary(py, &s))
             .transpose()
     }
@@ -2857,11 +2855,8 @@ impl PyQuebec {
     /// stop summary when it stopped, `None` when it started. Stopping also
     /// logs the per-class summary (see `log_job_metrics_summary`).
     fn toggle_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let stopped = self
-            .ctx
-            .job_metrics
-            .recorder()
-            .toggle()
+        let stopped = py
+            .detach(|| self.ctx.job_metrics.recorder().toggle())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         if stopped.is_some() {
             self.ctx.job_metrics.aggregator().log_summary();
@@ -2979,6 +2974,7 @@ impl PyQuebec {
             });
         });
 
+        py.detach(|| self.ctx.job_metrics.recorder().stop());
         std::process::exit(0);
     }
 
