@@ -1,6 +1,6 @@
 [project]
 name = "quebec"
-version = "0.3.14"
+version = "0.3.15"
 requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Rust",
@@ -32,7 +32,7 @@ Homepage = "https://github.com/ratazzi/quebec"
 Repository = "https://github.com/ratazzi/quebec"
 
 [project.optional-dependencies]
-test = ["pytest>=7.0.0", "pytest-cov"]
+test = ["pytest>=7.0.0", "pytest-cov", "anyio>=4.0", "trio>=0.26"]
 docs = ["sphinx>=7.0", "shibuya", "myst-parser"]
 
 [build-system]
@@ -52,6 +52,8 @@ dev = [
     "sqlalchemy>=2.0.40",
     "pytest>=7.0.0",
     "pytest-cov",
+    "anyio>=4.0",
+    "trio>=0.26",
     "structlog>=25.5.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",

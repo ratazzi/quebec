@@ -226,16 +226,23 @@ where
     // Use normalized args (consistent with what's stored in the job)
     let args_is_empty = matches!(&args, serde_json::Value::Array(arr) if arr.is_empty());
     #[cfg(feature = "python")]
-    let concurrency_constraint = ctx
-        .has_concurrency_control(&entry.class.to_string())
-        .then(|| ctx.get_runnable(&entry.class).ok())
-        .flatten()
-        .and_then(|runnable| {
-            let args_ref = if args_is_empty { None } else { Some(&args) };
-            runnable
-                .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
-                .unwrap_or(None)
-        });
+    let concurrency_constraint = if ctx.has_concurrency_control(&entry.class) {
+        let runnable = ctx.get_runnable(&entry.class).map_err(|e| {
+            DbErr::Custom(format!(
+                "Failed to resolve concurrency handler for recurring task '{task_key}': {e}"
+            ))
+        })?;
+        let args_ref = if args_is_empty { None } else { Some(&args) };
+        runnable
+            .get_concurrency_constraint(args_ref, None::<&serde_yaml::Value>)
+            .map_err(|e| {
+                DbErr::Custom(format!(
+                    "Failed to resolve concurrency constraint for recurring task '{task_key}': {e}"
+                ))
+            })?
+    } else {
+        None
+    };
     #[cfg(not(feature = "python"))]
     let concurrency_constraint: Option<crate::context::ConcurrencyConstraint> = None;
 

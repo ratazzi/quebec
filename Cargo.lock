@@ -2041,7 +2041,7 @@ dependencies = [
 
 [[package]]
 name = "quebec"
-version = "0.3.14"
+version = "0.3.15"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3202,7 +3202,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",

@@ -1,6 +1,5 @@
 from .quebec import *  # NOQA
 from . import quebec
-from . import sqlalchemy  # NOQA
 from .quebec import Quebec, ActiveJob, JobInterrupted, InvalidStepError
 from .quebec import BatchAlreadyFinished
 from .quebec import Continuable as _RustContinuable
@@ -8,6 +7,7 @@ from .quebec import StepContext, StepContextManager
 import json
 import logging
 import os
+import sys
 import time
 import queue
 import threading
@@ -20,6 +20,17 @@ from .context import current_batch_id, current_batch_transaction
 __doc__ = quebec.__doc__
 if hasattr(quebec, "__all__"):
     __all__ = quebec.__all__
+
+
+def __getattr__(name):
+    # sqlalchemy is an optional dependency; import the submodule lazily so that
+    # `import quebec` works without it installed.
+    if name == "sqlalchemy":
+        import importlib
+
+        return importlib.import_module(f"{__name__}.sqlalchemy")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -929,10 +940,48 @@ def _quebec_run(
 
 
 class ControlPlaneASGI:
-    """ASGI application bridging to Quebec's Rust control plane."""
+    """ASGI bridge for asyncio and Trio hosts.
 
-    def __init__(self, quebec_instance):
+    Blocking Rust calls use the active runtime's worker threads and inherit
+    the request's context variables. Receiving and sending stay on the event
+    loop. ``backend`` can be "auto" (default), "asyncio", or "trio"; it selects
+    the host runtime, it does not start a new event loop.
+
+    Cancellation stops waiting for the response without interrupting a
+    database action already running in a thread. Optional runtimes are
+    imported lazily.
+    """
+
+    def __init__(self, quebec_instance, *, backend="auto"):
+        if backend not in ("auto", "asyncio", "trio"):
+            raise ValueError("backend must be 'auto', 'asyncio', or 'trio'")
         self.qc = quebec_instance
+        self._backend = backend
+
+    async def _run_request(self, request):
+        backend = self._backend
+        if backend == "auto":
+            # A running Trio host has already imported Trio. Check its active
+            # task, not just module presence (including Trio guest mode).
+            trio = sys.modules.get("trio")
+            if trio is not None:
+                try:
+                    trio.lowlevel.current_task()
+                except RuntimeError:
+                    pass
+                else:
+                    backend = "trio"
+
+        if backend == "trio":
+            import trio
+
+            return await trio.to_thread.run_sync(
+                self.qc.handle_control_plane_request, request, abandon_on_cancel=True
+            )
+
+        import asyncio
+
+        return await asyncio.to_thread(self.qc.handle_control_plane_request, request)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -967,7 +1016,8 @@ class ControlPlaneASGI:
             await send({"type": "http.response.body", "body": b""})
             return
 
-        # Call Rust handler (releases GIL internally via py.detach)
+        # Releasing the GIL inside Rust does not release this event-loop thread.
+        # Offload the synchronous bridge using the active runtime's thread pool.
         # base_path is passed to Rust so templates generate correct prefixed URLs
         req = quebec.AsgiRequest(
             scope["method"],
@@ -977,7 +1027,7 @@ class ControlPlaneASGI:
             body,
             root_path,
         )
-        status, headers, response_body = self.qc.handle_control_plane_request(req)
+        status, headers, response_body = await self._run_request(req)
 
         # Rewrite Location headers for redirects (303 etc.)
         # The Rust handlers already emit prefixed Locations (from base_path or
@@ -1012,17 +1062,21 @@ class ControlPlaneASGI:
         )
 
 
-def _quebec_asgi_app(self):
+def _quebec_asgi_app(self, *, backend="auto"):
     """Return an ASGI application for the control plane.
 
     Mount this on a FastAPI/Starlette app to serve the control plane dashboard.
+    Auto-detects asyncio or Trio; set ``backend="asyncio"`` or ``backend="trio"``
+    to select the host runtime explicitly. Synchronous Rust requests run in
+    its worker threads; /events retains the polling fallback. No AnyIO
+    dependency is required, and Trio is loaded only for Trio requests.
 
     Example:
         app = FastAPI()
         qc = Quebec("postgres://localhost/mydb")
         app.mount("/quebec", qc.asgi_app())
     """
-    return ControlPlaneASGI(self)
+    return ControlPlaneASGI(self, backend=backend)
 
 
 def _quebec_discover_jobs(

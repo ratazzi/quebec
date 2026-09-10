@@ -10,7 +10,7 @@ import tempfile
 import quebec
 from sqlalchemy import create_engine, text
 
-from .helpers import wait_until
+from .helpers import observe_sqlite, wait_until
 
 
 class TestRecurringConfig:
@@ -59,7 +59,7 @@ test:
             # Start scheduler (spawns async task)
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///{temp_db_path}"
+            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
             engine = create_engine(sa_url)
 
             def fetch_tasks():
@@ -72,11 +72,11 @@ test:
                     return [dict(row._mapping) for row in result.fetchall()]
 
             wait_until(
-                lambda: len(fetch_tasks()) == 2,
+                lambda: len(observe_sqlite(fetch_tasks)) == 2,
                 timeout=5,
                 message="scheduler did not load recurring tasks",
             )
-            tasks = fetch_tasks()
+            tasks = observe_sqlite(fetch_tasks)
 
             engine.dispose()
 
@@ -138,7 +138,7 @@ test:
             # Start scheduler
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///{temp_db_path}"
+            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
             engine = create_engine(sa_url)
 
             def fetch_task():
@@ -151,11 +151,11 @@ test:
                     return result.fetchone()
 
             wait_until(
-                lambda: fetch_task() is not None,
+                lambda: observe_sqlite(fetch_task) is not None,
                 timeout=5,
                 message="scheduler did not persist the recurring task",
             )
-            task = fetch_task()
+            task = observe_sqlite(fetch_task)
             engine.dispose()
 
             assert task is not None
@@ -221,7 +221,7 @@ test:
 
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///{temp_db_path}"
+            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
             engine = create_engine(sa_url)
 
             def fetch_tasks():
@@ -234,11 +234,11 @@ test:
                     return {row[0]: row[1] for row in result.fetchall()}
 
             wait_until(
-                lambda: "prod_job" in fetch_tasks(),
+                lambda: "prod_job" in observe_sqlite(fetch_tasks),
                 timeout=5,
                 message="scheduler did not load the production recurring tasks",
             )
-            tasks = fetch_tasks()
+            tasks = observe_sqlite(fetch_tasks)
             engine.dispose()
 
             assert "prod_job" in tasks

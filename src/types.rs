@@ -355,7 +355,7 @@ pub struct PyQuebec {
 
 /// Kwargs injected by `JobBuilder.set()` (queue / priority / scheduled_at
 /// overrides). They are consumed by the enqueue path and must be stripped from
-/// the job's serialized arguments and from any user `queue` callable. Only
+/// the job's serialized arguments and user `queue` / `concurrency_key` callables. Only
 /// these exact keys are reserved — a user kwarg that merely starts with `_`
 /// (e.g. `_id`, `_type`, `_meta`) is a real argument and must pass through to
 /// `perform()`.
@@ -633,7 +633,7 @@ impl PyQuebec {
         })?;
 
         // Resolve concurrency (if registered)
-        let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
+        let (concurrency_key, concurrency_limit, concurrency_duration, concurrency_on_conflict) =
             if resolve_concurrency && self.worker.ctx.has_concurrency_control(&class_name) {
                 if let Ok(runnable) = self.worker.ctx.get_runnable(&class_name) {
                     let kwargs_opt = if kwargs_bound.is_empty() {
@@ -649,14 +649,14 @@ impl PyQuebec {
                             ))
                         })?;
                     match constraint {
-                        Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
-                        None => (None, None, runnable.concurrency_on_conflict),
+                        Some(c) => (Some(c.key), Some(c.limit), c.duration, c.on_conflict),
+                        None => (None, None, None, runnable.concurrency_on_conflict),
                     }
                 } else {
-                    (None, None, ConcurrencyConflict::default())
+                    (None, None, None, ConcurrencyConflict::default())
                 }
             } else {
-                (None, None, ConcurrencyConflict::default())
+                (None, None, None, ConcurrencyConflict::default())
             };
 
         // Note: perform_all_later does NOT run enqueue callbacks, matching
@@ -685,6 +685,7 @@ impl PyQuebec {
             scheduled_at,
             concurrency_key,
             concurrency_limit,
+            concurrency_duration,
             concurrency_on_conflict,
             batch_id,
         })
@@ -2413,36 +2414,51 @@ impl PyQuebec {
         let instance = bound.call0()?;
 
         // Check if this job class has concurrency control without needing GIL
-        let (concurrency_key, concurrency_limit, concurrency_on_conflict) = if self
-            .worker
-            .ctx
-            .has_concurrency_control(&class_name.to_string())
-        {
-            let runnable = self
+        let (concurrency_key, concurrency_limit, concurrency_duration, concurrency_on_conflict) =
+            if self
                 .worker
                 .ctx
-                .get_runnable(&class_name.to_string())
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get runnable: {e:?}"
-                    ))
-                })?;
+                .has_concurrency_control(&class_name.to_string())
+            {
+                let runnable = self
+                    .worker
+                    .ctx
+                    .get_runnable(&class_name.to_string())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get runnable: {e:?}"
+                        ))
+                    })?;
 
-            let constraint = runnable
-                .get_concurrency_constraint(Some(args), kwargs)
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Failed to get concurrency info: {e:?}"
-                    ))
-                })?;
+                // Builder options configure enqueueing, not the user's key.
+                // Preserve real kwargs such as `_id`; only strip reserved keys.
+                let constraint_kwargs = kwargs
+                    .map(|kwargs| {
+                        let filtered = PyDict::new(py);
+                        for (key, value) in kwargs.iter() {
+                            if !is_job_builder_internal_kwarg(&key.extract::<String>()?) {
+                                filtered.set_item(key, value)?;
+                            }
+                        }
+                        Ok::<_, PyErr>(filtered)
+                    })
+                    .transpose()?;
 
-            match constraint {
-                Some(c) => (Some(c.key), Some(c.limit), c.on_conflict),
-                None => (None, None, runnable.concurrency_on_conflict),
-            }
-        } else {
-            (None, None, ConcurrencyConflict::default())
-        };
+                let constraint = runnable
+                    .get_concurrency_constraint(Some(args), constraint_kwargs.as_ref())
+                    .map_err(|e| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "Failed to get concurrency info: {e:?}"
+                        ))
+                    })?;
+
+                match constraint {
+                    Some(c) => (Some(c.key), Some(c.limit), c.duration, c.on_conflict),
+                    None => (None, None, None, runnable.concurrency_on_conflict),
+                }
+            } else {
+                (None, None, None, ConcurrencyConflict::default())
+            };
 
         // Convert Python args and kwargs to JSON for job arguments storage
         let args_json = crate::utils::python_object(&args).into_json()?;
@@ -2513,6 +2529,7 @@ impl PyQuebec {
         obj.priority = priority;
         obj.concurrency_key = concurrency_key;
         obj.concurrency_limit = concurrency_limit;
+        obj.concurrency_duration = concurrency_duration;
         obj.concurrency_on_conflict = concurrency_on_conflict;
         // Join the batch open in the caller's context, if any.
         obj.batch_id = current_batch_id(py)?;
@@ -2749,6 +2766,7 @@ impl PyQuebec {
                 finished_at: None,
                 concurrency_key: p.concurrency_key,
                 concurrency_limit: p.concurrency_limit,
+                concurrency_duration: p.concurrency_duration,
                 concurrency_on_conflict: p.concurrency_on_conflict,
                 created_at: Some(model.created_at),
                 updated_at: Some(model.updated_at),
@@ -4506,6 +4524,7 @@ pub struct ActiveJob {
     pub finished_at: Option<chrono::NaiveDateTime>,
     pub concurrency_key: Option<String>,
     pub concurrency_limit: Option<i32>,
+    pub concurrency_duration: Option<chrono::Duration>,
     pub concurrency_on_conflict: crate::context::ConcurrencyConflict,
     pub created_at: Option<chrono::NaiveDateTime>,
     pub updated_at: Option<chrono::NaiveDateTime>,
@@ -4539,6 +4558,7 @@ impl ActiveJob {
             finished_at: None,
             concurrency_key: None,
             concurrency_limit: None,
+            concurrency_duration: None,
             concurrency_on_conflict: crate::context::ConcurrencyConflict::default(),
             created_at: None,
             updated_at: None,

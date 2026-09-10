@@ -416,6 +416,7 @@ fn prepare_callback(
         // Active Job stores class/arguments, not a frozen semaphore constraint.
         job.concurrency_key = constraint.as_ref().map(|c| c.key.clone());
         job.concurrency_limit = constraint.as_ref().map(|c| c.limit);
+        job.concurrency_duration = constraint.as_ref().and_then(|c| c.duration);
         job.concurrency_on_conflict =
             constraint.map_or(runnable.concurrency_on_conflict, |c| c.on_conflict);
         job.batch_id = None;
@@ -507,6 +508,10 @@ fn deserialize_callback(
             .get("concurrency_limit")
             .and_then(|v| v.as_i64())
             .map(|v| v as i32),
+        concurrency_duration: data
+            .get("concurrency_duration")
+            .and_then(|v| v.as_i64())
+            .map(chrono::Duration::seconds),
         concurrency_on_conflict,
         created_at: None,
         updated_at: None,
