@@ -119,6 +119,13 @@ sd-notify = "0.5.0"
 [target.'cfg(not(target_arch = "x86"))'.dependencies]
 probe = "0.5.2"
 
+[profile.release]
+# Smaller wheels: symbols stripped, whole-program LTO and a single codegen
+# unit. opt-level and panic strategy are left at their defaults on purpose.
+strip = true
+lto = "fat"
+codegen-units = 1
+
 [lints.rust]
 dead_code = "warn"
 unused_variables = "warn"
