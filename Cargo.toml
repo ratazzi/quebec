@@ -43,7 +43,25 @@ sea-orm = { version = "1.1.0", features = [
 ] }
 sqlx-postgres = "0.8.2"
 thiserror = "1.0.64"
-tokio = { version = "1.40.0", features = ["full"] }
+# "full" minus "parking_lot": with that feature the multi_thread parker blocks
+# idle workers on a parking_lot Condvar, which registers their ThreadData in a
+# process-global hash table. os.fork() in the supervisor leaves those entries
+# behind pointing at threads that no longer exist, and the child corrupts its
+# heap the first time it parks/unparks. std's futex Condvar has no such
+# process-global state.
+tokio = { version = "1.40.0", features = [
+  "fs",
+  "io-util",
+  "io-std",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "rt-multi-thread",
+  "signal",
+  "sync",
+  "time",
+] }
 tokio-postgres = "0.7.12"
 clap = { version = "4.5.4", features = ["derive", "env"] }
 url = "2.5.2"
