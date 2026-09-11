@@ -44,12 +44,17 @@ RECYCLE_EXIT_CODE = 75
 #: nor queue.yml's ``workers_pool_memory_max`` sets one.
 POOL_MEMORY_MAX_ENV = "QUEBEC_WORKERS_POOL_MEMORY_MAX"
 
-#: ``oom_score_adj`` for the supervisor. -1000 is the kernel's floor: it marks
-#: the process as never selectable by the OOM killer, so a group- or host-level
-#: OOM event removes a worker, never the process that reforks it.
-SUPERVISOR_OOM_SCORE_ADJ = -1000
-#: ``oom_score_adj`` for forked children. The kernel default: an ordinary,
-#: killable OOM victim. Children reset from the inherited -1000 to this.
+#: ``oom_score_adj`` for worker children. The kernel default: an ordinary,
+#: killable OOM victim.
+#:
+#: Protecting the supervisor is the unit's job, not ours — ``OOMScoreAdjust=``
+#: in the systemd unit (lowering the value needs CAP_SYS_RESOURCE, which a
+#: non-root supervisor does not have, so a self-write would only ever work for
+#: the deployments that need it least). Whatever protection the unit grants is
+#: inherited by the whole process tree, and only workers give it up: they run
+#: user code and must stay killable, or a pool OOM finds no valid target. The
+#: control roles keep it, which is the point — a worker's memory spike must not
+#: take out the dispatcher.
 CHILD_OOM_SCORE_ADJ = 0
 
 #: The Supervisor currently running in this process (there is at most one).
@@ -134,26 +139,36 @@ def _write_oom_score_adj(pid: int, value: int) -> bool:
 
 
 def _reset_child_oom_priority() -> bool:
-    """Ensure a forked child is an ordinary, killable OOM victim.
+    """Ensure a forked worker is an ordinary, killable OOM victim.
 
-    The child inherits the supervisor's ``-1000`` and must raise itself back
-    to 0. Raising is always permitted, so a failure means something is very
-    wrong (read-only /proc, seccomp). Returns False in that case — the caller
-    exits rather than run user code while unkillable. On hosts without /proc
-    the read itself fails and there is no OOM killer to be immune from, so the
-    child simply carries on (True).
+    A worker inherits whatever protection the unit gave the supervisor and must
+    raise itself back to the kernel default. Raising is always permitted, so a
+    failure means something is very wrong (read-only /proc, seccomp). Returns
+    False in that case — the caller exits rather than run user code while
+    unkillable.
     """
     try:
         with open("/proc/self/oom_score_adj") as fh:
             inherited = fh.read().strip()
-    except OSError:
+    except OSError as exc:
+        # Off Linux there is no OOM killer to be immune from, so there is
+        # nothing to reset. On Linux the file always exists, and a read that
+        # fails there says nothing about whether protection was inherited —
+        # the one thing that must not be assumed away.
+        if sys.platform == "linux":
+            logger.error(
+                "cannot read /proc/self/oom_score_adj (%s); refusing to run a "
+                "worker that may have inherited OOM protection",
+                exc,
+            )
+            return False
         return True
     if inherited == str(CHILD_OOM_SCORE_ADJ):
         return True
     if _write_oom_score_adj(os.getpid(), CHILD_OOM_SCORE_ADJ):
         return True
     logger.error(
-        "child inherited oom_score_adj=%s and cannot reset it to %d; "
+        "worker inherited oom_score_adj=%s and cannot reset it to %d; "
         "refusing to run an unkillable worker",
         inherited,
         CHILD_OOM_SCORE_ADJ,
@@ -408,7 +423,6 @@ class Supervisor:
         """Blocking entrypoint: register, fork children, supervise, cleanup."""
         global _active_supervisor
         _active_supervisor = self
-        self._protect_from_oom()
         self._process_id = self.qc.register_supervisor()
         logger.info(
             "Supervisor registered (process_id=%d, pid=%d)",
@@ -554,24 +568,6 @@ class Supervisor:
         return new
 
     # -- internals --------------------------------------------------------
-
-    def _protect_from_oom(self) -> None:
-        """Keep the supervisor off the OOM killer's menu.
-
-        With ``oom_score_adj=-1000`` the kernel never selects this process as
-        a victim, so an OOM event — group-level or host-wide — removes a
-        worker, never the brain that reforks it. Best-effort: lowering the
-        value needs CAP_SYS_RESOURCE, so a non-root supervisor stays at the
-        default; point it at systemd's ``OOMScoreAdjust=-1000`` in that case.
-        """
-        if not _write_oom_score_adj(os.getpid(), SUPERVISOR_OOM_SCORE_ADJ):
-            logger.warning(
-                "Cannot lower oom_score_adj to %d (needs CAP_SYS_RESOURCE as "
-                "non-root); the supervisor remains an OOM-kill candidate. Set "
-                "OOMScoreAdjust=%d in the systemd unit to protect it.",
-                SUPERVISOR_OOM_SCORE_ADJ,
-                SUPERVISOR_OOM_SCORE_ADJ,
-            )
 
     def _enforced_limit_sources(self) -> List[str]:
         """Configured limits that actually change kernel behaviour, by source.
@@ -846,12 +842,13 @@ class Supervisor:
                     # died, or placing us in the cgroup failed and it wants
                     # this child gone.
                     os._exit(1)
-                # Undo the supervisor's "never OOM-kill" priority before this
-                # child runs user code: workers must stay ordinary, killable
-                # victims, otherwise the OOM killer finds no valid target when
-                # the group runs out of memory. If the reset cannot be applied
-                # the child exits rather than run while unkillable.
-                if not _reset_child_oom_priority():
+                # Only workers give up the OOM protection the unit granted the
+                # process tree: they run user code, so they must stay ordinary,
+                # killable victims or a pool OOM finds no valid target. The
+                # control roles keep it — surviving a worker's memory spike is
+                # exactly what it is for. A worker that cannot reset exits
+                # rather than run while unkillable.
+                if role == ROLE_WORKER and not _reset_child_oom_priority():
                     os._exit(1)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)

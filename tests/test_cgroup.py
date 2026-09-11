@@ -28,7 +28,6 @@ from quebec.supervisor import (
     CHILD_OOM_SCORE_ADJ,
     ROLE_DISPATCHER,
     ROLE_WORKER,
-    SUPERVISOR_OOM_SCORE_ADJ,
     Supervisor,
     _ChildInfo,
     _ExitStatus,
@@ -1280,7 +1279,7 @@ class TestFailureReason:
 
 
 class TestOomScoreAdj:
-    """The supervisor stays off the OOM killer's menu; workers reset to 0."""
+    """Protecting the supervisor is the unit's job; only workers give it up."""
 
     def test_write_targets_the_proc_interface(self, monkeypatch):
         fake = MagicMock()
@@ -1296,23 +1295,24 @@ class TestOomScoreAdj:
         monkeypatch.setattr("builtins.open", boom)
         assert _write_oom_score_adj(4242, 0) is False
 
-    def test_supervisor_protects_itself(self, monkeypatch):
-        calls = []
+    def test_the_supervisor_never_writes_its_own_score(self, monkeypatch):
+        """Lowering it needs CAP_SYS_RESOURCE; the unit owns this, not us."""
+        assert not hasattr(Supervisor, "_protect_from_oom")
+
+        qc = MagicMock()
+        qc.register_supervisor.return_value = 1
+        writes = []
         monkeypatch.setattr(
             "quebec.supervisor._write_oom_score_adj",
-            lambda pid, value: calls.append((pid, value)) or True,
+            lambda pid, value: writes.append((pid, value)) or True,
         )
-        sup, _qc = make_supervisor(DisabledCgroup("test"), plan={ROLE_WORKER: 1})
-        sup._protect_from_oom()
-        assert calls == [(os.getpid(), SUPERVISOR_OOM_SCORE_ADJ)]
+        sup = Supervisor(
+            qc, {ROLE_WORKER: 1}, cgroup=DisabledCgroup("test"), limits={}
+        )
+        sup._stopping = True  # register, then unwind without forking
+        sup.start()
 
-    def test_supervisor_warns_when_it_cannot_lower(self, monkeypatch, caplog):
-        monkeypatch.setattr(
-            "quebec.supervisor._write_oom_score_adj", lambda *_args: False
-        )
-        sup, _qc = make_supervisor(DisabledCgroup("test"), plan={ROLE_WORKER: 1})
-        sup._protect_from_oom()
-        assert "OOMScoreAdjust" in caplog.text
+        assert writes == []
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is Unix-only")
     def test_forked_child_resets_to_default(self, monkeypatch):
@@ -1337,6 +1337,35 @@ class TestOomScoreAdj:
             os.close(read_fd)
         os.waitpid(child_pid, 0)
         assert data == b"reset"
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is Unix-only")
+    def test_a_forked_control_role_keeps_the_inherited_protection(self, monkeypatch):
+        """Losing the dispatcher to a worker's memory spike is the failure
+        this protection exists to prevent, so it is never dropped there."""
+        read_fd, write_fd = os.pipe()
+
+        def child_side_reset():
+            os.write(write_fd, b"reset")
+            os.close(write_fd)
+            os._exit(0)
+
+        monkeypatch.setattr(
+            "quebec.supervisor._reset_child_oom_priority", child_side_reset
+        )
+        sup, qc = make_supervisor(
+            DisabledCgroup("test"), plan={ROLE_DISPATCHER: 1}
+        )
+        qc.reset_after_fork = lambda: os._exit(0)  # stop before the role loop
+        sup._fork_child(ROLE_DISPATCHER, 0)
+
+        (child_pid,) = sup._children
+        os.close(write_fd)
+        try:
+            data = os.read(read_fd, 1024)
+        finally:
+            os.close(read_fd)
+        os.waitpid(child_pid, 0)
+        assert data == b"", "a control role must not reset its oom_score_adj"
 
     def test_child_reset_skips_when_already_default(self, monkeypatch):
         class FakeProc:
@@ -1404,12 +1433,26 @@ class TestOomScoreAdj:
         )
         assert _reset_child_oom_priority() is False
 
-    def test_child_reset_ignores_missing_proc(self, monkeypatch):
+    def test_child_reset_ignores_missing_proc_off_linux(self, monkeypatch):
+        """No /proc, no OOM killer: nothing to be immune from."""
+
         def boom(*_args, **_kwargs):
             raise OSError("no /proc")
 
         monkeypatch.setattr("builtins.open", boom)
+        monkeypatch.setattr(sys, "platform", "darwin")
         assert _reset_child_oom_priority() is True
+
+    def test_child_reset_fails_on_linux_when_the_read_fails(self, monkeypatch):
+        """A failed read proves nothing about what was inherited, and an
+        unkillable worker is the one outcome that cannot be risked."""
+
+        def boom(*_args, **_kwargs):
+            raise OSError("seccomp")
+
+        monkeypatch.setattr("builtins.open", boom)
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert _reset_child_oom_priority() is False
 
 
 class TestRuntimeAdjust:
