@@ -24,12 +24,17 @@ from quebec.cgroup import (
     Limits,
 )
 from quebec.supervisor import (
+    CHILD_OOM_SCORE_ADJ,
     ROLE_WORKER,
+    SUPERVISOR_OOM_SCORE_ADJ,
     Supervisor,
     _ChildInfo,
     _ExitStatus,
     _SlotState,
+    _reset_child_oom_priority,
+    _write_oom_score_adj,
     classify_exit,
+    current_supervisor,
     exceeded_own_limit,
     oom_failure_reason,
 )
@@ -319,19 +324,29 @@ class TestProbe:
 class TestManagerFileOperations:
     def manager(self, tmp_path):
         root = make_root(tmp_path)
-        return CgroupManager(str(root)), root
+        mgr = CgroupManager(str(root))
+        mgr.prepare()
+        return mgr, root
+
+    def slot(self, root, name):
+        return root / "workers" / name
 
     def test_prepare_moves_self_out_then_enables_controllers(self, tmp_path):
-        mgr, root = self.manager(tmp_path)
-        mgr.prepare()
+        root = make_root(tmp_path)
+        CgroupManager(str(root)).prepare()
 
-        leaf = root / "supervisor"
-        assert leaf.is_dir()
-        assert leaf.joinpath("cgroup.procs").read_text() == str(os.getpid())
+        # The supervisor goes into its own leaf, leaving `control` processless
+        # so the memory controller can be enabled for the control slots.
+        supervisor = root / "control" / "supervisor"
+        assert supervisor.is_dir()
+        assert supervisor.joinpath("cgroup.procs").read_text() == str(os.getpid())
         assert (root / "cgroup.subtree_control").read_text() == "+memory"
+        assert (root / "control" / "cgroup.subtree_control").read_text() == "+memory"
+        assert (root / "workers" / "cgroup.subtree_control").read_text() == "+memory"
 
     def test_prepare_is_idempotent(self, tmp_path):
-        mgr, root = self.manager(tmp_path)
+        root = make_root(tmp_path)
+        mgr = CgroupManager(str(root))
         mgr.prepare()
         (root / "cgroup.subtree_control").write_text("memory")
         mgr.prepare()
@@ -351,12 +366,17 @@ class TestManagerFileOperations:
         assert str(os.getpid()) not in message, "our own pid is not an offender"
         assert "QUEBEC_CGROUP_ROOT" in message
         # We still vacated our own pid before giving up.
-        assert (root / "supervisor" / "cgroup.procs").read_text() == str(os.getpid())
+        assert (root / "control" / "supervisor" / "cgroup.procs").read_text() == str(
+            os.getpid()
+        )
 
     def test_prepare_skips_migration_when_not_in_root(self, tmp_path):
         root = make_root(tmp_path, in_root=False)
         CgroupManager(str(root)).prepare()
-        assert not (root / "supervisor").exists()
+        # Nothing to migrate, but the control children still need somewhere to
+        # be placed, so the subtree itself is stood up regardless.
+        assert not (root / "control" / "supervisor").exists()
+        assert (root / "control" / "cgroup.subtree_control").read_text() == "+memory"
 
     def test_create_writes_limits_in_order(self, tmp_path):
         mgr, root = self.manager(tmp_path)
@@ -368,7 +388,7 @@ class TestManagerFileOperations:
         )
         path = mgr.create("worker", 0, limits)
 
-        slot = root / "worker-0"
+        slot = self.slot(root, "worker-0")
         assert str(slot) == path
         assert slot.joinpath("memory.max").read_text() == str(128 * 1024 * 1024)
         assert slot.joinpath("memory.high").read_text() == str(100 * 1024 * 1024)
@@ -378,32 +398,32 @@ class TestManagerFileOperations:
     def test_create_steps_over_an_occupied_directory(self, tmp_path):
         """A predecessor still draining must not have its limits rewritten."""
         mgr, root = self.manager(tmp_path)
-        occupied = root / "worker-0"
+        occupied = self.slot(root, "worker-0")
         occupied.mkdir()
         occupied.joinpath("cgroup.procs").write_text("4321\n")
         occupied.joinpath("memory.max").write_text("999\n")
 
         path = mgr.create("worker", 0, Limits(memory_max=128))
 
-        assert path == str(root / "worker-0.2")
+        assert path == str(self.slot(root, "worker-0.2"))
         assert occupied.joinpath("memory.max").read_text() == "999\n", (
             "the occupied cgroup's limits must be left alone"
         )
-        assert root.joinpath("worker-0.2", "memory.max").read_text() == "128"
+        assert self.slot(root, "worker-0.2").joinpath("memory.max").read_text() == "128"
 
     def test_an_existing_empty_directory_is_never_reused(self, tmp_path):
         """Empty is not free: its owner may simply not have destroyed it yet."""
         mgr, root = self.manager(tmp_path)
-        (root / "worker-0").mkdir()
+        self.slot(root, "worker-0").mkdir()
 
-        assert mgr.create("worker", 0, Limits()) == str(root / "worker-0.2")
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.2"))
 
     def test_claims_climb_past_every_existing_name(self, tmp_path):
         mgr, root = self.manager(tmp_path)
-        (root / "worker-0").mkdir()
-        (root / "worker-0.2").mkdir()
+        self.slot(root, "worker-0").mkdir()
+        self.slot(root, "worker-0.2").mkdir()
 
-        assert mgr.create("worker", 0, Limits()) == str(root / "worker-0.3")
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.3"))
 
     def test_a_lost_mkdir_race_falls_through_to_the_next_name(
         self, tmp_path, monkeypatch
@@ -414,6 +434,10 @@ class TestManagerFileOperations:
         calls = []
 
         def racing_mkdir(path, *args, **kwargs):
+            # Only race on worker-leaf candidates; let the pool directory's
+            # makedirs() pass through to the real syscall.
+            if not os.path.basename(path).startswith("worker-"):
+                return real_mkdir(path, *args, **kwargs)
             calls.append(path)
             if len(calls) == 1:
                 # The other supervisor won this name between our two syscalls.
@@ -422,12 +446,15 @@ class TestManagerFileOperations:
 
         monkeypatch.setattr(os, "mkdir", racing_mkdir)
 
-        assert mgr.create("worker", 0, Limits()) == str(root / "worker-0.2")
-        assert calls == [str(root / "worker-0"), str(root / "worker-0.2")]
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.2"))
+        assert calls == [
+            str(self.slot(root, "worker-0")),
+            str(self.slot(root, "worker-0.2")),
+        ]
 
     def test_destroy_only_removes_the_directory_this_child_owned(self, tmp_path):
         mgr, root = self.manager(tmp_path)
-        occupied = root / "worker-0"
+        occupied = self.slot(root, "worker-0")
         occupied.mkdir()
         occupied.joinpath("cgroup.procs").write_text("4321\n")
 
@@ -435,11 +462,11 @@ class TestManagerFileOperations:
         mgr.destroy("worker", 0)
 
         assert occupied.is_dir(), "the predecessor's cgroup must survive"
-        assert not (root / "worker-0.2").exists()
+        assert not self.slot(root, "worker-0.2").exists()
 
     def test_place_and_stats_follow_the_claimed_path(self, tmp_path):
         mgr, root = self.manager(tmp_path)
-        occupied = root / "worker-0"
+        occupied = self.slot(root, "worker-0")
         occupied.mkdir()
         occupied.joinpath("cgroup.procs").write_text("4321\n")
         occupied.joinpath("memory.events").write_text("oom_kill 7\n")
@@ -447,7 +474,7 @@ class TestManagerFileOperations:
         mgr.create("worker", 0, Limits())
         mgr.place(555, "worker", 0)
 
-        assert root.joinpath("worker-0.2", "cgroup.procs").read_text() == "555"
+        assert self.slot(root, "worker-0.2").joinpath("cgroup.procs").read_text() == "555"
         assert occupied.joinpath("cgroup.procs").read_text() == "4321\n"
         # Counters come from the new directory, so they start at zero.
         assert mgr.stats("worker", 0) is None
@@ -456,29 +483,29 @@ class TestManagerFileOperations:
         mgr, root = self.manager(tmp_path)
         mgr.create("worker", 0, Limits())
         mgr.destroy("worker", 0)
-        assert mgr.create("worker", 0, Limits()) == str(root / "worker-0")
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0"))
 
     def test_create_with_empty_limits_writes_nothing(self, tmp_path):
         mgr, root = self.manager(tmp_path)
         mgr.create("worker", 0, Limits())
-        slot = root / "worker-0"
+        slot = self.slot(root, "worker-0")
         assert slot.is_dir()
         assert list(slot.iterdir()) == []
 
     def test_create_failure_raises_cgroup_error(self, tmp_path):
         mgr, root = self.manager(tmp_path)
-        root.chmod(0o555)
+        (root / "workers").chmod(0o555)
         try:
             with pytest.raises(CgroupError):
                 mgr.create("worker", 0, Limits(memory_max=1024))
         finally:
-            root.chmod(0o755)
+            (root / "workers").chmod(0o755)
 
     def test_place_writes_pid(self, tmp_path):
         mgr, root = self.manager(tmp_path)
         mgr.create("worker", 1, Limits())
         assert mgr.place(4242, "worker", 1) is True
-        assert root.joinpath("worker-1", "cgroup.procs").read_text() == "4242"
+        assert self.slot(root, "worker-1").joinpath("cgroup.procs").read_text() == "4242"
 
     def test_place_missing_cgroup_raises(self, tmp_path):
         mgr, _ = self.manager(tmp_path)
@@ -522,11 +549,54 @@ class TestManagerFileOperations:
         mgr, root = self.manager(tmp_path)
         mgr.create("worker", 0, Limits())
         mgr.destroy("worker", 0)
-        assert not (root / "worker-0").exists()
+        assert not self.slot(root, "worker-0").exists()
 
     def test_destroy_is_a_noop_when_already_gone(self, tmp_path):
         mgr, _ = self.manager(tmp_path)
         mgr.destroy("worker", 0)
+
+    def test_control_roles_get_their_own_leaf_under_control(self, tmp_path):
+        """A dispatcher limit in queue.yml has to reach a real cgroup file."""
+        mgr, root = self.manager(tmp_path)
+        path = mgr.create("dispatcher", 0, Limits(memory_max=1024))
+
+        leaf = root / "control" / "dispatcher-0"
+        assert path == str(leaf)
+        assert leaf.joinpath("memory.max").read_text() == "1024"
+        # Pooling is a worker-only affair: control slots sit beside the
+        # supervisor, outside the workers budget.
+        assert not (root / "workers" / "dispatcher-0").exists()
+
+    def test_place_control_role_uses_its_own_leaf(self, tmp_path):
+        mgr, root = self.manager(tmp_path)
+        mgr.create("scheduler", 0, Limits())
+        assert mgr.place(4242, "scheduler", 0) is True
+
+        assert (root / "control" / "scheduler-0" / "cgroup.procs").read_text() == "4242"
+        # Never the shared parent: a process there would block the controller.
+        parent_procs = root / "control" / "cgroup.procs"
+        assert not parent_procs.exists() or parent_procs.read_text().strip() != "4242"
+
+    def test_destroy_removes_a_control_leaf_but_never_the_parent(self, tmp_path):
+        mgr, root = self.manager(tmp_path)
+        mgr.create("scheduler", 0, Limits())
+
+        mgr.destroy("scheduler", 0)
+
+        assert not (root / "control" / "scheduler-0").exists()
+        assert (root / "control").is_dir()
+
+    def test_prepare_writes_pool_limits(self, tmp_path):
+        root = make_root(tmp_path)
+        mgr = CgroupManager(
+            str(root),
+            workers_pool_limits=Limits(memory_max=7 * 1024**3, memory_oom_group=False),
+        )
+        mgr.prepare()
+
+        workers = root / "workers"
+        assert workers.joinpath("memory.max").read_text() == str(7 * 1024**3)
+        assert workers.joinpath("memory.oom.group").read_text() == "0"
 
 
 class TestScavenge:
@@ -549,7 +619,7 @@ os._exit(0)  # Simulate owner death without running Python cleanup.
             timeout=10,
         )
         CgroupManager(str(root)).scavenge()
-        assert not (root / "worker-0").exists()
+        assert not (root / "workers" / "worker-0").exists()
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is Unix-only")
     def test_child_close_preserves_parent_lock_without_retaining_it(self, tmp_path):
@@ -610,37 +680,44 @@ finally:
 
     def test_removes_empty_slot_dirs_only(self, tmp_path):
         root = make_root(tmp_path)
+        (root / "workers").mkdir()
         # Left without a cgroup.procs file: a real hierarchy removes the
         # interface files as part of rmdir, which a plain directory cannot
         # model. The decision under test is "no live pids -> remove".
-        for name in ("worker-0", "dispatcher-1", "scheduler-0"):
-            (root / name).mkdir()
+        for name in ("worker-0", "worker-0.2"):
+            (root / "workers" / name).mkdir()
 
-        busy = root / "worker-7"
+        busy = root / "workers" / "worker-7"
         busy.mkdir()
         busy.joinpath("cgroup.procs").write_text("1234\n")
 
-        # Suffixed leftovers from the collision path are ours too.
-        (root / "worker-0.2").mkdir()
-
-        # Not ours: a shared cgroup root may hold other things.
-        for name in ("supervisor", "some-other-thing", "worker-abc"):
+        # Control slots are leftovers too, but the supervisor's own leaf and
+        # anything that is not a slot name must survive.
+        (root / "control").mkdir()
+        for name in ("dispatcher-1", "scheduler-0", "supervisor", "not-a-slot"):
+            (root / "control" / name).mkdir()
+        for name in ("some-other-thing", "worker-abc", "dispatcher-1"):
             (root / name).mkdir()
 
         CgroupManager(str(root)).scavenge()
 
-        assert not (root / "worker-0").exists()
-        assert not (root / "worker-0.2").exists()
-        assert not (root / "dispatcher-1").exists()
-        assert not (root / "scheduler-0").exists()
+        assert not (root / "workers" / "worker-0").exists()
+        assert not (root / "workers" / "worker-0.2").exists()
         assert busy.exists(), "a populated leftover must be left for its owner"
-        assert (root / "supervisor").exists()
-        assert (root / "some-other-thing").exists()
-        assert (root / "worker-abc").exists()
+        assert not (root / "control" / "dispatcher-1").exists()
+        assert not (root / "control" / "scheduler-0").exists()
+        assert (root / "control" / "supervisor").exists(), (
+            "the supervisor's own leaf is never a scavenge candidate"
+        )
+        assert (root / "control" / "not-a-slot").exists()
+        # Only the two subtrees are scanned; the root itself is left alone.
+        for name in ("some-other-thing", "worker-abc", "dispatcher-1"):
+            assert (root / name).exists()
 
     def test_empty_procs_file_is_not_treated_as_busy(self, tmp_path, caplog):
         root = make_root(tmp_path)
-        slot = root / "worker-0"
+        (root / "workers").mkdir()
+        slot = root / "workers" / "worker-0"
         slot.mkdir()
         slot.joinpath("cgroup.procs").write_text("")
 
@@ -1042,3 +1119,251 @@ class TestFailureReason:
         reason = oom_failure_reason(1, None)
         assert "killed by the OOM killer" in reason
         assert "pid=1" in reason
+
+
+class TestOomScoreAdj:
+    """The supervisor stays off the OOM killer's menu; workers reset to 0."""
+
+    def test_write_targets_the_proc_interface(self, monkeypatch):
+        fake = MagicMock()
+        monkeypatch.setattr("builtins.open", fake)
+        assert _write_oom_score_adj(4242, -1000) is True
+        fake.assert_called_once_with("/proc/4242/oom_score_adj", "w")
+        fake.return_value.__enter__.return_value.write.assert_called_once_with("-1000")
+
+    def test_write_is_best_effort(self, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise OSError("no /proc here")
+
+        monkeypatch.setattr("builtins.open", boom)
+        assert _write_oom_score_adj(4242, 0) is False
+
+    def test_supervisor_protects_itself(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "quebec.supervisor._write_oom_score_adj",
+            lambda pid, value: calls.append((pid, value)) or True,
+        )
+        sup, _qc = make_supervisor(DisabledCgroup("test"), plan={ROLE_WORKER: 1})
+        sup._protect_from_oom()
+        assert calls == [(os.getpid(), SUPERVISOR_OOM_SCORE_ADJ)]
+
+    def test_supervisor_warns_when_it_cannot_lower(self, monkeypatch, caplog):
+        monkeypatch.setattr(
+            "quebec.supervisor._write_oom_score_adj", lambda *_args: False
+        )
+        sup, _qc = make_supervisor(DisabledCgroup("test"), plan={ROLE_WORKER: 1})
+        sup._protect_from_oom()
+        assert "OOMScoreAdjust" in caplog.text
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is Unix-only")
+    def test_forked_child_resets_to_default(self, monkeypatch):
+        read_fd, write_fd = os.pipe()
+
+        def child_side_reset():
+            os.write(write_fd, b"reset")
+            os.close(write_fd)
+            os._exit(0)  # short-circuit before user code runs
+
+        monkeypatch.setattr(
+            "quebec.supervisor._reset_child_oom_priority", child_side_reset
+        )
+        sup, _qc = make_supervisor(DisabledCgroup("test"), plan={ROLE_WORKER: 1})
+        sup._fork_child(ROLE_WORKER, 0)
+
+        (child_pid,) = sup._children
+        os.close(write_fd)
+        try:
+            data = os.read(read_fd, 1024)
+        finally:
+            os.close(read_fd)
+        os.waitpid(child_pid, 0)
+        assert data == b"reset"
+
+    def test_child_reset_skips_when_already_default(self, monkeypatch):
+        class FakeProc:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return "0\n"
+
+        monkeypatch.setattr("builtins.open", FakeProc)
+        writes = []
+        monkeypatch.setattr(
+            "quebec.supervisor._write_oom_score_adj",
+            lambda pid, value: writes.append((pid, value)) or True,
+        )
+        assert _reset_child_oom_priority() is True
+        assert writes == []
+
+    def test_child_reset_writes_when_inherited(self, monkeypatch):
+        class FakeProc:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return "-1000\n"
+
+        monkeypatch.setattr("builtins.open", FakeProc)
+        writes = []
+        monkeypatch.setattr(
+            "quebec.supervisor._write_oom_score_adj",
+            lambda pid, value: writes.append((pid, value)) or True,
+        )
+        assert _reset_child_oom_priority() is True
+        assert writes == [(os.getpid(), CHILD_OOM_SCORE_ADJ)]
+
+    def test_child_reset_fails_when_it_cannot_write(self, monkeypatch):
+        class FakeProc:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return "-1000\n"
+
+        monkeypatch.setattr("builtins.open", FakeProc)
+        monkeypatch.setattr(
+            "quebec.supervisor._write_oom_score_adj", lambda *_args: False
+        )
+        assert _reset_child_oom_priority() is False
+
+    def test_child_reset_ignores_missing_proc(self, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise OSError("no /proc")
+
+        monkeypatch.setattr("builtins.open", boom)
+        assert _reset_child_oom_priority() is True
+
+
+class TestRuntimeAdjust:
+    """Adjusting a slot's limits is immediate on a live child and sticky."""
+
+    def test_adjust_rewrites_limits_on_a_live_leaf(self, tmp_path):
+        root = make_root(tmp_path)
+        mgr = CgroupManager(str(root))
+        path = mgr.create(ROLE_WORKER, 0, Limits(memory_max=1024, memory_swap_max=0))
+
+        mgr.adjust(
+            ROLE_WORKER,
+            0,
+            Limits(
+                memory_max=2048,
+                memory_high=1024,
+                memory_swap_max=cgroup.UNLIMITED,
+                memory_oom_group=False,
+            ),
+        )
+
+        assert (Path(path) / "memory.max").read_text() == "2048"
+        assert (Path(path) / "memory.high").read_text() == "1024"
+        assert (Path(path) / "memory.swap.max").read_text() == "max"
+        assert (Path(path) / "memory.oom.group").read_text() == "0"
+
+    def test_adjust_clears_a_limit_by_writing_max(self, tmp_path):
+        root = make_root(tmp_path)
+        mgr = CgroupManager(str(root))
+        path = mgr.create(ROLE_WORKER, 0, Limits(memory_max=1024, memory_swap_max=0))
+
+        mgr.adjust(ROLE_WORKER, 0, Limits(memory_max=cgroup.UNLIMITED))
+
+        assert (Path(path) / "memory.max").read_text() == "max"
+
+    def test_adjust_without_a_live_child_is_a_noop(self, tmp_path):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        mgr.adjust(ROLE_WORKER, 0, Limits(memory_max=1024))  # must not raise
+
+    def test_supervisor_adjust_records_and_defers_to_the_loop(self):
+        cg = MagicMock(enabled=True)
+        sup, _qc = make_supervisor(cg, plan={ROLE_WORKER: 2})
+        sup._slot_limits[(ROLE_WORKER, 0)] = Limits(memory_max=1024)
+
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max="2G")
+
+        assert new.memory_max == 2 * 1024**3
+        assert sup._slot_limits[(ROLE_WORKER, 0)] is new
+        assert sup._pending_adjusts[(ROLE_WORKER, 0)] is new
+        cg.adjust.assert_not_called(), "the live write is deferred to the loop"
+
+        sup._apply_pending_adjusts()
+        cg.adjust.assert_called_once_with(ROLE_WORKER, 0, new)
+        assert sup._pending_adjusts == {}
+
+    def test_supervisor_adjust_parses_sizes_and_keeps_explicit_max(self):
+        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+
+        new = sup.adjust_slot_limit(
+            ROLE_WORKER, 0, memory_max="512MiB", memory_swap_max="max"
+        )
+
+        assert new.memory_max == 512 * 1024**2
+        assert new.memory_swap_max == cgroup.UNLIMITED
+        assert new.memory_oom_group is True  # companion default
+
+    def test_supervisor_adjust_clear_keeps_the_other_fields(self):
+        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        sup._slot_limits[(ROLE_WORKER, 0)] = Limits(
+            memory_max=1024, memory_swap_max=0, memory_oom_group=True
+        )
+
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max=None)
+
+        assert new.memory_max == cgroup.UNLIMITED, "clearing writes `max`, not nothing"
+        assert new.memory_swap_max == 0  # unchanged unless told otherwise
+        assert new.memory_oom_group is True
+
+    def test_supervisor_adjust_clear_oom_group_resets_to_default(self):
+        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        sup._slot_limits[(ROLE_WORKER, 0)] = Limits(
+            memory_max=1024, memory_oom_group=True
+        )
+
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
+
+        assert new.memory_oom_group is False
+
+    def test_supervisor_adjust_rejects_bad_role_and_index(self):
+        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 2})
+        with pytest.raises(ValueError):
+            sup.adjust_slot_limit("nope", 0, memory_max=1)
+        with pytest.raises(IndexError):
+            sup.adjust_slot_limit(ROLE_WORKER, 5, memory_max=1)
+
+    def test_supervisor_adjust_rejects_bad_values(self):
+        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        with pytest.raises(ValueError):
+            sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max="garbage")
+        with pytest.raises(ValueError):
+            sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=1)
+
+
+def test_current_supervisor_defaults_to_none():
+    assert current_supervisor() is None
+
+
+def test_supervisor_applies_the_pool_budget_to_the_cgroup():
+    sup, _qc = make_supervisor(
+        DisabledCgroup("t"), plan={ROLE_WORKER: 1}, workers_pool_memory_max="7GiB"
+    )
+    assert sup._workers_pool_limits.memory_max == 7 * 1024**3
+    assert sup._workers_pool_limits.memory_oom_group is False
+    assert sup._cgroup.workers_pool_limits is sup._workers_pool_limits
+

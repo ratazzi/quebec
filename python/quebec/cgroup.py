@@ -1,9 +1,23 @@
-"""cgroup v2 leaf cgroups for the fork-based supervisor.
+"""cgroup v2 supervision for the fork-based supervisor.
 
-Each supervised child gets its own leaf cgroup under a delegated subtree, so a
-runaway job is killed by the kernel as a unit (``memory.oom.group``) instead of
-taking the whole host with it. The supervisor reads ``memory.events`` after
-reaping a child to tell a cgroup OOM apart from an ordinary crash.
+The supervisor builds a two-tier tree under a delegated subtree::
+
+    root
+    ├── control/
+    │   ├── supervisor/     the supervisor itself
+    │   ├── dispatcher-0/   per-slot leaf (limits from queue.yml)
+    │   └── scheduler-0/    ...
+    └── workers/            the worker pool (memory.max, oom.group=0)
+        ├── worker-0/       per-worker leaf (memory.max, oom.group=1)
+        └── worker-1/       ...
+
+Every child gets a leaf of its own, so its ``memory.events`` counters start at
+zero and any OOM kill is attributable to it rather than to a predecessor in the
+same slot. Worker leaves kill a runaway job as a unit (``memory.oom.group``);
+the ``workers`` pool budget scopes a pool-level OOM to the workers, never the
+control processes. ``control`` holds no process of its own — the supervisor
+lives in its own leaf there — which is what lets the memory controller be
+enabled for the control slots at all (cgroup v2's "no internal process" rule).
 
 Everything here is Linux-only and best-effort by default: when no subtree is
 writable and no limits are configured, :func:`probe` returns a
@@ -33,10 +47,18 @@ logger = logging.getLogger(__name__)
 ENABLE_ENV = "QUEBEC_CGROUP"
 ROOT_ENV = "QUEBEC_CGROUP_ROOT"
 
+CONTROL_DIR = "control"
+WORKERS_DIR = "workers"
+#: The supervisor's own leaf under ``control``. Never scavenged.
 SUPERVISOR_LEAF = "supervisor"
-#: Only directories matching this are ever touched by scavenge/destroy, so a
-#: shared cgroup root cannot have unrelated directories removed.
-SLOT_DIR_RE = re.compile(r"^(worker|dispatcher|scheduler)-\d+(\.\d+)?$")
+#: Workers are pooled under ``workers``; every other role is a control-plane
+#: role and gets its leaf directly under ``control``.
+WORKER_ROLE = "worker"
+#: Matches worker leaf names under ``workers`` (including collision suffixes).
+WORKER_DIR_RE = re.compile(r"^worker-\d+(\.\d+)?$")
+#: Matches control-slot leaf names under ``control``. Deliberately excludes
+#: ``supervisor``, so scavenging can never reclaim the supervisor's own leaf.
+CONTROL_DIR_RE = re.compile(r"^(dispatcher|scheduler)-\d+(\.\d+)?$")
 
 #: `memory.max` is derived from `memory_recycle_at` times this factor. RSS and
 #: `memory.current` are different quantities (the latter includes page cache),
@@ -279,9 +301,11 @@ def _write(path: str, value: str) -> None:
     cgroupfs wants the whole value in a single unbuffered write, so this uses
     a raw fd rather than a buffered file object. ``O_CREAT`` never fires on a
     real hierarchy (the kernel materialises every interface file on mkdir) but
-    lets the unit tests drive a plain directory tree.
+    lets the unit tests drive a plain directory tree; ``O_TRUNC`` keeps a
+    shorter value (e.g. clearing a limit to ``max``) from leaving stale bytes
+    behind in that regular-file tree. On cgroupfs both flags are harmless.
     """
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         os.write(fd, value.encode())
     finally:
@@ -324,6 +348,7 @@ class DisabledCgroup:
 
     def __init__(self, reason: str):
         self.reason = reason
+        self.workers_pool_limits = EMPTY_LIMITS
 
     def prepare(self) -> None:
         pass
@@ -332,6 +357,9 @@ class DisabledCgroup:
         pass
 
     def create(self, role: str, index: int, limits: Limits) -> None:
+        pass
+
+    def adjust(self, role: str, index: int, limits: Limits) -> None:
         pass
 
     def place(self, pid: int, role: str, index: int) -> bool:
@@ -358,11 +386,18 @@ class CgroupManager:
 
     enabled = True
 
-    def __init__(self, root: str, controllers: Iterable[str] = ("memory",)):
+    def __init__(
+        self,
+        root: str,
+        controllers: Iterable[str] = ("memory",),
+        workers_pool_limits: Limits = EMPTY_LIMITS,
+    ):
         self.root = root
         self.controllers = frozenset(controllers)
+        #: Limits applied to the ``workers`` pool cgroup itself, not the leaves.
+        self.workers_pool_limits = workers_pool_limits
         # (role, index) -> the directory this slot's *current* child owns.
-        # Not always `{role}-{index}`: see _claim_path.
+        # Not always `worker-{index}`: see _claim_path.
         self._paths: Dict[Tuple[str, int], str] = {}
         self._locks: Dict[Tuple[str, int], int] = {}
 
@@ -384,8 +419,10 @@ class CgroupManager:
         """The directory the slot's live child occupies, if it has one."""
         return self._paths.get((role, index))
 
-    def _claim_path(self, role: str, index: int) -> str:
+    def _claim_path(self, base: str, role: str, index: int) -> str:
         """Create a directory this child owns outright, and return it.
+
+        ``base`` is the preferred full path (``<root>/workers/worker-0``).
 
         `os.mkdir` without `exist_ok` is the whole point: it is the atomic
         exclusive-create the kernel gives us. Checking "is it empty?" and then
@@ -399,7 +436,6 @@ class CgroupManager:
         A directory nobody has touched also guarantees the `memory.events`
         counters start at zero, which is what makes them attributable.
         """
-        base = os.path.join(self.root, f"{role}-{index}")
         try:
             # Serialize mkdir + ownership lock with every scavenger. Holding
             # only the leaf lock would leave a gap between mkdir and flock.
@@ -430,59 +466,86 @@ class CgroupManager:
         raise CgroupError(f"no free cgroup directory for {role}[{index}] under {base}")
 
     def prepare(self) -> None:
-        """Move the supervisor into its own leaf, then enable controllers.
+        """Vacate the root, enable controllers, stand up both subtrees.
 
-        The order matters: cgroup v2 refuses to write ``cgroup.subtree_control``
-        while the cgroup still has member processes ("no internal process"
-        constraint), so the supervisor has to vacate the root first.
+        cgroup v2 refuses to write ``cgroup.subtree_control`` while a cgroup
+        still has member processes (the "no internal process" rule), which sets
+        the whole order: the supervisor moves into ``control/supervisor`` so
+        both the root and ``control`` are processless, then the controllers are
+        enabled on the root, then on ``control`` (for the dispatcher/scheduler
+        leaves) and on ``workers`` (for the worker leaves) — the latter only
+        after the pool budget has been written, so no worker can be placed
+        under an unbudgeted pool.
         """
         root_procs = os.path.join(self.root, "cgroup.procs")
         pids = {
             line.strip() for line in (_read(root_procs) or "").split() if line.strip()
         }
+        control = os.path.join(self.root, CONTROL_DIR)
         if str(os.getpid()) in pids:
-            leaf = os.path.join(self.root, SUPERVISOR_LEAF)
-            os.makedirs(leaf, exist_ok=True)
+            supervisor_leaf = os.path.join(control, SUPERVISOR_LEAF)
+            os.makedirs(supervisor_leaf, exist_ok=True)
             # Writing to cgroup.procs migrates the whole thread group, so the
             # heartbeat/maintenance threads follow us regardless of ordering.
-            _write(os.path.join(leaf, "cgroup.procs"), str(os.getpid()))
+            _write(os.path.join(supervisor_leaf, "cgroup.procs"), str(os.getpid()))
 
         enabled = set(
             (_read(os.path.join(self.root, "cgroup.subtree_control")) or "").split()
         )
         missing = sorted(c for c in self.controllers if c not in enabled)
-        if not missing:
-            return
-
-        # Vacating our own pid is not enough if something else shares the root:
-        # the kernel answers EBUSY, which on its own tells the operator nothing.
-        # Our own pid is excluded: we just migrated it out, and a real
-        # hierarchy has already dropped it from this list.
-        leftover = {
-            p.strip()
-            for p in (_read(root_procs) or "").split()
-            if p.strip() and p.strip() != str(os.getpid())
-        }
-        if leftover:
-            raise CgroupError(
-                f"cgroup root {self.root} still holds {len(leftover)} other "
-                f"process(es) (pids {','.join(sorted(leftover))}); cgroup v2 cannot "
-                "enable controllers for a cgroup that has member processes. Give "
-                "Quebec a cgroup of its own (systemd Delegate=yes, or point "
-                "QUEBEC_CGROUP_ROOT at a dedicated empty subtree)."
+        if missing:
+            # Vacating our own pid is not enough if something else shares the
+            # root: the kernel answers EBUSY, which on its own tells the
+            # operator nothing. Our own pid is excluded: we just migrated it
+            # out, and a real hierarchy has already dropped it from this list.
+            leftover = {
+                p.strip()
+                for p in (_read(root_procs) or "").split()
+                if p.strip() and p.strip() != str(os.getpid())
+            }
+            if leftover:
+                raise CgroupError(
+                    f"cgroup root {self.root} still holds {len(leftover)} other "
+                    f"process(es) (pids {','.join(sorted(leftover))}); cgroup v2 cannot "
+                    "enable controllers for a cgroup that has member processes. Give "
+                    "Quebec a cgroup of its own (systemd Delegate=yes, or point "
+                    "QUEBEC_CGROUP_ROOT at a dedicated empty subtree)."
+                )
+            _write(
+                os.path.join(self.root, "cgroup.subtree_control"),
+                " ".join(f"+{c}" for c in missing),
             )
 
-        _write(
-            os.path.join(self.root, "cgroup.subtree_control"),
-            " ".join(f"+{c}" for c in missing),
+        # `control` is created unconditionally: a supervisor that was already
+        # outside the root still needs somewhere to place its control children.
+        os.makedirs(control, exist_ok=True)
+        self._enable_controllers(control)
+
+        workers = os.path.join(self.root, WORKERS_DIR)
+        os.makedirs(workers, exist_ok=True)
+        self._write_limits(workers, self.workers_pool_limits)
+        self._enable_controllers(workers)
+
+    def _enable_controllers(self, path: str) -> None:
+        """Enable this manager's controllers for ``path``'s children."""
+        enabled = set(
+            (_read(os.path.join(path, "cgroup.subtree_control")) or "").split()
         )
+        missing = sorted(c for c in self.controllers if c not in enabled)
+        if missing:
+            _write(
+                os.path.join(path, "cgroup.subtree_control"),
+                " ".join(f"+{c}" for c in missing),
+            )
 
     def scavenge(self) -> None:
-        """Remove leftover slot cgroups from a previous supervisor.
+        """Remove leftover slot leaves from a previous supervisor.
 
-        A non-empty leftover is left alone: during a rolling restart the old
-        children may still be draining, and killing them here would fail jobs
-        that were about to finish.
+        Covers both subtrees, and only names a slot leaf can have — the
+        supervisor's own leaf and anything else sharing the root are never
+        candidates. A non-empty leftover is left alone: during a rolling
+        restart the old children may still be draining, and killing them here
+        would fail jobs that were about to finish.
         """
         try:
             with _directory_lock(self.root):
@@ -491,10 +554,16 @@ class CgroupManager:
             logger.warning("Cannot scan cgroup root %s: %s", self.root, exc)
 
     def _scavenge_unlocked(self) -> None:
-        for name in os.listdir(self.root):
-            if not SLOT_DIR_RE.match(name):
+        self._scavenge_dir(os.path.join(self.root, WORKERS_DIR), WORKER_DIR_RE)
+        self._scavenge_dir(os.path.join(self.root, CONTROL_DIR), CONTROL_DIR_RE)
+
+    def _scavenge_dir(self, parent: str, pattern) -> None:
+        if not os.path.isdir(parent):
+            return
+        for name in os.listdir(parent):
+            if not pattern.match(name):
                 continue
-            path = os.path.join(self.root, name)
+            path = os.path.join(parent, name)
             if not os.path.isdir(path):
                 continue
             try:
@@ -521,39 +590,78 @@ class CgroupManager:
             finally:
                 os.close(fd)
 
-    def create(self, role: str, index: int, limits: Limits) -> str:
-        """Create the leaf cgroup and write its limits, before the fork.
+    def _write_limits(self, path: str, limits: Limits) -> None:
+        """Write a slot's memory limits into its cgroup directory."""
+        # Swap first: capping swap after memory.max would leave a window where
+        # the child can escape the limit by swapping out.
+        if limits.memory_swap_max is not None:
+            _write(os.path.join(path, "memory.swap.max"), str(limits.memory_swap_max))
+        if limits.memory_high is not None:
+            _write(os.path.join(path, "memory.high"), str(limits.memory_high))
+        if limits.memory_max is not None:
+            _write(os.path.join(path, "memory.max"), str(limits.memory_max))
+        if limits.memory_oom_group is not None:
+            _write(
+                os.path.join(path, "memory.oom.group"),
+                "1" if limits.memory_oom_group else "0",
+            )
+
+    def _slot_parent(self, role: str) -> str:
+        """The directory this role's leaves live under.
+
+        Workers are pooled so a pool budget can cap them together; every other
+        role is a control-plane role and sits beside the supervisor's own leaf.
+        """
+        return os.path.join(
+            self.root, WORKERS_DIR if role == WORKER_ROLE else CONTROL_DIR
+        )
+
+    def create(self, role: str, index: int, limits: Limits) -> Optional[str]:
+        """Create this slot's leaf cgroup and write its limits, before the fork.
 
         Writing limits up front means the child is already constrained the
         instant it is migrated in.
         """
         if (role, index) in self._paths:
             raise CgroupError(f"{role}[{index}] already owns a cgroup")
-        path = self._claim_path(role, index)
+        # The parent directory is normally created by prepare(); ensure it
+        # exists so create() also works standalone (and in the fake-tree tests)
+        # without the full prepare() dance. A no-op once prepare() has run.
+        parent = self._slot_parent(role)
+        os.makedirs(parent, exist_ok=True)
+        base = os.path.join(parent, f"{role}-{index}")
+        path = self._claim_path(base, role, index)
         self._paths[(role, index)] = path
         try:
-            # Swap first: capping swap after memory.max would leave a window
-            # where the child can escape the limit by swapping out.
-            if limits.memory_swap_max is not None:
-                _write(
-                    os.path.join(path, "memory.swap.max"), str(limits.memory_swap_max)
-                )
-            if limits.memory_high is not None:
-                _write(os.path.join(path, "memory.high"), str(limits.memory_high))
-            if limits.memory_max is not None:
-                _write(os.path.join(path, "memory.max"), str(limits.memory_max))
-            if limits.memory_oom_group is not None:
-                _write(
-                    os.path.join(path, "memory.oom.group"),
-                    "1" if limits.memory_oom_group else "0",
-                )
+            self._write_limits(path, limits)
         except OSError as exc:
             self.destroy(role, index)
             raise CgroupError(f"cannot set up cgroup {path}: {exc}") from exc
         return path
 
+    def adjust(self, role: str, index: int, limits: Limits) -> None:
+        """Re-write limits onto a live child's cgroup, immediately.
+
+        The kernel enforces the new values the moment they are written:
+        lowering ``memory.max`` below current usage starts reclaiming and OOMs
+        if it cannot shrink; raising it relaxes at once. A slot with no live
+        child is a no-op here — the caller records the limits for the next
+        fork. Serialised against ``destroy`` so a concurrent reap cannot rmdir
+        the leaf mid-write.
+        """
+        path = self.path_for(role, index)
+        if path is None:
+            return
+        try:
+            with _directory_lock(self.root):
+                if self.path_for(role, index) != path:
+                    return  # reaped between the lookup and the lock
+                self._write_limits(path, limits)
+        except OSError as exc:
+            raise CgroupError(f"cannot adjust cgroup {path}: {exc}") from exc
+
     def place(self, pid: int, role: str, index: int) -> bool:
-        """Migrate a freshly forked child into its leaf cgroup.
+        """Migrate a freshly forked child into its own leaf cgroup.
 
         Returns False when the child is already gone (ESRCH), which is not a
         cgroup failure — the normal reap path handles it.
@@ -561,13 +669,13 @@ class CgroupManager:
         slot_path = self.path_for(role, index)
         if slot_path is None:
             raise CgroupError(f"no cgroup created for {role}[{index}]")
-        path = os.path.join(slot_path, "cgroup.procs")
+        target = os.path.join(slot_path, "cgroup.procs")
         try:
-            _write(path, str(pid))
+            _write(target, str(pid))
         except OSError as exc:
             if exc.errno == errno.ESRCH:
                 return False
-            raise CgroupError(f"cannot move pid {pid} into {path}: {exc}") from exc
+            raise CgroupError(f"cannot move pid {pid} into {target}: {exc}") from exc
         return True
 
     def stats(self, role: str, index: int) -> Optional[CgroupStats]:

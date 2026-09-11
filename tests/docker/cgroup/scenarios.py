@@ -264,7 +264,7 @@ test:
 
     root = cgroup_root()
     check(root is not None, f"cgroup probe succeeded (root={root})")
-    slot_dir = os.path.join(root, "worker-0")
+    slot_dir = os.path.join(root, "workers", "worker-0")
     observed = {}
 
     def worker_is_up():
@@ -308,7 +308,7 @@ test:
 
     root = cgroup_root()
     check(root is not None, f"cgroup probe succeeded (root={root})")
-    slot_dir = os.path.join(root, "worker-0")
+    slot_dir = os.path.join(root, "workers", "worker-0")
     seen = {"created": False}
 
     def worker_is_up():
@@ -322,12 +322,12 @@ test:
 
     check(seen["created"], "the worker cgroup existed while running")
     check(
-        not any(p.startswith("worker-0.") for p in os.listdir(root)),
+        not any(p.startswith("worker-0.") for p in os.listdir(os.path.join(root, "workers"))),
         "no orphaned suffixed cgroup directories were left behind",
     )
     check(not os.path.isdir(slot_dir), f"{slot_dir} was removed on shutdown")
     check(
-        os.path.isdir(os.path.join(root, "supervisor")),
+        os.path.isdir(os.path.join(root, "control", "supervisor")),
         "the supervisor's own leaf is intentionally kept for reuse",
     )
     qc.close()
@@ -351,7 +351,7 @@ test:
 
     root = cgroup_root()
     check(root is not None, f"cgroup probe succeeded (root={root})")
-    slot_dir = os.path.join(root, "worker-0")
+    slot_dir = os.path.join(root, "workers", "worker-0")
     observed = {}
 
     def worker_is_up():
@@ -598,7 +598,7 @@ def read_text(*parts):
 def slot_dirs(root, prefix="worker-0"):
     return sorted(
         name
-        for name in os.listdir(root)
+        for name in os.listdir(os.path.join(root, "workers"))
         if name == prefix or name.startswith(prefix + ".")
     )
 
@@ -674,15 +674,15 @@ test:
     )
     check(
         wait_for(
-            lambda: bool(read_text(root, "worker-0", "cgroup.procs").split()),
+            lambda: bool(read_text(root, "workers", "worker-0", "cgroup.procs").split()),
             60.0,
             "A's worker to be placed",
         ),
         "supervisor A's worker is in worker-0",
     )
-    a_limit = read_text(root, "worker-0", "memory.max").strip()
+    a_limit = read_text(root, "workers", "worker-0", "memory.max").strip()
     print(f"    A worker-0/memory.max = {a_limit}")
-    a_pids = {int(pid) for pid in read_text(root, "worker-0", "cgroup.procs").split()}
+    a_pids = {int(pid) for pid in read_text(root, "workers", "worker-0", "cgroup.procs").split()}
     check(
         wait_for(lambda: claimed_by(db_path, a_pids), 60.0, "A to claim the slow job"),
         "A owns the slow job before B starts",
@@ -700,10 +700,10 @@ test:
         f"B claimed a suffixed directory, not worker-0 (got {dirs})",
     )
     check(
-        read_text(root, "worker-0", "memory.max").strip() == a_limit,
+        read_text(root, "workers", "worker-0", "memory.max").strip() == a_limit,
         "A's memory.max was not rewritten by B",
     )
-    b_dir = os.path.join(root, dirs[1])
+    b_dir = os.path.join(root, "workers", dirs[1])
     check(
         wait_for(
             lambda: bool(read_text(b_dir, "cgroup.procs").split()),
@@ -719,7 +719,7 @@ test:
     check(True, "supervisor A exited after draining")
     check(
         wait_for(
-            lambda: not os.path.isdir(os.path.join(root, "worker-0")), 30.0, "A cleanup"
+            lambda: not os.path.isdir(os.path.join(root, "workers", "worker-0")), 30.0, "A cleanup"
         ),
         "A removed its own worker-0 on the way out",
     )
