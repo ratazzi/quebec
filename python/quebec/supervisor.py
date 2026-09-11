@@ -40,6 +40,10 @@ ROLE_SCHEDULER = "scheduler"
 VALID_ROLES = {ROLE_WORKER, ROLE_DISPATCHER, ROLE_SCHEDULER}
 RECYCLE_EXIT_CODE = 75
 
+#: Fallback for the ``workers`` pool budget, used when neither the constructor
+#: nor queue.yml's ``workers_pool_memory_max`` sets one.
+POOL_MEMORY_MAX_ENV = "QUEBEC_WORKERS_POOL_MEMORY_MAX"
+
 #: ``oom_score_adj`` for the supervisor. -1000 is the kernel's floor: it marks
 #: the process as never selectable by the OOM killer, so a group- or host-level
 #: OOM event removes a worker, never the process that reforks it.
@@ -290,7 +294,9 @@ class Supervisor:
             (bytes, a size string like ``"7GiB"``, or ``"max"``). Worker
             leaves overcommit against it; a pool-level OOM then scopes its
             victims to workers, never the control processes. ``None`` (default)
-            leaves the pool bounded only by the group's own limit.
+            falls back to queue.yml's top-level ``workers_pool_memory_max``,
+            then to ``QUEBEC_WORKERS_POOL_MEMORY_MAX``, and leaves the pool
+            bounded only by the group's own limit if neither is set.
     """
 
     def __init__(
@@ -363,10 +369,9 @@ class Supervisor:
         self._pending_adjusts: Dict[Tuple[str, int], Limits] = {}
 
         self._cgroup = probe() if cgroup is None else cgroup
-        pool_max = (
-            _coerce_memory_size(workers_pool_memory_max)
-            if workers_pool_memory_max is not None
-            else None
+        raw_limits = self._load_config_limits() if limits is None else limits
+        pool_max = _coerce_memory_size(
+            self._resolve_pool_memory_max(workers_pool_memory_max, raw_limits)
         )
         # `oom.group=0` at the pool scopes a pool-level OOM to a single worker
         # instead of the whole pool, but only a real byte count asks the kernel
@@ -381,7 +386,6 @@ class Supervisor:
         else:
             self._workers_pool_limits = EMPTY_LIMITS
         self._cgroup.workers_pool_limits = self._workers_pool_limits
-        raw_limits = self._load_config_limits() if limits is None else limits
         self._configured_limits = config_has_explicit_limits(raw_limits)
         sources = self._enforced_limit_sources()
         if not self._cgroup.enabled and sources:
@@ -624,6 +628,21 @@ class Supervisor:
             return
         self._cgroup_ready = True
         self._cgroup.scavenge()
+
+    @staticmethod
+    def _resolve_pool_memory_max(explicit, raw_limits: Optional[Dict]):
+        """Pick the pool budget: constructor, then queue.yml, then environment.
+
+        queue.yml outranks the environment the same way ``memory_recycle_at``
+        outranks ``QUEBEC_WORKER_MAX_RSS_MB`` — the file describes this
+        deployment, the variable is the fallback for hosts that have no file.
+        """
+        if explicit is not None:
+            return explicit
+        from_config = (raw_limits or {}).get("workers_pool_memory_max")
+        if from_config is not None:
+            return from_config
+        return os.environ.get(POOL_MEMORY_MAX_ENV) or None
 
     def _load_config_limits(self) -> Dict:
         try:

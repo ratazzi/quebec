@@ -984,6 +984,54 @@ class TestSupervisorConfigAndStartup:
         finally:
             qc.close()
 
+    def test_pool_budget_comes_from_queue_yml(self, tmp_path, monkeypatch):
+        """The ordinary entrypoint reads the budget through the config bridge."""
+        config = tmp_path / "queue.yml"
+        config.write_text(
+            "test:\n  workers_pool_memory_max: 7GiB\n  workers:\n    - processes: 1\n"
+        )
+        monkeypatch.setenv("QUEBEC_CONFIG", str(config))
+        monkeypatch.setenv("QUEBEC_ENV", "test")
+        qc = quebec.Quebec("sqlite::memory:")
+        try:
+            raw = qc.supervisor_resource_limits_from_config()
+            assert raw["workers_pool_memory_max"] == 7 * 1024**3
+            sup = Supervisor(
+                qc, {ROLE_WORKER: 1}, cgroup=CgroupManager(str(tmp_path)), limits=raw
+            )
+            assert sup._workers_pool_limits.memory_max == 7 * 1024**3
+        finally:
+            qc.close()
+
+    def test_pool_budget_falls_back_to_the_environment(self, monkeypatch):
+        monkeypatch.setenv("QUEBEC_WORKERS_POOL_MEMORY_MAX", "512MiB")
+        sup, _qc = make_supervisor(EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1})
+        assert sup._workers_pool_limits.memory_max == 512 * 1024 * 1024
+
+    def test_queue_yml_outranks_the_environment(self, monkeypatch):
+        monkeypatch.setenv("QUEBEC_WORKERS_POOL_MEMORY_MAX", "512MiB")
+        sup, _qc = make_supervisor(
+            EnabledNoopCgroup("t"),
+            plan={ROLE_WORKER: 1},
+            limits={"workers_pool_memory_max": 2 * 1024**3},
+        )
+        assert sup._workers_pool_limits.memory_max == 2 * 1024**3
+
+    def test_the_constructor_outranks_both(self, monkeypatch):
+        monkeypatch.setenv("QUEBEC_WORKERS_POOL_MEMORY_MAX", "512MiB")
+        sup, _qc = make_supervisor(
+            EnabledNoopCgroup("t"),
+            plan={ROLE_WORKER: 1},
+            limits={"workers_pool_memory_max": 2 * 1024**3},
+            workers_pool_memory_max="1GiB",
+        )
+        assert sup._workers_pool_limits.memory_max == 1024**3
+
+    def test_an_empty_environment_value_is_not_a_budget(self, monkeypatch):
+        monkeypatch.setenv("QUEBEC_WORKERS_POOL_MEMORY_MAX", "")
+        sup, _qc = make_supervisor(EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1})
+        assert sup._workers_pool_limits is cgroup.EMPTY_LIMITS
+
     def test_initial_placement_failure_aborts_and_reclaims_child(self, monkeypatch):
         qc = MagicMock()
         qc.register_supervisor.return_value = 1

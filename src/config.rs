@@ -454,6 +454,13 @@ pub struct QueueConfig {
 
     /// Dispatcher configurations
     pub dispatchers: Option<Vec<DispatcherConfig>>,
+
+    /// cgroup v2 `memory.max` for the `workers` pool that holds every worker
+    /// leaf. Worker limits may overcommit against it; a pool-level OOM then
+    /// picks a worker rather than a control-plane process. Overridden by the
+    /// `QUEBEC_WORKERS_POOL_MEMORY_MAX` environment variable only when absent
+    /// here, matching how `memory_recycle_at` wins over `worker_max_rss_mb`.
+    pub workers_pool_memory_max: Option<SizeSpec>,
 }
 
 impl QueueConfig {

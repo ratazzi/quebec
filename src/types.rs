@@ -2008,6 +2008,15 @@ impl PyQuebec {
             return Ok(out.into());
         };
 
+        out.set_item(
+            "workers_pool_memory_max",
+            size_spec_item(
+                py,
+                "workers_pool_memory_max",
+                config.workers_pool_memory_max.as_ref(),
+            )?,
+        )?;
+
         if let Some(workers) = config.workers.as_ref() {
             let items = PyList::empty(py);
             for w in workers {
