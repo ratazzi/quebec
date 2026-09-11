@@ -17,6 +17,7 @@ import pytest
 import quebec
 from quebec import cgroup
 from quebec.cgroup import (
+    EMPTY_LIMITS,
     CgroupError,
     CgroupManager,
     CgroupStats,
@@ -25,6 +26,7 @@ from quebec.cgroup import (
 )
 from quebec.supervisor import (
     CHILD_OOM_SCORE_ADJ,
+    ROLE_DISPATCHER,
     ROLE_WORKER,
     SUPERVISOR_OOM_SCORE_ADJ,
     Supervisor,
@@ -799,6 +801,16 @@ class FakeQuebec:
         return 0
 
 
+class EnabledNoopCgroup(DisabledCgroup):
+    """A backend that reports itself usable but does nothing.
+
+    ``DisabledCgroup`` doubles as the no-op implementation; flipping ``enabled``
+    lets a test exercise the paths that only run when a cgroup is available.
+    """
+
+    enabled = True
+
+
 class ExplodingCgroup(DisabledCgroup):
     """Cgroup backend whose create() starts failing after ``after`` calls."""
 
@@ -1067,6 +1079,104 @@ class TestMustEnforce:
         )
 
         assert released is True, "an unenforceable `max` must not kill the child"
+
+
+class TestPoolBudgetIsEnforced:
+    """The pool budget is a configured limit, so it decides what is fatal too.
+
+    It arrives as a kwarg rather than through queue.yml, so every path that
+    asks "can this cgroup failure be tolerated?" has to consult it separately
+    or a worker ends up running outside the budget — in the supervisor's own
+    cgroup, competing with the control processes it was meant to protect.
+    """
+
+    class BadPrepare(DisabledCgroup):
+        enabled = True
+
+        def prepare(self):
+            raise CgroupError("cannot enable controllers")
+
+    class BadPlace(DisabledCgroup):
+        enabled = True
+
+        def place(self, pid, role, index):
+            raise CgroupError("cannot migrate")
+
+    def test_an_unusable_cgroup_with_a_pool_budget_is_fatal(self):
+        with pytest.raises(RuntimeError, match="workers pool memory budget"):
+            Supervisor(
+                FakeQuebec(),
+                {ROLE_WORKER: 1},
+                cgroup=DisabledCgroup("no cgroup here"),
+                workers_pool_memory_max="7GiB",
+            )
+
+    def test_no_pool_budget_stays_best_effort(self):
+        """The default must never turn a cgroup-less host into a hard error."""
+        sup = Supervisor(
+            FakeQuebec(), {ROLE_WORKER: 1}, cgroup=DisabledCgroup("no cgroup here")
+        )
+        assert sup._workers_pool_limits is cgroup.EMPTY_LIMITS
+        assert sup._enforced_limit_sources() == []
+
+    def test_an_explicit_max_pool_budget_asks_for_nothing(self):
+        sup = Supervisor(
+            FakeQuebec(),
+            {ROLE_WORKER: 1},
+            cgroup=DisabledCgroup("no cgroup here"),
+            workers_pool_memory_max="max",
+        )
+        assert sup._workers_pool_limits.memory_max == cgroup.UNLIMITED
+        assert sup._workers_pool_limits.memory_oom_group is None
+        assert sup._enforced_limit_sources() == []
+
+    def test_prepare_failure_with_a_pool_budget_is_fatal(self):
+        sup, _qc = make_supervisor(
+            self.BadPrepare("test double"),
+            plan={ROLE_WORKER: 1},
+            workers_pool_memory_max="7GiB",
+        )
+        sup._cgroup_ready = False
+
+        with pytest.raises(RuntimeError, match="cannot prepare cgroup root"):
+            sup._setup_cgroup_root()
+
+    def test_create_failure_with_a_pool_budget_fails_the_slot(self):
+        """The worker has no limit of its own; the budget alone must bind it."""
+        sup, _qc = make_supervisor(
+            ExplodingCgroup(after=0),
+            plan={ROLE_WORKER: 1},
+            workers_pool_memory_max="7GiB",
+        )
+
+        with pytest.raises(CgroupError):
+            sup._create_slot_cgroup(ROLE_WORKER, 0, EMPTY_LIMITS)
+
+    def test_place_failure_with_a_pool_budget_aborts_the_worker(self):
+        sup, _qc = make_supervisor(
+            self.BadPlace("test double"),
+            plan={ROLE_WORKER: 1},
+            workers_pool_memory_max="7GiB",
+        )
+        sup._starting = False
+
+        released = sup._place_in_cgroup(123, ROLE_WORKER, 0, EMPTY_LIMITS)
+
+        assert released is False, (
+            "a worker outside the workers subtree runs in the supervisor's own "
+            "cgroup, escaping the budget entirely"
+        )
+
+    def test_control_roles_are_not_bound_by_the_pool_budget(self):
+        """The budget caps the worker pool; a dispatcher is not in it."""
+        sup, _qc = make_supervisor(
+            self.BadPlace("test double"),
+            plan={ROLE_WORKER: 1, ROLE_DISPATCHER: 1},
+            workers_pool_memory_max="7GiB",
+        )
+        sup._starting = False
+
+        assert sup._place_in_cgroup(123, ROLE_DISPATCHER, 0, EMPTY_LIMITS) is True
 
 
 class TestFailureReason:
@@ -1361,7 +1471,7 @@ def test_current_supervisor_defaults_to_none():
 
 def test_supervisor_applies_the_pool_budget_to_the_cgroup():
     sup, _qc = make_supervisor(
-        DisabledCgroup("t"), plan={ROLE_WORKER: 1}, workers_pool_memory_max="7GiB"
+        EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1}, workers_pool_memory_max="7GiB"
     )
     assert sup._workers_pool_limits.memory_max == 7 * 1024**3
     assert sup._workers_pool_limits.memory_oom_group is False
