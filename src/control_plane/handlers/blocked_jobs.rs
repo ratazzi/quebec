@@ -231,9 +231,11 @@ impl ControlPlane {
         let table_config = state.ctx.table_config.clone();
         let redirect = state.referer_or(&headers, "/blocked-jobs");
 
+        let ctx = state.ctx.clone();
         match db
-            .transaction::<_, i64, DbErr>(|txn| {
+            .transaction::<_, (i64, Option<i64>), DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     let blocked_execution =
                         query_builder::blocked_executions::find_by_id(txn, &table_config, id)
@@ -244,13 +246,17 @@ impl ControlPlane {
 
                     let job_id = blocked_execution.job_id;
                     query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
+                    // Release before the delete: the FK cascade would drop the
+                    // tracking row without telling us which batch to re-check.
+                    let released = crate::batch::release_job(&ctx, txn, job_id).await?;
                     query_builder::jobs::delete_by_id(txn, &table_config, job_id).await?;
-                    Ok(job_id)
+                    Ok((job_id, released))
                 })
             })
             .await
         {
-            Ok(job_id) => {
+            Ok((job_id, released)) => {
+                crate::core::finish_released_batches(&state.ctx, db, released).await;
                 info!("Cancelled blocked job ID: {}, job ID: {}", id, job_id);
                 Self::redirect_back(&redirect)
             }

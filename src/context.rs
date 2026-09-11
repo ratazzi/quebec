@@ -137,6 +137,8 @@ pub struct TableConfig {
     pub pauses: String,
     pub processes: String,
     pub semaphores: String,
+    pub batches: String,
+    pub batch_executions: String,
 }
 
 impl Default for TableConfig {
@@ -153,6 +155,8 @@ impl Default for TableConfig {
             pauses: "solid_queue_pauses".to_string(),
             processes: "solid_queue_processes".to_string(),
             semaphores: "solid_queue_semaphores".to_string(),
+            batches: "solid_queue_batches".to_string(),
+            batch_executions: "solid_queue_batch_executions".to_string(),
         }
     }
 }
@@ -173,6 +177,8 @@ impl TableConfig {
             pauses: format!("{prefix}_pauses"),
             processes: format!("{prefix}_processes"),
             semaphores: format!("{prefix}_semaphores"),
+            batches: format!("{prefix}_batches"),
+            batch_executions: format!("{prefix}_batch_executions"),
         }
     }
 }
@@ -400,6 +406,10 @@ pub struct AppContext {
     /// Whether the dispatcher runs concurrency maintenance (expiring stale
     /// semaphores + unblocking blocked jobs) each polling cycle. Default true.
     pub dispatcher_concurrency_maintenance: bool,
+    /// Sweep stalled batches on the dispatcher's maintenance timer (Solid
+    /// Queue's `batch_maintenance`, default on). Disable when no batches are
+    /// used or when only some of several dispatchers should do maintenance.
+    pub dispatcher_batch_maintenance: bool,
     pub worker_polling_interval: Duration,
     pub worker_threads: u64,
     /// Optional worker RSS soft limit. When set, a worker that stays above the
@@ -465,6 +475,20 @@ pub struct AppContext {
     /// Unix seconds of the last column probe made while
     /// `recurring_pause_state` is "unavailable"; throttles re-detection.
     pub recurring_pause_probed_at: Arc<AtomicU64>,
+    /// Runtime detection of the Solid Queue batches schema (`jobs.batch_id`
+    /// plus the `batches` / `batch_executions` tables). No switch: the schema
+    /// ships with Solid Queue >= 1.5 and `create_tables()` always creates it.
+    /// Against an older Rails-managed database jobs still enqueue and run,
+    /// just without batch bookkeeping, and `Quebec.batch()` refuses.
+    /// 0 unknown, 1 ready, 2 unavailable. See `ensure_batches`.
+    pub batches_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Unix seconds of the last schema probe made while `batches_state` is
+    /// "unavailable"; throttles re-detection.
+    pub batches_probed_at: Arc<AtomicU64>,
+    /// Batches whose job was released inside a claim transaction (rate-limit
+    /// discard) and still need a completion check once that transaction has
+    /// committed. Drained by the worker right after claiming.
+    pub deferred_batch_finishes: Arc<std::sync::Mutex<Vec<i64>>>,
     /// EXPERIMENTAL: per-class sliding-window rate limits. Empty means
     /// no class declared `rate_limit_max`; the worker claim path uses
     /// `.is_empty()` to skip the rate check path with zero overhead.
@@ -611,6 +635,9 @@ impl Drop for InFlightGuard {
 /// lookup per interval, however many tasks or pages poll) and the delay before
 /// a column added elsewhere takes effect.
 const RECURRING_PAUSE_REPROBE_SECS: u64 = 5;
+
+/// Same throttle for the batches schema probe.
+const BATCHES_REPROBE_SECS: u64 = 5;
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -933,6 +960,9 @@ impl AppContext {
             if let Some(v) = get_bool("recurring_pause") {
                 ctx.recurring_pause = v;
             }
+            if let Some(v) = get_bool("dispatcher_batch_maintenance") {
+                ctx.dispatcher_batch_maintenance = v;
+            }
             if let Some(v) = get_bool("preserve_finished_jobs") {
                 ctx.preserve_finished_jobs = v;
             }
@@ -1141,6 +1171,7 @@ impl AppContext {
             has_explicit_dispatcher_batch_size: false,
             has_explicit_dispatcher_maintenance: false,
             dispatcher_concurrency_maintenance: true,
+            dispatcher_batch_maintenance: true,
             worker_polling_interval: Duration::from_millis(100),
             worker_threads: 3,
             worker_max_rss_bytes: None,
@@ -1161,6 +1192,9 @@ impl AppContext {
             recurring_pause: false,
             recurring_pause_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             recurring_pause_probed_at: Arc::new(AtomicU64::new(0)),
+            batches_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            batches_probed_at: Arc::new(AtomicU64::new(0)),
+            deferred_batch_finishes: Arc::new(std::sync::Mutex::new(Vec::new())),
             rate_limited_classes: Arc::new(RwLock::new(HashMap::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
@@ -1332,6 +1366,7 @@ impl AppContext {
             has_explicit_dispatcher_batch_size: self.has_explicit_dispatcher_batch_size,
             has_explicit_dispatcher_maintenance: self.has_explicit_dispatcher_maintenance,
             dispatcher_concurrency_maintenance: self.dispatcher_concurrency_maintenance,
+            dispatcher_batch_maintenance: self.dispatcher_batch_maintenance,
             worker_polling_interval: self.worker_polling_interval,
             worker_threads: self.worker_threads,
             worker_max_rss_bytes: self.worker_max_rss_bytes,
@@ -1352,6 +1387,9 @@ impl AppContext {
             recurring_pause: self.recurring_pause,
             recurring_pause_state: self.recurring_pause_state.clone(),
             recurring_pause_probed_at: self.recurring_pause_probed_at.clone(),
+            batches_state: self.batches_state.clone(),
+            batches_probed_at: self.batches_probed_at.clone(),
+            deferred_batch_finishes: self.deferred_batch_finishes.clone(),
             rate_limited_classes: self.rate_limited_classes.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
@@ -1464,6 +1502,75 @@ impl AppContext {
         self.recurring_pause_probed_at
             .store(unix_now_secs(), Ordering::Release);
         self.recurring_pause_state
+            .store(if ready { 1 } else { 2 }, Ordering::Release);
+        ready
+    }
+
+    pub fn defer_batch_finish(&self, batch_id: i64) {
+        if let Ok(mut pending) = self.deferred_batch_finishes.lock() {
+            pending.push(batch_id);
+        }
+    }
+
+    pub fn take_deferred_batch_finishes(&self) -> Vec<i64> {
+        self.deferred_batch_finishes
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    /// Forget an earlier "batches schema missing" verdict so the next
+    /// `ensure_batches` probes again immediately. For `create_tables()` and
+    /// explicit Python API calls.
+    pub fn forget_batches_probe(&self) {
+        if self.batches_state.load(Ordering::Acquire) == 2 {
+            self.batches_state.store(0, Ordering::Release);
+        }
+    }
+
+    /// Whether the batches schema is usable, mirroring Solid Queue's
+    /// `Batch.migrated?`. Free once ready (an atomic read), so every job
+    /// finish calls it directly. A missing schema is reported once and then
+    /// re-probed at most every `BATCHES_REPROBE_SECS`, so a migration run
+    /// elsewhere is picked up without a restart.
+    pub async fn ensure_batches<C>(&self, db: &C) -> bool
+    where
+        C: sea_orm::ConnectionTrait,
+    {
+        match self.batches_state.load(Ordering::Acquire) {
+            1 => return true,
+            2 => {
+                let now = unix_now_secs();
+                let last = self.batches_probed_at.load(Ordering::Acquire);
+                if now.saturating_sub(last) < BATCHES_REPROBE_SECS {
+                    return false;
+                }
+                self.batches_probed_at.store(now, Ordering::Release);
+                let found =
+                    crate::schema_builder::batches_schema_exists(db, &self.table_config).await;
+                if found {
+                    tracing::info!("batches: schema appeared, batch bookkeeping is now active");
+                    self.batches_state.store(1, Ordering::Release);
+                }
+                return found;
+            }
+            _ => {}
+        }
+
+        let ready = crate::schema_builder::batches_schema_exists(db, &self.table_config).await;
+        if !ready {
+            warn!(
+                "batches: `{}.batch_id` / `{}` / `{}` not found; jobs enqueue without batch \
+                 bookkeeping and Quebec.batch() is unavailable. Run create_tables() or the \
+                 Solid Queue `add_batches_to_solid_queue` migration.",
+                self.table_config.jobs,
+                self.table_config.batches,
+                self.table_config.batch_executions
+            );
+        }
+        self.batches_probed_at
+            .store(unix_now_secs(), Ordering::Release);
+        self.batches_state
             .store(if ready { 1 } else { 2 }, Ordering::Release);
         ready
     }

@@ -238,9 +238,25 @@ impl Runnable {
         T: crate::utils::IntoPython,
         K: crate::utils::IntoPython,
     {
+        self.get_concurrency_constraint_on(args, kwargs, None)
+    }
+
+    pub(crate) fn get_concurrency_constraint_on<T, K>(
+        &self,
+        args: Option<T>,
+        kwargs: Option<K>,
+        instance: Option<Py<PyAny>>,
+    ) -> Result<Option<ConcurrencyConstraint>>
+    where
+        T: crate::utils::IntoPython,
+        K: crate::utils::IntoPython,
+    {
         Python::attach(|py| {
             let bound = self.handler.bind(py);
-            let instance = bound.call0()?;
+            let instance = match instance {
+                Some(instance) => instance.into_bound(py),
+                None => bound.call0()?,
+            };
 
             // Check if the instance has a concurrency_key method (not just the property)
             if !instance.hasattr("concurrency_key")? {
@@ -600,7 +616,19 @@ impl Runnable {
     ) -> Option<Bound<'py, PyAny>> {
         let instance = self.handler.bind(py).call0().ok()?;
         instance.setattr("id", job.id).ok();
+        Self::inject_batch_ids(&instance, job).ok();
         Some(instance)
+    }
+
+    /// Stamp the batch ids `BaseClass.batch` reads: the member batch from the
+    /// jobs row, and for callback jobs the batch that enqueued them (carried
+    /// only in the serialized envelope, as in Active Job).
+    fn inject_batch_ids(instance: &Bound<'_, PyAny>, job: &quebec_jobs::Model) -> PyResult<()> {
+        instance.setattr("_batch_id", job.batch_id)?;
+        instance.setattr(
+            "_callback_batch_id",
+            crate::utils::get_callback_batch_id(job.arguments.as_deref()),
+        )
     }
 
     /// Invoke an error-strategy handler with `(job, error)`. Logs and swallows
@@ -743,7 +771,7 @@ impl Runnable {
         });
 
         // Parse task parameters from original args (without continuation metadata)
-        let (args, kwargs) = self.parse_job_arguments_from_json(py, &original_args)?;
+        let (args, kwargs) = Self::parse_job_arguments_from_json(py, &original_args)?;
 
         // Create Python instance and invoke
         let bound = self.handler.bind(py);
@@ -751,6 +779,7 @@ impl Runnable {
         instance.setattr("id", job.id)?;
         let executions = crate::utils::get_executions(job.arguments.as_deref());
         instance.setattr("executions", executions)?;
+        Self::inject_batch_ids(&instance, job)?;
 
         // Check if the job class inherits from Continuable mixin
         // We check for _continuation attribute (defined in Continuable class) and verify it's None
@@ -868,8 +897,7 @@ impl Runnable {
     }
 
     /// Parse job arguments from JSON value (used for continuation support)
-    fn parse_job_arguments_from_json(
-        &self,
+    pub(crate) fn parse_job_arguments_from_json(
         py: Python,
         json_args: &serde_json::Value,
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
@@ -910,10 +938,15 @@ impl Runnable {
 
             if last.is_instance_of::<pyo3::types::PyDict>() {
                 let last_dict = last.cast::<pyo3::types::PyDict>()?;
-                if last_dict.contains("_quebec_kwargs")? {
+                if last_dict.contains("_quebec_kwargs")?
+                    || last_dict.contains("_aj_ruby2_keywords")?
+                {
                     for (key, value) in last_dict {
                         let key_str: String = key.extract()?;
-                        if key_str == "_quebec_kwargs" || key_str == "_aj_symbol_keys" {
+                        if key_str == "_quebec_kwargs"
+                            || key_str == "_aj_symbol_keys"
+                            || key_str == "_aj_ruby2_keywords"
+                        {
                             continue;
                         }
                         kwargs.set_item(key, value)?;
@@ -1517,12 +1550,13 @@ impl Execution {
     /// (used for continuation support)
     async fn schedule_retry_job<C: ConnectionTrait>(
         txn: &C,
-        table_config: &crate::context::TableConfig,
+        ctx: &AppContext,
         job: &quebec_jobs::Model,
         scheduled_at: chrono::NaiveDateTime,
         arguments: &str,
         override_arguments: Option<&str>,
     ) -> std::result::Result<(), DbErr> {
+        let table_config = &ctx.table_config;
         let arguments = override_arguments.unwrap_or(arguments);
 
         let new_job_id = query_builder::jobs::insert(
@@ -1535,8 +1569,38 @@ impl Execution {
             job.active_job_id.as_deref(),
             Some(scheduled_at),
             job.concurrency_key.as_deref(),
+            job.batch_id,
         )
         .await?;
+
+        // A retry is a new attempt of the same logical job: it keeps the batch
+        // open with its own tracking row but does not bump `total_jobs`
+        // (`executions > 0`). Inserted before the previous attempt's row is
+        // released in the same transaction, so the batch cannot finish in
+        // between. The batch is only ever already finished if the sweep
+        // removed our row underneath us; then the retry runs untracked.
+        if let Some(batch_id) = job.batch_id {
+            let executions = crate::utils::get_executions(Some(arguments));
+            let active_job_id = job.active_job_id.as_deref().unwrap_or_default();
+            match crate::batch::track_jobs(
+                txn,
+                ctx,
+                batch_id,
+                &[(new_job_id, executions, active_job_id)],
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if crate::batch::already_finished_id(&e).is_some() => {
+                    warn!(
+                        batch_id,
+                        job_id = new_job_id,
+                        "batch already finished; retry runs outside the batch"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         query_builder::scheduled_executions::insert(
             txn,
@@ -1741,9 +1805,12 @@ impl Execution {
 
         let claimed_id = claimed.id;
         let max_retries = 3u32;
-        let mut transaction_result: std::result::Result<bool, TransactionError<DbErr>> = Err(
-            TransactionError::Transaction(DbErr::Custom("not attempted".into())),
-        );
+        let mut transaction_result: std::result::Result<
+            (bool, Option<i64>),
+            TransactionError<DbErr>,
+        > = Err(TransactionError::Transaction(DbErr::Custom(
+            "not attempted".into(),
+        )));
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -1779,7 +1846,7 @@ impl Execution {
                 .await
                 {
                     Ok(None) => {
-                        transaction_result = Ok(failed);
+                        transaction_result = Ok((failed, None));
                         break;
                     }
                     Ok(Some(_)) => {} // still present: safe to re-run the closure
@@ -1803,13 +1870,13 @@ impl Execution {
             let queue_name = queue_name.clone();
 
             transaction_result = db
-                .transaction::<_, bool, DbErr>(|txn| {
+                .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                     let queue_name = queue_name.clone();
                     Box::pin(async move {
                         if let Some((scheduled_at, ref arguments)) = retry_job_data {
                             Self::schedule_retry_job(
                                 txn,
-                                &table_config,
+                                &ctx,
                                 &job,
                                 scheduled_at,
                                 arguments,
@@ -1842,6 +1909,15 @@ impl Execution {
                             // Only mark as finished for successful jobs (like Solid Queue)
                             query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
                         }
+
+                        // Either outcome is terminal for this attempt: drop its
+                        // batch tracking row. The completion check runs after
+                        // commit (see below), never inside this transaction.
+                        let released_batch = if job.batch_id.is_some() {
+                            crate::batch::release_job(&ctx, txn, job_id).await?
+                        } else {
+                            None
+                        };
 
                         // Directly delete record from claimed_executions table
                         let delete_result = query_builder::claimed_executions::delete_by_id(
@@ -1898,7 +1974,7 @@ impl Execution {
                         // them up.
                         Worker::release_queue_slot(&ctx, txn, &table_config, &queue_name).await?;
 
-                        Ok(failed)
+                        Ok((failed, released_batch))
                     })
                 })
                 .await;
@@ -1906,6 +1982,13 @@ impl Execution {
             if transaction_result.is_ok() {
                 break;
             }
+        }
+
+        // The attempt's outcome is committed; now see whether it was the
+        // batch's last outstanding attempt. Errors are logged only: the
+        // job is done either way and the dispatcher sweep repairs misses.
+        if let Ok((_, Some(batch_id))) = transaction_result {
+            crate::core::finish_released_batches(&self.ctx, db.as_ref(), [batch_id]).await;
         }
 
         // Cleanup succeeded: the transaction committed and the claimed row was
@@ -1945,6 +2028,10 @@ impl Execution {
                     "Emergency cleanup: after_executed transaction failed after all retries",
                 )
                 .await;
+                if let Ok(released) = fail_result {
+                    crate::core::finish_released_batches(&self.ctx, cleanup_db.as_ref(), released)
+                        .await;
+                }
                 if let Err(e) = fail_result {
                     // Fallback: at minimum delete the claimed record to unblock the worker.
                     // `fail_claimed_execution` can return Err *after* the claimed
@@ -1999,7 +2086,7 @@ impl Execution {
 
         // Log the result
         let transaction_result = transaction_result
-            .map(|failed| {
+            .map(|(failed, _)| {
                 let duration = self.timer.elapsed();
                 if failed {
                     error!("Job `{}' processed in: {:?}", class_name, duration);
@@ -2281,41 +2368,22 @@ impl Execution {
                     .get_db()
                     .await
                     .map_err(sea_orm::TransactionError::Connection)?;
-                let table_config = self.ctx.table_config.clone();
+                let ctx = self.ctx.clone();
                 db.transaction::<_, (), DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    let queue_name = job.queue_name.clone();
-                    let class_name = job.class_name.clone();
+                    let ctx = ctx.clone();
+                    let job = job.clone();
                     let new_arguments = new_arguments.clone();
-                    let priority = job.priority;
-                    let active_job_id = job.active_job_id.clone();
-                    let concurrency_key = job.concurrency_key.clone().unwrap_or_default();
 
                     Box::pin(async move {
-                        let job_id = query_builder::jobs::insert(
+                        Self::schedule_retry_job(
                             txn,
-                            &table_config,
-                            &queue_name,
-                            &class_name,
-                            Some(&new_arguments),
-                            priority,
-                            active_job_id.as_deref(),
-                            Some(scheduled_at),
-                            Some(&concurrency_key),
-                        )
-                        .await?;
-
-                        query_builder::scheduled_executions::insert(
-                            txn,
-                            &table_config,
-                            job_id,
-                            &queue_name,
-                            priority,
+                            &ctx,
+                            &job,
                             scheduled_at,
+                            &new_arguments,
+                            None,
                         )
-                        .await?;
-
-                        Ok(())
+                        .await
                     })
                 })
                 .await
@@ -2903,6 +2971,16 @@ impl Worker {
                             "rate-limit: throttled, discarding"
                         );
                         query_builder::jobs::mark_finished(txn, table_config, job.id).await?;
+                        // The completion check must wait for this claim
+                        // transaction to commit; park the batch id on the
+                        // context and drain it after the claim returns.
+                        if job.batch_id.is_some() {
+                            if let Some(batch_id) =
+                                crate::batch::release_job(ctx, txn, job.id).await?
+                            {
+                                ctx.defer_batch_finish(batch_id);
+                            }
+                        }
                     }
                 }
                 // Release the class-level concurrency_key semaphore (if any).
@@ -3248,10 +3326,22 @@ impl Worker {
                     Ok(None)
                 })
             })
-            .await?
-            .ok_or_else(|| QuebecError::Database(DbErr::Custom("No job found".into())))?;
+            .await;
+        self.finish_deferred_batches(&db).await;
+        let job =
+            job?.ok_or_else(|| QuebecError::Database(DbErr::Custom("No job found".into())))?;
 
         Ok(job)
+    }
+
+    /// Run completion checks for batches whose jobs were discarded inside a
+    /// claim transaction (rate-limit throttling). Harmless when that
+    /// transaction rolled back: the check just finds the tracking row intact.
+    async fn finish_deferred_batches(&self, db: &DatabaseConnection) {
+        let deferred = self.ctx.take_deferred_batch_finishes();
+        if !deferred.is_empty() {
+            crate::core::finish_released_batches(&self.ctx, db, deferred).await;
+        }
     }
 
     pub async fn claim_jobs(
@@ -3643,7 +3733,9 @@ impl Worker {
                     Ok(claimed_jobs)
                 })
             })
-            .await?;
+            .await;
+        self.finish_deferred_batches(&db).await;
+        let jobs = jobs?;
 
         // Record each claimed row as Dispatched. It stays Dispatched until
         // `pick_job` hands it to the Python side and flips it to InFlight.
@@ -3868,7 +3960,7 @@ impl Worker {
             // the next sweep tick / another process to retry, instead of
             // propagating and leaving every other orphan un-reclaimed.
             let result = db
-                .transaction::<_, (), DbErr>(|txn| {
+                .transaction::<_, Option<i64>, DbErr>(|txn| {
                     Box::pin(async move {
                         Self::fail_claimed_execution(
                             &ctx,
@@ -3884,7 +3976,8 @@ impl Worker {
                 .await;
 
             match result {
-                Ok(()) => {
+                Ok(released) => {
+                    crate::core::finish_released_batches(&self.ctx, db.as_ref(), released).await;
                     reclaimed += 1;
                     debug!(
                         "Marked orphaned job {} as failed (was claimed by process {:?})",
@@ -3983,7 +4076,7 @@ impl Worker {
                 let job_id = execution.job_id;
                 let execution_id = execution.id;
                 let result = db
-                    .transaction::<_, (), DbErr>(|txn| {
+                    .transaction::<_, Option<i64>, DbErr>(|txn| {
                         Box::pin(async move {
                             Self::fail_claimed_execution(
                                 &ctx,
@@ -3999,7 +4092,11 @@ impl Worker {
                     .await;
 
                 match result {
-                    Ok(()) => failed += 1,
+                    Ok(released) => {
+                        crate::core::finish_released_batches(&self.ctx, db.as_ref(), released)
+                            .await;
+                        failed += 1
+                    }
                     Err(e) => warn!(
                         "Failed to fail claimed execution {} (job {}) for stale process {}: {:?}; leaving it for the orphan-sweep",
                         execution_id, job_id, process_id, e
@@ -4092,6 +4189,31 @@ impl Worker {
                 "Cleared {} finished job(s) older than {:?}",
                 total_deleted, clear_after
             );
+        }
+
+        // Succeeded batches age out on the same schedule; failed ones are kept.
+        if self.ctx.ensure_batches(db.as_ref()).await {
+            let mut batches_deleted = 0u64;
+            while !graceful_shutdown.is_cancelled() {
+                let deleted = query_builder::batches::delete_finished_before(
+                    db.as_ref(),
+                    &table_config,
+                    finished_before,
+                    batch_size,
+                )
+                .await?;
+                batches_deleted += deleted;
+                if deleted == 0 {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            }
+            if batches_deleted > 0 {
+                info!(
+                    "Cleared {} finished batch(es) older than {:?}",
+                    batches_deleted, clear_after
+                );
+            }
         }
 
         Ok(total_deleted)
@@ -4431,7 +4553,7 @@ impl Worker {
         let table_config = ctx.table_config.clone();
         let ctx = ctx.clone();
         match db
-            .transaction::<_, (), DbErr>(|txn| {
+            .transaction::<_, Option<i64>, DbErr>(|txn| {
                 let table_config = table_config.clone();
                 let ctx = ctx.clone();
                 let error_msg = error_msg.to_string();
@@ -4444,13 +4566,13 @@ impl Worker {
                         execution_id,
                         &error_msg,
                     )
-                    .await?;
-                    Ok(())
+                    .await
                 })
             })
             .await
         {
-            Ok(()) => {
+            Ok(released) => {
+                crate::core::finish_released_batches(&ctx, db.as_ref(), released).await;
                 // Claim row failed + deleted: drop the ledger entry so it stops
                 // counting against in-flight / blocking drain exit.
                 ctx.ledger_remove(execution_id);
@@ -4470,6 +4592,8 @@ impl Worker {
     }
 
     /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
+    /// Returns the batch the job belonged to, for a completion check once the
+    /// caller's transaction has committed.
     pub(crate) async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
         db: &C,
@@ -4477,13 +4601,15 @@ impl Worker {
         job_id: i64,
         execution_id: i64,
         error_msg: &str,
-    ) -> std::result::Result<(), DbErr>
+    ) -> std::result::Result<Option<i64>, DbErr>
     where
         C: ConnectionTrait,
     {
         query_builder::failed_executions::insert(db, table_config, job_id, Some(error_msg)).await?;
+        let released_batch = crate::batch::release_job(ctx, db, job_id).await?;
         query_builder::claimed_executions::delete_by_id(db, table_config, execution_id).await?;
-        Self::unblock_next_job(ctx, db, table_config, job_id).await
+        Self::unblock_next_job(ctx, db, table_config, job_id).await?;
+        Ok(released_batch)
     }
 
     /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.

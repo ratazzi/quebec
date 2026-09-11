@@ -260,38 +260,43 @@ impl ControlPlane {
         let table_config = state.ctx.table_config.clone();
 
         // Use transaction to operate
+        let ctx = state.ctx.clone();
         let txn_result = db
-            .transaction::<_, (), DbErr>(|txn| {
+            .transaction::<_, Option<i64>, DbErr>(|txn| {
                 let table_config = table_config.clone();
+                let ctx = ctx.clone();
                 Box::pin(async move {
                     // Find scheduled execution record to cancel using query_builder
                     let scheduled_execution =
                         query_builder::scheduled_executions::find_by_id(txn, &table_config, id)
                             .await?;
 
-                    if let Some(execution) = scheduled_execution {
-                        // Mark job as finished using query_builder
-                        query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
-                            .await?;
-
-                        // Delete scheduled_execution record using query_builder
-                        query_builder::scheduled_executions::delete_by_id(txn, &table_config, id)
-                            .await?;
-
-                        info!("Cancelled scheduled job ID: {}", id);
-                    } else {
+                    let Some(execution) = scheduled_execution else {
                         return Err(DbErr::Custom(format!(
                             "Scheduled job with ID {id} not found"
                         )));
-                    }
+                    };
 
-                    Ok(())
+                    // Mark job as finished using query_builder
+                    query_builder::jobs::mark_finished(txn, &table_config, execution.job_id)
+                        .await?;
+                    let released = crate::batch::release_job(&ctx, txn, execution.job_id).await?;
+
+                    // Delete scheduled_execution record using query_builder
+                    query_builder::scheduled_executions::delete_by_id(txn, &table_config, id)
+                        .await?;
+
+                    info!("Cancelled scheduled job ID: {}", id);
+                    Ok(released)
                 })
             })
             .await;
 
         match txn_result {
-            Ok(_) => state.redirect_to("/scheduled-jobs"),
+            Ok(released) => {
+                crate::core::finish_released_batches(&state.ctx, db, released).await;
+                state.redirect_to("/scheduled-jobs")
+            }
             Err(e) => {
                 error!("Failed to cancel scheduled job {}: {}", id, e);
                 Self::error_response()

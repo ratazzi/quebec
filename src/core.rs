@@ -25,11 +25,12 @@ pub struct PreparedJob {
     pub concurrency_limit: Option<i32>,
     pub concurrency_duration: Option<chrono::Duration>,
     pub concurrency_on_conflict: ConcurrencyConflict,
+    pub batch_id: Option<i64>,
 }
 
 /// Where the job was routed after enqueue
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobDestination {
+pub(crate) enum JobDestination {
     /// Job is ready for immediate execution
     Ready,
     /// Job is scheduled for future execution
@@ -41,7 +42,7 @@ enum JobDestination {
 }
 
 impl JobDestination {
-    fn should_notify(&self) -> bool {
+    pub(crate) fn should_notify(&self) -> bool {
         matches!(self, JobDestination::Ready)
     }
 }
@@ -59,21 +60,32 @@ impl Quebec {
     pub async fn perform_all_later(
         &self,
         jobs: Arc<Vec<PreparedJob>>,
+        transaction: Option<Arc<crate::batch_transaction::TransactionState>>,
     ) -> Result<Vec<quebec_jobs::Model>> {
         if jobs.is_empty() {
             return Ok(vec![]);
         }
 
+        if let Some(transaction) = transaction {
+            let txn = transaction.connection()?;
+            let duration = chrono::Duration::from_std(self.ctx.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            let (models, queues, released) =
+                enqueue_all_jobs(&txn, &self.ctx, &jobs, duration).await?;
+            transaction.after_enqueue(queues, released);
+            return Ok(models);
+        }
+
         let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
 
-        let (job_models, ready_queues) = db
-            .transaction::<_, (Vec<quebec_jobs::Model>, HashSet<String>), DbErr>(|txn| {
-                let table_config = ctx.table_config.clone();
+        let (job_models, ready_queues, released_batches) = db
+            .transaction::<_, (Vec<quebec_jobs::Model>, HashSet<String>, Vec<i64>), DbErr>(|txn| {
+                let ctx = ctx.clone();
                 let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60));
                 let jobs = Arc::clone(&jobs);
-                Box::pin(async move { enqueue_all_jobs(txn, &table_config, &jobs, duration).await })
+                Box::pin(async move { enqueue_all_jobs(txn, &ctx, &jobs, duration).await })
             })
             .await
             .map_err(crate::error::QuebecError::from)?;
@@ -90,21 +102,41 @@ impl Quebec {
                 .ok();
         }
 
+        finish_released_batches(&self.ctx, &db, released_batches).await;
+
         Ok(job_models)
     }
 
-    pub async fn perform_later(&self, job: ActiveJob) -> Result<quebec_jobs::Model> {
+    pub async fn perform_later(
+        &self,
+        job: ActiveJob,
+        transaction: Option<Arc<crate::batch_transaction::TransactionState>>,
+    ) -> Result<quebec_jobs::Model> {
+        if let Some(transaction) = transaction {
+            let txn = transaction.connection()?;
+            let duration = chrono::Duration::from_std(self.ctx.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+            let (model, destination, released) =
+                enqueue_job(&txn, &self.ctx, &job, duration).await?;
+            transaction.after_enqueue(
+                destination
+                    .should_notify()
+                    .then(|| model.queue_name.clone()),
+                released,
+            );
+            return Ok(model);
+        }
         let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
         trace!("job: {:?}", job);
 
-        let (job_model, destination) = db
-            .transaction::<_, (quebec_jobs::Model, JobDestination), DbErr>(|txn| {
-                let table_config = ctx.table_config.clone();
+        let (job_model, destination, released_batch) = db
+            .transaction::<_, (quebec_jobs::Model, JobDestination, Option<i64>), DbErr>(|txn| {
+                let ctx = ctx.clone();
                 let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
                     .unwrap_or_else(|_| chrono::Duration::seconds(60));
                 let job = job.clone();
-                Box::pin(async move { enqueue_job(txn, &table_config, &job, duration).await })
+                Box::pin(async move { enqueue_job(txn, &ctx, &job, duration).await })
             })
             .await
             .map_err(crate::error::QuebecError::from)?;
@@ -118,24 +150,48 @@ impl Quebec {
                 .ok();
         }
 
+        finish_released_batches(&self.ctx, &db, released_batch).await;
+
         Ok(job_model)
     }
 }
 
-/// Core job enqueue logic, runs inside a transaction
-async fn enqueue_job(
+/// Run the batch completion check for every batch whose job was released
+/// (discarded on enqueue) inside a transaction that has now committed.
+/// Failures are logged: the sweep repairs anything missed here.
+pub(crate) async fn finish_released_batches(
+    ctx: &Arc<AppContext>,
+    db: &DatabaseConnection,
+    batch_ids: impl IntoIterator<Item = i64>,
+) {
+    let mut seen = HashSet::new();
+    for batch_id in batch_ids {
+        if !seen.insert(batch_id) {
+            continue;
+        }
+        if let Err(e) = crate::batch::try_finish(ctx, db, batch_id).await {
+            warn!(batch_id, "batch: completion check failed: {e}");
+        }
+    }
+}
+
+/// Core job enqueue logic, runs inside a transaction. The third element is
+/// the batch to re-check for completion once the transaction commits, set
+/// when a batched job was discarded on enqueue.
+pub(crate) async fn enqueue_job(
     txn: &DatabaseTransaction,
-    table_config: &TableConfig,
+    ctx: &AppContext,
     job: &ActiveJob,
     concurrency_duration: chrono::Duration,
-) -> std::result::Result<(quebec_jobs::Model, JobDestination), DbErr> {
+) -> std::result::Result<(quebec_jobs::Model, JobDestination, Option<i64>), DbErr> {
+    let table_config = &ctx.table_config;
     let now = chrono::Utc::now().naive_utc();
 
     // Validate arguments JSON without full parsing (zero-copy validation)
     let args: Box<serde_json::value::RawValue> = serde_json::from_str(&job.arguments)
         .map_err(|e| DbErr::Custom(format!("Invalid JSON in arguments: {e}")))?;
 
-    let params = crate::utils::build_job_params(serde_json::json!({
+    let mut overrides = serde_json::json!({
         "job_class": job.class_name,
         "job_id": job.active_job_id,
         "provider_job_id": job.active_job_id,
@@ -143,7 +199,16 @@ async fn enqueue_job(
         "priority": job.priority,
         "arguments": args,
         "enqueued_at": now,
-    }));
+    });
+    // Same keys Active Job's BatchId extension serializes; omitted when unset
+    // so non-batched envelopes are unchanged.
+    if let Some(batch_id) = job.batch_id {
+        overrides["batch_id"] = serde_json::Value::from(batch_id);
+    }
+    if let Some(callback_batch_id) = job.callback_batch_id {
+        overrides["callback_batch_id"] = serde_json::Value::from(callback_batch_id);
+    }
+    let params = crate::utils::build_job_params(overrides);
 
     let concurrency_key = job.concurrency_key.as_deref().unwrap_or_default();
 
@@ -162,13 +227,26 @@ async fn enqueue_job(
         } else {
             Some(concurrency_key)
         },
+        job.batch_id,
     )
     .await?;
 
+    // Track before routing so a job discarded by a concurrency conflict is
+    // still counted, then released, exactly like Solid Queue.
+    if let Some(batch_id) = job.batch_id {
+        crate::batch::track_jobs(
+            txn,
+            ctx,
+            batch_id,
+            &[(job_model.id, job.executions, &job.active_job_id)],
+        )
+        .await?;
+    }
+
     // Route job to appropriate destination
-    let destination = route_job(
+    let (destination, released_batch) = route_job(
         txn,
-        table_config,
+        ctx,
         &job_model,
         job,
         concurrency_key,
@@ -177,19 +255,21 @@ async fn enqueue_job(
     )
     .await?;
 
-    Ok((job_model, destination))
+    Ok((job_model, destination, released_batch))
 }
 
-/// Determine where the job should go based on scheduling and concurrency
+/// Determine where the job should go based on scheduling and concurrency.
+/// Also returns the batch to re-check when a batched job was discarded.
 async fn route_job(
     txn: &DatabaseTransaction,
-    table_config: &TableConfig,
+    ctx: &AppContext,
     job_model: &quebec_jobs::Model,
     job: &ActiveJob,
     concurrency_key: &str,
     now: chrono::NaiveDateTime,
     concurrency_duration: chrono::Duration,
-) -> std::result::Result<JobDestination, DbErr> {
+) -> std::result::Result<(JobDestination, Option<i64>), DbErr> {
+    let table_config = &ctx.table_config;
     let job_id = job_model.id;
 
     // Check if job is scheduled for the future
@@ -204,7 +284,7 @@ async fn route_job(
             job.scheduled_at,
         )
         .await?;
-        return Ok(JobDestination::Scheduled);
+        return Ok((JobDestination::Scheduled, None));
     }
 
     // Handle concurrency control if configured
@@ -221,7 +301,7 @@ async fn route_job(
         if !acquired {
             return handle_concurrency_conflict(
                 txn,
-                table_config,
+                ctx,
                 job_model,
                 job,
                 concurrency_key,
@@ -243,19 +323,20 @@ async fn route_job(
     )
     .await?;
 
-    Ok(JobDestination::Ready)
+    Ok((JobDestination::Ready, None))
 }
 
 /// Handle the case when concurrency limit is reached
 async fn handle_concurrency_conflict(
     txn: &DatabaseTransaction,
-    table_config: &TableConfig,
+    ctx: &AppContext,
     job_model: &quebec_jobs::Model,
     job: &ActiveJob,
     concurrency_key: &str,
     now: chrono::NaiveDateTime,
     concurrency_duration: chrono::Duration,
-) -> std::result::Result<JobDestination, DbErr> {
+) -> std::result::Result<(JobDestination, Option<i64>), DbErr> {
+    let table_config = &ctx.table_config;
     let job_id = job_model.id;
 
     match job.concurrency_on_conflict {
@@ -269,7 +350,12 @@ async fn handle_concurrency_conflict(
                 concurrency_duration.num_seconds()
             );
             query_builder::jobs::mark_finished(txn, table_config, job_id).await?;
-            Ok(JobDestination::Discarded)
+            let released = if job.batch_id.is_some() {
+                crate::batch::release_job(ctx, txn, job_id).await?
+            } else {
+                None
+            };
+            Ok((JobDestination::Discarded, released))
         }
         ConcurrencyConflict::Block => {
             info!(
@@ -291,7 +377,7 @@ async fn handle_concurrency_conflict(
                 expires_at,
             )
             .await?;
-            Ok(JobDestination::Blocked)
+            Ok((JobDestination::Blocked, None))
         }
     }
 }
@@ -301,10 +387,11 @@ async fn handle_concurrency_conflict(
 /// queues that actually have ready jobs.
 async fn enqueue_all_jobs(
     txn: &DatabaseTransaction,
-    table_config: &TableConfig,
+    ctx: &AppContext,
     jobs: &[PreparedJob],
     concurrency_duration: chrono::Duration,
-) -> std::result::Result<(Vec<quebec_jobs::Model>, HashSet<String>), DbErr> {
+) -> std::result::Result<(Vec<quebec_jobs::Model>, HashSet<String>, Vec<i64>), DbErr> {
+    let table_config = &ctx.table_config;
     let now = chrono::Utc::now().naive_utc();
 
     // Phase 1: bulk INSERT all jobs
@@ -320,11 +407,30 @@ async fn enqueue_all_jobs(
             active_job_id: j.active_job_id.clone(),
             scheduled_at: Some(j.scheduled_at.unwrap_or(now)),
             concurrency_key: j.concurrency_key.clone(),
+            batch_id: j.batch_id,
         })
         .collect();
 
     let job_models =
         query_builder::jobs::insert_all_returning(txn, table_config, &bulk_rows, now).await?;
+
+    // Track batch membership before dispatch (Solid Queue's `batch_all`), so
+    // jobs discarded by a concurrency conflict below still count.
+    let mut by_batch: std::collections::BTreeMap<i64, Vec<(i64, i32, &str)>> =
+        std::collections::BTreeMap::new();
+    for (model, prepared) in job_models.iter().zip(jobs.iter()) {
+        if let Some(batch_id) = prepared.batch_id {
+            by_batch.entry(batch_id).or_default().push((
+                model.id,
+                0,
+                prepared.active_job_id.as_str(),
+            ));
+        }
+    }
+    for (batch_id, tracked) in &by_batch {
+        crate::batch::track_jobs(txn, ctx, *batch_id, tracked).await?;
+    }
+    let mut released_batches: Vec<i64> = Vec::new();
 
     // Phase 2: route each job to ready / scheduled / concurrency
     // Collect bulk inserts for ready and scheduled, route concurrency jobs individually
@@ -363,10 +469,12 @@ async fn enqueue_all_jobs(
                 concurrency_on_conflict: prepared.concurrency_on_conflict,
                 created_at: None,
                 updated_at: None,
+                batch_id: prepared.batch_id,
+                callback_batch_id: None,
             };
-            let destination = route_job(
+            let (destination, released) = route_job(
                 txn,
-                table_config,
+                ctx,
                 model,
                 &dummy_active_job,
                 concurrency_key,
@@ -377,6 +485,7 @@ async fn enqueue_all_jobs(
             if destination.should_notify() {
                 ready_queues.insert(model.queue_name.clone());
             }
+            released_batches.extend(released);
             continue;
         }
 
@@ -393,5 +502,5 @@ async fn enqueue_all_jobs(
         query_builder::scheduled_executions::insert_all(txn, table_config, &scheduled_data).await?;
     }
 
-    Ok((job_models, ready_queues))
+    Ok((job_models, ready_queues, released_batches))
 }

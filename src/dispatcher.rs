@@ -49,6 +49,9 @@ impl Dispatcher {
         // Clamp to >= 1s: a zero period would panic tokio's interval (same
         // guard as the worker's cleanup_interval).
         let maintenance_enabled = self.ctx.dispatcher_concurrency_maintenance;
+        // Batch maintenance shares the same timer (Solid Queue parity).
+        let batch_maintenance = self.ctx.dispatcher_batch_maintenance;
+        let mut batch_schema_warned = false;
         let mut maintenance_interval = tokio::time::interval(
             self.ctx
                 .dispatcher_concurrency_maintenance_interval
@@ -93,38 +96,60 @@ impl Dispatcher {
                 // semaphore and unblocks the next job directly (after_executed),
                 // so this sweep only reclaims semaphores whose holder crashed.
                 // Skipped entirely when `concurrency_maintenance: false`.
-                _ = maintenance_interval.tick(), if maintenance_enabled => {
+                _ = maintenance_interval.tick(), if maintenance_enabled || batch_maintenance => {
                     let Ok(maintenance_db) = self.ctx.get_db().await.inspect_err(|e| {
-                        warn!("Failed to get DB for concurrency maintenance: {}", e);
+                        warn!("Failed to get DB for maintenance: {}", e);
                     }) else { continue };
                     let ctx = self.ctx.clone();
 
-                    // Clean up expired semaphores (matches Solid Queue's
-                    // `expire_semaphores`). Solid Queue runs expire + unblock in
-                    // a single maintenance task, so a failed expire aborts the
-                    // task before unblock runs — mirror that by skipping unblock
-                    // when expire fails.
-                    let expire_ok =
-                        match query_builder::semaphores::delete_expired(&*maintenance_db, &ctx.table_config).await {
-                            Ok(n) => {
-                                if n > 0 {
-                                    info!("Cleaned up {} expired semaphores", n);
+                    if maintenance_enabled {
+                        // Clean up expired semaphores (matches Solid Queue's
+                        // `expire_semaphores`). Solid Queue runs expire + unblock in
+                        // a single maintenance task, so a failed expire aborts the
+                        // task before unblock runs — mirror that by skipping unblock
+                        // when expire fails.
+                        let expire_ok =
+                            match query_builder::semaphores::delete_expired(&*maintenance_db, &ctx.table_config).await {
+                                Ok(n) => {
+                                    if n > 0 {
+                                        info!("Cleaned up {} expired semaphores", n);
+                                    }
+                                    true
                                 }
-                                true
-                            }
-                            Err(e) => {
-                                warn!("Error cleaning up expired semaphores: {:?}", e);
-                                false
-                            }
-                        };
+                                Err(e) => {
+                                    warn!("Error cleaning up expired semaphores: {:?}", e);
+                                    false
+                                }
+                            };
 
-                    // Unblock jobs with expired concurrency keys — one transaction
-                    // per key, matching Solid Queue's `BlockedExecution.unblock`.
-                    if expire_ok {
-                        if let Err(e) =
-                            Self::unblock_blocked_executions(&maintenance_db, &ctx, batch_size).await
-                        {
-                            warn!("Error unblocking blocked executions: {:?}", e);
+                        // Unblock jobs with expired concurrency keys — one transaction
+                        // per key, matching Solid Queue's `BlockedExecution.unblock`.
+                        if expire_ok {
+                            if let Err(e) =
+                                Self::unblock_blocked_executions(&maintenance_db, &ctx, batch_size).await
+                            {
+                                warn!("Error unblocking blocked executions: {:?}", e);
+                            }
+                        }
+                    }
+
+                    // Batch sweep (Solid Queue's `Batch.sweep_stalled`), skipped
+                    // quietly while the batches schema is absent.
+                    if batch_maintenance {
+                        if ctx.ensure_batches(maintenance_db.as_ref()).await {
+                            if let Err(e) = crate::batch::sweep_stalled(
+                                &ctx,
+                                &maintenance_db,
+                                std::time::Duration::from_secs(300),
+                                batch_size,
+                            )
+                            .await
+                            {
+                                warn!("Error sweeping stalled batches: {:?}", e);
+                            }
+                        } else if !batch_schema_warned {
+                            batch_schema_warned = true;
+                            info!("Batch maintenance is on but the batches schema is not installed; skipping the sweep");
                         }
                     }
                 }
@@ -135,7 +160,7 @@ impl Dispatcher {
                     let ctx = self.ctx.clone(); // Clone ctx for the async closure
 
                     // Dispatch scheduled jobs in their own transaction.
-                    let transaction_result = polling_db.transaction::<_, std::collections::HashSet<String>, DbErr>(|txn| {
+                    let transaction_result = polling_db.transaction::<_, (std::collections::HashSet<String>, Vec<i64>), DbErr>(|txn| {
                         Box::pin(async move {
                           // Dispatch scheduled jobs
                           // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
@@ -149,13 +174,15 @@ impl Dispatcher {
 
                           if scheduled_executions.is_err() {
                               warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
-                              return Ok(std::collections::HashSet::new());
+                              return Ok((std::collections::HashSet::new(), Vec::new()));
                           }
                           let scheduled_executions = scheduled_executions?;
                           let size = scheduled_executions.len();
 
                           // Collect queue names for NOTIFY
                           let mut notified_queues = std::collections::HashSet::new();
+                          // Batched jobs discarded on promotion, re-checked after commit.
+                          let mut released_batches: Vec<i64> = Vec::new();
 
                           // Batch fetch all jobs at once (eliminates N+1)
                           let job_ids: Vec<i64> = scheduled_executions.iter().map(|se| se.job_id).collect();
@@ -269,6 +296,14 @@ impl Dispatcher {
                                               job.id,
                                           )
                                           .await?;
+                                          released_batches.extend(
+                                              crate::batch::release_batched_job(
+                                                  txn,
+                                                  &ctx.table_config,
+                                                  &job,
+                                              )
+                                              .await?,
+                                          );
                                       }
                                       ConcurrencyConflict::Block => {
                                           let now = chrono::Utc::now().naive_utc();
@@ -307,7 +342,7 @@ impl Dispatcher {
                               info!("Dispatch scheduled jobs size: {}", size);
                           }
 
-                          Ok(notified_queues)
+                          Ok((notified_queues, released_batches))
                         })
                     })
                     .instrument(tracing::info_span!("polling", component = "dispatcher"))
@@ -315,7 +350,8 @@ impl Dispatcher {
 
                     // Send NOTIFY for each unique queue after transaction commits.
                     // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
-                    let Ok(queues) = transaction_result else { continue };
+                    let Ok((queues, released_batches)) = transaction_result else { continue };
+                    crate::core::finish_released_batches(&self.ctx, &polling_db, released_batches).await;
 
                     for queue_name in queues {
                         if !crate::notify::should_send_notify(&self.ctx, &queue_name) {

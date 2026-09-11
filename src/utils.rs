@@ -361,6 +361,17 @@ pub fn get_executions(arguments: Option<&str>) -> i32 {
         .unwrap_or(0) as i32
 }
 
+/// The `callback_batch_id` a batch stamps on its callback jobs. Read from the
+/// top level of the stored envelope, falling back to a nested `arguments`
+/// object for the double-wrapped shape.
+pub fn get_callback_batch_id(arguments: Option<&str>) -> Option<i64> {
+    let value = arguments.and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+    value
+        .get("callback_batch_id")
+        .or_else(|| value.get("arguments")?.get("callback_batch_id"))
+        .and_then(|v| v.as_i64())
+}
+
 /// Get the per-exception-type execution count from `exception_executions`.
 /// Matches ActiveJob's `executions_for(exceptions)` which tracks retries independently
 /// per retry_on declaration.

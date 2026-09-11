@@ -35,6 +35,13 @@ impl ControlPlane {
 
         // Get job basic information using dynamic table names
         let table_config = &state.ctx.table_config;
+        // `batch_id` only exists once the batches schema is installed.
+        let batches_available = state.ctx.ensure_batches(db).await;
+        let batch_column = if batches_available {
+            ", j.batch_id"
+        } else {
+            ""
+        };
         // Use subqueries to avoid row multiplication from multiple failed_executions records
         // and check failed status BEFORE finished_at (since failed jobs also get mark_finished called)
         let job_details_sql = clean_sql(&format!("SELECT
@@ -44,7 +51,7 @@ impl ControlPlane {
             j.priority,
             j.created_at,
             j.finished_at,
-            j.arguments,
+            j.arguments{batch_column},
             CASE
                 WHEN EXISTS (SELECT 1 FROM {fe} WHERE job_id = j.id) THEN 'failed'
                 WHEN c.id IS NOT NULL THEN 'processing'
@@ -72,6 +79,7 @@ impl ControlPlane {
         fe = table_config.failed_executions,
         se = table_config.scheduled_executions,
         be = table_config.blocked_executions,
+        batch_column = batch_column,
         p = p1));
 
         let job_result = db
@@ -92,6 +100,12 @@ impl ControlPlane {
             let status: String = row.try_get("", "status").unwrap_or_default();
             let arguments: Option<String> = row.try_get("", "arguments").ok();
             let error: Option<String> = row.try_get("", "error_message").ok();
+            let batch_id: Option<i64> = if batches_available {
+                row.try_get::<Option<i64>>("", "batch_id").ok().flatten()
+            } else {
+                None
+            };
+            let callback_batch_id = crate::utils::get_callback_batch_id(arguments.as_deref());
             let context: Option<String> = None; // No metadata field in current schema
 
             // Parse creation time
@@ -145,6 +159,8 @@ impl ControlPlane {
                 context,
                 execution_id: None,
                 execution_history: Vec::new(),
+                batch_id,
+                callback_batch_id,
             };
 
             // Get specific detailed information based on status

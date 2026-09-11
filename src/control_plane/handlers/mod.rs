@@ -1,3 +1,4 @@
+pub mod batches;
 pub mod blocked_jobs;
 pub mod events;
 pub mod failed_jobs;
