@@ -382,6 +382,14 @@ class Supervisor:
         # write off this method means it never re-enters cgroup locking, so it
         # is safe to call from a signal handler.
         self._pending_adjusts: Dict[Tuple[str, int], Limits] = {}
+        # Guards the read-merge-record sequence in adjust_slot_limit: two
+        # threads adjusting different fields of the same slot would otherwise
+        # both merge onto the same pre-change value and the later write would
+        # drop the earlier field. Reentrant because a signal handler may call
+        # adjust_slot_limit on the very thread that already holds it — that
+        # nested call still merges onto the pre-change value, but a deadlock
+        # would be worse than a lost field in a case this rare.
+        self._adjust_lock = threading.RLock()
 
         self._cgroup = probe() if cgroup is None else cgroup
         raw_limits = self._load_config_limits() if limits is None else limits
@@ -524,6 +532,13 @@ class Supervisor:
             raise IndexError(f"{role}[{index}] is not in this supervisor's plan")
 
         provided = set(overrides)
+        with self._adjust_lock:
+            return self._merge_slot_limit(role, index, provided, overrides)
+
+    def _merge_slot_limit(
+        self, role: str, index: int, provided: set, overrides: Dict
+    ) -> Limits:
+        """Merge ``overrides`` onto a slot's current limits and record them."""
         current = self._slot_limits.get((role, index), EMPTY_LIMITS)
         memory_max = (
             _coerce_adjust_memory(overrides["memory_max"])
@@ -829,7 +844,13 @@ class Supervisor:
         pid = os.fork()
         if pid == 0:
             # --- child ---
+            global _active_supervisor
             try:
+                # The child inherited a copy of the supervisor object, but it
+                # supervises nothing: current_supervisor() must not hand user
+                # code a Supervisor whose limit changes would be written to
+                # dicts no supervise loop will ever drain.
+                _active_supervisor = None
                 self._cgroup.close()
                 os.close(barrier_w)
                 try:

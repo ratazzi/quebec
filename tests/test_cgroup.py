@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1541,6 +1542,41 @@ class TestRuntimeAdjust:
 
         assert new.memory_oom_group is False
 
+    def test_concurrent_adjusts_do_not_lose_a_field(self, monkeypatch):
+        """Two threads tuning different fields both read the pre-change value
+        unless the read-merge-record window is held, and the later write then
+        silently reverts the earlier one."""
+        sup, _qc = make_supervisor(
+            EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1}, limits={}
+        )
+        sup._slot_limits[(ROLE_WORKER, 0)] = Limits()
+        reading = threading.Event()
+
+        class SlowRead(dict):
+            """Stretch the gap between reading the current limits and writing
+            the merged ones, where a scheduler switch would otherwise land."""
+
+            def get(self, key, default=None):
+                current = super().get(key, default)
+                if not reading.is_set():
+                    reading.set()
+                    time.sleep(0.05)
+                return current
+
+        sup._slot_limits = SlowRead(sup._slot_limits)
+
+        thread = threading.Thread(
+            target=lambda: sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max="256MiB")
+        )
+        thread.start()
+        assert reading.wait(2.0), "the first adjust never read the current limits"
+        sup.adjust_slot_limit(ROLE_WORKER, 0, memory_high="128MiB")
+        thread.join(2.0)
+
+        final = sup._slot_limits[(ROLE_WORKER, 0)]
+        assert final.memory_max == 256 * 1024 * 1024
+        assert final.memory_high == 128 * 1024 * 1024
+
     def test_supervisor_adjust_rejects_bad_role_and_index(self):
         sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 2})
         with pytest.raises(ValueError):
@@ -1554,6 +1590,32 @@ class TestRuntimeAdjust:
             sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max="garbage")
         with pytest.raises(ValueError):
             sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=1)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is Unix-only")
+def test_a_forked_child_forgets_the_supervisor(monkeypatch):
+    """A worker inherits a copy of the object but supervises nothing: handing
+    it out would accept limit changes into dicts nothing ever drains."""
+    read_fd, write_fd = os.pipe()
+    sup, qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1}, limits={})
+    monkeypatch.setattr("quebec.supervisor._active_supervisor", sup)
+
+    def probe():
+        os.write(write_fd, b"none" if current_supervisor() is None else b"stale")
+        os.close(write_fd)
+        os._exit(0)
+
+    qc.reset_after_fork = probe
+    sup._fork_child(ROLE_WORKER, 0)
+
+    (child_pid,) = sup._children
+    os.close(write_fd)
+    try:
+        data = os.read(read_fd, 1024)
+    finally:
+        os.close(read_fd)
+    os.waitpid(child_pid, 0)
+    assert data == b"none"
 
 
 def test_current_supervisor_defaults_to_none():
