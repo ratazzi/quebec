@@ -204,6 +204,17 @@ fn apply_dispatcher_cfg_to(
     Ok(())
 }
 
+fn job_metrics_summary<'py>(
+    py: Python<'py>,
+    summary: &crate::job_metrics::RecordingSummary,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("path", summary.path.display().to_string())?;
+    dict.set_item("rows", summary.rows)?;
+    dict.set_item("dropped", summary.dropped)?;
+    Ok(dict)
+}
+
 #[pyfunction]
 fn signal_handler(
     py: Python<'_>,
@@ -227,6 +238,22 @@ fn signal_handler(
             info!("Received {}, entering quiet mode (no new jobs)", sname);
             if let Err(e) = quebec.bind(py).call_method0("quiet") {
                 error!("Error calling quiet: {:?}", e);
+            }
+            return Ok(());
+        }
+        // SIGUSR2 toggles the per-job metrics CSV recording (see job_metrics.rs).
+        if signum == libc::SIGUSR2 {
+            info!("Received SIGUSR2, toggling job metrics recording");
+            match quebec.bind(py).cast::<PyQuebec>() {
+                Ok(qc) => {
+                    let qc = qc.borrow();
+                    match qc.ctx.job_metrics.recorder().toggle_in_background() {
+                        Ok(true) => qc.ctx.job_metrics.aggregator().log_summary(),
+                        Ok(false) => {}
+                        Err(error) => error!("Error toggling job metrics: {:?}", error),
+                    }
+                }
+                Err(error) => error!("Invalid Quebec signal target: {:?}", error),
             }
             return Ok(());
         }
@@ -1509,6 +1536,7 @@ impl PyQuebec {
                     }
                 }
             });
+            self.ctx.job_metrics.recorder().stop();
         });
         Ok(())
     }
@@ -2710,10 +2738,13 @@ impl PyQuebec {
         // (no controlling tty), SIGTSTP also enters quiet mode.
         use std::io::IsTerminal;
         let stdin_is_tty = std::io::stdin().is_terminal();
+        // SIGUSR2 toggles per-job metrics recording (SIGUSR1 is taken by quiet).
         let signals: &[&str] = if stdin_is_tty {
-            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGUSR1"]
+            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGUSR1", "SIGUSR2"]
         } else {
-            &["SIGINT", "SIGTERM", "SIGQUIT", "SIGTSTP", "SIGUSR1"]
+            &[
+                "SIGINT", "SIGTERM", "SIGQUIT", "SIGTSTP", "SIGUSR1", "SIGUSR2",
+            ]
         };
 
         let mut registered: Vec<&str> = Vec::with_capacity(signals.len());
@@ -2799,6 +2830,93 @@ impl PyQuebec {
         self.ctx.quiet.is_cancelled()
     }
 
+    /// Start recording one CSV row per finished job (memory + timing) to
+    /// `path`, or to `$QUEBEC_JOB_METRICS_DIR` / the OS temp dir when omitted.
+    /// Returns the path. Raises if a recording is already running.
+    #[pyo3(signature = (path=None))]
+    fn start_job_metrics(&self, path: Option<std::path::PathBuf>) -> PyResult<String> {
+        self.ctx
+            .job_metrics
+            .recorder()
+            .start(path.as_deref())
+            .map(|p| p.display().to_string())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+    }
+
+    /// Stop the job metrics recording. Returns `{"path", "rows", "dropped"}`,
+    /// or `None` when nothing was recording.
+    fn stop_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        py.detach(|| self.ctx.job_metrics.recorder().stop())
+            .map(|s| job_metrics_summary(py, &s))
+            .transpose()
+    }
+
+    /// Start if idle, stop if recording — what `SIGUSR2` does. Returns the
+    /// stop summary when it stopped, `None` when it started. Stopping also
+    /// logs the per-class summary (see `log_job_metrics_summary`).
+    fn toggle_job_metrics<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let stopped = py
+            .detach(|| self.ctx.job_metrics.recorder().toggle())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        if stopped.is_some() {
+            self.ctx.job_metrics.aggregator().log_summary();
+        }
+        stopped.map(|s| job_metrics_summary(py, &s)).transpose()
+    }
+
+    /// Per-class aggregates since startup (or the last reset), as
+    /// `{class: {count, failed, duration_ms, minor_faults,
+    /// process_rss_peak_delta_kb}}`. RSS aggregates contain only single-job
+    /// windows (`threads=1` or exclusive jobs). `reset=True` atomically takes
+    /// and clears the current values.
+    #[pyo3(signature = (reset=false))]
+    fn job_metrics_summary<'py>(
+        &self,
+        py: Python<'py>,
+        reset: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let aggregator = self.ctx.job_metrics.aggregator();
+        let out = PyDict::new(py);
+        for (class, s) in aggregator.snapshot(reset) {
+            let duration = PyDict::new(py);
+            duration.set_item("avg", s.duration_ms_avg())?;
+            duration.set_item("max", s.duration_ms_max)?;
+            let rss = PyDict::new(py);
+            rss.set_item("samples", s.rss_samples)?;
+            rss.set_item("avg", s.rss_peak_delta_kb_avg())?;
+            rss.set_item("p50", s.rss_peak_delta_kb_percentile(0.5))?;
+            rss.set_item("p95", s.rss_peak_delta_kb_percentile(0.95))?;
+            rss.set_item("max", s.rss_peak_delta_kb_max())?;
+            rss.set_item("max_jid", s.rss_peak_delta_kb_max_jid())?;
+            let faults = PyDict::new(py);
+            faults.set_item("samples", s.fault_samples)?;
+            faults.set_item("sum", s.minor_faults_sum)?;
+            let entry = PyDict::new(py);
+            entry.set_item("count", s.count)?;
+            entry.set_item("failed", s.failed)?;
+            entry.set_item("duration_ms", duration)?;
+            entry.set_item("minor_faults", faults)?;
+            entry.set_item("process_rss_peak_delta_kb", rss)?;
+            out.set_item(class, entry)?;
+        }
+        Ok(out)
+    }
+
+    /// Write one `job_metrics.summary` log line per class.
+    fn log_job_metrics_summary(&self) {
+        self.ctx.job_metrics.aggregator().log_summary();
+    }
+
+    /// Path of the running job metrics recording, or `None`.
+    #[getter]
+    fn job_metrics_path(&self) -> Option<String> {
+        self.ctx
+            .job_metrics
+            .recorder()
+            .current_path()
+            .map(|p| p.display().to_string())
+    }
+
     fn graceful_shutdown(&self, py: Python) -> PyResult<()> {
         info!("Graceful shutdown initiated");
 
@@ -2856,6 +2974,7 @@ impl PyQuebec {
             });
         });
 
+        py.detach(|| self.ctx.job_metrics.recorder().stop());
         std::process::exit(0);
     }
 

@@ -403,6 +403,87 @@ WantedBy=multi-user.target
 
 Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker. If you'd rather not have planned recycles show up as failures (in `systemctl status` or the start-limit counter), add `SuccessExitStatus=75` together with `RestartForceExitStatus=75` — the former keeps 75 out of the failure tally, the latter still forces the restart.
 
+### Per-Job Memory Metrics (Linux)
+
+Quebec observes two different Linux signals during `perform()`:
+
+- `minor_faults` / `major_faults` are native-thread activity counters from
+  `getrusage(RUSAGE_THREAD)`. They are useful when investigating allocation and
+  I/O behaviour, but are not converted to bytes and are not RSS.
+- Process RSS is read at job start and end and sampled every 100 ms in between.
+  This produces `process_rss_start`, `process_rss_peak`, `process_rss_end`, and
+  `process_rss_peak_delta`. Shorter-lived peaks may fall between samples.
+
+RSS belongs to the process, not a thread. Quebec marks a window
+`process_rss_single_job=true` only in a supervisor-managed worker where either
+`threads: 1` or the job is `exclusive`. Only those single-job windows enter the
+per-class RSS aggregate. Other windows remain useful as process context but are
+not presented as memory attributable to one job. Allocations in subprocesses are
+not included in the worker's RSS. Even a single-job window is a sampled process
+envelope: allocator reuse and worker-runtime activity can still affect it.
+
+These are observability metrics, not enforcement. Use a separate cgroup per
+worker process with `memory.high` / `memory.max` when one job must not exhaust
+the host.
+
+The observations appear on every `job.completed` log line and on
+`execution.metric`. For offline analysis, record one CSV row per finished job:
+
+```bash
+kill -USR2 <worker pid>   # start recording; send again to stop
+```
+
+or from code: `qc.start_job_metrics(path=None)`, `qc.stop_job_metrics()`, `qc.toggle_job_metrics()`, `qc.job_metrics_path`. Under the fork supervisor the signal is forwarded to every worker child, and each child writes its own file. Columns:
+
+```
+ts_ms,pid,tid,jid,class,queue,status,duration_ms,minor_faults,major_faults,process_rss_start_kb,process_rss_peak_kb,process_rss_end_kb,process_rss_peak_delta_kb,process_rss_single_job,active_jobs
+```
+
+`active_jobs` shows how many jobs the process owned when the row was recorded.
+Aggregate attributable samples with whatever reads CSV, e.g.
+
+```sql
+select class, count(*), max(process_rss_peak_delta_kb),
+       quantile_cont(process_rss_peak_delta_kb, 0.95)
+from 'quebec-job-metrics-*.csv'
+where process_rss_single_job = true
+group by class order by 3 desc;
+```
+
+Environment variables:
+
+```bash
+QUEBEC_JOB_METRICS_DIR=/var/log/quebec   # output dir for SIGUSR2 recordings (default: OS temp dir)
+QUEBEC_JOB_METRICS_MAX_ROWS=100000       # recording stops itself after this many rows
+QUEBEC_JOB_METRICS_MAX_SECONDS=3600      # ...or after this long
+```
+
+Each Quebec instance also keeps per-class aggregates since startup: count,
+failures, duration, thread faults, and average / p50 / p95 / max of single-job
+`process_rss_peak_delta_kb` samples with the jid of the largest job.
+`qc.job_metrics_summary(reset=False)` returns them as a dict;
+`reset=True` takes and clears the current snapshot atomically.
+`qc.log_job_metrics_summary()` writes one `job_metrics.summary` log line per
+class, and stopping a recording with `SIGUSR2` logs them too. Percentiles come
+from a log2 histogram, so they are bucket upper bounds rather than exact values.
+
+Rows are handed to a writer thread through a bounded queue and flushed every 5
+seconds. If the writer falls behind, rows are dropped rather than blocking jobs.
+The time limit also stops idle recordings. When a row/time limit automatically
+ends a recording, its writer drains accepted rows and flushes in the background.
+Normal shutdown and `qc.close()` wait for active and already-stopping recordings
+to finish flushing; forced termination can still lose buffered rows.
+
+**USDT probes.** The Linux extension module carries `quebec:job_start` and
+`quebec:job_end`. They are a single `nop` until a tracer attaches. The end probe
+exports the minor-fault delta and the sampled RSS peak delta; the RSS argument is
+`-1` unless `process_rss_single_job` is true. `job_start` exports jid, class,
+and queue as pointer/length pairs. `job_end` exports jid, class, success,
+duration nanoseconds, minor faults, and the attributable RSS peak delta.
+The strings are not NUL-terminated: in bpftrace read them as
+`buf(argN, argN+1)` printed with `%r`, or `str(argN, argN+1 + 1)` (that
+argument is a buffer size, so `str(argN, argN+1)` drops the last character).
+
 ### Per-Queue Concurrency (experimental)
 
 Cap how many jobs run concurrently across the cluster for specific queues, independent of per-class `concurrency_key`:

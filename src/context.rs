@@ -409,6 +409,8 @@ pub struct AppContext {
     pub worker_memory_check_interval: Duration,
     pub worker_memory_graceful_timeout: Duration,
     pub worker_memory_recycle_confirmations: u64,
+    /// Per-instance job observability. Forked children receive fresh state.
+    pub job_metrics: Arc<crate::job_metrics::JobMetrics>,
     pub control_plane_sse_interval: Duration,
     pub worker_queues: Option<crate::config::QueueSelector>, // Queue configuration for worker
     pub graceful_shutdown: CancellationToken,
@@ -1145,6 +1147,7 @@ impl AppContext {
             worker_memory_check_interval: Duration::from_secs(5),
             worker_memory_graceful_timeout: Duration::from_secs(300),
             worker_memory_recycle_confirmations: 3,
+            job_metrics: Arc::new(crate::job_metrics::JobMetrics::default()),
             control_plane_sse_interval: Duration::from_secs(5),
             worker_queues: None, // Default to all queues
             graceful_shutdown: CancellationToken::new(),
@@ -1335,6 +1338,7 @@ impl AppContext {
             worker_memory_check_interval: self.worker_memory_check_interval,
             worker_memory_graceful_timeout: self.worker_memory_graceful_timeout,
             worker_memory_recycle_confirmations: self.worker_memory_recycle_confirmations,
+            job_metrics: Arc::new(crate::job_metrics::JobMetrics::default()),
             control_plane_sse_interval: self.control_plane_sse_interval,
             worker_queues: self.worker_queues.clone(),
             graceful_shutdown: CancellationToken::new(),

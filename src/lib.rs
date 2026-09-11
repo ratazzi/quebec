@@ -8,6 +8,7 @@ pub mod database_url;
 mod dispatcher;
 pub mod entities;
 mod error;
+mod job_metrics;
 mod memory;
 mod notify;
 mod process;
