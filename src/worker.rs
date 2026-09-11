@@ -5651,13 +5651,18 @@ impl ProcessTrait for Worker {
             &self.ctx.worker_last_rss_bytes,
             crate::memory::current_rss_bytes(),
         );
-        crate::process::build_runtime_metadata_with_memory(
+        // Sampled here rather than on the memory-recycle tick: that tick only
+        // runs when worker_max_rss_mb is configured, while cgroup metrics are
+        // readable everywhere (including read-only /sys/fs/cgroup) and are
+        // only ever published at heartbeat time anyway.
+        crate::process::build_runtime_metadata_full(
             self.ctx.quiet.is_cancelled(),
             self.ctx
                 .worker_memory_recycle_requested
                 .load(Ordering::Relaxed)
                 .then_some("rss_limit"),
             rss_bytes,
+            Some(crate::process::CgroupMetrics::sample()),
         )
     }
 }

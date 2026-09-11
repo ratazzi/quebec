@@ -30,6 +30,7 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Exclusive (stop-the-world) jobs
 - Multi-process (fork) mode
 - Memory-based worker recycling
+- cgroup v2 memory limits per worker (Linux)
 - Web dashboard
 - Automatic retries
 - Signal handling & graceful restart
@@ -246,6 +247,8 @@ dispatchers:
 
 The supervisor forks `workers[].processes` worker children and `dispatchers[].processes` dispatcher children, each taking its config from the matching yml entry, and reforks any child that dies (matching Solid Queue's process model). Fork mode is opt-in via the env var so an existing config with `processes` set doesn't silently switch process model on upgrade; `spawn` is ignored in this mode. Outside supervisor mode the `processes` keys are ignored and Quebec uses the single-process threaded runtime.
 
+On Linux the supervisor can also give each child a memory limit the kernel enforces — see [cgroup Memory Limits](#cgroup-memory-limits-linux-supervisor-mode).
+
 ### Force Queue Override (multi-branch development)
 
 Set `QUEBEC_FORCE_OVERRIDE_QUEUE` to pin every enqueue and consumption to one queue — handy when several development branches share a single database:
@@ -435,6 +438,15 @@ QUEBEC_WORKER_MEMORY_RECYCLE_CONFIRMATIONS=3  # consecutive over-limit samples b
 QUEBEC_WORKER_MEMORY_CHECK_INTERVAL=5s        # how often RSS is sampled (default)
 ```
 
+In supervisor mode each worker entry can set its own threshold, which overrides the environment variable for that entry:
+
+```yaml
+workers:
+  - queues: "*"
+    processes: 4
+    memory_recycle_at: 512MiB   # or `max` / `0` to switch recycling off here
+```
+
 When a worker's RSS stays above the limit for that many consecutive samples, it enters quiet mode, stops claiming, drains its in-flight jobs (no time limit), and exits with code **75** — the planned-recycle code. The supervisor then relaunches a fresh process. Under the built-in fork supervisor (`QUEBEC_SUPERVISOR=1`) this refork is automatic; under systemd, `Restart=on-failure` relaunches the worker after the non-zero recycle exit:
 
 ```ini
@@ -450,6 +462,8 @@ WantedBy=multi-user.target
 ```
 
 Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker. If you'd rather not have planned recycles show up as failures (in `systemctl status` or the start-limit counter), add `SuccessExitStatus=75` together with `RestartForceExitStatus=75` — the former keeps 75 out of the failure tally, the latter still forces the restart.
+
+Recycling is cooperative: it samples RSS and acts between jobs, so a single job that allocates faster than the sampling interval still takes the process past the limit. On Linux, pair it with a cgroup limit (below) to have the kernel stop that case outright.
 
 ### Per-Job Memory Metrics (Linux)
 
@@ -470,9 +484,9 @@ not presented as memory attributable to one job. Allocations in subprocesses are
 not included in the worker's RSS. Even a single-job window is a sampled process
 envelope: allocator reuse and worker-runtime activity can still affect it.
 
-These are observability metrics, not enforcement. Use a separate cgroup per
-worker process with `memory.high` / `memory.max` when one job must not exhaust
-the host.
+These are observability metrics, not enforcement. When one job must not exhaust
+the host, give each worker process its own `memory.high` / `memory.max` — see
+[cgroup Memory Limits](#cgroup-memory-limits-linux-supervisor-mode) below.
 
 The observations appear on every `job.completed` log line and on
 `execution.metric`. For offline analysis, record one CSV row per finished job:
@@ -531,6 +545,90 @@ duration nanoseconds, minor faults, and the attributable RSS peak delta.
 The strings are not NUL-terminated: in bpftrace read them as
 `buf(argN, argN+1)` printed with `%r`, or `str(argN, argN+1 + 1)` (that
 argument is a buffer size, so `str(argN, argN+1)` drops the last character).
+### cgroup Memory Limits (Linux, supervisor mode)
+
+RSS recycling reacts after the fact. A cgroup limit lets the kernel enforce the ceiling as it is hit: the job dies instead of the host, and because each child sits in a cgroup of its own, the kill is attributable — the job that was running is marked failed with the memory cause, rather than left to the heartbeat pruner as an anonymous crash.
+
+```yaml
+# queue.yml (under your environment, e.g. production:)
+workers_pool_memory_max: 7GiB   # budget for all workers together
+workers:
+  - queues: "*"
+    threads: 5
+    processes: 4
+    memory_recycle_at: 500MiB   # RSS soft limit (cooperative, see above)
+    memory_max: 2GiB            # cgroup hard limit (kernel-enforced)
+    memory_high: 1500MiB        # throttle + reclaim, no kill
+    memory_swap_max: 0          # default once a memory limit is set
+    memory_oom_group: true      # default once a memory limit is set
+dispatchers:
+  - processes: 1
+    memory_max: 256MiB
+```
+
+The supervisor builds two tiers under its delegated cgroup:
+
+```
+root
+├── control/
+│   ├── supervisor/     the supervisor itself
+│   ├── dispatcher-0/   limits from dispatchers[]
+│   └── scheduler-0/    no limits (queue.yml has no scheduler section)
+└── workers/            workers_pool_memory_max
+    ├── worker-0/       limits from workers[]
+    └── worker-1/
+```
+
+Worker limits may overcommit against the pool: the sum of `memory_max` can exceed `workers_pool_memory_max`, which then caps them collectively. That is the point of the pool — a spike that a single worker's own limit would not catch is still contained, and the resulting OOM picks a worker rather than the dispatcher or the supervisor. `control` deliberately holds no process of its own so the memory controller can be enabled for the control slots at all (cgroup v2 refuses to enable controllers for the children of a cgroup that has member processes).
+
+`memory_oom_group=true` means a worker is killed as a unit, taking any subprocess a job forked with it. At the pool level it is off, so a pool-level OOM removes one worker rather than all of them. Every child gets a leaf whether or not it has limits, since that is what makes its counters attributable to it rather than to whichever process ran in the slot before it.
+
+Sizes accept a plain byte count, binary suffixes (`512MiB`), decimal suffixes (`1GB`), or `max`. An explicit `max` is not the same as omitting the key: it asks the kernel for nothing, and — unlike a real limit — neither derives a `memory_max` nor pulls in the `memory_swap_max=0` / `memory_oom_group=true` companions. When `memory_max` is omitted it is derived as `memory_recycle_at × 1.5`, because `memory.current` includes page cache and so has to sit well above the RSS line the soft recycle watches; set it explicitly to override, and note that derivation only happens once a cgroup has actually been found, so an existing deployment that only sets `memory_recycle_at` still boots on a host without cgroups.
+
+**Failure policy.** With no limits configured and no writable cgroup, Quebec logs one warning and runs exactly as it did before. Once any limit is configured — per-slot or the pool budget — a cgroup that cannot deliver it is a startup error instead: an unusable subtree, a failed `prepare`, a leaf that cannot be created, a child that cannot be migrated. Silently dropping the limit would leave you believing in a protection you do not have, and a worker that never reaches the `workers` subtree does not merely run unconstrained — it keeps running in the supervisor's own cgroup, outside the budget and beside the control processes. After the initial fleet is up, the same failure on a later refork takes down only that slot.
+
+**Delegation.** Quebec needs a cgroup subtree it may write to: run as root, run under systemd with `Delegate=yes`, or point `QUEBEC_CGROUP_ROOT` at a subtree someone else delegated. Containers usually mount `/sys/fs/cgroup` read-only, which is enough for the metrics below but not for limits.
+
+```ini
+# /etc/systemd/system/quebec.service
+[Service]
+Type=notify
+Delegate=yes
+OOMScoreAdjust=-1000
+WatchdogSec=30
+ExecStart=/usr/bin/env QUEBEC_SUPERVISOR=1 python -m quebec your.jobs
+Restart=on-failure
+```
+
+`OOMScoreAdjust=` is how the supervisor gets protected — Quebec never writes its own `oom_score_adj`, since lowering it requires `CAP_SYS_RESOURCE` and a self-write would only ever work for deployments that need it least. Whatever the unit grants is inherited by the whole tree, and only workers give it up: they run your code and must stay killable, or a pool OOM finds no valid target. The dispatcher and scheduler keep it, which is the point — a worker's memory spike must not take the dispatcher with it.
+
+**What an OOM looks like.** After reaping a child the supervisor reads that leaf's `memory.events`. The cgroup's own `oom_kill` counter outranks any guess from the exit signal, because SIGKILL alone cannot separate a kernel OOM from a shutdown escalation or an operator's `kill -9`. The job is then failed with the counters as evidence:
+
+```
+Worker process killed by the OOM killer (pid=175017, oom_kill=2,
+memory.max=134217728, memory.peak=134217728).
+Likely exceeded this worker's memory.max.
+```
+
+The last sentence appears only when a `max` event or a peak that reached the limit actually implicates this worker's own limit — `memory.events` counts kills by any OOM killer, the global one included, so `oom_kill > 0` on its own does not prove it outgrew its own ceiling. Repeated OOMs count against the same crash-loop guard as ordinary crashes, so a `memory_max` too small to boot the interpreter disables the slot instead of fork-looping.
+
+**Metrics work without delegation.** Reading a cgroup is independent of managing one: a process can always read its own counters even where `/sys/fs/cgroup` is mounted read-only, which is the normal case under Docker and Kubernetes. Workers publish `memory.current`, `memory.peak`, the configured max and high, the `oom_kill` / `high` / `max` event counts, and `cpu.stat` usage and throttle counts in their heartbeat metadata; the control plane's workers page shows usage against the limit and flags a throttled worker. Every reader degrades to nothing rather than failing — `memory.peak` only exists on kernels 5.19 and newer, `memory.events` keys come and go, and a non-cgroup host simply reports none of it.
+
+Limits can also be retuned without a restart. The change is written to the live cgroup and remembered for the next fork, so it survives a refork:
+
+```python
+# In the supervisor process — a signal handler, or a lifecycle hook.
+# `current_supervisor()` is None everywhere else, children included.
+from quebec.supervisor import current_supervisor
+
+current_supervisor().adjust_slot_limit("worker", 0, memory_max="3GiB")
+```
+
+Lowering `memory_max` below what the worker is already using starts reclaim immediately, and OOM-kills it if the kernel cannot shrink it that far.
+
+Environment variables: `QUEBEC_CGROUP=0` turns the whole mechanism off, `QUEBEC_CGROUP_ROOT` names the delegated subtree, and `QUEBEC_WORKERS_POOL_MEMORY_MAX` sets the pool budget on hosts with no config file (queue.yml wins over it, the same way `memory_recycle_at` wins over `QUEBEC_WORKER_MAX_RSS_MB`).
+
+Only cgroup **v2** is supported — v1 lacks `memory.oom.group` and `cgroup.kill`, which the attribution and cleanup paths rely on — and only memory is limited: `cpu.max` and `pids.max` are not written, though CPU usage and throttle counts are reported.
 
 ### Per-Queue Concurrency (experimental)
 

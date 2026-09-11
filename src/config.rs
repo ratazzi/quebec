@@ -5,6 +5,116 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 
+/// A memory size written in queue.yml. Accepts a bare number (bytes), a
+/// suffixed string (`512MiB`, `1GB`), or `max`. Parsing happens in
+/// [`SizeSpec::bytes`] so a malformed value degrades to a warning at use
+/// time instead of failing the whole config load.
+#[derive(Debug, Clone, Serialize)]
+pub struct SizeSpec(pub String);
+
+impl SizeSpec {
+    /// Parsed byte count. `None` means either `max` (explicitly unlimited,
+    /// which is the kernel default anyway) or an unparseable value; callers
+    /// distinguish the two via [`SizeSpec::is_valid`].
+    pub fn bytes(&self) -> Option<u64> {
+        match parse_size(&self.0) {
+            Some(SizeValue::Bytes(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        parse_size(&self.0).is_some()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SizeSpec {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let value: serde_yaml::Value = serde::Deserialize::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(s) => Ok(SizeSpec(s)),
+            serde_yaml::Value::Number(n) => Ok(SizeSpec(n.to_string())),
+            _ => Err(D::Error::custom(
+                "memory size must be a number of bytes or a string like '512MiB' / 'max'",
+            )),
+        }
+    }
+}
+
+/// Result of parsing a memory size. `Max` is the kernel's "no limit"
+/// sentinel and is kept distinct from a parse failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeValue {
+    Bytes(u64),
+    Max,
+}
+
+/// Parse a cgroup memory size. Bare numbers are bytes; `K`/`Ki`/`KiB` style
+/// suffixes are binary, `KB`/`MB`/`GB` are decimal. Returns `None` when the
+/// input cannot be understood.
+pub fn parse_size(raw: &str) -> Option<SizeValue> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("max") {
+        return Some(SizeValue::Max);
+    }
+
+    let split = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(s.len());
+    let (number, unit) = s.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+
+    let multiplier: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "ki" | "kib" => 1024.0,
+        "kb" => 1_000.0,
+        "m" | "mi" | "mib" => 1024.0 * 1024.0,
+        "mb" => 1_000_000.0,
+        "g" | "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "gb" => 1_000_000_000.0,
+        "t" | "ti" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "tb" => 1_000_000_000_000.0,
+        _ => return None,
+    };
+
+    let bytes = number * multiplier;
+    if bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(SizeValue::Bytes(bytes.round() as u64))
+}
+
+/// How a worker entry configures the soft-recycle threshold. Kept as an enum
+/// so "the key is absent" stays distinct from "the key says `max`": the first
+/// inherits the constructor/env `worker_max_rss_mb`, the second switches the
+/// soft recycle off, and only the second must also stop `memory.max` being
+/// derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecycleThreshold {
+    /// Key absent: inherit whatever the constructor/env set.
+    Inherit,
+    /// Explicit `max` or `0`: no soft recycle, and nothing to derive from.
+    Disabled,
+    Bytes(u64),
+    /// Present but unparseable; callers warn and fall back to `Inherit`.
+    Invalid,
+}
+
 /// Worker configuration
 /// Compatible with Solid Queue's worker config
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +132,38 @@ pub struct WorkerConfig {
 
     /// Number of processes to fork (for compatibility, Quebec uses single process)
     pub processes: Option<u32>,
+
+    /// RSS soft limit for the planned-recycle path (`200MiB`). Also the
+    /// derivation source for `memory_max` when the latter is not set
+    /// explicitly. Named for what it does rather than for its unit, so it
+    /// reads the same way as the `memory_*` fields below.
+    pub memory_recycle_at: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.max` for this worker's leaf cgroup.
+    pub memory_max: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.high` (throttle, no OOM kill).
+    pub memory_high: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.swap.max`. Defaults to 0 when a memory limit is set.
+    pub memory_swap_max: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.oom.group`. Defaults to true when a memory limit is set.
+    pub memory_oom_group: Option<bool>,
+}
+
+impl WorkerConfig {
+    /// Classify `memory_recycle_at` for this entry.
+    pub fn recycle_threshold(&self) -> RecycleThreshold {
+        let Some(spec) = self.memory_recycle_at.as_ref() else {
+            return RecycleThreshold::Inherit;
+        };
+        match parse_size(spec.as_str()) {
+            Some(SizeValue::Bytes(0)) | Some(SizeValue::Max) => RecycleThreshold::Disabled,
+            Some(SizeValue::Bytes(n)) => RecycleThreshold::Bytes(n),
+            None => RecycleThreshold::Invalid,
+        }
+    }
 }
 
 #[cfg(feature = "python")]
@@ -228,6 +370,18 @@ pub struct DispatcherConfig {
 
     /// Number of processes to fork (supervisor mode)
     pub processes: Option<u32>,
+
+    /// cgroup v2 `memory.max` for this dispatcher's leaf cgroup.
+    pub memory_max: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.high` (throttle, no OOM kill).
+    pub memory_high: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.swap.max`. Defaults to 0 when a memory limit is set.
+    pub memory_swap_max: Option<SizeSpec>,
+
+    /// cgroup v2 `memory.oom.group`. Defaults to true when a memory limit is set.
+    pub memory_oom_group: Option<bool>,
 }
 
 #[cfg(feature = "python")]
@@ -308,6 +462,13 @@ pub struct QueueConfig {
 
     /// Dispatcher configurations
     pub dispatchers: Option<Vec<DispatcherConfig>>,
+
+    /// cgroup v2 `memory.max` for the `workers` pool that holds every worker
+    /// leaf. Worker limits may overcommit against it; a pool-level OOM then
+    /// picks a worker rather than a control-plane process. Overridden by the
+    /// `QUEBEC_WORKERS_POOL_MEMORY_MAX` environment variable only when absent
+    /// here, matching how `memory_recycle_at` wins over `worker_max_rss_mb`.
+    pub workers_pool_memory_max: Option<SizeSpec>,
 }
 
 impl QueueConfig {
@@ -512,6 +673,151 @@ const DEFAULT_CONFIG_PATHS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_plain_byte_counts() {
+        assert_eq!(parse_size("1073741824"), Some(SizeValue::Bytes(1073741824)));
+        assert_eq!(parse_size("0"), Some(SizeValue::Bytes(0)));
+    }
+
+    #[test]
+    fn parses_binary_and_decimal_suffixes() {
+        for raw in ["1GiB", "1Gi", "1G", " 1gib "] {
+            assert_eq!(
+                parse_size(raw),
+                Some(SizeValue::Bytes(1073741824)),
+                "{raw} should be binary"
+            );
+        }
+        for raw in ["512MiB", "512Mi", "512M"] {
+            assert_eq!(
+                parse_size(raw),
+                Some(SizeValue::Bytes(536870912)),
+                "{raw} should be binary"
+            );
+        }
+        assert_eq!(parse_size("1GB"), Some(SizeValue::Bytes(1_000_000_000)));
+        assert_eq!(parse_size("1MB"), Some(SizeValue::Bytes(1_000_000)));
+    }
+
+    #[test]
+    fn parses_max_distinctly_from_failure() {
+        assert_eq!(parse_size("max"), Some(SizeValue::Max));
+        assert_eq!(parse_size("MAX"), Some(SizeValue::Max));
+        assert_eq!(parse_size("abc"), None);
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("12PB"), None);
+        assert_eq!(parse_size("-1"), None);
+    }
+
+    #[test]
+    fn size_spec_accepts_numbers_and_strings() {
+        let yaml = r#"
+production:
+  workers:
+    - queues: "*"
+      processes: 2
+      memory_max: 512MiB
+      memory_swap_max: 0
+      memory_oom_group: false
+      memory_recycle_at: 200MiB
+"#;
+        let cfg = QueueConfig::parse_yaml(yaml, Some("production")).expect("must parse");
+        let worker = &cfg.workers.as_ref().expect("workers")[0];
+        assert_eq!(
+            worker.memory_max.as_ref().and_then(|s| s.bytes()),
+            Some(536870912)
+        );
+        assert_eq!(
+            worker.memory_swap_max.as_ref().and_then(|s| s.bytes()),
+            Some(0)
+        );
+        assert_eq!(worker.memory_oom_group, Some(false));
+        assert_eq!(
+            worker.memory_recycle_at.as_ref().and_then(|s| s.bytes()),
+            Some(200 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn explicit_max_is_distinct_from_an_absent_field() {
+        // Both reproduce a real mis-parse: collapsing `max` into "unset" made
+        // memory_max: max derive a hard limit from memory_recycle_at, and
+        // memory_swap_max: max turn swap off.
+        let yaml = r#"
+production:
+  workers:
+    - queues: "*"
+      memory_max: max
+      memory_swap_max: max
+      memory_recycle_at: 100MiB
+"#;
+        let cfg = QueueConfig::parse_yaml(yaml, Some("production")).expect("must parse");
+        let worker = &cfg.workers.as_ref().expect("workers")[0];
+
+        assert_eq!(
+            parse_size(worker.memory_max.as_ref().expect("present").as_str()),
+            Some(SizeValue::Max),
+            "an explicit max must stay distinguishable from an absent field"
+        );
+        assert_eq!(
+            parse_size(worker.memory_swap_max.as_ref().expect("present").as_str()),
+            Some(SizeValue::Max)
+        );
+        assert!(worker.memory_high.is_none(), "absent stays absent");
+        assert_eq!(
+            worker.memory_recycle_at.as_ref().and_then(|s| s.bytes()),
+            Some(100 * 1024 * 1024)
+        );
+    }
+
+    fn worker_with(field: &str) -> WorkerConfig {
+        let yaml = format!("production:\n  workers:\n    - queues: \"*\"\n{field}");
+        let cfg = QueueConfig::parse_yaml(&yaml, Some("production")).expect("must parse");
+        cfg.workers.expect("workers").remove(0)
+    }
+
+    #[test]
+    fn recycle_threshold_keeps_absent_and_max_apart() {
+        // An absent key inherits the constructor/env worker_max_rss_mb...
+        assert_eq!(
+            worker_with("").recycle_threshold(),
+            RecycleThreshold::Inherit
+        );
+        // ...but an explicit max switches the soft recycle off, so nothing may
+        // be inherited and no memory.max may be derived from it.
+        assert_eq!(
+            worker_with("      memory_recycle_at: max\n").recycle_threshold(),
+            RecycleThreshold::Disabled
+        );
+        assert_eq!(
+            worker_with("      memory_recycle_at: 0\n").recycle_threshold(),
+            RecycleThreshold::Disabled
+        );
+        assert_eq!(
+            worker_with("      memory_recycle_at: 100MiB\n").recycle_threshold(),
+            RecycleThreshold::Bytes(100 * 1024 * 1024)
+        );
+        assert_eq!(
+            worker_with("      memory_recycle_at: nonsense\n").recycle_threshold(),
+            RecycleThreshold::Invalid
+        );
+    }
+
+    #[test]
+    fn unknown_and_absent_cgroup_fields_are_tolerated() {
+        let yaml = r#"
+production:
+  workers:
+    - queues: "*"
+      threads: 3
+      some_future_solid_queue_field: 7
+"#;
+        let cfg = QueueConfig::parse_yaml(yaml, Some("production")).expect("must parse");
+        let worker = &cfg.workers.as_ref().expect("workers")[0];
+        assert!(worker.memory_max.is_none());
+        assert!(worker.memory_recycle_at.is_none());
+    }
 
     #[test]
     fn parses_yaml_merge_keys_in_queue_config() {

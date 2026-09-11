@@ -18,6 +18,20 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
+from .cgroup import (
+    EMPTY_LIMITS,
+    UNLIMITED,
+    CgroupError,
+    CgroupStats,
+    DisabledCgroup,
+    Limits,
+    config_has_explicit_limits,
+    is_limit_value,
+    limits_from_config,
+    parse_size_bytes,
+    probe,
+)
+
 logger = logging.getLogger(__name__)
 
 ROLE_WORKER = "worker"
@@ -25,6 +39,34 @@ ROLE_DISPATCHER = "dispatcher"
 ROLE_SCHEDULER = "scheduler"
 VALID_ROLES = {ROLE_WORKER, ROLE_DISPATCHER, ROLE_SCHEDULER}
 RECYCLE_EXIT_CODE = 75
+
+#: Fallback for the ``workers`` pool budget, used when neither the constructor
+#: nor queue.yml's ``workers_pool_memory_max`` sets one.
+POOL_MEMORY_MAX_ENV = "QUEBEC_WORKERS_POOL_MEMORY_MAX"
+
+#: ``oom_score_adj`` for worker children. The kernel default: an ordinary,
+#: killable OOM victim.
+#:
+#: Protecting the supervisor is the unit's job, not ours — ``OOMScoreAdjust=``
+#: in the systemd unit (lowering the value needs CAP_SYS_RESOURCE, which a
+#: non-root supervisor does not have, so a self-write would only ever work for
+#: the deployments that need it least). Whatever protection the unit grants is
+#: inherited by the whole process tree, and only workers give it up: they run
+#: user code and must stay killable, or a pool OOM finds no valid target. The
+#: control roles keep it, which is the point — a worker's memory spike must not
+#: take out the dispatcher.
+CHILD_OOM_SCORE_ADJ = 0
+
+#: The Supervisor currently running in this process (there is at most one).
+#: Reachable so host code, signal handlers and future hooks can adjust limits
+#: at runtime without having constructed the Supervisor themselves.
+_active_supervisor: Optional["Supervisor"] = None
+
+
+def current_supervisor() -> Optional["Supervisor"]:
+    """The running :class:`Supervisor`, or None outside supervisor mode."""
+    return _active_supervisor
+
 
 Plan = Dict[str, Union[int, List]]
 
@@ -79,6 +121,168 @@ def _status_description(status: _ExitStatus) -> str:
     return "status=unknown"
 
 
+def _write_oom_score_adj(pid: int, value: int) -> bool:
+    """Set ``/proc/<pid>/oom_score_adj``; best-effort, returns success.
+
+    Linux only. The range is [-1000, 1000]; -1000 means the kernel never picks
+    the process as an OOM victim. Lowering the value needs CAP_SYS_RESOURCE, so
+    a non-root supervisor cannot protect itself here (it should use systemd's
+    ``OOMScoreAdjust=`` instead); raising it — the child's reset back to 0 — is
+    always permitted.
+    """
+    try:
+        with open(f"/proc/{pid}/oom_score_adj", "w") as fh:
+            fh.write(str(value))
+    except OSError:
+        return False
+    return True
+
+
+def _reset_child_oom_priority() -> bool:
+    """Ensure a forked worker is an ordinary, killable OOM victim.
+
+    A worker inherits whatever protection the unit gave the supervisor and must
+    raise itself back to the kernel default. Raising is always permitted, so a
+    failure means something is very wrong (read-only /proc, seccomp). Returns
+    False in that case — the caller exits rather than run user code while
+    unkillable.
+    """
+    try:
+        with open("/proc/self/oom_score_adj") as fh:
+            inherited = fh.read().strip()
+    except OSError as exc:
+        # Off Linux there is no OOM killer to be immune from, so there is
+        # nothing to reset. On Linux the file always exists, and a read that
+        # fails there says nothing about whether protection was inherited —
+        # the one thing that must not be assumed away.
+        if sys.platform == "linux":
+            logger.error(
+                "cannot read /proc/self/oom_score_adj (%s); refusing to run a "
+                "worker that may have inherited OOM protection",
+                exc,
+            )
+            return False
+        return True
+    if inherited == str(CHILD_OOM_SCORE_ADJ):
+        return True
+    if _write_oom_score_adj(os.getpid(), CHILD_OOM_SCORE_ADJ):
+        return True
+    logger.error(
+        "worker inherited oom_score_adj=%s and cannot reset it to %d; "
+        "refusing to run an unkillable worker",
+        inherited,
+        CHILD_OOM_SCORE_ADJ,
+    )
+    return False
+
+
+def _coerce_memory_size(value) -> Optional[Union[int, str]]:
+    """Normalise a memory limit for :meth:`Supervisor.adjust_slot_limit`.
+
+    Returns an int byte count, the ``UNLIMITED`` sentinel (``"max"``, meaning
+    "explicitly no limit"), or ``None`` (field cleared, kernel default). Size
+    strings follow the same grammar as queue.yml (``512MiB``, ``2G``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"memory size must be a number or size string, got {value!r}")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"memory size must be >= 0, got {value}")
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() == "max":
+        return UNLIMITED
+    parsed = parse_size_bytes(text)
+    if parsed is None:
+        raise ValueError(f"cannot parse memory size {value!r}")
+    return parsed
+
+
+def _coerce_adjust_memory(value) -> Optional[Union[int, str]]:
+    """As :func:`_coerce_memory_size`, but ``None`` means "clear" (→ unlimited).
+
+    Clearing must *write* the kernel default (``max``) rather than skip the
+    field, otherwise an existing limit survives in the live cgroup.
+    """
+    if value is None:
+        return UNLIMITED
+    return _coerce_memory_size(value)
+
+
+def _coerce_adjust_oom_group(value) -> Optional[bool]:
+    """Normalise ``memory_oom_group``: ``None`` clears it to the kernel default."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"memory_oom_group must be a bool or None, got {value!r}")
+    return value
+
+
+def classify_exit(
+    status: _ExitStatus,
+    stats: Optional[CgroupStats],
+    we_sent_sigkill: bool,
+) -> str:
+    """Label a reaped child's exit.
+
+    The cgroup's own ``oom_kill`` counter outranks any guess made from the
+    signal: SIGKILL alone cannot distinguish a kernel OOM from our own
+    shutdown escalation or an operator's ``kill -9``.
+    """
+    if status.exited and status.exit_code == RECYCLE_EXIT_CODE:
+        return "planned_recycle"
+    if stats is not None and stats.oom_kill > 0:
+        return "oom"
+    if status.signaled and status.signal == signal.SIGKILL and we_sent_sigkill:
+        return "killed_by_supervisor"
+    if status.signaled:
+        return "signaled"
+    return "crashed"
+
+
+def exceeded_own_limit(stats: Optional[CgroupStats]) -> bool:
+    """Whether the kill is attributable to *this* cgroup's own memory.max.
+
+    ``memory.events`` counts every process in the cgroup killed by any OOM
+    killer, the global one included, so ``oom_kill > 0`` on its own does not
+    mean the worker outgrew its own limit. A `max` event, or a peak that
+    reached the limit, is what actually implicates it.
+    """
+    if stats is None or not stats.memory_max or stats.memory_max == "max":
+        return False
+    try:
+        limit = int(stats.memory_max)
+    except ValueError:
+        return False
+    if stats.max_events > 0:
+        return True
+    return stats.memory_peak is not None and stats.memory_peak >= limit
+
+
+def oom_failure_reason(pid: int, stats: Optional[CgroupStats]) -> str:
+    """Error text recorded on jobs whose worker was killed by an OOM killer.
+
+    Written into ``failed_executions.error`` so the control plane shows the
+    memory cause directly instead of a generic crash. Deliberately reports
+    only what the counters prove; see :func:`exceeded_own_limit`.
+    """
+    parts = [f"pid={pid}"]
+    if stats is not None:
+        parts.append(f"oom_kill={stats.oom_kill}")
+        if stats.memory_max:
+            parts.append(f"memory.max={stats.memory_max}")
+        if stats.memory_peak is not None:
+            parts.append(f"memory.peak={stats.memory_peak}")
+    reason = "Worker process killed by the OOM killer (" + ", ".join(parts) + ")."
+    if exceeded_own_limit(stats):
+        reason += " Likely exceeded this worker's memory.max."
+    return reason
+
+
 class Supervisor:
     """Fork-based supervisor.
 
@@ -95,6 +299,19 @@ class Supervisor:
             ``crash_loop_max`` times in ``crash_loop_window`` seconds is
             considered unhealthy; auto-restart is disabled for that slot.
         heartbeat_interval: Seconds between supervisor heartbeats to the DB.
+        cgroup: Cgroup backend override. Defaults to probing the host; pass a
+            ``DisabledCgroup`` or a ``CgroupManager`` rooted at a temp dir in
+            tests.
+        limits: Per-role cgroup limits keyed like
+            ``Quebec.supervisor_resource_limits_from_config()``. Defaults to
+            reading queue.yml through ``qc``.
+        workers_pool_memory_max: Memory budget for the ``workers`` pool cgroup
+            (bytes, a size string like ``"7GiB"``, or ``"max"``). Worker
+            leaves overcommit against it; a pool-level OOM then scopes its
+            victims to workers, never the control processes. ``None`` (default)
+            falls back to queue.yml's top-level ``workers_pool_memory_max``,
+            then to ``QUEBEC_WORKERS_POOL_MEMORY_MAX``, and leaves the pool
+            bounded only by the group's own limit if neither is set.
     """
 
     def __init__(
@@ -108,6 +325,9 @@ class Supervisor:
         crash_loop_max: int = 3,
         heartbeat_interval: float = 60.0,
         maintenance_interval: float = 300.0,
+        cgroup=None,
+        limits: Optional[Dict] = None,
+        workers_pool_memory_max: Optional[Union[int, str]] = None,
     ):
         normalized: Dict[str, int] = {}
         for role, spec in plan.items():
@@ -148,11 +368,69 @@ class Supervisor:
         self._heartbeat_stop = threading.Event()
         self._maintenance_thread: Optional[threading.Thread] = None
         self._maintenance_stop = threading.Event()
+        # pids we SIGKILLed ourselves, so an exit signal of SIGKILL is not
+        # mistaken for something the kernel did.
+        self._sigkilled: set = set()
+        self._cgroup_ready = False
+        # True only while start() is standing up the initial fleet. A cgroup
+        # failure then is fatal (see §3.6); the same failure on a later refork
+        # must not take down the slots that are running fine.
+        self._starting = True
+        # Slots whose refork failed and should be retried by the supervise loop.
+        self._pending_forks: set = set()
+        # Runtime limit changes queued for the supervise loop. Keeping the live
+        # write off this method means it never re-enters cgroup locking, so it
+        # is safe to call from a signal handler.
+        self._pending_adjusts: Dict[Tuple[str, int], Limits] = {}
+        # Guards the read-merge-record sequence in adjust_slot_limit: two
+        # threads adjusting different fields of the same slot would otherwise
+        # both merge onto the same pre-change value and the later write would
+        # drop the earlier field. Reentrant because a signal handler may call
+        # adjust_slot_limit on the very thread that already holds it — that
+        # nested call still merges onto the pre-change value, but a deadlock
+        # would be worse than a lost field in a case this rare.
+        self._adjust_lock = threading.RLock()
+
+        self._cgroup = probe() if cgroup is None else cgroup
+        raw_limits = self._load_config_limits() if limits is None else limits
+        pool_max = _coerce_memory_size(
+            self._resolve_pool_memory_max(workers_pool_memory_max, raw_limits)
+        )
+        # `oom.group=0` at the pool scopes a pool-level OOM to a single worker
+        # instead of the whole pool, but only a real byte count asks the kernel
+        # for anything — an unset or explicit-`max` budget must not turn a
+        # cgroup-less host into a startup error.
+        if is_limit_value(pool_max):
+            self._workers_pool_limits = Limits(
+                memory_max=pool_max, memory_oom_group=False
+            )
+        elif pool_max is not None:
+            self._workers_pool_limits = Limits(memory_max=pool_max)
+        else:
+            self._workers_pool_limits = EMPTY_LIMITS
+        self._cgroup.workers_pool_limits = self._workers_pool_limits
+        self._configured_limits = config_has_explicit_limits(raw_limits)
+        sources = self._enforced_limit_sources()
+        if not self._cgroup.enabled and sources:
+            raise RuntimeError(
+                f"{' and '.join(sources)} cannot be enforced: no usable cgroup v2 "
+                f"subtree is available ({getattr(self._cgroup, 'reason', 'unknown')}). "
+                "Run under systemd with Delegate=yes, run as root, point "
+                "QUEBEC_CGROUP_ROOT at a delegated subtree, or remove the limits."
+            )
+        if not self._cgroup.enabled:
+            logger.warning(
+                "cgroup limits are unavailable (%s); supervisor continues without them",
+                getattr(self._cgroup, "reason", "unknown"),
+            )
+        self._slot_limits = self._resolve_slot_limits(raw_limits)
 
     # -- public -----------------------------------------------------------
 
     def start(self) -> None:
         """Blocking entrypoint: register, fork children, supervise, cleanup."""
+        global _active_supervisor
+        _active_supervisor = self
         self._process_id = self.qc.register_supervisor()
         logger.info(
             "Supervisor registered (process_id=%d, pid=%d)",
@@ -162,6 +440,7 @@ class Supervisor:
         self._install_signal_handlers()
 
         try:
+            self._setup_cgroup_root()
             for role, count in self.plan.items():
                 for index in range(count):
                     # A SIGTERM/SIGQUIT arriving mid-startup sets _stopping via
@@ -188,6 +467,10 @@ class Supervisor:
                 except Exception:
                     logger.exception("Failed to start control plane")
 
+            # The initial fleet is up: from here a cgroup failure is a
+            # single-slot problem, not a reason to tear everything down.
+            self._starting = False
+
             if not self._stopping:
                 self._start_heartbeat()
 
@@ -211,18 +494,211 @@ class Supervisor:
                     self._heartbeat_thread.join(timeout=2.0)
                 if self._maintenance_thread is not None:
                     self._maintenance_thread.join(timeout=2.0)
+                if self._cgroup_ready:
+                    self._cgroup.scavenge()
+                self._cgroup.close()
                 if self._process_id is not None:
                     try:
                         self.qc.deregister_process(self._process_id)
                     except Exception:
                         logger.exception("Failed to deregister supervisor row")
+                if _active_supervisor is self:
+                    _active_supervisor = None
 
     def stop(self) -> None:
         """Request a graceful shutdown from another thread."""
         self._stopping = True
         self._wake()
 
+    def adjust_slot_limit(self, role: str, index: int, **overrides) -> Limits:
+        """Adjust one slot's cgroup memory limits at runtime.
+
+        Records the new limits immediately (so the next refork uses them) and
+        queues the live write for the supervise loop, which applies it without
+        re-entering cgroup locking — safe to call from a signal handler. Keys
+        mirror queue.yml: ``memory_max``, ``memory_high``, ``memory_swap_max``
+        (bytes, size strings like ``"512MiB"``, or ``"max"``/``None`` to
+        clear) and ``memory_oom_group`` (bool or ``None``). Omitted keys keep
+        their current value. A numeric ``memory_max`` pulls in the usual
+        companion defaults — swap capped at 0, ``oom.group`` on — unless those
+        keys are given explicitly.
+        """
+        if role not in VALID_ROLES:
+            raise ValueError(
+                f"unknown role {role!r}; must be one of {sorted(VALID_ROLES)}"
+            )
+        count = self.plan.get(role, 0)
+        if index < 0 or index >= count:
+            raise IndexError(f"{role}[{index}] is not in this supervisor's plan")
+
+        provided = set(overrides)
+        with self._adjust_lock:
+            return self._merge_slot_limit(role, index, provided, overrides)
+
+    def _merge_slot_limit(
+        self, role: str, index: int, provided: set, overrides: Dict
+    ) -> Limits:
+        """Merge ``overrides`` onto a slot's current limits and record them."""
+        current = self._slot_limits.get((role, index), EMPTY_LIMITS)
+        memory_max = (
+            _coerce_adjust_memory(overrides["memory_max"])
+            if "memory_max" in provided
+            else current.memory_max
+        )
+        memory_high = (
+            _coerce_adjust_memory(overrides["memory_high"])
+            if "memory_high" in provided
+            else current.memory_high
+        )
+        memory_swap_max = (
+            _coerce_adjust_memory(overrides["memory_swap_max"])
+            if "memory_swap_max" in provided
+            else current.memory_swap_max
+        )
+        memory_oom_group = (
+            _coerce_adjust_oom_group(overrides["memory_oom_group"])
+            if "memory_oom_group" in provided
+            else current.memory_oom_group
+        )
+
+        # Companion defaults, mirroring limits_from_config: only a real byte
+        # count implies them, and only when the caller did not override them.
+        if isinstance(memory_max, int):
+            if "memory_swap_max" not in provided and memory_swap_max is None:
+                memory_swap_max = 0
+            if "memory_oom_group" not in provided and memory_oom_group is None:
+                memory_oom_group = True
+
+        new = Limits(
+            memory_max=memory_max,
+            memory_high=memory_high,
+            memory_swap_max=memory_swap_max,
+            memory_oom_group=memory_oom_group,
+            derived=False,
+        )
+        # Intent is recorded up front; the live write is deferred to the loop.
+        self._slot_limits[(role, index)] = new
+        self._pending_adjusts[(role, index)] = new
+        self._wake()
+        return new
+
     # -- internals --------------------------------------------------------
+
+    def _enforced_limit_sources(self) -> List[str]:
+        """Configured limits that actually change kernel behaviour, by source.
+
+        The pool budget is a limit like any other: it comes in as a constructor
+        kwarg or environment variable rather than from queue.yml, so it has to
+        be named separately or every "can this failure be tolerated?" decision
+        would silently ignore it.
+        """
+        sources = []
+        if self._configured_limits:
+            sources.append("queue.yml cgroup memory limits")
+        if self._workers_pool_limits.must_enforce():
+            sources.append("the workers pool memory budget")
+        return sources
+
+    def _must_enforce(self, role: str, limits: Limits) -> bool:
+        """Whether this slot must not be allowed to run outside its cgroup.
+
+        A worker answers for the pool budget as well as for its own limits: a
+        child that never reaches the ``workers`` subtree is not merely
+        unconstrained, it keeps running in the supervisor's own cgroup, where
+        it escapes the budget and competes with the control processes.
+        """
+        if role == ROLE_WORKER and self._workers_pool_limits.must_enforce():
+            return True
+        return limits.must_enforce()
+
+    def _setup_cgroup_root(self) -> None:
+        """Vacate the delegated root, enable controllers, sweep leftovers.
+
+        Ordering is mandated by the v2 "no internal process" rule: the
+        supervisor has to move into its own leaf before controllers can be
+        enabled for the children.
+        """
+        if not self._cgroup.enabled:
+            return
+        try:
+            self._cgroup.prepare()
+        except (OSError, CgroupError) as exc:
+            if self._enforced_limit_sources() or any(
+                limits.must_enforce() for limits in self._slot_limits.values()
+            ):
+                raise RuntimeError(
+                    f"cannot prepare cgroup root {getattr(self._cgroup, 'root', '?')}: "
+                    f"{exc}. Configured memory limits cannot be enforced."
+                ) from exc
+            logger.warning(
+                "Cannot prepare cgroup root %s: %s; continuing without cgroups",
+                getattr(self._cgroup, "root", "?"),
+                exc,
+            )
+            self._cgroup = DisabledCgroup(f"prepare failed: {exc}")
+            return
+        self._cgroup_ready = True
+        self._cgroup.scavenge()
+
+    @staticmethod
+    def _resolve_pool_memory_max(explicit, raw_limits: Optional[Dict]):
+        """Pick the pool budget: constructor, then queue.yml, then environment.
+
+        queue.yml outranks the environment the same way ``memory_recycle_at``
+        outranks ``QUEBEC_WORKER_MAX_RSS_MB`` — the file describes this
+        deployment, the variable is the fallback for hosts that have no file.
+        """
+        if explicit is not None:
+            return explicit
+        from_config = (raw_limits or {}).get("workers_pool_memory_max")
+        if from_config is not None:
+            return from_config
+        return os.environ.get(POOL_MEMORY_MAX_ENV) or None
+
+    def _load_config_limits(self) -> Dict:
+        try:
+            raw = self.qc.supervisor_resource_limits_from_config()
+        except Exception:
+            # No queue.yml / older core: fall through to no limits. A missing
+            # config cannot be a hard error here, the low-level Supervisor API
+            # is documented to work without one.
+            logger.debug("No cgroup limits available from config", exc_info=True)
+            return {}
+        # `qc` is duck-typed by the low-level API, so anything but a mapping is
+        # treated as "nothing configured" rather than trusted downstream.
+        return raw if isinstance(raw, dict) else {}
+
+    def _resolve_slot_limits(
+        self, raw: Optional[Dict]
+    ) -> Dict[Tuple[str, int], Limits]:
+        """Expand config limits per slot, deriving memory.max where needed.
+
+        Derivation only runs when a cgroup is actually usable, so an existing
+        deployment that only sets ``memory_recycle_at`` keeps booting on hosts
+        without cgroups.
+        """
+        raw = raw or {}
+        default_rss = raw.get("default_worker_max_rss_bytes")
+        resolved: Dict[Tuple[str, int], Limits] = {}
+        for role, count in self.plan.items():
+            entries = raw.get(role) or []
+            for index in range(count):
+                entry = dict(entries[index]) if index < len(entries) else {}
+                if role == ROLE_WORKER and "worker_max_rss_bytes" not in entry:
+                    entry["worker_max_rss_bytes"] = default_rss
+                limits = limits_from_config(entry, derive=self._cgroup.enabled)
+                if limits.derived:
+                    logger.info(
+                        "%s[%d]: cgroup memory.max derived from memory_recycle_at=%dMiB "
+                        "-> %dMiB (x%.1f; set memory_max explicitly to override)",
+                        role,
+                        index,
+                        (entry.get("worker_max_rss_bytes") or 0) // (1024 * 1024),
+                        (limits.memory_max or 0) // (1024 * 1024),
+                        1.5,
+                    )
+                resolved[(role, index)] = limits
+        return resolved
 
     def _install_signal_handlers(self) -> None:
         def forward_to_workers(forwarded_signal, label):
@@ -358,10 +834,63 @@ class Supervisor:
         ]
         slot.spawn_times.append(now)
 
+        limits = self._slot_limits.get((role, index), EMPTY_LIMITS)
+        try:
+            placed_in_cgroup = self._create_slot_cgroup(role, index, limits)
+        except CgroupError as exc:
+            if self._starting:
+                raise
+            # Runtime refork: fail this slot only. Retried by _supervise until
+            # the crash-loop guard disables it.
+            logger.error(
+                "Cannot prepare cgroup for %s[%d]: %s; leaving the slot down "
+                "for now (its configured memory limit would not be enforced)",
+                role,
+                index,
+                exc,
+            )
+            if not self._record_slot_crash(role, index):
+                self._pending_forks.add((role, index))
+            else:
+                self._pending_forks.discard((role, index))
+            return
+
+        # Barrier so the child does not run before the parent has migrated it
+        # into its cgroup. Without it, everything the child allocates between
+        # fork() and the migration is charged to the supervisor's cgroup and
+        # stays there (v2 does not move existing charges).
+        barrier_r, barrier_w = os.pipe()
+
         pid = os.fork()
         if pid == 0:
             # --- child ---
+            global _active_supervisor
             try:
+                # The child inherited a copy of the supervisor object, but it
+                # supervises nothing: current_supervisor() must not hand user
+                # code a Supervisor whose limit changes would be written to
+                # dicts no supervise loop will ever drain.
+                _active_supervisor = None
+                self._cgroup.close()
+                os.close(barrier_w)
+                try:
+                    go = os.read(barrier_r, 1)
+                except OSError:
+                    go = b""
+                os.close(barrier_r)
+                if not go:
+                    # Parent closed the pipe without releasing us: either it
+                    # died, or placing us in the cgroup failed and it wants
+                    # this child gone.
+                    os._exit(1)
+                # Only workers give up the OOM protection the unit granted the
+                # process tree: they run user code, so they must stay ordinary,
+                # killable victims or a pool OOM finds no valid target. The
+                # control roles keep it — surviving a worker's memory spike is
+                # exactly what it is for. A worker that cannot reset exits
+                # rather than run while unkillable.
+                if role == ROLE_WORKER and not _reset_child_oom_priority():
+                    os._exit(1)
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
@@ -414,8 +943,74 @@ class Supervisor:
                 os._exit(1)
         else:
             # --- parent ---
-            logger.info("Forked %s[%d] as pid=%d", role, index, pid)
+            os.close(barrier_r)
+            # Track the child before placement: a startup exception must leave
+            # it visible to start()'s shutdown/reap path.
             self._children[pid] = _ChildInfo(role=role, index=index, pid=pid)
+            try:
+                release = True
+                if placed_in_cgroup:
+                    release = self._place_in_cgroup(pid, role, index, limits)
+                if release:
+                    try:
+                        os.write(barrier_w, b"x")
+                    except OSError:
+                        pass
+            finally:
+                # EOF releases an aborted child without running user code.
+                os.close(barrier_w)
+            logger.info("Forked %s[%d] as pid=%d", role, index, pid)
+
+    def _create_slot_cgroup(self, role: str, index: int, limits: Limits) -> bool:
+        """Create this slot's leaf cgroup before forking. Returns usability."""
+        if not self._cgroup_ready:
+            return False
+        try:
+            self._cgroup.create(role, index, limits)
+        except CgroupError as exc:
+            if not self._must_enforce(role, limits):
+                logger.warning(
+                    "Cannot create cgroup for %s[%d]: %s; starting it unconstrained",
+                    role,
+                    index,
+                    exc,
+                )
+                return False
+            # A configured limit that cannot be applied must not be silently
+            # dropped, so this slot's fork is treated as a failure.
+            logger.error("Cannot create cgroup for %s[%d]: %s", role, index, exc)
+            raise
+        return True
+
+    def _place_in_cgroup(self, pid: int, role: str, index: int, limits: Limits) -> bool:
+        """Migrate the child. Returns whether it should be released to run."""
+        try:
+            # False means ESRCH: the child died before we could move it, which
+            # the normal reap path already handles.
+            self._cgroup.place(pid, role, index)
+            return True
+        except CgroupError as exc:
+            if not self._must_enforce(role, limits):
+                logger.warning(
+                    "Cannot place %s[%d] (pid=%d) in its cgroup: %s; "
+                    "running it unconstrained",
+                    role,
+                    index,
+                    pid,
+                    exc,
+                )
+                return True
+            logger.error(
+                "Cannot place %s[%d] (pid=%d) in its cgroup: %s; aborting this child "
+                "because its configured memory limit would not be enforced",
+                role,
+                index,
+                pid,
+                exc,
+            )
+            if self._starting:
+                raise
+            return False
 
     def _status_text(self) -> str:
         """Build the systemd STATUS line from in-process state.
@@ -443,12 +1038,47 @@ class Supervisor:
             state = "running"
         return f"Quebec {__version__}: supervisor; {body}; {state}"
 
+    def _retry_pending_forks(self) -> None:
+        """Re-attempt reforks whose cgroup setup failed a moment ago."""
+        for key in sorted(self._pending_forks):
+            slot = self._slots.get(key)
+            if slot is not None and slot.disabled:
+                self._pending_forks.discard(key)
+                continue
+            self._pending_forks.discard(key)
+            self._fork_child(*key)
+
+    def _apply_pending_adjusts(self) -> None:
+        """Drain queued runtime limit changes onto live children.
+
+        Runs on the supervise loop only, so it is serialised with
+        create/destroy and never re-enters cgroup locking. A live write that
+        fails is logged; ``_slot_limits`` already holds the new value, so the
+        next refork converges regardless.
+        """
+        while self._pending_adjusts:
+            (role, index), limits = self._pending_adjusts.popitem()
+            try:
+                self._cgroup.adjust(role, index, limits)
+            except CgroupError as exc:
+                logger.warning(
+                    "Cannot apply runtime limits to %s[%d]: %s "
+                    "(will apply on next fork)",
+                    role,
+                    index,
+                    exc,
+                )
+
     def _supervise(self) -> None:
         while not self._stopping:
             # Refresh status + pet the systemd watchdog. Driving this from the
             # supervise loop means a hung loop stops petting and lets systemd
             # restart us. No-op unless launched under a Type=notify unit.
             self.qc.systemd_notify(self._status_text())
+            if self._pending_adjusts:
+                self._apply_pending_adjusts()
+            if self._pending_forks:
+                self._retry_pending_forks()
             pid, status = self._reap_one(block=False)
             if pid == 0:
                 self._interruptible_sleep(1.0)
@@ -466,7 +1096,9 @@ class Supervisor:
         except ChildProcessError:
             return 0, None
 
-    def _fail_claimed_for_pid(self, pid: int, info: Optional[_ChildInfo]) -> None:
+    def _fail_claimed_for_pid(
+        self, pid: int, info: Optional[_ChildInfo], reason: Optional[str] = None
+    ) -> None:
         """Best-effort: mark any claimed jobs owned by a dead child as failed.
 
         Safe to call on cleanly exited children — a worker that completed its
@@ -475,7 +1107,13 @@ class Supervisor:
         where the child never got to run its cleanup.
         """
         try:
-            failed = self.qc.supervisor_fail_claimed_by_pid(pid, self._hostname)
+            # Keep the two-argument call on the unattributed path so behaviour
+            # is unchanged wherever cgroups are not in play.
+            failed = (
+                self.qc.supervisor_fail_claimed_by_pid(pid, self._hostname)
+                if reason is None
+                else self.qc.supervisor_fail_claimed_by_pid(pid, self._hostname, reason)
+            )
             if failed:
                 if info is not None:
                     logger.info(
@@ -509,12 +1147,10 @@ class Supervisor:
             logger.warning("Reaped unknown pid=%d", pid)
             return
 
-        planned_recycle = (
-            info.role == ROLE_WORKER
-            and status.exited
-            and status.exit_code == RECYCLE_EXIT_CODE
-        )
-        if planned_recycle:
+        kind, cg_stats = self._reclaim_child(pid, info, status)
+        oom = kind == "oom"
+
+        if kind == "planned_recycle" and info.role == ROLE_WORKER:
             if self._stopping:
                 return
             logger.info(
@@ -526,38 +1162,108 @@ class Supervisor:
             self._fork_child(info.role, info.index)
             return
 
-        self._fail_claimed_for_pid(pid, info)
-
         if self._stopping:
             return
 
-        logger.warning(
-            "Child %s[%d] (pid=%d) exited unexpectedly (%s)",
-            info.role,
-            info.index,
-            pid,
-            _status_description(status),
-        )
+        if oom:
+            logger.error(
+                "Child %s[%d] (pid=%d) was killed by the OOM killer (%s)",
+                info.role,
+                info.index,
+                pid,
+                self._describe_cgroup_stats(cg_stats),
+            )
+        else:
+            logger.warning(
+                "Child %s[%d] (pid=%d) exited unexpectedly (%s)",
+                info.role,
+                info.index,
+                pid,
+                _status_description(status),
+            )
 
-        slot = self._slots.get((info.role, info.index))
-        if slot is not None:
-            now = time.monotonic()
-            slot.crash_times = [
-                t for t in slot.crash_times if now - t <= self.crash_loop_window
-            ]
-            slot.crash_times.append(now)
-            if len(slot.crash_times) >= self.crash_loop_max:
-                slot.disabled = True
-                logger.error(
-                    "Slot (%s, %d) crashed %d times in %.0fs; disabling auto-restart",
-                    info.role,
-                    info.index,
-                    len(slot.crash_times),
-                    self.crash_loop_window,
-                )
-                return
+        # OOM shares this counter on purpose: a memory_max too small to even
+        # boot the interpreter would otherwise fork-loop forever.
+        hint = (
+            f" Last exit was an OOM kill ({self._describe_cgroup_stats(cg_stats)});"
+            " raise memory_max for this entry, or lower threads."
+            if oom
+            else ""
+        )
+        if self._record_slot_crash(info.role, info.index, hint):
+            return
 
         self._fork_child(info.role, info.index)
+
+    def _reclaim_child(
+        self,
+        pid: int,
+        info: Optional[_ChildInfo],
+        status: Optional[_ExitStatus],
+    ) -> Tuple[str, Optional[CgroupStats]]:
+        """The tail every reap shares: snapshot, classify, attribute, destroy.
+
+        Every path that reaps a child goes through here, shutdown included:
+        a worker OOM-killed while draining deserves the same attribution as
+        one killed mid-run, and the cgroup snapshot has to be taken before
+        the directory is removed either way.
+        """
+        status = status or _ExitStatus(
+            exited=False, exit_code=None, signaled=False, signal=None
+        )
+        cg_stats = self._cgroup.stats(info.role, info.index) if info else None
+        we_sent_sigkill = pid in self._sigkilled
+        self._sigkilled.discard(pid)
+        kind = classify_exit(status, cg_stats, we_sent_sigkill)
+
+        planned_recycle = (
+            info is not None and info.role == ROLE_WORKER and kind == "planned_recycle"
+        )
+        if not planned_recycle:
+            # Two-argument call on the unattributed path keeps the pre-cgroup
+            # behaviour (and call shape) untouched.
+            if kind == "oom":
+                self._fail_claimed_for_pid(pid, info, oom_failure_reason(pid, cg_stats))
+            else:
+                self._fail_claimed_for_pid(pid, info)
+        if info is not None:
+            self._cgroup.destroy(info.role, info.index)
+        return kind, cg_stats
+
+    def _record_slot_crash(self, role: str, index: int, hint: str = "") -> bool:
+        """Count one failure against a slot. Returns True once it is disabled."""
+        slot = self._slots.get((role, index))
+        if slot is None:
+            return False
+        now = time.monotonic()
+        slot.crash_times = [
+            t for t in slot.crash_times if now - t <= self.crash_loop_window
+        ]
+        slot.crash_times.append(now)
+        if len(slot.crash_times) < self.crash_loop_max:
+            return False
+        slot.disabled = True
+        logger.error(
+            "Slot (%s, %d) crashed %d times in %.0fs; disabling auto-restart.%s",
+            role,
+            index,
+            len(slot.crash_times),
+            self.crash_loop_window,
+            hint,
+        )
+        return True
+
+    @staticmethod
+    def _describe_cgroup_stats(stats: Optional[CgroupStats]) -> str:
+        if stats is None:
+            return "no cgroup stats"
+        parts = []
+        if stats.memory_max:
+            parts.append(f"memory.max={stats.memory_max}")
+        if stats.memory_peak is not None:
+            parts.append(f"memory.peak={stats.memory_peak}")
+        parts.append(f"oom_kill={stats.oom_kill}")
+        return ", ".join(parts)
 
     def _interruptible_sleep(self, seconds: float) -> None:
         try:
@@ -599,17 +1305,17 @@ class Supervisor:
         remaining = list(self._children.keys())
         for pid in remaining:
             logger.warning("Shutdown timeout; SIGKILLing pid=%d", pid)
+            self._sigkilled.add(pid)
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
 
         while self._children:
-            pid, _status = self._reap_one(block=True)
+            pid, status = self._reap_one(block=True)
             if pid == 0:
                 break
-            info = self._children.pop(pid, None)
-            self._fail_claimed_for_pid(pid, info)
+            self._reclaim_child(pid, self._children.pop(pid, None), status)
 
     def _kill_children(self, pids: List[int], sig: int, sig_name: str) -> None:
         logger.info("Supervisor sending %s to %d child(ren)", sig_name, len(pids))
@@ -621,9 +1327,8 @@ class Supervisor:
 
     def _reap_until(self, *, deadline: float) -> None:
         while self._children and time.monotonic() < deadline:
-            pid, _status = self._reap_one(block=False)
+            pid, status = self._reap_one(block=False)
             if pid == 0:
                 time.sleep(0.1)
                 continue
-            info = self._children.pop(pid, None)
-            self._fail_claimed_for_pid(pid, info)
+            self._reclaim_child(pid, self._children.pop(pid, None), status)

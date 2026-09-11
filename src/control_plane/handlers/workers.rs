@@ -64,6 +64,30 @@ impl ControlPlane {
                     .and_then(|v| v.get("rss_bytes").and_then(|b| b.as_u64()))
                     .map(Self::format_rss_bytes);
 
+                let num = |key: &str| {
+                    metadata
+                        .as_ref()
+                        .and_then(|v| v.get(key).and_then(|b| b.as_u64()))
+                };
+                let cgroup_current = num("cgroup_current_bytes");
+                let cgroup_limit = num("cgroup_memory_max");
+                let cgroup_memory = cgroup_current.map(Self::format_rss_bytes);
+                let cgroup_memory_max = cgroup_limit.map(Self::format_rss_bytes);
+                // Only meaningful with a limit to divide by; an unlimited
+                // cgroup shows the raw number and no bar.
+                let cgroup_memory_pct = match (cgroup_current, cgroup_limit) {
+                    (Some(current), Some(limit)) if limit > 0 => {
+                        Some((current.saturating_mul(100) / limit).min(100))
+                    }
+                    _ => None,
+                };
+                let nr_throttled = num("cpu_nr_throttled").unwrap_or(0);
+                let high_events = num("cgroup_high_events").unwrap_or(0);
+                let cgroup_throttled = nr_throttled > 0 || high_events > 0;
+                let cgroup_throttle_hint = cgroup_throttled.then(|| {
+                    format!("Kernel throttling: nr_throttled={nr_throttled}, memory.events high={high_events}")
+                });
+
                 WorkerInfo {
                     id: worker.id,
                     name: worker.name,
@@ -77,6 +101,11 @@ impl ControlPlane {
                     quiet,
                     revision,
                     memory,
+                    cgroup_memory,
+                    cgroup_memory_max,
+                    cgroup_memory_pct,
+                    cgroup_throttled,
+                    cgroup_throttle_hint,
                 }
             })
             .collect();

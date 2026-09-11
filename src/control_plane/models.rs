@@ -61,6 +61,16 @@ pub struct WorkerInfo {
     pub quiet: bool,
     pub revision: Option<String>,
     pub memory: Option<String>,
+    /// cgroup `memory.current`, formatted. Present whenever the worker runs
+    /// in a cgroup v2 hierarchy, even one we cannot write to.
+    pub cgroup_memory: Option<String>,
+    /// cgroup `memory.max`, formatted. Absent when unlimited.
+    pub cgroup_memory_max: Option<String>,
+    /// `memory.current / memory.max` as a whole percentage, for the bar.
+    pub cgroup_memory_pct: Option<u64>,
+    /// True when the kernel throttled this cgroup on CPU or `memory.high`.
+    pub cgroup_throttled: bool,
+    pub cgroup_throttle_hint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

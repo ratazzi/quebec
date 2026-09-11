@@ -71,18 +71,28 @@ impl Supervisor {
     }
 
     /// Mark all claimed executions for the given process row as failed, then prune the row.
-    /// Returns number of claimed executions failed.
-    pub async fn fail_claimed_by_process_id(&self, process_id: i64) -> Result<u64> {
+    /// Returns number of claimed executions failed. `reason` overrides the
+    /// generic "crashed" error text recorded on each failed execution.
+    pub async fn fail_claimed_by_process_id(
+        &self,
+        process_id: i64,
+        reason: Option<&str>,
+    ) -> Result<u64> {
         let db = self.ctx.get_db().await?;
-        fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), process_id).await
+        fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), process_id, reason).await
     }
 
     /// Convenience: look up by (pid, hostname) and fail. Returns 0 if no such row.
-    pub async fn fail_claimed_by_pid(&self, pid: i32, hostname: &str) -> Result<u64> {
+    pub async fn fail_claimed_by_pid(
+        &self,
+        pid: i32,
+        hostname: &str,
+        reason: Option<&str>,
+    ) -> Result<u64> {
         let Some(process_id) = self.lookup_process_id_by_pid(pid, hostname).await? else {
             return Ok(0);
         };
-        self.fail_claimed_by_process_id(process_id).await
+        self.fail_claimed_by_process_id(process_id, reason).await
     }
 
     /// Periodic maintenance run by the supervisor itself. Mirrors Solid Queue's
@@ -116,7 +126,9 @@ impl Supervisor {
             );
         }
         for p in stale {
-            if let Err(e) = fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), p.id).await {
+            if let Err(e) =
+                fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), p.id, None).await
+            {
                 warn!(
                     "Supervisor maintenance: failed to prune process {}: {}",
                     p.id, e
@@ -183,6 +195,7 @@ async fn fail_claimed_by_process_id_inner(
     ctx: &Arc<AppContext>,
     db: &DatabaseConnection,
     process_id: i64,
+    reason: Option<&str>,
 ) -> Result<u64> {
     let table_config = ctx.table_config.clone();
     let process = query_builder::processes::find_by_id(db, &table_config, process_id).await?;
@@ -197,9 +210,12 @@ async fn fail_claimed_by_process_id_inner(
         }
     };
 
-    let error_msg = format!(
-        "Child process {process_id} (pid={process_pid}, host={process_hostname:?}) crashed"
-    );
+    let error_msg = match reason {
+        Some(reason) => reason.to_string(),
+        None => format!(
+            "Child process {process_id} (pid={process_pid}, host={process_hostname:?}) crashed"
+        ),
+    };
 
     let claimed =
         query_builder::claimed_executions::find_by_process_id(db, &table_config, process_id)
