@@ -657,13 +657,16 @@ class Supervisor:
 
     def _load_config_limits(self) -> Dict:
         try:
-            return self.qc.supervisor_resource_limits_from_config() or {}
+            raw = self.qc.supervisor_resource_limits_from_config()
         except Exception:
             # No queue.yml / older core: fall through to no limits. A missing
             # config cannot be a hard error here, the low-level Supervisor API
             # is documented to work without one.
             logger.debug("No cgroup limits available from config", exc_info=True)
             return {}
+        # `qc` is duck-typed by the low-level API, so anything but a mapping is
+        # treated as "nothing configured" rather than trusted downstream.
+        return raw if isinstance(raw, dict) else {}
 
     def _resolve_slot_limits(
         self, raw: Optional[Dict]
