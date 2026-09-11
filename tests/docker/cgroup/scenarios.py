@@ -220,7 +220,18 @@ test:
         "killed by the OOM killer" in error,
         "error states the fact the counters prove",
     )
-    check("memory.peak=" in error, "error carries memory.peak")
+    # `memory.peak` is 5.19+. On an older kernel the reason line simply has one
+    # fewer counter, and the "exceeded its own limit" verdict falls back to the
+    # `max` event — a path a newer kernel never exercises.
+    # Checked on the `workers` pool, not on `root`: the root cgroup of a
+    # hierarchy carries a reduced set of interface files, so its own missing
+    # memory.peak would say nothing about the kernel.
+    peak_available = os.path.exists(os.path.join(root, "workers", "memory.peak"))
+    check(
+        ("memory.peak=" in error) == peak_available,
+        f"error carries memory.peak exactly when the kernel has it "
+        f"(available={peak_available})",
+    )
     check("memory.max=134217728" in error, "error carries the configured memory.max")
     check("oom_kill=" in error, "error carries the oom_kill counter")
     check(
