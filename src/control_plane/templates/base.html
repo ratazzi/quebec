@@ -737,6 +737,7 @@
             <option id="nav-option-scheduled-jobs" value="{{ base_path }}/scheduled-jobs">Scheduled jobs · {{ nav_scheduled_jobs | default(value=0) }}</option>
             <option value="{{ base_path }}/recurring-jobs">Recurring jobs</option>
             <option id="nav-option-finished-jobs" value="{{ base_path }}/finished-jobs">Finished jobs</option>
+            {% if batches_available %}<option id="nav-option-batches" value="{{ base_path }}/batches">Batches · {{ nav_batches_running | default(value=0) }}</option>{% endif %}
             <option value="{{ base_path }}/workers">Workers</option>
           </select>
           <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
@@ -771,6 +772,11 @@
           <a href="{{ base_path }}/finished-jobs" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Finished jobs
           </a>
+          {% if batches_available %}
+          <a href="{{ base_path }}/batches" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
+            Batches <span id="batches-count" class="px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800">{{ nav_batches_running | default(value=0) }}</span>
+          </a>
+          {% endif %}
 
           <a href="{{ base_path }}/workers" data-nav-target="navItem" data-action="click->nav#navigate" class="shrink-0 whitespace-nowrap px-4 h-8 font-medium text-gray-600 hover:text-black border-b-2 border-transparent hover:border-black">
             Workers

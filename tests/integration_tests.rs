@@ -98,6 +98,7 @@ mod jobs {
             Some("job-001"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -127,6 +128,7 @@ mod jobs {
             Some("job-ret-001"),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -140,9 +142,10 @@ mod jobs {
     async fn test_mark_finished() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let rows = query_builder::jobs::mark_finished(&db, &tc, job_id)
             .await
@@ -168,13 +171,13 @@ mod jobs {
     async fn test_mark_finished_by_ids() {
         let (db, tc) = setup_db().await;
 
-        let id1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let id1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let id2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let id2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let _id3 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let _id3 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -205,6 +208,7 @@ mod jobs {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -226,13 +230,13 @@ mod jobs {
     async fn test_find_by_ids() {
         let (db, tc) = setup_db().await;
 
-        let id1 = query_builder::jobs::insert(&db, &tc, "q", "A", None, 0, None, None, None)
+        let id1 = query_builder::jobs::insert(&db, &tc, "q", "A", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let id2 = query_builder::jobs::insert(&db, &tc, "q", "B", None, 0, None, None, None)
+        let id2 = query_builder::jobs::insert(&db, &tc, "q", "B", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let _id3 = query_builder::jobs::insert(&db, &tc, "q", "C", None, 0, None, None, None)
+        let _id3 = query_builder::jobs::insert(&db, &tc, "q", "C", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -246,13 +250,13 @@ mod jobs {
     async fn test_count_and_queue_names() {
         let (db, tc) = setup_db().await;
 
-        query_builder::jobs::insert(&db, &tc, "emails", "A", None, 0, None, None, None)
+        query_builder::jobs::insert(&db, &tc, "emails", "A", None, 0, None, None, None, None)
             .await
             .unwrap();
-        query_builder::jobs::insert(&db, &tc, "default", "B", None, 0, None, None, None)
+        query_builder::jobs::insert(&db, &tc, "default", "B", None, 0, None, None, None, None)
             .await
             .unwrap();
-        query_builder::jobs::insert(&db, &tc, "emails", "C", None, 0, None, None, None)
+        query_builder::jobs::insert(&db, &tc, "emails", "C", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -281,9 +285,10 @@ mod jobs {
     async fn test_delete_by_id() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let rows = query_builder::jobs::delete_by_id(&db, &tc, job_id)
             .await
@@ -311,6 +316,7 @@ mod jobs {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -331,10 +337,10 @@ mod jobs {
     async fn test_delete_finished_before() {
         let (db, tc) = setup_db().await;
 
-        let id1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let id1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let id2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let id2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -362,7 +368,7 @@ mod ready_executions {
         let (db, tc) = setup_db().await;
 
         let job_id =
-            query_builder::jobs::insert(&db, &tc, "default", "J", None, 0, None, None, None)
+            query_builder::jobs::insert(&db, &tc, "default", "J", None, 0, None, None, None, None)
                 .await
                 .unwrap();
 
@@ -396,9 +402,10 @@ mod claimed_executions {
     async fn test_crud() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let ce_id = query_builder::claimed_executions::insert(
             &db,
@@ -444,10 +451,10 @@ mod claimed_executions {
     async fn test_delete_by_process_id() {
         let (db, tc) = setup_db().await;
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -481,13 +488,13 @@ mod claimed_executions {
         let (db, tc) = setup_db().await;
         let now = chrono::Utc::now().naive_utc();
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j3 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j3 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -523,10 +530,10 @@ mod claimed_executions {
         let (db, tc) = setup_db().await;
         let now = chrono::Utc::now().naive_utc();
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -560,10 +567,10 @@ mod ready_executions_batch {
     async fn test_delete_by_ids() {
         let (db, tc) = setup_db().await;
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -594,10 +601,10 @@ mod scheduled_executions_batch {
         let (db, tc) = setup_db().await;
         let future = chrono::Utc::now().naive_utc() + chrono::Duration::hours(1);
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -622,9 +629,10 @@ mod failed_executions {
     async fn test_crud() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let fe_id =
             query_builder::failed_executions::insert(&db, &tc, job_id, Some("something broke"))
@@ -660,10 +668,10 @@ mod failed_executions {
     async fn test_delete_by_job_ids() {
         let (db, tc) = setup_db().await;
 
-        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j1 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
-        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
+        let j2 = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
             .await
             .unwrap();
 
@@ -688,10 +696,20 @@ mod blocked_executions {
     async fn test_crud() {
         let (db, tc) = setup_db().await;
 
-        let job_id =
-            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, Some("my_key"))
-                .await
-                .unwrap();
+        let job_id = query_builder::jobs::insert(
+            &db,
+            &tc,
+            "q",
+            "J",
+            None,
+            0,
+            None,
+            None,
+            Some("my_key"),
+            None,
+        )
+        .await
+        .unwrap();
 
         let expires = chrono::Utc::now().naive_utc() + chrono::Duration::minutes(5);
         let be_id =
@@ -733,9 +751,10 @@ mod scheduled_executions {
     async fn test_crud() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let scheduled_at = chrono::Utc::now().naive_utc() - chrono::Duration::seconds(10);
         let se_id =
@@ -773,9 +792,10 @@ mod scheduled_executions {
     async fn test_not_due_yet() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
 
         let future = chrono::Utc::now().naive_utc() + chrono::Duration::hours(1);
         query_builder::scheduled_executions::insert(&db, &tc, job_id, "q", 0, future)
@@ -885,9 +905,10 @@ mod recurring_executions {
     async fn test_try_insert_idempotent() {
         let (db, tc) = setup_db().await;
 
-        let job_id = query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None)
-            .await
-            .unwrap();
+        let job_id =
+            query_builder::jobs::insert(&db, &tc, "q", "J", None, 0, None, None, None, None)
+                .await
+                .unwrap();
         let run_at = chrono::Utc::now().naive_utc();
 
         let inserted = query_builder::recurring_executions::try_insert(
@@ -1029,6 +1050,7 @@ mod lifecycle {
             Some(r#"{"order_id":42}"#),
             0,
             Some("job-lifecycle-001"),
+            None,
             None,
             None,
         )

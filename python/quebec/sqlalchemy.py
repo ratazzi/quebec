@@ -69,6 +69,7 @@ class Job(Base):
     concurrency_key: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    batch_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
     # Relationships
     ready_execution: Mapped[Optional["ReadyExecution"]] = relationship(
@@ -94,6 +95,7 @@ class Job(Base):
         Index("idx_solid_queue_jobs_queue_priority", "queue_name", "priority"),
         Index("idx_solid_queue_jobs_class_name", "class_name"),
         Index("idx_solid_queue_jobs_finished_at", "finished_at"),
+        Index("idx_solid_queue_jobs_batch_id", "batch_id"),
     )
 
     def __repr__(self) -> str:
@@ -403,3 +405,78 @@ __all__ = [
     "Semaphore",
     "Pause",
 ]
+
+
+class Batch(Base):
+    """A group of jobs tracked together (Solid Queue >= 1.5 batches)."""
+
+    __tablename__ = "solid_queue_batches"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    active_job_batch_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True
+    )
+    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    on_finish: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    on_success: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    on_failure: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(
+        "metadata", Text, nullable=True
+    )
+    total_jobs: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    completed_jobs: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    failed_jobs: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    enqueued_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    batch_executions: Mapped[list["BatchExecution"]] = relationship(
+        back_populates="batch", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index(
+            "idx_solid_queue_batches_active_job_batch_id",
+            "active_job_batch_id",
+            unique=True,
+        ),
+        Index("idx_solid_queue_batches_finished_at", "finished_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Batch(id={self.id}, total_jobs={self.total_jobs})>"
+
+
+class BatchExecution(Base):
+    """One outstanding attempt of a batched job; removed when it finishes."""
+
+    __tablename__ = "solid_queue_batch_executions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("solid_queue_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    batch_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("solid_queue_batches.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    batch: Mapped["Batch"] = relationship(back_populates="batch_executions")
+
+    __table_args__ = (Index("idx_solid_queue_batch_executions_batch_id", "batch_id"),)
+
+    def __repr__(self) -> str:
+        return f"<BatchExecution(id={self.id}, job_id={self.job_id}, batch_id={self.batch_id})>"

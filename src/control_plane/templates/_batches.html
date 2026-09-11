@@ -1,0 +1,18 @@
+{#
+  Shared fragments for the batch pages. Kept in a macro file: a template that
+  defines its own macros cannot call imported macros that use `self::`
+  (Tera resolves `self` against the caller), which breaks `pagination::bar`.
+  Import order matters too: import `_pagination.html` before this file, or
+  `pagination::bar`'s `self::num` fails to resolve.
+#}
+{% macro status_badge(status) %}
+<span class="px-2 py-1 text-xs font-medium rounded-full
+  {% if status == 'failed' %}bg-red-100 text-red-800
+  {% elif status == 'completed' or status == 'finished' %}bg-green-100 text-green-800
+  {% elif status == 'enqueued' or status == 'processing' %}bg-blue-100 text-blue-800
+  {% elif status == 'scheduled' %}bg-purple-100 text-purple-800
+  {% elif status == 'blocked' %}bg-amber-100 text-amber-800
+  {% else %}bg-gray-100 text-gray-800{% endif %}">
+  {{ status | title }}
+</span>
+{% endmacro status_badge %}

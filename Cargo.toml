@@ -1,6 +1,6 @@
 [package]
 name = "quebec"
-version = "0.3.15"
+version = "0.3.16-beta.3"
 edition = "2021"
 authors = ["ratazzi"]
 description = "A simple, database-powered background task queue for Python, written in Rust"
@@ -88,6 +88,7 @@ tokio-cron-scheduler = { version = "0.13.0", features = [
 serde_yaml = "0.9.34"
 serde = { version = "1.0.214", features = ["derive"] }
 nanoid = "0.4"
+uuid = { version = "1", features = ["v4"] }
 hostname = "0.4.0"
 sysinfo = { version = "0.31.4", default-features = false, features = ["system"] }
 async-trait = "0.1.83"
@@ -105,12 +106,19 @@ regex = "1.10"
 proctitle = "0.1.1"
 libc = "0.2"
 moka = { version = "0.12.15", features = ["future"] }
+csv = "1.4.0"
 
 # systemd sd_notify(3) integration. unix-only crate (UnixDatagram +
 # CLOCK_MONOTONIC), so gate it off Windows wheel builds; src/systemd.rs
 # provides a no-op stub on non-unix targets.
 [target.'cfg(unix)'.dependencies]
 sd-notify = "0.5.0"
+
+# USDT probes (SystemTap SDT). The probe crate's inline asm runs out of
+# registers on 32-bit x86, so gate it off there; src/worker.rs falls back to
+# a no-op macro on that target.
+[target.'cfg(not(target_arch = "x86"))'.dependencies]
+probe = "0.5.2"
 
 [profile.release]
 # Smaller wheels: symbols stripped, whole-program LTO and a single codegen

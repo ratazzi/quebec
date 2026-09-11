@@ -191,6 +191,8 @@ impl ControlPlane {
                 post(Self::resume_recurring_job),
             )
             .route("/finished-jobs", get(Self::finished_jobs))
+            .route("/batches", get(Self::batches))
+            .route("/batches/:id", get(Self::batch_details))
             .route("/jobs/:id", get(Self::job_details))
             .route("/stats", get(Self::stats))
             .route("/workers", get(Self::workers))

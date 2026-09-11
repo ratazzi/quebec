@@ -220,7 +220,7 @@ impl ControlPlane {
         let redirect = state.referer_or(&headers, "/failed-jobs");
 
         match db
-            .transaction::<_, (), DbErr>(|txn| {
+            .transaction::<_, Option<i64>, DbErr>(|txn| {
                 let table_config = table_config.clone();
                 Box::pin(async move {
                     let failed_execution =
@@ -228,10 +228,7 @@ impl ControlPlane {
                             .await?;
 
                     match failed_execution {
-                        Some(execution) => {
-                            execution.discard(txn, &table_config).await?;
-                            Ok(())
-                        }
+                        Some(execution) => execution.discard(txn, &table_config).await,
                         None => Err(DbErr::Custom(format!(
                             "Failed execution for job {id} not found"
                         ))),
@@ -240,7 +237,8 @@ impl ControlPlane {
             })
             .await
         {
-            Ok(_) => {
+            Ok(released) => {
+                crate::core::finish_released_batches(&state.ctx, db, released).await;
                 info!("Deleted failed job {}", id);
                 Self::redirect_back(&redirect)
             }
@@ -333,9 +331,9 @@ impl ControlPlane {
         let error_like = pagination.error_like.clone();
 
         match db
-            .transaction::<_, u64, DbErr>(|txn| {
+            .transaction::<_, (u64, Vec<i64>), DbErr>(|txn| {
                 Box::pin(async move {
-                    let count = FailedExecutionEntity
+                    FailedExecutionEntity
                         .discard_all(
                             txn,
                             &table_config,
@@ -345,13 +343,13 @@ impl ControlPlane {
                             until,
                             error_like.as_deref(),
                         )
-                        .await?;
-                    Ok(count)
+                        .await
                 })
             })
             .await
         {
-            Ok(count) => {
+            Ok((count, released)) => {
+                crate::core::finish_released_batches(&state.ctx, db, released).await;
                 info!("Discarded all {} failed jobs", count);
                 Self::redirect_back(&redirect)
             }

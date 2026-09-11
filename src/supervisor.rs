@@ -160,7 +160,7 @@ impl Supervisor {
             // so one bad row is logged and skipped, left for the next
             // maintenance tick / another process to retry.
             let result = db
-                .transaction::<_, (), DbErr>(|txn| {
+                .transaction::<_, Option<i64>, DbErr>(|txn| {
                     Box::pin(async move {
                         Worker::fail_claimed_execution(
                             &ctx,
@@ -176,7 +176,10 @@ impl Supervisor {
                 .await;
 
             match result {
-                Ok(()) => orphaned_count += 1,
+                Ok(released) => {
+                    crate::core::finish_released_batches(&self.ctx, db.as_ref(), released).await;
+                    orphaned_count += 1
+                }
                 Err(e) => warn!(
                     "Supervisor maintenance: failed to reclaim orphaned execution {} (job {}): {}; leaving it for a later sweep",
                     exec_id, job_id, e
@@ -229,22 +232,32 @@ async fn fail_claimed_by_process_id_inner(
     // safety net that reclaims the leftovers.
     let mut failed = 0u64;
     for execution in &claimed {
-        let ctx = ctx.clone();
+        let txn_ctx = ctx.clone();
         let tc = table_config.clone();
         let error_msg = error_msg.clone();
         let job_id = execution.job_id;
         let execution_id = execution.id;
         let result = db
-            .transaction::<_, (), DbErr>(|txn| {
+            .transaction::<_, Option<i64>, DbErr>(|txn| {
                 Box::pin(async move {
-                    Worker::fail_claimed_execution(&ctx, txn, &tc, job_id, execution_id, &error_msg)
-                        .await
+                    Worker::fail_claimed_execution(
+                        &txn_ctx,
+                        txn,
+                        &tc,
+                        job_id,
+                        execution_id,
+                        &error_msg,
+                    )
+                    .await
                 })
             })
             .await;
 
         match result {
-            Ok(()) => failed += 1,
+            Ok(released) => {
+                crate::core::finish_released_batches(ctx, db, released).await;
+                failed += 1
+            }
             Err(e) => warn!(
                 "Supervisor: failed to fail claimed execution {} (job {}) for process {}: {}; leaving it for the orphan-sweep",
                 execution_id, job_id, process_id, e

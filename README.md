@@ -24,6 +24,7 @@ This project is inspired by [Solid Queue](https://github.com/rails/solid_queue).
 - Scheduled tasks
 - Recurring tasks
 - Concurrency control
+- Batches (Solid Queue-compatible)
 - Per-queue concurrency limits
 - Rate limiting
 - Exclusive (stop-the-world) jobs
@@ -331,6 +332,53 @@ class ReportJob(quebec.BaseClass):
 
 The actual concurrency key is `"ClassName/key"` (e.g. `"ReportJob/123"`), so different job classes never conflict. When the limit is reached, new jobs are blocked until a slot becomes available. The `concurrency_duration` acts as a safety TTL — the semaphore is released automatically if a worker crashes.
 
+### Batches
+
+Group jobs so you can track the set as a whole and run callbacks when it finishes. Batches follow Solid Queue's tables and semantics (`solid_queue_batches` / `solid_queue_batch_executions`, added in Solid Queue 1.5), so a batch started by Rails can be finished by Quebec and vice versa.
+
+```python
+class ImportRow(quebec.BaseClass):
+    def perform(self, row):
+        ...
+
+class ImportDone(quebec.BaseClass):
+    def perform(self):
+        b = self.batch          # the batch that enqueued this callback
+        print(f"{b.completed_jobs}/{b.total_jobs} imported, {b.failed_jobs} failed")
+
+with qc.batch(description="import 42",
+              on_success=ImportDone,                                # job class ...
+              on_failure=AlertJob.set(queue="alerts").build("import"),  # ... or a built descriptor
+              on_finish=ImportDone,
+              user_id=42) as batch:                                # extra kwargs -> batch.metadata
+    for row in rows:
+        ImportRow.perform_later(qc, row)
+    qc.perform_all_later([ImportRow.build(r) for r in more_rows])  # bulk enqueue joins too
+
+batch.id, batch.status            # "enqueued"
+batch.total_jobs, batch.pending_jobs, batch.completed_jobs, batch.failed_jobs, batch.progress_percentage
+batch.reload()                    # refresh from the database
+qc.find_batch(batch.id)           # or qc.find_batch_by_active_job_batch_id(uuid)
+```
+
+Every job enqueued inside the `with` block joins the batch; leaving the block starts it (an empty batch finishes right away). To add jobs later, including from one of the batch's own jobs, use `with batch.enqueue(): ...`. A member job can read `self.batch_id` / `self.batch`. Nested `with qc.batch()` blocks are independent batches.
+
+Nested batch contexts on the same Quebec instance share an enqueue transaction, without savepoints. Jobs become visible to workers and completion checks start only after the outermost context commits. An exception escaping the **outermost block body** rolls back the transaction. If an inner block raises and the outer block catches it, the inner block's enqueues are kept and commit with the outer block. That failed inner block does not register a start: its batch remains pending until a later successful `batch.enqueue()` context or the dispatcher's stalled-batch sweep starts it. Errors from post-commit start/completion checks are collected and raised after all pending checks have been attempted; they do not undo already-committed enqueues.
+
+SQLite's single connection is held for the duration of a batch transaction, so other threads' database operations wait for it. A regular thread pool does not inherit the batch ContextVars: do not wait inside the block for other threads to enqueue or query through the same Quebec instance, as that can deadlock. Prepare work outside the block and use `perform_all_later` inside it, or give independent producers their own batch contexts.
+
+Enqueue hooks on registered batch callbacks run when the batch finishes, inside the callback transaction; `AbortEnqueue` skips that callback without preventing batch completion. Maintenance-only processes can finish batches without registering their callback classes: they enqueue the stored callback payload and log a warning. Python enqueue hooks and fresh class-level concurrency resolution require registration in the process finishing the batch; otherwise only serialized options and any legacy serialized concurrency fields are available.
+
+- `on_success` runs when every job finished without failing, `on_failure` when at least one job exhausted its retries, and `on_finish` in either case. Callback jobs are enqueued when the batch finishes; their queue, priority and `wait` come from the `.set(...)` used when the batch was created.
+- Counters count logical jobs: a job that retries and then succeeds is one `total_jobs`. Jobs discarded by `discard_on` or a concurrency `Discard` conflict count as completed. Manually retrying a failed job (`qc.retry_failed`) does not rejoin its batch.
+- Adding to a finished batch raises `quebec.BatchAlreadyFinished`. Building a descriptor inside a batch does not keep it open: enqueue it before the batch finishes.
+
+Completion is detected as jobs finish. The few cases that can't trigger it (a crash between a job's terminal write and its batch release, a bulk delete that cascaded a tracking row away, a callback enqueue that failed, a process that died before starting its batch) are repaired by the dispatcher's maintenance timer (`batch_maintenance: true` by default, sharing `concurrency_maintenance_interval`; disable it via queue.yml, `dispatcher_batch_maintenance=False` or `QUEBEC_DISPATCHER_BATCH_MAINTENANCE=false`). Without a dispatcher, call `qc.sweep_stalled_batches()` yourself. Succeeded batches older than `clear_finished_jobs_after` are cleared by the worker's periodic cleanup or `qc.clear_finished_batches()`; failed batches are kept, like failed jobs.
+
+The control plane lists batches under **Batches** (with progress and a status filter), shows each batch's jobs and callbacks, and links a job's page to its batch.
+
+`create_tables()` creates the batch tables and adds `jobs.batch_id` to an existing database. Against a Rails-managed database that predates the Solid Queue batches migration, jobs enqueue and run without batch bookkeeping and `qc.batch()` raises `RuntimeError` until the migration is applied.
+
 ### Rate Limiting (experimental)
 
 Cap how many jobs run within a sliding time window, scoped per key:
@@ -402,6 +450,87 @@ WantedBy=multi-user.target
 ```
 
 Exit code 75 is non-zero, so `Restart=on-failure` treats the planned recycle as a failure and relaunches the worker. If you'd rather not have planned recycles show up as failures (in `systemctl status` or the start-limit counter), add `SuccessExitStatus=75` together with `RestartForceExitStatus=75` — the former keeps 75 out of the failure tally, the latter still forces the restart.
+
+### Per-Job Memory Metrics (Linux)
+
+Quebec observes two different Linux signals during `perform()`:
+
+- `minor_faults` / `major_faults` are native-thread activity counters from
+  `getrusage(RUSAGE_THREAD)`. They are useful when investigating allocation and
+  I/O behaviour, but are not converted to bytes and are not RSS.
+- Process RSS is read at job start and end and sampled every 100 ms in between.
+  This produces `process_rss_start`, `process_rss_peak`, `process_rss_end`, and
+  `process_rss_peak_delta`. Shorter-lived peaks may fall between samples.
+
+RSS belongs to the process, not a thread. Quebec marks a window
+`process_rss_single_job=true` only in a supervisor-managed worker where either
+`threads: 1` or the job is `exclusive`. Only those single-job windows enter the
+per-class RSS aggregate. Other windows remain useful as process context but are
+not presented as memory attributable to one job. Allocations in subprocesses are
+not included in the worker's RSS. Even a single-job window is a sampled process
+envelope: allocator reuse and worker-runtime activity can still affect it.
+
+These are observability metrics, not enforcement. Use a separate cgroup per
+worker process with `memory.high` / `memory.max` when one job must not exhaust
+the host.
+
+The observations appear on every `job.completed` log line and on
+`execution.metric`. For offline analysis, record one CSV row per finished job:
+
+```bash
+kill -USR2 <worker pid>   # start recording; send again to stop
+```
+
+or from code: `qc.start_job_metrics(path=None)`, `qc.stop_job_metrics()`, `qc.toggle_job_metrics()`, `qc.job_metrics_path`. Under the fork supervisor the signal is forwarded to every worker child, and each child writes its own file. Columns:
+
+```
+ts_ms,pid,tid,jid,class,queue,status,duration_ms,minor_faults,major_faults,process_rss_start_kb,process_rss_peak_kb,process_rss_end_kb,process_rss_peak_delta_kb,process_rss_single_job,active_jobs
+```
+
+`active_jobs` shows how many jobs the process owned when the row was recorded.
+Aggregate attributable samples with whatever reads CSV, e.g.
+
+```sql
+select class, count(*), max(process_rss_peak_delta_kb),
+       quantile_cont(process_rss_peak_delta_kb, 0.95)
+from 'quebec-job-metrics-*.csv'
+where process_rss_single_job = true
+group by class order by 3 desc;
+```
+
+Environment variables:
+
+```bash
+QUEBEC_JOB_METRICS_DIR=/var/log/quebec   # output dir for SIGUSR2 recordings (default: OS temp dir)
+QUEBEC_JOB_METRICS_MAX_ROWS=100000       # recording stops itself after this many rows
+QUEBEC_JOB_METRICS_MAX_SECONDS=3600      # ...or after this long
+```
+
+Each Quebec instance also keeps per-class aggregates since startup: count,
+failures, duration, thread faults, and average / p50 / p95 / max of single-job
+`process_rss_peak_delta_kb` samples with the jid of the largest job.
+`qc.job_metrics_summary(reset=False)` returns them as a dict;
+`reset=True` takes and clears the current snapshot atomically.
+`qc.log_job_metrics_summary()` writes one `job_metrics.summary` log line per
+class, and stopping a recording with `SIGUSR2` logs them too. Percentiles come
+from a log2 histogram, so they are bucket upper bounds rather than exact values.
+
+Rows are handed to a writer thread through a bounded queue and flushed every 5
+seconds. If the writer falls behind, rows are dropped rather than blocking jobs.
+The time limit also stops idle recordings. When a row/time limit automatically
+ends a recording, its writer drains accepted rows and flushes in the background.
+Normal shutdown and `qc.close()` wait for active and already-stopping recordings
+to finish flushing; forced termination can still lose buffered rows.
+
+**USDT probes.** The Linux extension module carries `quebec:job_start` and
+`quebec:job_end`. They are a single `nop` until a tracer attaches. The end probe
+exports the minor-fault delta and the sampled RSS peak delta; the RSS argument is
+`-1` unless `process_rss_single_job` is true. `job_start` exports jid, class,
+and queue as pointer/length pairs. `job_end` exports jid, class, success,
+duration nanoseconds, minor faults, and the attributable RSS peak delta.
+The strings are not NUL-terminated: in bpftrace read them as
+`buf(argN, argN+1)` printed with `%r`, or `str(argN, argN+1 + 1)` (that
+argument is a buffer size, so `str(argN, argN+1)` drops the last character).
 
 ### Per-Queue Concurrency (experimental)
 

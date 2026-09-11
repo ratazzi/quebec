@@ -1,3 +1,7 @@
+#[cfg(feature = "python")]
+mod batch;
+#[cfg(feature = "python")]
+mod batch_transaction;
 mod config;
 pub mod context;
 pub mod continuation;
@@ -8,6 +12,7 @@ pub mod database_url;
 mod dispatcher;
 pub mod entities;
 mod error;
+mod job_metrics;
 mod memory;
 mod notify;
 mod process;
@@ -35,6 +40,8 @@ mod worker;
 #[cfg(feature = "python")]
 use context::*;
 pub use control_plane::ControlPlaneExt;
+#[cfg(feature = "python")]
+use entities::quebec_batches;
 #[cfg(feature = "python")]
 use entities::quebec_claimed_executions;
 #[cfg(feature = "python")]
@@ -199,6 +206,7 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DiscardStrategy>()?;
     m.add_class::<quebec_jobs::Model>()?;
     m.add_class::<quebec_claimed_executions::Model>()?;
+    m.add_class::<quebec_batches::Model>()?;
     m.add_class::<Runnable>()?;
     m.add_class::<Execution>()?;
 
@@ -209,6 +217,10 @@ fn quebec(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "JobInterrupted",
         <continuation::JobInterrupted as pyo3::PyTypeInfo>::type_object(_py),
+    )?;
+    m.add(
+        "BatchAlreadyFinished",
+        <batch::BatchAlreadyFinished as pyo3::PyTypeInfo>::type_object(_py),
     )?;
     m.add(
         "InvalidStepError",

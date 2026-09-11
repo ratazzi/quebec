@@ -150,6 +150,15 @@ impl ControlPlane {
         // Count active workers
         let active_workers = query_builder::processes::count_all(db, table_config).await?;
 
+        // Batches: nav entry and running-count badge only once the schema exists.
+        let batches_available = self.ctx.ensure_batches(db).await;
+        context.insert("batches_available", &batches_available);
+        if batches_available {
+            let running =
+                query_builder::batches::count_all(db, table_config, Some("enqueued")).await?;
+            context.insert("nav_batches_running", &running);
+        }
+
         context.insert("nav_scheduled_jobs", &scheduled_count);
         context.insert("nav_in_progress_jobs", &in_progress_count);
         context.insert("nav_failed_jobs", &failed_count);

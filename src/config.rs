@@ -365,6 +365,9 @@ pub struct DispatcherConfig {
     /// Whether to perform concurrency maintenance
     pub concurrency_maintenance: Option<bool>,
 
+    /// Whether to sweep stalled batches on the maintenance timer
+    pub batch_maintenance: Option<bool>,
+
     /// Number of processes to fork (supervisor mode)
     pub processes: Option<u32>,
 
@@ -402,6 +405,11 @@ impl DispatcherConfig {
     #[getter]
     fn concurrency_maintenance(&self) -> Option<bool> {
         self.concurrency_maintenance
+    }
+
+    #[getter]
+    fn batch_maintenance(&self) -> Option<bool> {
+        self.batch_maintenance
     }
 
     #[getter]
