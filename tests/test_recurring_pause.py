@@ -19,7 +19,7 @@ import pytest
 
 import quebec
 
-from .helpers import wait_until
+from .helpers import observe_sqlite, readonly_connect, wait_until
 
 
 class TickJob(quebec.BaseClass):
@@ -33,21 +33,36 @@ def _db_path(db_url: str) -> str:
 
 
 def _columns(db_url: str, table: str) -> list[str]:
-    with sqlite3.connect(_db_path(db_url)) as conn:
-        return [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+    conn = readonly_connect(_db_path(db_url))
+    try:
+        return observe_sqlite(
+            lambda: [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+        )
+    finally:
+        conn.close()
 
 
 def _count(db_url: str, table: str) -> int:
-    with sqlite3.connect(_db_path(db_url)) as conn:
-        return conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    conn = readonly_connect(_db_path(db_url))
+    try:
+        return observe_sqlite(
+            lambda: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        )
+    finally:
+        conn.close()
 
 
 def _paused_at(db_url: str, prefix: str, key: str):
-    with sqlite3.connect(_db_path(db_url)) as conn:
-        return conn.execute(
-            f'SELECT paused_at FROM "{prefix}_recurring_tasks" WHERE "key" = ?',
-            (key,),
-        ).fetchone()[0]
+    conn = readonly_connect(_db_path(db_url))
+    try:
+        return observe_sqlite(
+            lambda: conn.execute(
+                f'SELECT paused_at FROM "{prefix}_recurring_tasks" WHERE "key" = ?',
+                (key,),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
 
 
 def _seed_task(db_url: str, prefix: str, key: str, class_name: str) -> None:
@@ -255,11 +270,16 @@ test:
         # Plain cron semantics, as with un-commenting a crontab line: the
         # first run after resuming is the very next occurrence after the
         # resume — not a replay of a skipped one, and not the one after next.
-        with sqlite3.connect(_db_path(db_url)) as conn:
-            (first_run_at,) = conn.execute(
-                f'SELECT MIN(run_at) FROM "{executions_table}" WHERE run_at > ?',
-                (resumed_at.isoformat(sep=" "),),
-            ).fetchone()
+        conn = readonly_connect(_db_path(db_url))
+        try:
+            (first_run_at,) = observe_sqlite(
+                lambda: conn.execute(
+                    f'SELECT MIN(run_at) FROM "{executions_table}" WHERE run_at > ?',
+                    (resumed_at.isoformat(sep=" "),),
+                ).fetchone()
+            )
+        finally:
+            conn.close()
         assert first_run_at is not None
         delay = datetime.fromisoformat(first_run_at) - resumed_at
         assert timedelta(0) < delay <= timedelta(seconds=2), delay
