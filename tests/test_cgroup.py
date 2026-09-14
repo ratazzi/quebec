@@ -5,6 +5,8 @@ whole file is platform-independent and runs on macOS. Real-kernel behaviour is
 covered by the Docker suite under ``tests/docker/cgroup``.
 """
 
+import errno
+import logging
 import os
 import signal
 import subprocess
@@ -455,17 +457,37 @@ class TestManagerFileOperations:
         )
         assert self.slot(root, "worker-0.2").joinpath("memory.max").read_text() == "128"
 
-    def test_an_existing_empty_directory_is_never_reused(self, tmp_path):
-        """Empty is not free: its owner may simply not have destroyed it yet."""
+    def test_an_abandoned_leaf_is_reclaimed_rather_than_stepped_over(self, tmp_path):
+        """Otherwise every refork climbs one suffix and the cap is reachable.
+
+        Reclaimed, not reused: the leftover is removed and the leaf recreated,
+        so the exclusive mkdir and the zeroed counters both still hold.
+        """
         mgr, root = self.manager(tmp_path)
         self.slot(root, "worker-0").mkdir()
 
-        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.2"))
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0"))
 
-    def test_claims_climb_past_every_existing_name(self, tmp_path):
+    def test_reclaiming_never_takes_a_leaf_another_owner_holds(self, tmp_path):
+        """An empty leaf is not a free one while its owner still holds the lock."""
         mgr, root = self.manager(tmp_path)
-        self.slot(root, "worker-0").mkdir()
-        self.slot(root, "worker-0.2").mkdir()
+        held = self.slot(root, "worker-0")
+        held.mkdir()
+        fd = cgroup._lock_directory(str(held), blocking=False)
+        try:
+            assert mgr.create("worker", 0, Limits()) == str(
+                self.slot(root, "worker-0.2")
+            )
+            assert held.is_dir(), "the owner's leaf must survive"
+        finally:
+            os.close(fd)
+
+    def test_claims_climb_past_every_name_that_cannot_be_reclaimed(self, tmp_path):
+        mgr, root = self.manager(tmp_path)
+        for name in ("worker-0", "worker-0.2"):
+            leaf = self.slot(root, name)
+            leaf.mkdir()
+            leaf.joinpath("cgroup.procs").write_text("4321\n")
 
         assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.3"))
 
@@ -634,6 +656,50 @@ class TestManagerFileOperations:
     def test_destroy_is_a_noop_when_already_gone(self, tmp_path):
         mgr, _ = self.manager(tmp_path)
         mgr.destroy("worker", 0)
+
+    def test_destroy_waits_for_the_kill_to_land(self, tmp_path, monkeypatch, caplog):
+        """`cgroup.kill` only delivers SIGKILL; the members die a moment later.
+
+        Retrying without pausing burns every attempt inside the first
+        microsecond, so the leaf survives a straggler it was meant to reclaim.
+        """
+        mgr, root = self.manager(tmp_path)
+        mgr.create("worker", 0, Limits())
+        leaf = self.slot(root, "worker-0")
+        # Present on every kernel the two-tier tree supports, so the straggler
+        # sweep writes here instead of signalling pids of its own.
+        leaf.joinpath("cgroup.kill").write_text("")
+
+        real_rmdir = os.rmdir
+        # One more than the immediate rmdir plus every retry the tight loop
+        # used to make, so only a loop that waits gets there.
+        busy_until = 6
+        attempts = []
+        slept = []
+        monkeypatch.setattr(cgroup.time, "sleep", slept.append)
+
+        def slow_to_empty(path, *args, **kwargs):
+            if os.path.basename(path) != "worker-0":
+                return real_rmdir(path, *args, **kwargs)
+            attempts.append(path)
+            if len(attempts) <= busy_until:
+                raise OSError(errno.EBUSY, "Device or resource busy", path)
+            # The stragglers have finally been reaped; the kernel drops the
+            # interface files with them.
+            leaf.joinpath("cgroup.kill").unlink(missing_ok=True)
+            return real_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rmdir", slow_to_empty)
+        with caplog.at_level(logging.WARNING, logger="quebec.cgroup"):
+            mgr.destroy("worker", 0)
+
+        assert not leaf.exists()
+        assert len(attempts) == busy_until + 1
+        assert "still busy" not in caplog.text
+        # Backing off is the point: a fixed tiny delay would still land inside
+        # the window the kill needs on a loaded host.
+        assert slept == sorted(slept) and len(set(slept)) > 1
+        assert sum(slept) > 0.02
 
     def test_control_roles_get_their_own_leaf_under_control(self, tmp_path):
         """A dispatcher limit in queue.yml has to reach a real cgroup file."""

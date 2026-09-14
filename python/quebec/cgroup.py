@@ -38,6 +38,7 @@ import os
 import re
 import signal
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple, Union
@@ -66,6 +67,13 @@ CONTROL_DIR_RE = re.compile(r"^(dispatcher|scheduler)-\d+(\.\d+)?$")
 DERIVE_FACTOR = 1.5
 
 REQUIRED_CONTROLLER = "memory"
+
+#: How many times :meth:`CgroupManager._destroy_path` retries the final rmdir
+#: after killing stragglers, and the cap on the delay between those retries.
+#: The backoff doubles from 2ms, so the budget is roughly 150ms — two orders of
+#: magnitude above the few milliseconds a measured `cgroup.kill` needs.
+_DESTROY_ATTEMPTS = 6
+_DESTROY_MAX_DELAY = 0.05
 
 #: What queue.yml's `max` becomes once parsed. Kept distinct from `None` (not
 #: configured at all) so an explicit "no limit" neither derives a limit nor
@@ -440,15 +448,22 @@ class CgroupManager:
         one has not destroyed yet) end up sharing a cgroup — where the loser's
         `destroy()` rmdirs and kills the winner's child.
 
-        So an existing directory is *never* reused, empty or not. Leftovers
-        are cleaned by :meth:`scavenge` at the next startup, never from here.
-        A directory nobody has touched also guarantees the `memory.events`
-        counters start at zero, which is what makes them attributable.
+        So an existing directory is *never* reused, empty or not. A directory
+        nobody has touched also guarantees the `memory.events` counters start
+        at zero, which is what makes them attributable.
         """
         try:
             # Serialize mkdir + ownership lock with every scavenger. Holding
             # only the leaf lock would leave a gap between mkdir and flock.
             with _directory_lock(self.root):
+                if os.path.exists(base):
+                    # A leaf whose `destroy` could not finish would otherwise
+                    # push this slot one suffix further on every refork, walking
+                    # it towards the attempt cap below — and nothing else
+                    # reclaims it, since `scavenge` runs only at startup. The
+                    # sweep only takes leaves nobody holds a lock on and that
+                    # have no member processes, so a live owner is still safe.
+                    self._scavenge_unlocked()
                 for attempt in range(1, 100):
                     candidate = base if attempt == 1 else f"{base}.{attempt}"
                     try:
@@ -777,7 +792,12 @@ class CgroupManager:
                 return
 
         self._kill_stragglers(path)
-        for _ in range(5):
+        # `cgroup.kill` only *delivers* SIGKILL. The cgroup stays unremovable
+        # until every member has died and been reaped, which on a real kernel
+        # takes milliseconds — retrying without pausing spends the whole budget
+        # inside the first microsecond and gives up before the kill lands.
+        delay = 0.002
+        for attempt in range(_DESTROY_ATTEMPTS):
             try:
                 os.rmdir(path)
                 return
@@ -785,6 +805,9 @@ class CgroupManager:
                 if exc.errno not in (errno.EBUSY, errno.ENOTEMPTY):
                     logger.warning("Cannot remove cgroup %s: %s", path, exc)
                     return
+            if attempt + 1 < _DESTROY_ATTEMPTS:
+                time.sleep(delay)
+                delay = min(delay * 2, _DESTROY_MAX_DELAY)
         remaining = (_read(os.path.join(path, "cgroup.procs")) or "").split()
         logger.warning(
             "cgroup %s still busy (pids=%s); leaving it for the next startup sweep",
