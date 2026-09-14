@@ -19,6 +19,12 @@ from sqlalchemy import text
 BASE = "/quebec"
 
 
+def _is_marked_shared(html: str) -> bool:
+    """Look for the badge itself, not the word — the column headers explain the
+    RSS/cgroup gap in prose that mentions sharing."""
+    return "shared &times;" in html or "shared ×" in html
+
+
 def _get(qc, path: str) -> tuple[int, str]:
     req = quebec.AsgiRequest("GET", path, "", [], b"", BASE)
     status, _headers, body = qc.handle_control_plane_request(req)
@@ -79,7 +85,7 @@ def test_workers_in_their_own_leaves_are_not_marked(env) -> None:
     status, html = _get(env["qc"], "/workers")
 
     assert status == 200
-    assert "shared" not in html
+    assert not _is_marked_shared(html)
 
 
 def test_the_same_path_on_two_hosts_is_two_cgroups(env) -> None:
@@ -91,7 +97,7 @@ def test_the_same_path_on_two_hosts_is_two_cgroups(env) -> None:
     status, html = _get(env["qc"], "/workers")
 
     assert status == 200
-    assert "shared" not in html
+    assert not _is_marked_shared(html)
 
 
 def test_a_worker_without_cgroup_counters_is_unaffected(env) -> None:
@@ -102,4 +108,4 @@ def test_a_worker_without_cgroup_counters_is_unaffected(env) -> None:
     status, html = _get(env["qc"], "/workers")
 
     assert status == 200
-    assert "shared" not in html
+    assert not _is_marked_shared(html)
