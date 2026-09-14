@@ -552,6 +552,10 @@ class CgroupManager:
 
         workers = os.path.join(self.root, WORKERS_DIR)
         os.makedirs(workers, exist_ok=True)
+        # The pool survives restarts, unlike slot leaves. Removing its budget
+        # must clear the previous ceiling rather than leave it in the kernel.
+        if self.workers_pool_limits.memory_max is None:
+            _write(os.path.join(workers, "memory.max"), UNLIMITED)
         self._write_limits(workers, self.workers_pool_limits)
         self._enable_controllers(workers)
 
@@ -751,10 +755,11 @@ class CgroupManager:
     def _parent_max_events(self, role: str) -> int:
         """The slot parent's `max` counter — how often it hit its own budget.
 
-        Hierarchical like every ``memory.events`` field, so a leaf that blew
-        its own limit also shows up here; callers must rule the leaf out first.
+        Use local events: the hierarchical counter also includes siblings
+        hitting their own limits, which is not evidence of pool pressure.
+        If unavailable, leave the pool unattributed rather than guess.
         """
-        raw = _read(os.path.join(self._slot_parent(role), "memory.events"))
+        raw = _read(os.path.join(self._slot_parent(role), "memory.events.local"))
         return parse_keyed_file(raw or "").get("max", 0)
 
     def destroy(self, role: str, index: int) -> None:

@@ -581,6 +581,8 @@ root
 
 Worker limits may overcommit against the pool: the sum of `memory_max` can exceed `workers_pool_memory_max`, which then caps them collectively. That is the point of the pool — a spike that a single worker's own limit would not catch is still contained, and the resulting OOM picks a worker rather than the dispatcher or the supervisor. `control` deliberately holds no process of its own so the memory controller can be enabled for the control slots at all (cgroup v2 refuses to enable controllers for the children of a cgroup that has member processes).
 
+Removing the pool budget from all configuration sources clears its previous `memory.max` at the next supervisor startup, even when the delegated directory is reused.
+
 `memory_oom_group=true` means a worker is killed as a unit, taking any subprocess a job forked with it. At the pool level it is off, so a pool-level OOM removes one worker rather than all of them. Every child gets a leaf whether or not it has limits, since that is what makes its counters attributable to it rather than to whichever process ran in the slot before it.
 
 Sizes accept a plain byte count, binary suffixes (`512MiB`), decimal suffixes (`1GB`), or `max`. An explicit `max` is not the same as omitting the key: it asks the kernel for nothing, and — unlike a real limit — neither derives a `memory_max` nor pulls in the `memory_swap_max=0` / `memory_oom_group=true` companions. When `memory_max` is omitted it is derived as `memory_recycle_at × 1.5`, because `memory.current` includes page cache and so has to sit well above the RSS line the soft recycle watches; set it explicitly to override, and note that derivation only happens once a cgroup has actually been found, so an existing deployment that only sets `memory_recycle_at` still boots on a host without cgroups.
@@ -612,6 +614,8 @@ Likely exceeded this worker's memory.max.
 
 The last sentence appears only when a `max` event or a peak that reached the limit actually implicates this worker's own limit — `memory.events` counts kills by any OOM killer, the global one included, so `oom_kill > 0` on its own does not prove it outgrew its own ceiling. Repeated OOMs count against the same crash-loop guard as ordinary crashes, so a `memory_max` too small to boot the interpreter disables the slot instead of fork-looping.
 
+Pool attribution uses the change in the parent's `memory.events.local` during the worker's lifetime. This excludes sibling workers hitting their own limits; if the local counters cannot be read, the supervisor does not attribute the kill to the pool.
+
 **Metrics work without delegation.** Reading a cgroup is independent of managing one: a process can always read its own counters even where `/sys/fs/cgroup` is mounted read-only, which is the normal case under Docker and Kubernetes. Workers publish `memory.current`, `memory.peak`, the configured max and high, the `oom_kill` / `high` / `max` event counts, and `cpu.stat` usage and throttle counts in their heartbeat metadata; the control plane's workers page shows usage against the limit and flags a throttled worker. Every reader degrades to nothing rather than failing — `memory.peak` only exists on kernels 5.19 and newer, `memory.events` keys come and go, and a non-cgroup host simply reports none of it.
 
 Limits can also be retuned without a restart. The change is written to the live cgroup and remembered for the next fork, so it survives a refork:
@@ -625,6 +629,8 @@ current_supervisor().adjust_slot_limit("worker", 0, memory_max="3GiB")
 ```
 
 Lowering `memory_max` below what the worker is already using starts reclaim immediately, and OOM-kills it if the kernel cannot shrink it that far.
+
+If the supervisor started without a usable cgroup backend, requesting a runtime limit raises `RuntimeError` without recording the change.
 
 Environment variables: `QUEBEC_CGROUP=0` turns the whole mechanism off, `QUEBEC_CGROUP_ROOT` names the delegated subtree, and `QUEBEC_WORKERS_POOL_MEMORY_MAX` sets the pool budget on hosts with no config file (queue.yml wins over it, the same way `memory_recycle_at` wins over `QUEBEC_WORKER_MAX_RSS_MB`).
 
