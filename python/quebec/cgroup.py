@@ -439,15 +439,22 @@ class CgroupManager:
         one has not destroyed yet) end up sharing a cgroup — where the loser's
         `destroy()` rmdirs and kills the winner's child.
 
-        So an existing directory is *never* reused, empty or not. Leftovers
-        are cleaned by :meth:`scavenge` at the next startup, never from here.
-        A directory nobody has touched also guarantees the `memory.events`
-        counters start at zero, which is what makes them attributable.
+        So an existing directory is *never* reused, empty or not. A directory
+        nobody has touched also guarantees the `memory.events` counters start
+        at zero, which is what makes them attributable.
         """
         try:
             # Serialize mkdir + ownership lock with every scavenger. Holding
             # only the leaf lock would leave a gap between mkdir and flock.
             with _directory_lock(self.root):
+                if os.path.exists(base):
+                    # A leaf whose `destroy` could not finish would otherwise
+                    # push this slot one suffix further on every refork, walking
+                    # it towards the attempt cap below — and nothing else
+                    # reclaims it, since `scavenge` runs only at startup. The
+                    # sweep only takes leaves nobody holds a lock on and that
+                    # have no member processes, so a live owner is still safe.
+                    self._scavenge_unlocked()
                 for attempt in range(1, 100):
                     candidate = base if attempt == 1 else f"{base}.{attempt}"
                     try:

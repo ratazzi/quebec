@@ -415,17 +415,37 @@ class TestManagerFileOperations:
         )
         assert self.slot(root, "worker-0.2").joinpath("memory.max").read_text() == "128"
 
-    def test_an_existing_empty_directory_is_never_reused(self, tmp_path):
-        """Empty is not free: its owner may simply not have destroyed it yet."""
+    def test_an_abandoned_leaf_is_reclaimed_rather_than_stepped_over(self, tmp_path):
+        """Otherwise every refork climbs one suffix and the cap is reachable.
+
+        Reclaimed, not reused: the leftover is removed and the leaf recreated,
+        so the exclusive mkdir and the zeroed counters both still hold.
+        """
         mgr, root = self.manager(tmp_path)
         self.slot(root, "worker-0").mkdir()
 
-        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.2"))
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0"))
 
-    def test_claims_climb_past_every_existing_name(self, tmp_path):
+    def test_reclaiming_never_takes_a_leaf_another_owner_holds(self, tmp_path):
+        """An empty leaf is not a free one while its owner still holds the lock."""
         mgr, root = self.manager(tmp_path)
-        self.slot(root, "worker-0").mkdir()
-        self.slot(root, "worker-0.2").mkdir()
+        held = self.slot(root, "worker-0")
+        held.mkdir()
+        fd = cgroup._lock_directory(str(held), blocking=False)
+        try:
+            assert mgr.create("worker", 0, Limits()) == str(
+                self.slot(root, "worker-0.2")
+            )
+            assert held.is_dir(), "the owner's leaf must survive"
+        finally:
+            os.close(fd)
+
+    def test_claims_climb_past_every_name_that_cannot_be_reclaimed(self, tmp_path):
+        mgr, root = self.manager(tmp_path)
+        for name in ("worker-0", "worker-0.2"):
+            leaf = self.slot(root, name)
+            leaf.mkdir()
+            leaf.joinpath("cgroup.procs").write_text("4321\n")
 
         assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.3"))
 
