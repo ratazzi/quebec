@@ -508,8 +508,13 @@ class CgroupManager:
                     f"cgroup root {self.root} still holds {len(leftover)} other "
                     f"process(es) (pids {','.join(sorted(leftover))}); cgroup v2 cannot "
                     "enable controllers for a cgroup that has member processes. Give "
-                    "Quebec a cgroup of its own (systemd Delegate=yes, or point "
-                    "QUEBEC_CGROUP_ROOT at a dedicated empty subtree)."
+                    "Quebec a cgroup of its own: under systemd, Delegate=yes on the "
+                    "unit (plus DelegateSubgroup= when the unit's own main process "
+                    "shares this cgroup); otherwise move this process into a subtree "
+                    f"of its own before startup — mkdir {self.root}/quebec && echo $$ "
+                    f"> {self.root}/quebec/cgroup.procs — and set QUEBEC_CGROUP_ROOT "
+                    "to it. Unless you run as root, that subtree has to be one this "
+                    "process is already in."
                 )
             _write(
                 os.path.join(self.root, "cgroup.subtree_control"),
@@ -849,7 +854,9 @@ def probe(
     if not inside and os.geteuid() != 0:
         return DisabledCgroup(
             f"supervisor cgroup {own_full} is outside {root} and we are not root; "
-            "cannot migrate into the target subtree"
+            "migrating between them needs write access to their common ancestor. "
+            f"Move this process into {root} before startup (echo $$ > "
+            f"{root}/cgroup.procs) or run as root."
         )
 
     for name in ("", "cgroup.procs", "cgroup.subtree_control"):
