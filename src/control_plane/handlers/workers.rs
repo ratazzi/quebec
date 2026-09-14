@@ -3,6 +3,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse},
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -30,7 +31,7 @@ impl ControlPlane {
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Calculate time since last heartbeat for each worker
-        let workers_info: Vec<WorkerInfo> = workers
+        let mut workers_info: Vec<WorkerInfo> = workers
             .into_iter()
             .map(|worker| {
                 let last_heartbeat = worker.last_heartbeat_at;
@@ -106,9 +107,43 @@ impl ControlPlane {
                     cgroup_memory_pct,
                     cgroup_throttled,
                     cgroup_throttle_hint,
+                    cgroup_path: metadata
+                        .as_ref()
+                        .and_then(|v| v.get("cgroup_path").and_then(|s| s.as_str()))
+                        .map(|s| s.to_string()),
+                    // Filled in below, once every row is known.
+                    cgroup_sharers: 1,
                 }
             })
             .collect();
+
+        // A process reports its own cgroup, so processes that were never moved
+        // into per-worker leaves all report the same one — and each row then
+        // shows the whole cgroup's usage. Count the rows per cgroup so the page
+        // can say so. Keyed by host too: the same path on two hosts is two
+        // different cgroups.
+        let mut per_cgroup: HashMap<(&str, &str), usize> = HashMap::new();
+        for worker in &workers_info {
+            if let Some(path) = worker.cgroup_path.as_deref() {
+                *per_cgroup
+                    .entry((worker.hostname.as_str(), path))
+                    .or_insert(0) += 1;
+            }
+        }
+        let counts: Vec<usize> = workers_info
+            .iter()
+            .map(|worker| {
+                worker
+                    .cgroup_path
+                    .as_deref()
+                    .and_then(|path| per_cgroup.get(&(worker.hostname.as_str(), path)))
+                    .copied()
+                    .unwrap_or(1)
+            })
+            .collect();
+        for (worker, count) in workers_info.iter_mut().zip(counts) {
+            worker.cgroup_sharers = count;
+        }
 
         let mut context = tera::Context::new();
         context.insert("workers", &workers_info);

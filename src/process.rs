@@ -63,8 +63,13 @@ pub fn build_runtime_metadata_with_memory(
 /// optional: a non-cgroup host reports none, an older kernel has no
 /// `memory.peak`, and `nr_throttled` only appears once the cpu controller is
 /// enabled for the cgroup.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct CgroupMetrics {
+    /// Which cgroup these counters describe. Reported so the control plane can
+    /// tell "this worker used 1.6 GiB" apart from "this worker shares a cgroup
+    /// that used 1.6 GiB" — the latter is what every process reports when the
+    /// per-worker leaves were never created.
+    pub path: Option<String>,
     pub current_bytes: Option<u64>,
     pub peak_bytes: Option<u64>,
     pub memory_max: Option<u64>,
@@ -93,6 +98,7 @@ impl CgroupMetrics {
         let events = crate::memory::cgroup_memory_events(&dir);
         let cpu = crate::memory::cgroup_cpu_stat(&dir);
         Self {
+            path: Some(dir.to_string_lossy().into_owned()),
             current_bytes: crate::memory::cgroup_memory_current(&dir),
             peak_bytes: crate::memory::cgroup_memory_peak(&dir),
             memory_max: crate::memory::cgroup_memory_max(&dir),
@@ -167,6 +173,9 @@ pub fn build_runtime_metadata_full(
         put("cgroup_max_events", cgroup.max_events);
         put("cpu_usage_usec", cgroup.cpu_usage_usec);
         put("cpu_nr_throttled", cgroup.cpu_nr_throttled);
+        if let Some(path) = cgroup.path {
+            obj.insert("cgroup_path".to_string(), serde_json::Value::String(path));
+        }
     }
     serde_json::to_string(&serde_json::Value::Object(obj)).ok()
 }

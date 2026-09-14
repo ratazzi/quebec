@@ -54,6 +54,9 @@
           {% if worker.cgroup_memory_max %}
             <div class="flex items-center gap-1.5">
               <span>{{ worker.cgroup_memory }} / {{ worker.cgroup_memory_max }}</span>
+              {% if worker.cgroup_sharers > 1 %}
+                <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-gray-100 text-gray-600" title="{{ worker.cgroup_sharers }} listed processes on this host report the same cgroup ({{ worker.cgroup_path }}), so this is the whole cgroup's usage, not this process's.">shared &times;{{ worker.cgroup_sharers }}</span>
+              {% endif %}
               {% if worker.cgroup_throttled %}
                 <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>
               {% endif %}
@@ -64,6 +67,9 @@
           {% else %}
             <span>{{ worker.cgroup_memory }}</span>
             <span class="text-gray-400">/ unlimited</span>
+            {% if worker.cgroup_sharers > 1 %}
+              <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-gray-100 text-gray-600" title="{{ worker.cgroup_sharers }} listed processes on this host report the same cgroup ({{ worker.cgroup_path }}), so this is the whole cgroup's usage, not this process's.">shared &times;{{ worker.cgroup_sharers }}</span>
+            {% endif %}
             {% if worker.cgroup_throttled %}
               <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>
             {% endif %}
@@ -139,6 +145,9 @@
                   <span class="text-gray-400">/ {{ worker.cgroup_memory_max }}</span>
                 {% else %}
                   <span class="text-gray-400">/ unlimited</span>
+                {% endif %}
+                {% if worker.cgroup_sharers > 1 %}
+                  <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-gray-100 text-gray-600" title="{{ worker.cgroup_sharers }} listed processes on this host report the same cgroup ({{ worker.cgroup_path }}), so this is the whole cgroup's usage, not this process's.">shared &times;{{ worker.cgroup_sharers }}</span>
                 {% endif %}
                 {% if worker.cgroup_throttled %}
                   <span class="px-1.5 inline-flex text-[10px] leading-4 font-semibold rounded-full bg-yellow-100 text-yellow-800" title="{{ worker.cgroup_throttle_hint }}">Throttled</span>

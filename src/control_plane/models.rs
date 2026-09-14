@@ -71,6 +71,12 @@ pub struct WorkerInfo {
     /// True when the kernel throttled this cgroup on CPU or `memory.high`.
     pub cgroup_throttled: bool,
     pub cgroup_throttle_hint: Option<String>,
+    /// The cgroup the counters above describe.
+    pub cgroup_path: Option<String>,
+    /// How many listed processes report this same cgroup on this host. Above 1
+    /// the counters are the whole cgroup's, not this process's — which is what
+    /// every process reports when no per-worker leaves were created.
+    pub cgroup_sharers: usize,
 }
 
 #[derive(Debug, Deserialize)]
