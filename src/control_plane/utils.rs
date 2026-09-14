@@ -157,6 +157,7 @@ impl ControlPlane {
             let running =
                 query_builder::batches::count_all(db, table_config, Some("enqueued")).await?;
             context.insert("nav_batches_running", &running);
+            context.insert("batches_running_count", &running);
         }
 
         context.insert("nav_scheduled_jobs", &scheduled_count);
