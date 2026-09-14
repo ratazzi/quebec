@@ -46,10 +46,10 @@
         <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.last_heartbeat_at }}"></span></dd>
         <dt class="text-gray-500">Uptime</dt>
         <dd class="text-gray-900"><span data-controller="timeago" data-timeago-datetime-value="{{ worker.created_at }}" title="Process started"></span></dd>
-        <dt class="text-gray-500">Memory</dt>
+        <dt class="text-gray-500" title="{{ memory_hint }}">Memory (RSS)</dt>
         <dd class="{% if worker.memory %}text-gray-900{% else %}text-gray-400{% endif %}">{% if worker.memory %}{{ worker.memory }}{% else %}N/A{% endif %}</dd>
         {% if worker.cgroup_memory %}
-        <dt class="text-gray-500">cgroup</dt>
+        <dt class="text-gray-500" title="{{ cgroup_hint }}">cgroup (current)</dt>
         <dd class="text-gray-900">
           {% if worker.cgroup_memory_max %}
             <div class="flex items-center gap-1.5">
@@ -94,8 +94,8 @@
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Hostname</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">PID</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Heartbeat</th>
-          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Memory</th>
-          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" title="cgroup v2 memory.current against memory.max">cgroup</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" title="{{ memory_hint }}">Memory (RSS)</th>
+          <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider" title="{{ cgroup_hint }}">cgroup (current)</th>
           <th scope="col" class="px-3 py-2 sm:px-6 sm:py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
         </tr>
       </thead>
