@@ -5247,7 +5247,7 @@ impl Worker {
                     // below before its own timeout fires.
                     self.shutdown_worker_process(
                         &process,
-                        self.ctx.shutdown_timeout.mul_f64(0.8),
+                        self.ctx.effective_shutdown_timeout().mul_f64(0.8),
                     ).await?;
 
                     return Ok(());

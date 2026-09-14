@@ -3529,7 +3529,9 @@ impl PyQuebec {
         // Cancel the token to initiate component shutdown
         self.ctx.graceful_shutdown.cancel();
 
-        let timeout = self.ctx.shutdown_timeout;
+        // Orphans get the longer budget here too, or this outer timeout would
+        // force-quit the process while the worker below is still draining.
+        let timeout = self.ctx.effective_shutdown_timeout();
         let quit = self.ctx.force_quit.clone();
         let handles = self.handles.clone();
         let rt = self.rt.clone();
