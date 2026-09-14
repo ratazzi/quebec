@@ -11,6 +11,21 @@ use tracing::debug;
 use crate::control_plane::{models::WorkerInfo, ControlPlane};
 use crate::query_builder;
 
+/// Why the two memory columns disagree, for the headers that carry them.
+///
+/// They are different quantities, not two readings of one: RSS counts every
+/// resident page the process can see, while the cgroup only charges what this
+/// leaf faulted in. A forked child inherits its parent's pages copy-on-write
+/// and those stay charged to the cgroup the supervisor forked from, so the
+/// cgroup figure starts far below RSS and climbs towards it as the writes
+/// break the sharing.
+const MEMORY_HINT: &str = "Resident set size, sampled at heartbeat. Includes pages \
+    still shared copy-on-write with the supervisor and the other children.";
+const CGROUP_HINT: &str = "cgroup v2 memory.current against memory.max. Charged to \
+    this leaf only from the moment the child was placed in it, so pages inherited \
+    from the supervisor are missing here and it reads below RSS until \
+    copy-on-write breaks the sharing.";
+
 impl ControlPlane {
     pub async fn workers(
         State(state): State<Arc<ControlPlane>>,
@@ -148,6 +163,8 @@ impl ControlPlane {
         let mut context = tera::Context::new();
         context.insert("workers", &workers_info);
         context.insert("active_page", "workers");
+        context.insert("memory_hint", MEMORY_HINT);
+        context.insert("cgroup_hint", CGROUP_HINT);
 
         let html = state.render_template("workers.html", &mut context).await?;
 
