@@ -383,6 +383,16 @@ pub struct AppContext {
     pub process_heartbeat_interval: Duration,
     pub process_alive_threshold: Duration,
     pub shutdown_timeout: Duration,
+    /// How long a child may drain after its supervisor disappeared, replacing
+    /// `shutdown_timeout` on that path only.
+    ///
+    /// `shutdown_timeout` is short because the supervisor SIGKILLs whatever is
+    /// left when it expires. An orphan has no such deadline — nobody is waiting
+    /// on it, it has stopped claiming, and a replacement supervisor's children
+    /// cannot take its jobs while it still holds them — so cutting its jobs off
+    /// after a few seconds only leaves them claimed until the row expires. Kept
+    /// bounded so a job that never returns cannot pin the process forever.
+    pub orphan_drain_timeout: Duration,
     /// When a quiet signal (SIGUSR1/SIGTSTP) is received, also exit the process
     /// once all of this worker's in-flight and claimed jobs have drained — with
     /// no time limit, matching Sidekiq Enterprise's USR2 rolling restart. Opt-in
@@ -948,6 +958,9 @@ impl AppContext {
             if let Some(v) = get_duration("shutdown_timeout") {
                 ctx.shutdown_timeout = v;
             }
+            if let Some(v) = get_duration("orphan_drain_timeout") {
+                ctx.orphan_drain_timeout = v;
+            }
             if let Some(v) = get_bool("silence_polling") {
                 ctx.silence_polling = v;
             }
@@ -1157,6 +1170,7 @@ impl AppContext {
             process_heartbeat_interval: Duration::from_secs(60),
             process_alive_threshold: Duration::from_secs(300),
             shutdown_timeout: Duration::from_secs(5),
+            orphan_drain_timeout: Duration::from_secs(300),
             silence_polling: true,
             quiet_then_exit: false,
             preserve_finished_jobs: true,
@@ -1307,6 +1321,19 @@ impl AppContext {
     /// Whether we were reparented since `watch_parent_pid` was called.
     /// Returns false when `watch_parent_pid` has not been invoked (the common
     /// single-process library case).
+    /// How long this process may take to shut down, given who is waiting.
+    ///
+    /// Under a live supervisor that is `shutdown_timeout`, because the
+    /// supervisor SIGKILLs the remainder once it expires. An orphan answers to
+    /// nobody, so it gets `orphan_drain_timeout` to finish what it started.
+    pub fn effective_shutdown_timeout(&self) -> Duration {
+        if self.is_orphaned() {
+            self.orphan_drain_timeout
+        } else {
+            self.shutdown_timeout
+        }
+    }
+
     pub fn is_orphaned(&self) -> bool {
         let stored = self.supervisor_pid.load(Ordering::Relaxed);
         if stored == 0 {
@@ -1351,6 +1378,7 @@ impl AppContext {
             process_heartbeat_interval: self.process_heartbeat_interval,
             process_alive_threshold: self.process_alive_threshold,
             shutdown_timeout: self.shutdown_timeout,
+            orphan_drain_timeout: self.orphan_drain_timeout,
             silence_polling: self.silence_polling,
             quiet_then_exit: self.quiet_then_exit,
             preserve_finished_jobs: self.preserve_finished_jobs,

@@ -38,6 +38,7 @@ import os
 import re
 import signal
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple, Union
@@ -66,6 +67,13 @@ CONTROL_DIR_RE = re.compile(r"^(dispatcher|scheduler)-\d+(\.\d+)?$")
 DERIVE_FACTOR = 1.5
 
 REQUIRED_CONTROLLER = "memory"
+
+#: How many times :meth:`CgroupManager._destroy_path` retries the final rmdir
+#: after killing stragglers, and the cap on the delay between those retries.
+#: The backoff doubles from 2ms, so the budget is roughly 150ms — two orders of
+#: magnitude above the few milliseconds a measured `cgroup.kill` needs.
+_DESTROY_ATTEMPTS = 6
+_DESTROY_MAX_DELAY = 0.05
 
 #: What queue.yml's `max` becomes once parsed. Kept distinct from `None` (not
 #: configured at all) so an explicit "no limit" neither derives a limit nor
@@ -122,6 +130,12 @@ class CgroupStats:
     max_events: int = 0
     memory_peak: Optional[int] = None
     memory_max: Optional[str] = None
+    #: The slot parent's `memory.max` — the `workers` pool budget for a worker.
+    parent_memory_max: Optional[str] = None
+    #: How many times the parent hit that budget *while this child ran*. A
+    #: pool OOM kills whichever member is largest at that instant, so without
+    #: the delta there is no way to tell a victim from a culprit.
+    parent_max_events: int = 0
 
 
 def parse_size_bytes(value) -> Optional[int]:
@@ -400,6 +414,8 @@ class CgroupManager:
         # Not always `worker-{index}`: see _claim_path.
         self._paths: Dict[Tuple[str, int], str] = {}
         self._locks: Dict[Tuple[str, int], int] = {}
+        # (role, index) -> the slot parent's `max` event count at fork time.
+        self._parent_baselines: Dict[Tuple[str, int], int] = {}
 
     def close(self) -> None:
         """Release ownership, also used to close inherited fds after fork.
@@ -411,6 +427,7 @@ class CgroupManager:
             os.close(fd)
         self._locks.clear()
         self._paths.clear()
+        self._parent_baselines.clear()
 
     def __del__(self):
         self.close()
@@ -431,15 +448,22 @@ class CgroupManager:
         one has not destroyed yet) end up sharing a cgroup — where the loser's
         `destroy()` rmdirs and kills the winner's child.
 
-        So an existing directory is *never* reused, empty or not. Leftovers
-        are cleaned by :meth:`scavenge` at the next startup, never from here.
-        A directory nobody has touched also guarantees the `memory.events`
-        counters start at zero, which is what makes them attributable.
+        So an existing directory is *never* reused, empty or not. A directory
+        nobody has touched also guarantees the `memory.events` counters start
+        at zero, which is what makes them attributable.
         """
         try:
             # Serialize mkdir + ownership lock with every scavenger. Holding
             # only the leaf lock would leave a gap between mkdir and flock.
             with _directory_lock(self.root):
+                if os.path.exists(base):
+                    # A leaf whose `destroy` could not finish would otherwise
+                    # push this slot one suffix further on every refork, walking
+                    # it towards the attempt cap below — and nothing else
+                    # reclaims it, since `scavenge` runs only at startup. The
+                    # sweep only takes leaves nobody holds a lock on and that
+                    # have no member processes, so a live owner is still safe.
+                    self._scavenge_unlocked()
                 for attempt in range(1, 100):
                     candidate = base if attempt == 1 else f"{base}.{attempt}"
                     try:
@@ -508,8 +532,13 @@ class CgroupManager:
                     f"cgroup root {self.root} still holds {len(leftover)} other "
                     f"process(es) (pids {','.join(sorted(leftover))}); cgroup v2 cannot "
                     "enable controllers for a cgroup that has member processes. Give "
-                    "Quebec a cgroup of its own (systemd Delegate=yes, or point "
-                    "QUEBEC_CGROUP_ROOT at a dedicated empty subtree)."
+                    "Quebec a cgroup of its own: under systemd, Delegate=yes on the "
+                    "unit (plus DelegateSubgroup= when the unit's own main process "
+                    "shares this cgroup); otherwise move this process into a subtree "
+                    f"of its own before startup — mkdir {self.root}/quebec && echo $$ "
+                    f"> {self.root}/quebec/cgroup.procs — and set QUEBEC_CGROUP_ROOT "
+                    "to it. Unless you run as root, that subtree has to be one this "
+                    "process is already in."
                 )
             _write(
                 os.path.join(self.root, "cgroup.subtree_control"),
@@ -632,6 +661,10 @@ class CgroupManager:
         base = os.path.join(parent, f"{role}-{index}")
         path = self._claim_path(base, role, index)
         self._paths[(role, index)] = path
+        # The parent's counters are cumulative over the supervisor's whole
+        # life, so only the change across this child's lifetime says anything
+        # about the child. Taken before the fork; see :meth:`stats`.
+        self._parent_baselines[(role, index)] = self._parent_max_events(role)
         try:
             self._write_limits(path, limits)
         except OSError as exc:
@@ -702,13 +735,27 @@ class CgroupManager:
                 peak = None
 
         max_raw = _read(os.path.join(path, "memory.max"))
+        parent = self._slot_parent(role)
+        parent_max_raw = _read(os.path.join(parent, "memory.max"))
+        baseline = self._parent_baselines.get((role, index), 0)
         return CgroupStats(
             oom_kill=events.get("oom_kill", 0),
             oom_group_kill=events.get("oom_group_kill", 0),
             max_events=events.get("max", 0),
             memory_peak=peak,
             memory_max=max_raw.strip() if max_raw else None,
+            parent_memory_max=parent_max_raw.strip() if parent_max_raw else None,
+            parent_max_events=max(0, self._parent_max_events(role) - baseline),
         )
+
+    def _parent_max_events(self, role: str) -> int:
+        """The slot parent's `max` counter — how often it hit its own budget.
+
+        Hierarchical like every ``memory.events`` field, so a leaf that blew
+        its own limit also shows up here; callers must rule the leaf out first.
+        """
+        raw = _read(os.path.join(self._slot_parent(role), "memory.events"))
+        return parse_keyed_file(raw or "").get("max", 0)
 
     def destroy(self, role: str, index: int) -> None:
         """Remove a child's leaf cgroup, killing any surviving grandchildren.
@@ -722,6 +769,7 @@ class CgroupManager:
         """
         path = self._paths.pop((role, index), None)
         fd = self._locks.pop((role, index), None)
+        self._parent_baselines.pop((role, index), None)
         try:
             if path is not None:
                 with _directory_lock(self.root):
@@ -744,7 +792,12 @@ class CgroupManager:
                 return
 
         self._kill_stragglers(path)
-        for _ in range(5):
+        # `cgroup.kill` only *delivers* SIGKILL. The cgroup stays unremovable
+        # until every member has died and been reaped, which on a real kernel
+        # takes milliseconds — retrying without pausing spends the whole budget
+        # inside the first microsecond and gives up before the kill lands.
+        delay = 0.002
+        for attempt in range(_DESTROY_ATTEMPTS):
             try:
                 os.rmdir(path)
                 return
@@ -752,6 +805,9 @@ class CgroupManager:
                 if exc.errno not in (errno.EBUSY, errno.ENOTEMPTY):
                     logger.warning("Cannot remove cgroup %s: %s", path, exc)
                     return
+            if attempt + 1 < _DESTROY_ATTEMPTS:
+                time.sleep(delay)
+                delay = min(delay * 2, _DESTROY_MAX_DELAY)
         remaining = (_read(os.path.join(path, "cgroup.procs")) or "").split()
         logger.warning(
             "cgroup %s still busy (pids=%s); leaving it for the next startup sweep",
@@ -849,7 +905,9 @@ def probe(
     if not inside and os.geteuid() != 0:
         return DisabledCgroup(
             f"supervisor cgroup {own_full} is outside {root} and we are not root; "
-            "cannot migrate into the target subtree"
+            "migrating between them needs write access to their common ancestor. "
+            f"Move this process into {root} before startup (echo $$ > "
+            f"{root}/cgroup.procs) or run as root."
         )
 
     for name in ("", "cgroup.procs", "cgroup.subtree_control"):

@@ -82,22 +82,27 @@ pub struct CgroupMetrics {
 }
 
 impl CgroupMetrics {
-    /// Sample this process's own cgroup. Cheap enough to call per heartbeat:
-    /// a handful of small reads under `/sys/fs/cgroup`.
+    /// Sample this process's own cgroup: six small reads under `/sys/fs/cgroup`.
+    ///
+    /// The directory is resolved once and reused for all of them. Resolving it
+    /// costs a full read of `/proc/mounts` — which grows with the host's mount
+    /// count — so doing it per file would make a heartbeat far from cheap. It
+    /// is still not *cached* across samples: a supervised child is migrated
+    /// into its leaf right after fork, so a value held onto would be wrong.
     pub fn sample() -> Self {
         // Short-circuit off a cgroup v2 host so a heartbeat does not attempt
         // half a dozen reads that can only fail.
-        let Some(path) = crate::memory::cgroup_v2_self_path() else {
+        let Some(dir) = crate::memory::cgroup_v2_self_path() else {
             return Self::default();
         };
-        let events = crate::memory::cgroup_memory_events();
-        let cpu = crate::memory::cgroup_cpu_stat();
+        let events = crate::memory::cgroup_memory_events(&dir);
+        let cpu = crate::memory::cgroup_cpu_stat(&dir);
         Self {
-            path: Some(path.to_string_lossy().into_owned()),
-            current_bytes: crate::memory::cgroup_memory_current(),
-            peak_bytes: crate::memory::cgroup_memory_peak(),
-            memory_max: crate::memory::cgroup_memory_max(),
-            memory_high: crate::memory::cgroup_memory_high(),
+            path: Some(dir.to_string_lossy().into_owned()),
+            current_bytes: crate::memory::cgroup_memory_current(&dir),
+            peak_bytes: crate::memory::cgroup_memory_peak(&dir),
+            memory_max: crate::memory::cgroup_memory_max(&dir),
+            memory_high: crate::memory::cgroup_memory_high(&dir),
             oom_kill: events.map(|e| e.oom_kill),
             high_events: events.map(|e| e.high),
             max_events: events.map(|e| e.max),

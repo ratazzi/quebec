@@ -5,6 +5,8 @@ whole file is platform-independent and runs on macOS. Real-kernel behaviour is
 covered by the Docker suite under ``tests/docker/cgroup``.
 """
 
+import errno
+import logging
 import os
 import signal
 import subprocess
@@ -39,6 +41,7 @@ from quebec.supervisor import (
     current_supervisor,
     exceeded_own_limit,
     oom_failure_reason,
+    oom_origin,
 )
 
 
@@ -367,10 +370,51 @@ class TestManagerFileOperations:
         assert "999" in message and "1234" in message
         assert str(os.getpid()) not in message, "our own pid is not an offender"
         assert "QUEBEC_CGROUP_ROOT" in message
+        # The way out has to be one a non-root process can actually take. It
+        # cannot migrate into a subtree it is not already in (see
+        # `test_the_two_ways_out_do_not_contradict_each_other`), so telling it
+        # to point QUEBEC_CGROUP_ROOT at an empty subtree is a dead end.
+        assert "cgroup.procs" in message, "no concrete way into a subtree of its own"
         # We still vacated our own pid before giving up.
         assert (root / "control" / "supervisor" / "cgroup.procs").read_text() == str(
             os.getpid()
         )
+
+    def test_the_two_ways_out_do_not_contradict_each_other(self, tmp_path):
+        """Following the EBUSY message has to actually get a non-root process
+        running.
+
+        `probe` refuses a root this process is not already inside, so advising
+        "point QUEBEC_CGROUP_ROOT at an empty subtree" would send a non-root
+        deployment straight into that second refusal. The advice has to be
+        "move yourself in first, then point at it" — and doing that must work.
+        """
+        root = make_root(tmp_path)
+        (root / "cgroup.procs").write_text(f"{os.getpid()}\n999\n")
+
+        with pytest.raises(CgroupError) as excinfo:
+            CgroupManager(str(root)).prepare()
+        assert "QUEBEC_CGROUP_ROOT" in str(excinfo.value)
+
+        # Do exactly what it says: a subtree of our own, with us inside it.
+        own = root / "quebec"
+        own.mkdir()
+        (own / "cgroup.controllers").write_text("memory\n")
+        (own / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        (own / "cgroup.subtree_control").write_text("")
+        mounts, self_file = make_proc_files(tmp_path, own, self_path="/root/quebec")
+
+        result = cgroup.probe(
+            env={"QUEBEC_CGROUP_ROOT": str(own)},
+            platform_name="linux",
+            proc_mounts=mounts,
+            proc_self_cgroup=self_file,
+        )
+
+        assert isinstance(result, CgroupManager), (
+            f"the documented way out was refused: {result}"
+        )
+        assert result.root == str(own)
 
     def test_prepare_skips_migration_when_not_in_root(self, tmp_path):
         root = make_root(tmp_path, in_root=False)
@@ -413,17 +457,37 @@ class TestManagerFileOperations:
         )
         assert self.slot(root, "worker-0.2").joinpath("memory.max").read_text() == "128"
 
-    def test_an_existing_empty_directory_is_never_reused(self, tmp_path):
-        """Empty is not free: its owner may simply not have destroyed it yet."""
+    def test_an_abandoned_leaf_is_reclaimed_rather_than_stepped_over(self, tmp_path):
+        """Otherwise every refork climbs one suffix and the cap is reachable.
+
+        Reclaimed, not reused: the leftover is removed and the leaf recreated,
+        so the exclusive mkdir and the zeroed counters both still hold.
+        """
         mgr, root = self.manager(tmp_path)
         self.slot(root, "worker-0").mkdir()
 
-        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.2"))
+        assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0"))
 
-    def test_claims_climb_past_every_existing_name(self, tmp_path):
+    def test_reclaiming_never_takes_a_leaf_another_owner_holds(self, tmp_path):
+        """An empty leaf is not a free one while its owner still holds the lock."""
         mgr, root = self.manager(tmp_path)
-        self.slot(root, "worker-0").mkdir()
-        self.slot(root, "worker-0.2").mkdir()
+        held = self.slot(root, "worker-0")
+        held.mkdir()
+        fd = cgroup._lock_directory(str(held), blocking=False)
+        try:
+            assert mgr.create("worker", 0, Limits()) == str(
+                self.slot(root, "worker-0.2")
+            )
+            assert held.is_dir(), "the owner's leaf must survive"
+        finally:
+            os.close(fd)
+
+    def test_claims_climb_past_every_name_that_cannot_be_reclaimed(self, tmp_path):
+        mgr, root = self.manager(tmp_path)
+        for name in ("worker-0", "worker-0.2"):
+            leaf = self.slot(root, name)
+            leaf.mkdir()
+            leaf.joinpath("cgroup.procs").write_text("4321\n")
 
         assert mgr.create("worker", 0, Limits()) == str(self.slot(root, "worker-0.3"))
 
@@ -547,6 +611,42 @@ class TestManagerFileOperations:
         assert stats.memory_peak is None
         assert stats.memory_max is None
 
+    def test_stats_reports_the_pool_budget_and_only_this_child_s_share(
+        self, tmp_path
+    ):
+        """The pool's counters run for the supervisor's whole life, so only the
+        change across this child's lifetime says anything about this child."""
+        mgr, root = self.manager(tmp_path)
+        pool = root / "workers"
+        pool.joinpath("memory.max").write_text("2147483648\n")
+        # Everything before the fork belongs to this slot's predecessors.
+        pool.joinpath("memory.events").write_text("max 3780\n")
+
+        slot = Path(mgr.create("worker", 0, Limits()))
+        pool.joinpath("memory.events").write_text("max 3786\n")
+        slot.joinpath("memory.events").write_text("oom_kill 2\nmax 0\n")
+
+        stats = mgr.stats("worker", 0)
+        assert stats.parent_memory_max == "2147483648"
+        assert stats.parent_max_events == 6
+
+    def test_a_fresh_slot_does_not_inherit_the_previous_child_s_pool_events(
+        self, tmp_path
+    ):
+        mgr, root = self.manager(tmp_path)
+        pool = root / "workers"
+        pool.joinpath("memory.events").write_text("max 10\n")
+        pool.joinpath("memory.max").write_text("2147483648\n")
+
+        mgr.create("worker", 0, Limits())
+        pool.joinpath("memory.events").write_text("max 40\n")
+        mgr.destroy("worker", 0)
+
+        # The successor was forked after all of that; none of it is its doing.
+        slot = Path(mgr.create("worker", 0, Limits()))
+        slot.joinpath("memory.events").write_text("oom_kill 1\n")
+        assert mgr.stats("worker", 0).parent_max_events == 0
+
     def test_destroy_removes_the_directory(self, tmp_path):
         mgr, root = self.manager(tmp_path)
         mgr.create("worker", 0, Limits())
@@ -556,6 +656,50 @@ class TestManagerFileOperations:
     def test_destroy_is_a_noop_when_already_gone(self, tmp_path):
         mgr, _ = self.manager(tmp_path)
         mgr.destroy("worker", 0)
+
+    def test_destroy_waits_for_the_kill_to_land(self, tmp_path, monkeypatch, caplog):
+        """`cgroup.kill` only delivers SIGKILL; the members die a moment later.
+
+        Retrying without pausing burns every attempt inside the first
+        microsecond, so the leaf survives a straggler it was meant to reclaim.
+        """
+        mgr, root = self.manager(tmp_path)
+        mgr.create("worker", 0, Limits())
+        leaf = self.slot(root, "worker-0")
+        # Present on every kernel the two-tier tree supports, so the straggler
+        # sweep writes here instead of signalling pids of its own.
+        leaf.joinpath("cgroup.kill").write_text("")
+
+        real_rmdir = os.rmdir
+        # One more than the immediate rmdir plus every retry the tight loop
+        # used to make, so only a loop that waits gets there.
+        busy_until = 6
+        attempts = []
+        slept = []
+        monkeypatch.setattr(cgroup.time, "sleep", slept.append)
+
+        def slow_to_empty(path, *args, **kwargs):
+            if os.path.basename(path) != "worker-0":
+                return real_rmdir(path, *args, **kwargs)
+            attempts.append(path)
+            if len(attempts) <= busy_until:
+                raise OSError(errno.EBUSY, "Device or resource busy", path)
+            # The stragglers have finally been reaped; the kernel drops the
+            # interface files with them.
+            leaf.joinpath("cgroup.kill").unlink(missing_ok=True)
+            return real_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rmdir", slow_to_empty)
+        with caplog.at_level(logging.WARNING, logger="quebec.cgroup"):
+            mgr.destroy("worker", 0)
+
+        assert not leaf.exists()
+        assert len(attempts) == busy_until + 1
+        assert "still busy" not in caplog.text
+        # Backing off is the point: a fixed tiny delay would still land inside
+        # the window the kill needs on a loaded host.
+        assert slept == sorted(slept) and len(set(slept)) > 1
+        assert sum(slept) > 0.02
 
     def test_control_roles_get_their_own_leaf_under_control(self, tmp_path):
         """A dispatcher limit in queue.yml has to reach a real cgroup file."""
@@ -1277,6 +1421,73 @@ class TestFailureReason:
         reason = oom_failure_reason(1, None)
         assert "killed by the OOM killer" in reason
         assert "pid=1" in reason
+
+
+class TestOomOrigin:
+    """A worker inside its own budget can still be killed — by the pool, or by
+    the host. Naming the leaf's limit in those cases accuses the wrong job and
+    points the operator at a knob that changes nothing."""
+
+    #: A bystander: peak is the bare interpreter, nowhere near its own 2GiB.
+    BYSTANDER = dict(oom_kill=2, max_events=0, memory_peak=255000576)
+
+    def test_the_pool_budget_is_named_when_the_leaf_stayed_under(self):
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="2147483648",
+            parent_max_events=6,
+        )
+        assert oom_origin(stats) == "pool"
+
+        reason = oom_failure_reason(333404, stats)
+        assert "workers pool" in reason
+        assert "memory.max=2147483648" in reason
+        assert "6 time(s) while this worker ran" in reason
+        assert "bystander" in reason
+        assert "workers_pool_memory_max" in reason
+        assert "Likely exceeded this worker" not in reason
+
+    def test_the_leaf_outranks_the_pool(self):
+        """memory.events is hierarchical: a leaf that blew its own limit bumps
+        the pool counter too, so the leaf has to be ruled out first."""
+        stats = CgroupStats(
+            oom_kill=1,
+            max_events=1,
+            memory_peak=2147483648,
+            memory_max="2147483648",
+            parent_memory_max="4294967296",
+            parent_max_events=1,
+        )
+        assert oom_origin(stats) == "self"
+        assert "workers pool" not in oom_failure_reason(1, stats)
+
+    def test_an_unhit_pool_budget_points_outside_the_tree(self):
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="4294967296",
+            parent_max_events=0,
+        )
+        assert oom_origin(stats) == "elsewhere"
+
+        reason = oom_failure_reason(1, stats)
+        assert "outside its cgroup" in reason
+        assert "host" in reason
+        assert "workers pool" not in reason
+
+    def test_an_unlimited_pool_cannot_be_the_cause(self):
+        """`max` is not a budget; it can never be hit, so it never explains."""
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="max",
+            parent_max_events=3,
+        )
+        assert oom_origin(stats) == "elsewhere"
+
+    def test_missing_stats_stay_unattributed(self):
+        assert oom_origin(None) == "elsewhere"
 
 
 class TestOomScoreAdj:
