@@ -263,12 +263,36 @@ def exceeded_own_limit(stats: Optional[CgroupStats]) -> bool:
     return stats.memory_peak is not None and stats.memory_peak >= limit
 
 
+def oom_origin(stats: Optional[CgroupStats]) -> str:
+    """Which limit the kill came from: ``self``, ``pool`` or ``elsewhere``.
+
+    Order matters. ``memory.events`` is hierarchical, so a leaf that blew its
+    own limit also bumps the pool's `max` counter — the leaf has to be ruled
+    out first. What is left is a worker that stayed inside its own budget and
+    was killed anyway: either the pool hit its ceiling while this child ran, or
+    the pressure came from outside the tree entirely, most often the host.
+    """
+    if exceeded_own_limit(stats):
+        return "self"
+    if (
+        stats is not None
+        and stats.parent_max_events > 0
+        and stats.parent_memory_max
+        and stats.parent_memory_max != UNLIMITED
+    ):
+        return "pool"
+    return "elsewhere"
+
+
 def oom_failure_reason(pid: int, stats: Optional[CgroupStats]) -> str:
     """Error text recorded on jobs whose worker was killed by an OOM killer.
 
     Written into ``failed_executions.error`` so the control plane shows the
-    memory cause directly instead of a generic crash. Deliberately reports
-    only what the counters prove; see :func:`exceeded_own_limit`.
+    memory cause directly instead of a generic crash. The counters alone are
+    not enough: a pool OOM kills whichever worker is largest at that instant,
+    so a job that allocated nothing can be failed by a neighbour's growth. It
+    has to say which, because the two call for opposite responses — shrink the
+    job, versus raise the budget and retry this job unchanged.
     """
     parts = [f"pid={pid}"]
     if stats is not None:
@@ -278,8 +302,26 @@ def oom_failure_reason(pid: int, stats: Optional[CgroupStats]) -> str:
         if stats.memory_peak is not None:
             parts.append(f"memory.peak={stats.memory_peak}")
     reason = "Worker process killed by the OOM killer (" + ", ".join(parts) + ")."
-    if exceeded_own_limit(stats):
+    pool_max = stats.parent_memory_max if stats is not None else None
+    pool_events = stats.parent_max_events if stats is not None else 0
+    origin = oom_origin(stats)
+    if origin == "self":
         reason += " Likely exceeded this worker's memory.max."
+    elif origin == "pool":
+        reason += (
+            " This worker stayed within its own memory.max: the workers pool"
+            f" (memory.max={pool_max}) hit its budget"
+            f" {pool_events} time(s) while this worker ran. A pool OOM"
+            " kills whichever worker is largest at that moment, so this job is"
+            " very likely a bystander rather than the cause — raise"
+            " workers_pool_memory_max or run fewer workers, then retry it."
+        )
+    else:
+        reason += (
+            " This worker stayed within its own memory.max and no pool budget"
+            " was hit, so the pressure came from outside its cgroup — most"
+            " often the host itself running out of memory."
+        )
     return reason
 
 
@@ -1184,12 +1226,20 @@ class Supervisor:
 
         # OOM shares this counter on purpose: a memory_max too small to even
         # boot the interpreter would otherwise fork-loop forever.
-        hint = (
-            f" Last exit was an OOM kill ({self._describe_cgroup_stats(cg_stats)});"
-            " raise memory_max for this entry, or lower threads."
-            if oom
-            else ""
-        )
+        if oom:
+            # Raising memory_max does nothing when the leaf never reached it;
+            # the budget that actually bound has to be the one named.
+            remedy = {
+                "self": "raise memory_max for this entry, or lower threads.",
+                "pool": "raise workers_pool_memory_max, or run fewer workers.",
+                "elsewhere": "give the host more memory, or run fewer workers.",
+            }[oom_origin(cg_stats)]
+            hint = (
+                " Last exit was an OOM kill"
+                f" ({self._describe_cgroup_stats(cg_stats)}); {remedy}"
+            )
+        else:
+            hint = ""
         if self._record_slot_crash(info.role, info.index, hint):
             return
 
@@ -1263,6 +1313,16 @@ class Supervisor:
         if stats.memory_peak is not None:
             parts.append(f"memory.peak={stats.memory_peak}")
         parts.append(f"oom_kill={stats.oom_kill}")
+        # Without this the numbers implicate the leaf's own limit even when a
+        # peak nowhere near it proves otherwise.
+        origin = oom_origin(stats)
+        if origin == "pool":
+            parts.append(
+                f"cause=workers pool budget {stats.parent_memory_max}"
+                f" (hit {stats.parent_max_events}x while this child ran)"
+            )
+        elif origin == "elsewhere":
+            parts.append("cause=outside this cgroup, likely host memory pressure")
         return ", ".join(parts)
 
     def _interruptible_sleep(self, seconds: float) -> None:
