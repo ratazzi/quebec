@@ -39,6 +39,7 @@ from quebec.supervisor import (
     current_supervisor,
     exceeded_own_limit,
     oom_failure_reason,
+    oom_origin,
 )
 
 
@@ -546,6 +547,42 @@ class TestManagerFileOperations:
         assert stats.oom_kill == 2
         assert stats.memory_peak is None
         assert stats.memory_max is None
+
+    def test_stats_reports_the_pool_budget_and_only_this_child_s_share(
+        self, tmp_path
+    ):
+        """The pool's counters run for the supervisor's whole life, so only the
+        change across this child's lifetime says anything about this child."""
+        mgr, root = self.manager(tmp_path)
+        pool = root / "workers"
+        pool.joinpath("memory.max").write_text("2147483648\n")
+        # Everything before the fork belongs to this slot's predecessors.
+        pool.joinpath("memory.events").write_text("max 3780\n")
+
+        slot = Path(mgr.create("worker", 0, Limits()))
+        pool.joinpath("memory.events").write_text("max 3786\n")
+        slot.joinpath("memory.events").write_text("oom_kill 2\nmax 0\n")
+
+        stats = mgr.stats("worker", 0)
+        assert stats.parent_memory_max == "2147483648"
+        assert stats.parent_max_events == 6
+
+    def test_a_fresh_slot_does_not_inherit_the_previous_child_s_pool_events(
+        self, tmp_path
+    ):
+        mgr, root = self.manager(tmp_path)
+        pool = root / "workers"
+        pool.joinpath("memory.events").write_text("max 10\n")
+        pool.joinpath("memory.max").write_text("2147483648\n")
+
+        mgr.create("worker", 0, Limits())
+        pool.joinpath("memory.events").write_text("max 40\n")
+        mgr.destroy("worker", 0)
+
+        # The successor was forked after all of that; none of it is its doing.
+        slot = Path(mgr.create("worker", 0, Limits()))
+        slot.joinpath("memory.events").write_text("oom_kill 1\n")
+        assert mgr.stats("worker", 0).parent_max_events == 0
 
     def test_destroy_removes_the_directory(self, tmp_path):
         mgr, root = self.manager(tmp_path)
@@ -1277,6 +1314,73 @@ class TestFailureReason:
         reason = oom_failure_reason(1, None)
         assert "killed by the OOM killer" in reason
         assert "pid=1" in reason
+
+
+class TestOomOrigin:
+    """A worker inside its own budget can still be killed — by the pool, or by
+    the host. Naming the leaf's limit in those cases accuses the wrong job and
+    points the operator at a knob that changes nothing."""
+
+    #: A bystander: peak is the bare interpreter, nowhere near its own 2GiB.
+    BYSTANDER = dict(oom_kill=2, max_events=0, memory_peak=255000576)
+
+    def test_the_pool_budget_is_named_when_the_leaf_stayed_under(self):
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="2147483648",
+            parent_max_events=6,
+        )
+        assert oom_origin(stats) == "pool"
+
+        reason = oom_failure_reason(333404, stats)
+        assert "workers pool" in reason
+        assert "memory.max=2147483648" in reason
+        assert "6 time(s) while this worker ran" in reason
+        assert "bystander" in reason
+        assert "workers_pool_memory_max" in reason
+        assert "Likely exceeded this worker" not in reason
+
+    def test_the_leaf_outranks_the_pool(self):
+        """memory.events is hierarchical: a leaf that blew its own limit bumps
+        the pool counter too, so the leaf has to be ruled out first."""
+        stats = CgroupStats(
+            oom_kill=1,
+            max_events=1,
+            memory_peak=2147483648,
+            memory_max="2147483648",
+            parent_memory_max="4294967296",
+            parent_max_events=1,
+        )
+        assert oom_origin(stats) == "self"
+        assert "workers pool" not in oom_failure_reason(1, stats)
+
+    def test_an_unhit_pool_budget_points_outside_the_tree(self):
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="4294967296",
+            parent_max_events=0,
+        )
+        assert oom_origin(stats) == "elsewhere"
+
+        reason = oom_failure_reason(1, stats)
+        assert "outside its cgroup" in reason
+        assert "host" in reason
+        assert "workers pool" not in reason
+
+    def test_an_unlimited_pool_cannot_be_the_cause(self):
+        """`max` is not a budget; it can never be hit, so it never explains."""
+        stats = CgroupStats(
+            **self.BYSTANDER,
+            memory_max="2147483648",
+            parent_memory_max="max",
+            parent_max_events=3,
+        )
+        assert oom_origin(stats) == "elsewhere"
+
+    def test_missing_stats_stay_unattributed(self):
+        assert oom_origin(None) == "elsewhere"
 
 
 class TestOomScoreAdj:

@@ -122,6 +122,12 @@ class CgroupStats:
     max_events: int = 0
     memory_peak: Optional[int] = None
     memory_max: Optional[str] = None
+    #: The slot parent's `memory.max` — the `workers` pool budget for a worker.
+    parent_memory_max: Optional[str] = None
+    #: How many times the parent hit that budget *while this child ran*. A
+    #: pool OOM kills whichever member is largest at that instant, so without
+    #: the delta there is no way to tell a victim from a culprit.
+    parent_max_events: int = 0
 
 
 def parse_size_bytes(value) -> Optional[int]:
@@ -400,6 +406,8 @@ class CgroupManager:
         # Not always `worker-{index}`: see _claim_path.
         self._paths: Dict[Tuple[str, int], str] = {}
         self._locks: Dict[Tuple[str, int], int] = {}
+        # (role, index) -> the slot parent's `max` event count at fork time.
+        self._parent_baselines: Dict[Tuple[str, int], int] = {}
 
     def close(self) -> None:
         """Release ownership, also used to close inherited fds after fork.
@@ -411,6 +419,7 @@ class CgroupManager:
             os.close(fd)
         self._locks.clear()
         self._paths.clear()
+        self._parent_baselines.clear()
 
     def __del__(self):
         self.close()
@@ -632,6 +641,10 @@ class CgroupManager:
         base = os.path.join(parent, f"{role}-{index}")
         path = self._claim_path(base, role, index)
         self._paths[(role, index)] = path
+        # The parent's counters are cumulative over the supervisor's whole
+        # life, so only the change across this child's lifetime says anything
+        # about the child. Taken before the fork; see :meth:`stats`.
+        self._parent_baselines[(role, index)] = self._parent_max_events(role)
         try:
             self._write_limits(path, limits)
         except OSError as exc:
@@ -702,13 +715,27 @@ class CgroupManager:
                 peak = None
 
         max_raw = _read(os.path.join(path, "memory.max"))
+        parent = self._slot_parent(role)
+        parent_max_raw = _read(os.path.join(parent, "memory.max"))
+        baseline = self._parent_baselines.get((role, index), 0)
         return CgroupStats(
             oom_kill=events.get("oom_kill", 0),
             oom_group_kill=events.get("oom_group_kill", 0),
             max_events=events.get("max", 0),
             memory_peak=peak,
             memory_max=max_raw.strip() if max_raw else None,
+            parent_memory_max=parent_max_raw.strip() if parent_max_raw else None,
+            parent_max_events=max(0, self._parent_max_events(role) - baseline),
         )
+
+    def _parent_max_events(self, role: str) -> int:
+        """The slot parent's `max` counter — how often it hit its own budget.
+
+        Hierarchical like every ``memory.events`` field, so a leaf that blew
+        its own limit also shows up here; callers must rule the leaf out first.
+        """
+        raw = _read(os.path.join(self._slot_parent(role), "memory.events"))
+        return parse_keyed_file(raw or "").get("max", 0)
 
     def destroy(self, role: str, index: int) -> None:
         """Remove a child's leaf cgroup, killing any surviving grandchildren.
@@ -722,6 +749,7 @@ class CgroupManager:
         """
         path = self._paths.pop((role, index), None)
         fd = self._locks.pop((role, index), None)
+        self._parent_baselines.pop((role, index), None)
         try:
             if path is not None:
                 with _directory_lock(self.root):
