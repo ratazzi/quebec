@@ -49,6 +49,22 @@ def test_count_streams_carry_the_number_alone(qc) -> None:
         assert payload.strip().isdigit(), f"{target} should stream a number: {payload!r}"
 
 
+def test_every_rendered_badge_is_also_refreshed(qc) -> None:
+    """A badge the stream forgets keeps its page-load value forever. Batches
+    was in exactly that state, which is also what made the old double-padding
+    visible: it was the only one the refresh never touched."""
+    _status, page = _get(qc, "/")
+    _status, stream = _get(qc, "/stats")
+
+    rendered = set(re.findall(r'<span id="([a-z-]+-count)"', page))
+    refreshed = set(
+        re.findall(r'<turbo-stream action="update" target="([a-z-]+-count)"', stream)
+    )
+
+    assert rendered, "no nav badges rendered"
+    assert rendered <= refreshed, f"never refreshed: {sorted(rendered - refreshed)}"
+
+
 def test_every_nav_badge_shares_one_style(qc) -> None:
     """A nav entry whose count is not streamed (Batches) must still look the
     same as the streamed ones."""

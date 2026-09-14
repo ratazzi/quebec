@@ -27,6 +27,15 @@
   <template>Scheduled jobs · {{ scheduled_jobs_count }}</template>
 </turbo-stream>
 
+{% if batches_available %}
+<turbo-stream action="update" target="batches-count">
+  <template>{{ batches_running_count | default(value=0) }}</template>
+</turbo-stream>
+<turbo-stream action="update" target="nav-option-batches">
+  <template>Batches · {{ batches_running_count | default(value=0) }}</template>
+</turbo-stream>
+{% endif %}
+
 {# Per-queue live counters. Anchored to id="queue-count-{slug}" and
    id="queue-status-{slug}" in queues.html. The queues page is the only one
    that renders these anchors; on other pages the targets simply don't exist
