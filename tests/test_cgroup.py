@@ -367,10 +367,51 @@ class TestManagerFileOperations:
         assert "999" in message and "1234" in message
         assert str(os.getpid()) not in message, "our own pid is not an offender"
         assert "QUEBEC_CGROUP_ROOT" in message
+        # The way out has to be one a non-root process can actually take. It
+        # cannot migrate into a subtree it is not already in (see
+        # `test_the_two_ways_out_do_not_contradict_each_other`), so telling it
+        # to point QUEBEC_CGROUP_ROOT at an empty subtree is a dead end.
+        assert "cgroup.procs" in message, "no concrete way into a subtree of its own"
         # We still vacated our own pid before giving up.
         assert (root / "control" / "supervisor" / "cgroup.procs").read_text() == str(
             os.getpid()
         )
+
+    def test_the_two_ways_out_do_not_contradict_each_other(self, tmp_path):
+        """Following the EBUSY message has to actually get a non-root process
+        running.
+
+        `probe` refuses a root this process is not already inside, so advising
+        "point QUEBEC_CGROUP_ROOT at an empty subtree" would send a non-root
+        deployment straight into that second refusal. The advice has to be
+        "move yourself in first, then point at it" — and doing that must work.
+        """
+        root = make_root(tmp_path)
+        (root / "cgroup.procs").write_text(f"{os.getpid()}\n999\n")
+
+        with pytest.raises(CgroupError) as excinfo:
+            CgroupManager(str(root)).prepare()
+        assert "QUEBEC_CGROUP_ROOT" in str(excinfo.value)
+
+        # Do exactly what it says: a subtree of our own, with us inside it.
+        own = root / "quebec"
+        own.mkdir()
+        (own / "cgroup.controllers").write_text("memory\n")
+        (own / "cgroup.procs").write_text(f"{os.getpid()}\n")
+        (own / "cgroup.subtree_control").write_text("")
+        mounts, self_file = make_proc_files(tmp_path, own, self_path="/root/quebec")
+
+        result = cgroup.probe(
+            env={"QUEBEC_CGROUP_ROOT": str(own)},
+            platform_name="linux",
+            proc_mounts=mounts,
+            proc_self_cgroup=self_file,
+        )
+
+        assert isinstance(result, CgroupManager), (
+            f"the documented way out was refused: {result}"
+        )
+        assert result.root == str(own)
 
     def test_prepare_skips_migration_when_not_in_root(self, tmp_path):
         root = make_root(tmp_path, in_root=False)
