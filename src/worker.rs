@@ -5017,6 +5017,13 @@ impl Worker {
         // now: the loop still checks the ledger once, then falls through to
         // release rather than draining.
         let drain_deadline = tokio::time::Instant::now() + drain_budget;
+        // The heartbeat lived on the main loop we just left, so without this the
+        // process row goes stale while we drain. Solid Queue keeps beating for
+        // the whole drain (`after_shutdown :stop_heartbeat`), and it has to: a
+        // drain outlasting `process_alive_threshold` gets the row pruned and the
+        // jobs still inside perform() handed to another worker, which is exactly
+        // the double execution the drain exists to prevent.
+        let mut next_heartbeat = tokio::time::Instant::now() + self.ctx.process_heartbeat_interval;
         loop {
             // pick_job has been stopped via the cancellation above, so
             // Dispatched rows never advance to InFlight. Drain only waits for
@@ -5038,6 +5045,20 @@ impl Worker {
                      leaving them claimed to avoid a double-execution race"
                 );
                 break;
+            }
+            if now >= next_heartbeat {
+                next_heartbeat = now + self.ctx.process_heartbeat_interval;
+                // Same tolerance as the main loop's heartbeat branch: a
+                // transient failure is logged and retried on the next beat
+                // rather than cutting the drain short.
+                match self.ctx.get_db().await {
+                    Ok(db) => {
+                        if let Err(e) = self.heartbeat(&db, process).await {
+                            warn!("Failed to flush heartbeat while draining: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Failed to get DB for drain heartbeat: {}", e),
+                }
             }
             // Cap the nap at the remaining budget so we never oversleep past
             // the deadline and eat into the release + on_stop time.
