@@ -5,6 +5,8 @@ whole file is platform-independent and runs on macOS. Real-kernel behaviour is
 covered by the Docker suite under ``tests/docker/cgroup``.
 """
 
+import errno
+import logging
 import os
 import signal
 import subprocess
@@ -556,6 +558,50 @@ class TestManagerFileOperations:
     def test_destroy_is_a_noop_when_already_gone(self, tmp_path):
         mgr, _ = self.manager(tmp_path)
         mgr.destroy("worker", 0)
+
+    def test_destroy_waits_for_the_kill_to_land(self, tmp_path, monkeypatch, caplog):
+        """`cgroup.kill` only delivers SIGKILL; the members die a moment later.
+
+        Retrying without pausing burns every attempt inside the first
+        microsecond, so the leaf survives a straggler it was meant to reclaim.
+        """
+        mgr, root = self.manager(tmp_path)
+        mgr.create("worker", 0, Limits())
+        leaf = self.slot(root, "worker-0")
+        # Present on every kernel the two-tier tree supports, so the straggler
+        # sweep writes here instead of signalling pids of its own.
+        leaf.joinpath("cgroup.kill").write_text("")
+
+        real_rmdir = os.rmdir
+        # One more than the immediate rmdir plus every retry the tight loop
+        # used to make, so only a loop that waits gets there.
+        busy_until = 6
+        attempts = []
+        slept = []
+        monkeypatch.setattr(cgroup.time, "sleep", slept.append)
+
+        def slow_to_empty(path, *args, **kwargs):
+            if os.path.basename(path) != "worker-0":
+                return real_rmdir(path, *args, **kwargs)
+            attempts.append(path)
+            if len(attempts) <= busy_until:
+                raise OSError(errno.EBUSY, "Device or resource busy", path)
+            # The stragglers have finally been reaped; the kernel drops the
+            # interface files with them.
+            leaf.joinpath("cgroup.kill").unlink(missing_ok=True)
+            return real_rmdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "rmdir", slow_to_empty)
+        with caplog.at_level(logging.WARNING, logger="quebec.cgroup"):
+            mgr.destroy("worker", 0)
+
+        assert not leaf.exists()
+        assert len(attempts) == busy_until + 1
+        assert "still busy" not in caplog.text
+        # Backing off is the point: a fixed tiny delay would still land inside
+        # the window the kill needs on a loaded host.
+        assert slept == sorted(slept) and len(set(slept)) > 1
+        assert sum(slept) > 0.02
 
     def test_control_roles_get_their_own_leaf_under_control(self, tmp_path):
         """A dispatcher limit in queue.yml has to reach a real cgroup file."""
