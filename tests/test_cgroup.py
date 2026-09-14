@@ -594,6 +594,7 @@ class TestManagerFileOperations:
             max_events=5,
             memory_peak=537067520,
             memory_max="536870912",
+            parent_memory_max="max",
         )
 
     def test_stats_returns_none_when_never_created(self, tmp_path):
@@ -620,10 +621,10 @@ class TestManagerFileOperations:
         pool = root / "workers"
         pool.joinpath("memory.max").write_text("2147483648\n")
         # Everything before the fork belongs to this slot's predecessors.
-        pool.joinpath("memory.events").write_text("max 3780\n")
+        pool.joinpath("memory.events.local").write_text("max 3780\n")
 
         slot = Path(mgr.create("worker", 0, Limits()))
-        pool.joinpath("memory.events").write_text("max 3786\n")
+        pool.joinpath("memory.events.local").write_text("max 3786\n")
         slot.joinpath("memory.events").write_text("oom_kill 2\nmax 0\n")
 
         stats = mgr.stats("worker", 0)
@@ -635,17 +636,39 @@ class TestManagerFileOperations:
     ):
         mgr, root = self.manager(tmp_path)
         pool = root / "workers"
-        pool.joinpath("memory.events").write_text("max 10\n")
+        pool.joinpath("memory.events.local").write_text("max 10\n")
         pool.joinpath("memory.max").write_text("2147483648\n")
 
         mgr.create("worker", 0, Limits())
-        pool.joinpath("memory.events").write_text("max 40\n")
+        pool.joinpath("memory.events.local").write_text("max 40\n")
         mgr.destroy("worker", 0)
 
         # The successor was forked after all of that; none of it is its doing.
         slot = Path(mgr.create("worker", 0, Limits()))
         slot.joinpath("memory.events").write_text("oom_kill 1\n")
         assert mgr.stats("worker", 0).parent_max_events == 0
+
+    @pytest.mark.parametrize("local_events", ["max 0\n", None])
+    def test_sibling_limit_events_do_not_blame_the_pool(self, tmp_path, local_events):
+        mgr, root = self.manager(tmp_path)
+        pool = root / "workers"
+        pool.joinpath("memory.max").write_text(str(7 * 1024**3))
+        pool.joinpath("memory.events").write_text("max 0\n")
+        if local_events is not None:
+            pool.joinpath("memory.events.local").write_text(local_events)
+        sibling = Path(mgr.create("worker", 0, Limits(memory_max=2 * 1024**3)))
+        victim = Path(mgr.create("worker", 1, Limits(memory_max=2 * 1024**3)))
+
+        # A sibling hits its own ceiling, then a host OOM kills this worker.
+        sibling.joinpath("memory.events").write_text("max 1\noom_kill 1\n")
+        pool.joinpath("memory.events").write_text("max 1\noom_kill 2\n")
+        victim.joinpath("memory.events").write_text("max 0\noom_kill 1\n")
+        victim.joinpath("memory.peak").write_text(str(512 * 1024**2))
+
+        stats = mgr.stats("worker", 1)
+        assert stats.parent_max_events == 0
+        assert oom_origin(stats) == "elsewhere"
+        assert "workers pool" not in oom_failure_reason(4242, stats)
 
     def test_destroy_removes_the_directory(self, tmp_path):
         mgr, root = self.manager(tmp_path)
@@ -743,6 +766,17 @@ class TestManagerFileOperations:
         workers = root / "workers"
         assert workers.joinpath("memory.max").read_text() == str(7 * 1024**3)
         assert workers.joinpath("memory.oom.group").read_text() == "0"
+
+    def test_prepare_clears_a_removed_pool_budget(self, tmp_path):
+        root = make_root(tmp_path)
+        previous = CgroupManager(str(root), workers_pool_limits=Limits(memory_max=1024))
+        previous.prepare()
+        previous.close()
+
+        restarted = CgroupManager(str(root))
+        restarted.prepare()
+
+        assert (root / "workers" / "memory.max").read_text() == "max"
 
 
 class TestScavenge:
@@ -1449,8 +1483,8 @@ class TestOomOrigin:
         assert "Likely exceeded this worker" not in reason
 
     def test_the_leaf_outranks_the_pool(self):
-        """memory.events is hierarchical: a leaf that blew its own limit bumps
-        the pool counter too, so the leaf has to be ruled out first."""
+        """Both budgets may have been hit during the child's lifetime; direct
+        evidence of its own limit takes precedence over pool pressure."""
         stats = CgroupStats(
             oom_kill=1,
             max_events=1,
@@ -1670,6 +1704,34 @@ class TestOomScoreAdj:
 class TestRuntimeAdjust:
     """Adjusting a slot's limits is immediate on a live child and sticky."""
 
+    @pytest.mark.parametrize("overrides", [
+        {"memory_max": "128MiB"},
+        {"memory_high": "64MiB"},
+        {"memory_swap_max": 0},
+        {"memory_oom_group": True},
+    ])
+    def test_unavailable_backend_rejects_runtime_limits_without_recording(self, overrides):
+        sup = Supervisor(
+            FakeQuebec(), {ROLE_WORKER: 1}, cgroup=DisabledCgroup("read-only"), limits={}
+        )
+        before = dict(sup._slot_limits)
+
+        with pytest.raises(RuntimeError, match="cannot enforce.*read-only"):
+            sup.adjust_slot_limit(ROLE_WORKER, 0, **overrides)
+
+        assert sup._slot_limits == before
+        assert sup._pending_adjusts == {}
+
+    def test_prepare_degradation_rejects_later_runtime_limits(self):
+        cg = MagicMock(enabled=True)
+        cg.prepare.side_effect = CgroupError("delegation lost")
+        sup = Supervisor(FakeQuebec(), {ROLE_WORKER: 1}, cgroup=cg, limits={})
+        sup._setup_cgroup_root()
+
+        with pytest.raises(RuntimeError, match="cannot enforce.*delegation lost"):
+            sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max="128MiB")
+        assert sup._pending_adjusts == {}
+
     def test_adjust_rewrites_limits_on_a_live_leaf(self, tmp_path):
         root = make_root(tmp_path)
         mgr = CgroupManager(str(root))
@@ -1721,7 +1783,7 @@ class TestRuntimeAdjust:
         assert sup._pending_adjusts == {}
 
     def test_supervisor_adjust_parses_sizes_and_keeps_explicit_max(self):
-        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        sup, _qc = make_supervisor(EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1})
 
         new = sup.adjust_slot_limit(
             ROLE_WORKER, 0, memory_max="512MiB", memory_swap_max="max"
@@ -1732,7 +1794,7 @@ class TestRuntimeAdjust:
         assert new.memory_oom_group is True  # companion default
 
     def test_supervisor_adjust_clear_keeps_the_other_fields(self):
-        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        sup, _qc = make_supervisor(EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1})
         sup._slot_limits[(ROLE_WORKER, 0)] = Limits(
             memory_max=1024, memory_swap_max=0, memory_oom_group=True
         )
@@ -1744,7 +1806,7 @@ class TestRuntimeAdjust:
         assert new.memory_oom_group is True
 
     def test_supervisor_adjust_clear_oom_group_resets_to_default(self):
-        sup, _qc = make_supervisor(DisabledCgroup("t"), plan={ROLE_WORKER: 1})
+        sup, _qc = make_supervisor(EnabledNoopCgroup("t"), plan={ROLE_WORKER: 1})
         sup._slot_limits[(ROLE_WORKER, 0)] = Limits(
             memory_max=1024, memory_oom_group=True
         )
@@ -1840,4 +1902,3 @@ def test_supervisor_applies_the_pool_budget_to_the_cgroup():
     assert sup._workers_pool_limits.memory_max == 7 * 1024**3
     assert sup._workers_pool_limits.memory_oom_group is False
     assert sup._cgroup.workers_pool_limits is sup._workers_pool_limits
-

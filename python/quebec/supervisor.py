@@ -266,11 +266,10 @@ def exceeded_own_limit(stats: Optional[CgroupStats]) -> bool:
 def oom_origin(stats: Optional[CgroupStats]) -> str:
     """Which limit the kill came from: ``self``, ``pool`` or ``elsewhere``.
 
-    Order matters. ``memory.events`` is hierarchical, so a leaf that blew its
-    own limit also bumps the pool's `max` counter — the leaf has to be ruled
-    out first. What is left is a worker that stayed inside its own budget and
-    was killed anyway: either the pool hit its ceiling while this child ran, or
-    the pressure came from outside the tree entirely, most often the host.
+    Prefer evidence of the leaf hitting its own limit. Otherwise use the
+    parent's local events, which exclude siblings hitting their leaf limits.
+    Without either, the pressure came from outside the tree or its origin
+    could not be established from the available counters.
     """
     if exceeded_own_limit(stats):
         return "self"
@@ -563,7 +562,8 @@ class Supervisor:
         clear) and ``memory_oom_group`` (bool or ``None``). Omitted keys keep
         their current value. A numeric ``memory_max`` pulls in the usual
         companion defaults — swap capped at 0, ``oom.group`` on — unless those
-        keys are given explicitly.
+        keys are given explicitly. Raises RuntimeError if a requested limit
+        cannot be enforced because the cgroup backend is unavailable.
         """
         if role not in VALID_ROLES:
             raise ValueError(
@@ -618,6 +618,11 @@ class Supervisor:
             memory_oom_group=memory_oom_group,
             derived=False,
         )
+        if new.must_enforce() and not self._cgroup.enabled:
+            raise RuntimeError(
+                f"cannot enforce runtime limits for {role}[{index}]: "
+                f"{getattr(self._cgroup, 'reason', 'cgroup unavailable')}"
+            )
         # Intent is recorded up front; the live write is deferred to the loop.
         self._slot_limits[(role, index)] = new
         self._pending_adjusts[(role, index)] = new
