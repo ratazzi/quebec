@@ -51,7 +51,7 @@ pub struct CgroupCpuStat {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{CgroupCpuStat, CgroupMemoryEvents};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
     const PROC_MOUNTS: &str = "/proc/mounts";
@@ -91,8 +91,8 @@ mod imp {
         })
     }
 
-    fn read_file(name: &str) -> Option<String> {
-        std::fs::read_to_string(cgroup_v2_self_path()?.join(name)).ok()
+    fn read_file(dir: &Path, name: &str) -> Option<String> {
+        std::fs::read_to_string(dir.join(name)).ok()
     }
 
     /// Parse a single-value file holding a byte count. `max` (the kernel's
@@ -116,26 +116,26 @@ mod imp {
         })
     }
 
-    pub fn cgroup_memory_current() -> Option<u64> {
-        parse_limit(&read_file("memory.current")?)
+    pub fn cgroup_memory_current(dir: &Path) -> Option<u64> {
+        parse_limit(&read_file(dir, "memory.current")?)
     }
 
     /// Historical peak. Only exists on newer kernels (memory.peak landed well
     /// after the rest of the memory interface), so absence is normal.
-    pub fn cgroup_memory_peak() -> Option<u64> {
-        parse_limit(&read_file("memory.peak")?)
+    pub fn cgroup_memory_peak(dir: &Path) -> Option<u64> {
+        parse_limit(&read_file(dir, "memory.peak")?)
     }
 
-    pub fn cgroup_memory_max() -> Option<u64> {
-        parse_limit(&read_file("memory.max")?)
+    pub fn cgroup_memory_max(dir: &Path) -> Option<u64> {
+        parse_limit(&read_file(dir, "memory.max")?)
     }
 
-    pub fn cgroup_memory_high() -> Option<u64> {
-        parse_limit(&read_file("memory.high")?)
+    pub fn cgroup_memory_high(dir: &Path) -> Option<u64> {
+        parse_limit(&read_file(dir, "memory.high")?)
     }
 
-    pub fn cgroup_memory_events() -> Option<CgroupMemoryEvents> {
-        let content = read_file("memory.events")?;
+    pub fn cgroup_memory_events(dir: &Path) -> Option<CgroupMemoryEvents> {
+        let content = read_file(dir, "memory.events")?;
         Some(CgroupMemoryEvents {
             oom_kill: parse_keyed(&content, "oom_kill").unwrap_or(0),
             high: parse_keyed(&content, "high").unwrap_or(0),
@@ -143,8 +143,8 @@ mod imp {
         })
     }
 
-    pub fn cgroup_cpu_stat() -> Option<CgroupCpuStat> {
-        let content = read_file("cpu.stat")?;
+    pub fn cgroup_cpu_stat(dir: &Path) -> Option<CgroupCpuStat> {
+        let content = read_file(dir, "cpu.stat")?;
         Some(CgroupCpuStat {
             usage_usec: parse_keyed(&content, "usage_usec").unwrap_or(0),
             // Absent unless the cpu controller is enabled for this cgroup.
@@ -156,27 +156,27 @@ mod imp {
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use super::{CgroupCpuStat, CgroupMemoryEvents};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     pub fn cgroup_v2_self_path() -> Option<PathBuf> {
         None
     }
-    pub fn cgroup_memory_current() -> Option<u64> {
+    pub fn cgroup_memory_current(_dir: &Path) -> Option<u64> {
         None
     }
-    pub fn cgroup_memory_peak() -> Option<u64> {
+    pub fn cgroup_memory_peak(_dir: &Path) -> Option<u64> {
         None
     }
-    pub fn cgroup_memory_max() -> Option<u64> {
+    pub fn cgroup_memory_max(_dir: &Path) -> Option<u64> {
         None
     }
-    pub fn cgroup_memory_high() -> Option<u64> {
+    pub fn cgroup_memory_high(_dir: &Path) -> Option<u64> {
         None
     }
-    pub fn cgroup_memory_events() -> Option<CgroupMemoryEvents> {
+    pub fn cgroup_memory_events(_dir: &Path) -> Option<CgroupMemoryEvents> {
         None
     }
-    pub fn cgroup_cpu_stat() -> Option<CgroupCpuStat> {
+    pub fn cgroup_cpu_stat(_dir: &Path) -> Option<CgroupCpuStat> {
         None
     }
 }
