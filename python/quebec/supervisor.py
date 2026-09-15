@@ -216,7 +216,7 @@ def _coerce_adjust_memory(value) -> Optional[Union[int, str]]:
 def _coerce_adjust_oom_group(value) -> Optional[bool]:
     """Normalise ``memory_oom_group``: ``None`` clears it to the kernel default."""
     if value is None:
-        return False
+        return None
     if not isinstance(value, bool):
         raise ValueError(f"memory_oom_group must be a bool or None, got {value!r}")
     return value
@@ -602,13 +602,22 @@ class Supervisor:
             if "memory_oom_group" in provided
             else current.memory_oom_group
         )
+        reset_oom_group = (
+            memory_oom_group is None
+            if "memory_oom_group" in provided
+            else current.reset_oom_group
+        )
 
         # Companion defaults, mirroring limits_from_config: only a real byte
         # count implies them, and only when the caller did not override them.
         if isinstance(memory_max, int):
             if "memory_swap_max" not in provided and memory_swap_max is None:
                 memory_swap_max = 0
-            if "memory_oom_group" not in provided and memory_oom_group is None:
+            if (
+                "memory_oom_group" not in provided
+                and memory_oom_group is None
+                and not reset_oom_group
+            ):
                 memory_oom_group = True
 
         new = Limits(
@@ -617,6 +626,7 @@ class Supervisor:
             memory_swap_max=memory_swap_max,
             memory_oom_group=memory_oom_group,
             derived=False,
+            reset_oom_group=reset_oom_group,
         )
         if new.must_enforce() and not self._cgroup.enabled:
             raise RuntimeError(

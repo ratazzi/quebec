@@ -101,6 +101,8 @@ class Limits:
     memory_oom_group: Optional[bool] = None
     #: True when `memory_max` was derived from `memory_recycle_at`.
     derived: bool = False
+    #: A runtime clear must write zero without becoming an explicit limit.
+    reset_oom_group: bool = False
 
     def must_enforce(self) -> bool:
         """Whether these limits actually change kernel behaviour.
@@ -633,7 +635,7 @@ class CgroupManager:
             _write(os.path.join(path, "memory.high"), str(limits.memory_high))
         if limits.memory_max is not None:
             _write(os.path.join(path, "memory.max"), str(limits.memory_max))
-        if limits.memory_oom_group is not None:
+        if limits.memory_oom_group is not None or limits.reset_oom_group:
             _write(
                 os.path.join(path, "memory.oom.group"),
                 "1" if limits.memory_oom_group else "0",

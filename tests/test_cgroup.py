@@ -1813,7 +1813,7 @@ class TestRuntimeAdjust:
 
         new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
 
-        assert new.memory_oom_group is False
+        assert new.memory_oom_group is None
 
     def test_concurrent_adjusts_do_not_lose_a_field(self, monkeypatch):
         """Two threads tuning different fields both read the pre-change value
@@ -1902,3 +1902,23 @@ def test_supervisor_applies_the_pool_budget_to_the_cgroup():
     assert sup._workers_pool_limits.memory_max == 7 * 1024**3
     assert sup._workers_pool_limits.memory_oom_group is False
     assert sup._cgroup.workers_pool_limits is sup._workers_pool_limits
+
+
+class TestCgroupReviewRegressions:
+    def test_clear_oom_group_on_disabled_backend(self):
+        sup, _ = make_supervisor(DisabledCgroup("unavailable"), limits={})
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
+        assert new.memory_oom_group is None
+        assert not new.must_enforce()
+
+    def test_clear_oom_group_writes_zero_and_stays_cleared(self, tmp_path):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        sup, _ = make_supervisor(mgr, limits={})
+        original = Limits(memory_oom_group=True)
+        sup._slot_limits[(ROLE_WORKER, 0)] = original
+        path = Path(mgr.create(ROLE_WORKER, 0, original))
+        sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_high="max")
+        sup._apply_pending_adjusts()
+        assert (path / "memory.oom.group").read_text() == "0"
+        assert not new.must_enforce()
