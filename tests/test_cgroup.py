@@ -924,6 +924,13 @@ class TestDisabledCgroup:
 
 
 class TestExitClassification:
+    @pytest.mark.parametrize("code", [0, 1])
+    def test_prior_descendant_oom_does_not_classify_worker_exit(self, code):
+        assert classify_exit(self.exited(code), CgroupStats(oom_kill=1), False) == "crashed"
+
+    def test_prior_descendant_oom_does_not_classify_sigterm(self):
+        assert classify_exit(self.signaled(signal.SIGTERM), CgroupStats(oom_kill=1), False) == "signaled"
+
     def exited(self, code):
         return _ExitStatus(exited=True, exit_code=code, signaled=False, signal=None)
 

@@ -230,13 +230,18 @@ def classify_exit(
 ) -> str:
     """Label a reaped child's exit.
 
-    The cgroup's own ``oom_kill`` counter outranks any guess made from the
-    signal: SIGKILL alone cannot distinguish a kernel OOM from our own
-    shutdown escalation or an operator's ``kill -9``.
+    An OOM victim must have died from SIGKILL. The leaf's cumulative counter
+    can also describe a descendant killed earlier while the worker survived.
+    SIGKILL alone cannot distinguish OOM from shutdown escalation or kill -9.
     """
     if status.exited and status.exit_code == RECYCLE_EXIT_CODE:
         return "planned_recycle"
-    if stats is not None and stats.oom_kill > 0:
+    if (
+        status.signaled
+        and status.signal == signal.SIGKILL
+        and stats is not None
+        and stats.oom_kill > 0
+    ):
         return "oom"
     if status.signaled and status.signal == signal.SIGKILL and we_sent_sigkill:
         return "killed_by_supervisor"
