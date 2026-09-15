@@ -324,9 +324,9 @@ def _write(path: str, value: str) -> None:
     """Write one cgroup control file.
 
     cgroupfs wants the whole value in a single unbuffered write, so this uses
-    a raw fd rather than a buffered file object. ``O_CREAT`` never fires on a
-    real hierarchy (the kernel materialises every interface file on mkdir) but
-    lets the unit tests drive a plain directory tree; ``O_TRUNC`` keeps a
+    a raw fd rather than a buffered file object. ``O_CREAT`` lets unit tests
+    drive a plain directory tree; on cgroupfs the kernel supplies supported
+    interfaces and rejects creation of unsupported ones. ``O_TRUNC`` keeps a
     shorter value (e.g. clearing a limit to ``max``) from leaving stale bytes
     behind in that regular-file tree. On cgroupfs both flags are harmless.
     """
@@ -639,7 +639,12 @@ class CgroupManager:
         # Swap first: capping swap after memory.max would leave a window where
         # the child can escape the limit by swapping out.
         if limits.memory_swap_max is not None:
-            _write(os.path.join(path, "memory.swap.max"), str(limits.memory_swap_max))
+            swap_path = os.path.join(path, "memory.swap.max")
+            # Missing kernfs interfaces opened with O_CREAT can fail with
+            # EACCES, so detect absence before writing an optional companion.
+            # Existing interfaces and explicit limits still require a write.
+            if not limits.swap_defaulted or os.path.exists(swap_path):
+                _write(swap_path, str(limits.memory_swap_max))
         if limits.memory_high is not None:
             _write(os.path.join(path, "memory.high"), str(limits.memory_high))
         if limits.memory_max is not None:

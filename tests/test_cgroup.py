@@ -1928,6 +1928,74 @@ class TestCgroupReviewRegressions:
         with pytest.raises(CgroupError):
             sup._place_in_cgroup(123, ROLE_WORKER, 0, sup._slot_limits[(ROLE_WORKER, 0)])
 
+    def test_runtime_default_swap_is_optional_but_explicit_zero_is_required(self, tmp_path, monkeypatch):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        sup, _ = make_supervisor(mgr, limits={})
+        path = Path(mgr.create(ROLE_WORKER, 0, EMPTY_LIMITS))
+        write = cgroup._write
+
+        def kernel_write(path, value):
+            if Path(path).name == "memory.swap.max":
+                raise PermissionError(errno.EACCES, "kernfs has no create operation", path)
+            write(path, value)
+
+        monkeypatch.setattr(cgroup, "_write", kernel_write)
+        sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max=1024)
+        sup._apply_pending_adjusts()
+        assert (path / "memory.max").read_text() == "1024"
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_swap_max=0)
+        with pytest.raises(CgroupError):
+            mgr.adjust(ROLE_WORKER, 0, new)
+
+    @pytest.mark.parametrize("explicit", [False, True])
+    @pytest.mark.parametrize("swap_access", ["missing", "writable", "read_only"])
+    @pytest.mark.parametrize("operation", ["create", "adjust"])
+    def test_swap_interface_access(self, tmp_path, monkeypatch, explicit, swap_access, operation):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        claim_path = mgr._claim_path
+        open_file = os.open
+        swap_writes = []
+
+        def claim_with_interfaces(*args):
+            path = claim_path(*args)
+            if swap_access != "missing":
+                Path(path, "memory.swap.max").write_text("max")
+            return path
+
+        def kernel_open(path, flags, *args, **kwargs):
+            if Path(path).name == "memory.swap.max":
+                swap_writes.append(path)
+                # O_CREAT cannot create a missing kernfs interface: the VFS
+                # returns EACCES, just as for an existing unwritable file.
+                if swap_access != "writable":
+                    raise PermissionError(errno.EACCES, "permission denied", path)
+            return open_file(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mgr, "_claim_path", claim_with_interfaces)
+        monkeypatch.setattr(os, "open", kernel_open)
+        entry = {"memory_max": 1024}
+        if explicit:
+            entry["memory_swap_max"] = 0
+        limits = cgroup.limits_from_config(entry, derive=True)
+        if operation == "adjust":
+            mgr.create(ROLE_WORKER, 0, EMPTY_LIMITS)
+
+        def apply():
+            getattr(mgr, operation)(ROLE_WORKER, 0, limits)
+
+        if swap_access == "read_only" or (explicit and swap_access == "missing"):
+            with pytest.raises(CgroupError):
+                apply()
+        else:
+            apply()
+            path = Path(mgr.path_for(ROLE_WORKER, 0))
+            if swap_access == "missing":
+                assert not (path / "memory.swap.max").exists()
+                assert swap_writes == [], "an absent default must never be opened"
+            else:
+                assert (path / "memory.swap.max").read_text() == "0"
+            assert (path / "memory.max").read_text() == "1024"
+
     @pytest.mark.parametrize("extra", [{}, {"memory_high": 128}, {"memory_swap_max": 0}, {"memory_oom_group": False}])
     @pytest.mark.parametrize("stage", ["probe", "prepare", "create", "place"])
     def test_derived_failure_policy(self, extra, stage):

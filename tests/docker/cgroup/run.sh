@@ -36,7 +36,7 @@ DOCKER_BUILDKIT=1 docker build --progress=plain \
 # One container per scenario, deliberately: the supervisor must be the only
 # process in the container cgroup, otherwise cgroup v2 refuses to enable
 # controllers there. A shared driver process would sit in that same cgroup.
-for scenario in oom no_limits cleanup derive observe rolling_restart placement_failure; do
+for scenario in oom no_limits cleanup derive swap_interface observe rolling_restart placement_failure; do
     note "scenario: $scenario (--cgroupns=private --privileged)"
     if docker run --rm --cgroupns=private --privileged "$IMAGE" run "$scenario"; then
         pass "scenario $scenario"
