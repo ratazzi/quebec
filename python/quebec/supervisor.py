@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 from .cgroup import (
+    DERIVE_FACTOR,
     EMPTY_LIMITS,
     UNLIMITED,
     CgroupError,
@@ -216,7 +217,7 @@ def _coerce_adjust_memory(value) -> Optional[Union[int, str]]:
 def _coerce_adjust_oom_group(value) -> Optional[bool]:
     """Normalise ``memory_oom_group``: ``None`` clears it to the kernel default."""
     if value is None:
-        return False
+        return None
     if not isinstance(value, bool):
         raise ValueError(f"memory_oom_group must be a bool or None, got {value!r}")
     return value
@@ -229,13 +230,18 @@ def classify_exit(
 ) -> str:
     """Label a reaped child's exit.
 
-    The cgroup's own ``oom_kill`` counter outranks any guess made from the
-    signal: SIGKILL alone cannot distinguish a kernel OOM from our own
-    shutdown escalation or an operator's ``kill -9``.
+    An OOM victim must have died from SIGKILL. The leaf's cumulative counter
+    can also describe a descendant killed earlier while the worker survived.
+    SIGKILL alone cannot distinguish OOM from shutdown escalation or kill -9.
     """
     if status.exited and status.exit_code == RECYCLE_EXIT_CODE:
         return "planned_recycle"
-    if stats is not None and stats.oom_kill > 0:
+    if (
+        status.signaled
+        and status.signal == signal.SIGKILL
+        and stats is not None
+        and stats.oom_kill > 0
+    ):
         return "oom"
     if status.signaled and status.signal == signal.SIGKILL and we_sent_sigkill:
         return "killed_by_supervisor"
@@ -602,21 +608,39 @@ class Supervisor:
             if "memory_oom_group" in provided
             else current.memory_oom_group
         )
+        swap_defaulted = current.swap_defaulted and "memory_swap_max" not in provided
+        oom_group_defaulted = (
+            current.oom_group_defaulted and "memory_oom_group" not in provided
+        )
+        reset_oom_group = (
+            memory_oom_group is None
+            if "memory_oom_group" in provided
+            else current.reset_oom_group
+        )
 
         # Companion defaults, mirroring limits_from_config: only a real byte
         # count implies them, and only when the caller did not override them.
         if isinstance(memory_max, int):
             if "memory_swap_max" not in provided and memory_swap_max is None:
                 memory_swap_max = 0
-            if "memory_oom_group" not in provided and memory_oom_group is None:
+                swap_defaulted = True
+            if (
+                "memory_oom_group" not in provided
+                and memory_oom_group is None
+                and not reset_oom_group
+            ):
                 memory_oom_group = True
+                oom_group_defaulted = True
 
         new = Limits(
             memory_max=memory_max,
             memory_high=memory_high,
             memory_swap_max=memory_swap_max,
             memory_oom_group=memory_oom_group,
-            derived=False,
+            derived=current.derived and "memory_max" not in provided,
+            swap_defaulted=swap_defaulted,
+            oom_group_defaulted=oom_group_defaulted,
+            reset_oom_group=reset_oom_group,
         )
         if new.must_enforce() and not self._cgroup.enabled:
             raise RuntimeError(
@@ -742,7 +766,7 @@ class Supervisor:
                         index,
                         (entry.get("worker_max_rss_bytes") or 0) // (1024 * 1024),
                         (limits.memory_max or 0) // (1024 * 1024),
-                        1.5,
+                        DERIVE_FACTOR,
                     )
                 resolved[(role, index)] = limits
         return resolved
@@ -906,9 +930,29 @@ class Supervisor:
         # into its cgroup. Without it, everything the child allocates between
         # fork() and the migration is charged to the supervisor's cgroup and
         # stays there (v2 does not move existing charges).
-        barrier_r, barrier_w = os.pipe()
-
-        pid = os.fork()
+        barrier_r = barrier_w = None
+        try:
+            barrier_r, barrier_w = os.pipe()
+            pid = os.fork()
+        except OSError as exc:
+            for fd in (barrier_r, barrier_w):
+                if fd is not None:
+                    os.close(fd)
+            if placed_in_cgroup:
+                self._cgroup.destroy(role, index)
+            if self._starting:
+                raise
+            logger.error(
+                "Cannot fork %s[%d]: %s; leaving the slot down for now",
+                role,
+                index,
+                exc,
+            )
+            if not self._record_slot_crash(role, index):
+                self._pending_forks.add((role, index))
+            else:
+                self._pending_forks.discard((role, index))
+            return
         if pid == 0:
             # --- child ---
             global _active_supervisor

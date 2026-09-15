@@ -2274,9 +2274,9 @@ impl PyQuebec {
     ///
     /// Shape: `{"worker": [{...}, ...], "dispatcher": [{...}, ...],
     /// "default_worker_max_rss_bytes": int | None}`. Each slot dict carries
-    /// already-parsed byte counts; `None` means "not configured" (an explicit
-    /// `max` and an unparseable value both collapse to `None`, the latter
-    /// after a warning). Deriving `memory_max` from the recycle threshold
+    /// already-parsed byte counts; `None` means "not configured". An explicit
+    /// `max` stays the string `"max"`; an unparseable value becomes `None`
+    /// after a warning. Deriving `memory_max` from the recycle threshold
     /// happens on the Python side, because it must only run once the cgroup
     /// probe has succeeded.
     fn supervisor_resource_limits_from_config(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {

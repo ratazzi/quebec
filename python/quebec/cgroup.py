@@ -101,20 +101,26 @@ class Limits:
     memory_oom_group: Optional[bool] = None
     #: True when `memory_max` was derived from `memory_recycle_at`.
     derived: bool = False
+    #: Companion defaults are not explicit requests from the user.
+    swap_defaulted: bool = False
+    oom_group_defaulted: bool = False
+    #: A runtime clear must write zero without becoming an explicit limit.
+    reset_oom_group: bool = False
 
     def must_enforce(self) -> bool:
-        """Whether these limits actually change kernel behaviour.
+        """Whether explicitly requested limits change kernel behaviour.
 
         The single judgement behind every "is this failure fatal?" decision.
         An explicit `max` asks the kernel for nothing, so failing to apply it
         is not worth aborting over; a numeric limit, or an explicit
         `memory_oom_group`, does change what happens and must be enforced.
+        A derived ceiling and its companion defaults remain best-effort.
         """
         return (
-            is_limit_value(self.memory_max)
+            (is_limit_value(self.memory_max) and not self.derived)
             or is_limit_value(self.memory_high)
-            or is_limit_value(self.memory_swap_max)
-            or self.memory_oom_group is not None
+            or (is_limit_value(self.memory_swap_max) and not self.swap_defaulted)
+            or (self.memory_oom_group is not None and not self.oom_group_defaulted)
         )
 
 
@@ -192,9 +198,8 @@ def resolve_memory_max(
 
     An explicit value always wins. Otherwise the soft RSS recycle line is
     scaled up to a hard limit, rounded up to whole MiB. Callers must only
-    invoke this once the cgroup probe has succeeded — a derived limit that
-    cannot be applied is a startup error, and a machine without cgroups must
-    keep booting.
+    invoke this once the cgroup probe has succeeded. Derived limits are
+    best-effort: a machine where cgroups cannot be used must keep booting.
     """
     # An explicit `max` is a decision too: never derive over the top of it.
     if explicit is not None:
@@ -246,6 +251,12 @@ def limits_from_config(entry: Optional[Dict], *, derive: bool) -> Limits:
         memory_swap_max=swap_max,
         memory_oom_group=oom_group,
         derived=derived,
+        swap_defaulted=(
+            is_limit_value(memory_max) and entry.get("memory_swap_max") is None
+        ),
+        oom_group_defaulted=(
+            is_limit_value(memory_max) and entry.get("memory_oom_group") is None
+        ),
     )
 
 
@@ -313,9 +324,9 @@ def _write(path: str, value: str) -> None:
     """Write one cgroup control file.
 
     cgroupfs wants the whole value in a single unbuffered write, so this uses
-    a raw fd rather than a buffered file object. ``O_CREAT`` never fires on a
-    real hierarchy (the kernel materialises every interface file on mkdir) but
-    lets the unit tests drive a plain directory tree; ``O_TRUNC`` keeps a
+    a raw fd rather than a buffered file object. ``O_CREAT`` lets unit tests
+    drive a plain directory tree; on cgroupfs the kernel supplies supported
+    interfaces and rejects creation of unsupported ones. ``O_TRUNC`` keeps a
     shorter value (e.g. clearing a limit to ``max``) from leaving stale bytes
     behind in that regular-file tree. On cgroupfs both flags are harmless.
     """
@@ -628,12 +639,17 @@ class CgroupManager:
         # Swap first: capping swap after memory.max would leave a window where
         # the child can escape the limit by swapping out.
         if limits.memory_swap_max is not None:
-            _write(os.path.join(path, "memory.swap.max"), str(limits.memory_swap_max))
+            swap_path = os.path.join(path, "memory.swap.max")
+            # Missing kernfs interfaces opened with O_CREAT can fail with
+            # EACCES, so detect absence before writing an optional companion.
+            # Existing interfaces and explicit limits still require a write.
+            if not limits.swap_defaulted or os.path.exists(swap_path):
+                _write(swap_path, str(limits.memory_swap_max))
         if limits.memory_high is not None:
             _write(os.path.join(path, "memory.high"), str(limits.memory_high))
         if limits.memory_max is not None:
             _write(os.path.join(path, "memory.max"), str(limits.memory_max))
-        if limits.memory_oom_group is not None:
+        if limits.memory_oom_group is not None or limits.reset_oom_group:
             _write(
                 os.path.join(path, "memory.oom.group"),
                 "1" if limits.memory_oom_group else "0",

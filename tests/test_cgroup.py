@@ -924,6 +924,13 @@ class TestDisabledCgroup:
 
 
 class TestExitClassification:
+    @pytest.mark.parametrize("code", [0, 1])
+    def test_prior_descendant_oom_does_not_classify_worker_exit(self, code):
+        assert classify_exit(self.exited(code), CgroupStats(oom_kill=1), False) == "crashed"
+
+    def test_prior_descendant_oom_does_not_classify_sigterm(self):
+        assert classify_exit(self.signaled(signal.SIGTERM), CgroupStats(oom_kill=1), False) == "signaled"
+
     def exited(self, code):
         return _ExitStatus(exited=True, exit_code=code, signaled=False, signal=None)
 
@@ -1813,7 +1820,7 @@ class TestRuntimeAdjust:
 
         new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
 
-        assert new.memory_oom_group is False
+        assert new.memory_oom_group is None
 
     def test_concurrent_adjusts_do_not_lose_a_field(self, monkeypatch):
         """Two threads tuning different fields both read the pre-change value
@@ -1902,3 +1909,177 @@ def test_supervisor_applies_the_pool_budget_to_the_cgroup():
     assert sup._workers_pool_limits.memory_max == 7 * 1024**3
     assert sup._workers_pool_limits.memory_oom_group is False
     assert sup._cgroup.workers_pool_limits is sup._workers_pool_limits
+
+
+class TestCgroupReviewRegressions:
+    @pytest.mark.parametrize("overrides", [
+        {"memory_high": "max"},
+        {"memory_max": None},
+        {"memory_oom_group": None},
+    ])
+    def test_adjust_does_not_promote_derived_limits_to_explicit(self, overrides):
+        sup, _ = make_supervisor(
+            EnabledNoopCgroup("t"),
+            limits={"default_worker_max_rss_bytes": 1024},
+        )
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, **overrides)
+        assert not new.must_enforce()
+
+    def test_pool_budget_still_requires_derived_worker_placement(self):
+        cg = MagicMock(enabled=True)
+        cg.place.side_effect = CgroupError("unavailable")
+        sup, _ = make_supervisor(
+            cg, workers_pool_memory_max=2048,
+            limits={"default_worker_max_rss_bytes": 1024},
+        )
+        with pytest.raises(CgroupError):
+            sup._place_in_cgroup(123, ROLE_WORKER, 0, sup._slot_limits[(ROLE_WORKER, 0)])
+
+    def test_runtime_default_swap_is_optional_but_explicit_zero_is_required(self, tmp_path, monkeypatch):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        sup, _ = make_supervisor(mgr, limits={})
+        path = Path(mgr.create(ROLE_WORKER, 0, EMPTY_LIMITS))
+        write = cgroup._write
+
+        def kernel_write(path, value):
+            if Path(path).name == "memory.swap.max":
+                raise PermissionError(errno.EACCES, "kernfs has no create operation", path)
+            write(path, value)
+
+        monkeypatch.setattr(cgroup, "_write", kernel_write)
+        sup.adjust_slot_limit(ROLE_WORKER, 0, memory_max=1024)
+        sup._apply_pending_adjusts()
+        assert (path / "memory.max").read_text() == "1024"
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_swap_max=0)
+        with pytest.raises(CgroupError):
+            mgr.adjust(ROLE_WORKER, 0, new)
+
+    @pytest.mark.parametrize("explicit", [False, True])
+    @pytest.mark.parametrize("swap_access", ["missing", "writable", "read_only"])
+    @pytest.mark.parametrize("operation", ["create", "adjust"])
+    def test_swap_interface_access(self, tmp_path, monkeypatch, explicit, swap_access, operation):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        claim_path = mgr._claim_path
+        open_file = os.open
+        swap_writes = []
+
+        def claim_with_interfaces(*args):
+            path = claim_path(*args)
+            if swap_access != "missing":
+                Path(path, "memory.swap.max").write_text("max")
+            return path
+
+        def kernel_open(path, flags, *args, **kwargs):
+            if Path(path).name == "memory.swap.max":
+                swap_writes.append(path)
+                # O_CREAT cannot create a missing kernfs interface: the VFS
+                # returns EACCES, just as for an existing unwritable file.
+                if swap_access != "writable":
+                    raise PermissionError(errno.EACCES, "permission denied", path)
+            return open_file(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(mgr, "_claim_path", claim_with_interfaces)
+        monkeypatch.setattr(os, "open", kernel_open)
+        entry = {"memory_max": 1024}
+        if explicit:
+            entry["memory_swap_max"] = 0
+        limits = cgroup.limits_from_config(entry, derive=True)
+        if operation == "adjust":
+            mgr.create(ROLE_WORKER, 0, EMPTY_LIMITS)
+
+        def apply():
+            getattr(mgr, operation)(ROLE_WORKER, 0, limits)
+
+        if swap_access == "read_only" or (explicit and swap_access == "missing"):
+            with pytest.raises(CgroupError):
+                apply()
+        else:
+            apply()
+            path = Path(mgr.path_for(ROLE_WORKER, 0))
+            if swap_access == "missing":
+                assert not (path / "memory.swap.max").exists()
+                assert swap_writes == [], "an absent default must never be opened"
+            else:
+                assert (path / "memory.swap.max").read_text() == "0"
+            assert (path / "memory.max").read_text() == "1024"
+
+    @pytest.mark.parametrize("extra", [{}, {"memory_high": 128}, {"memory_swap_max": 0}, {"memory_oom_group": False}])
+    @pytest.mark.parametrize("stage", ["probe", "prepare", "create", "place"])
+    def test_derived_failure_policy(self, extra, stage):
+        raw = {"worker": [{"worker_max_rss_bytes": 1024, **extra}]}
+        cg = MagicMock(enabled=stage != "probe")
+        cg.reason = "unavailable"
+        getattr(cg, stage).side_effect = CgroupError("unavailable")
+
+        def attempt():
+            sup, _ = make_supervisor(cg, plan={ROLE_WORKER: 1}, limits=raw)
+            limits = sup._slot_limits[(ROLE_WORKER, 0)]
+            if stage == "prepare":
+                sup._setup_cgroup_root()
+                assert not sup._cgroup.enabled
+            elif stage == "create":
+                assert not sup._create_slot_cgroup(ROLE_WORKER, 0, limits)
+            elif stage == "place":
+                assert sup._place_in_cgroup(123, ROLE_WORKER, 0, limits)
+
+        if extra:
+            with pytest.raises((RuntimeError, CgroupError)):
+                attempt()
+        else:
+            attempt()
+
+    def test_clear_oom_group_on_disabled_backend(self):
+        sup, _ = make_supervisor(DisabledCgroup("unavailable"), limits={})
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
+        assert new.memory_oom_group is None
+        assert not new.must_enforce()
+
+    def test_clear_oom_group_writes_zero_and_stays_cleared(self, tmp_path):
+        mgr = CgroupManager(str(make_root(tmp_path)))
+        sup, _ = make_supervisor(mgr, limits={})
+        original = Limits(memory_oom_group=True)
+        sup._slot_limits[(ROLE_WORKER, 0)] = original
+        path = Path(mgr.create(ROLE_WORKER, 0, original))
+        sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_high="max")
+        sup._apply_pending_adjusts()
+        assert (path / "memory.oom.group").read_text() == "0"
+        assert not new.must_enforce()
+
+    @pytest.mark.parametrize("starting", [False, True])
+    @pytest.mark.parametrize("operation", ["pipe", "fork"])
+    def test_failed_spawn_cleans_up_and_runtime_retries(self, monkeypatch, starting, operation):
+        cg = MagicMock(enabled=True)
+        sup, _ = make_supervisor(cg, limits={})
+        sup._starting = starting
+        pipe = os.pipe
+        descriptors = []
+
+        def track_pipe():
+            pair = pipe()
+            descriptors.extend(pair)
+            return pair
+
+        def fail():
+            raise OSError(errno.EAGAIN, "try again")
+
+        monkeypatch.setattr(os, "pipe", track_pipe)
+        monkeypatch.setattr(os, operation, fail)
+        try:
+            if starting:
+                with pytest.raises(OSError, match="try again"):
+                    sup._fork_child(ROLE_WORKER, 0)
+            else:
+                sup._fork_child(ROLE_WORKER, 0)
+                assert (ROLE_WORKER, 0) in sup._pending_forks
+            cg.destroy.assert_called_once_with(ROLE_WORKER, 0)
+            assert sup._children == {}
+            for fd in descriptors:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+        finally:
+            for fd in descriptors:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass

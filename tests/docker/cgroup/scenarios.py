@@ -33,6 +33,7 @@ SCENARIOS = [
     "no_limits",
     "cleanup",
     "derive",
+    "swap_interface",
     "observe",
     "observe_readonly",
     "rolling_restart",
@@ -344,6 +345,55 @@ test:
     qc.close()
 
 
+def scenario_swap_interface():
+    """Default swap caps tolerate kernels without the swap interface."""
+    setup_logging()
+    manager = cgroup_mod.probe()
+    check(manager.enabled, "cgroup probe succeeded")
+    manager.prepare()
+    try:
+        # Inspect a real leaf after the memory controller has been enabled.
+        path = manager.create(ROLE_WORKER, 0, cgroup_mod.EMPTY_LIMITS)
+        swap_path = os.path.join(path, "memory.swap.max")
+        has_swap = os.path.exists(swap_path)
+        print(f"    memory.swap.max exists: {has_swap}")
+        if not has_swap:
+            try:
+                cgroup_mod._write(swap_path, "0")
+            except OSError as exc:
+                print(f"    raw O_CREAT write to missing interface: errno={exc.errno}")
+            else:
+                raise Failure("a missing kernfs interface must not be created")
+        manager.destroy(ROLE_WORKER, 0)
+
+        limits = cgroup_mod.limits_from_config({"memory_max": 128 * MIB}, derive=True)
+        path = manager.create(ROLE_WORKER, 0, limits)
+        check(cgroup_mod._read(os.path.join(path, "memory.max")).strip() == str(128 * MIB),
+              "explicit memory.max with default swap creates a leaf")
+        updated = cgroup_mod.limits_from_config({"memory_max": 192 * MIB}, derive=True)
+        manager.adjust(ROLE_WORKER, 0, updated)
+        check(cgroup_mod._read(os.path.join(path, "memory.max")).strip() == str(192 * MIB),
+              "runtime adjustment applies memory.max with default swap")
+        if has_swap:
+            check(cgroup_mod._read(os.path.join(path, "memory.swap.max")).strip() == "0",
+                  "an available swap interface receives the default cap")
+        else:
+            check(not os.path.exists(os.path.join(path, "memory.swap.max")),
+                  "default swap does not attempt to create an interface")
+            explicit = cgroup_mod.limits_from_config(
+                {"memory_max": 192 * MIB, "memory_swap_max": 0}, derive=True
+            )
+            try:
+                manager.adjust(ROLE_WORKER, 0, explicit)
+            except cgroup_mod.CgroupError:
+                print("    ok: explicit swap limit requires the missing interface")
+            else:
+                raise Failure("explicit swap limit was silently dropped")
+    finally:
+        manager.destroy(ROLE_WORKER, 0)
+        manager.close()
+
+
 def scenario_derive():
     """memory.max is derived from memory_recycle_at when not set explicitly."""
     write_queue_yml(
@@ -369,8 +419,11 @@ test:
         if os.path.isdir(slot_dir):
             with open(os.path.join(slot_dir, "memory.max")) as fh:
                 observed["memory.max"] = fh.read().strip()
-            with open(os.path.join(slot_dir, "memory.swap.max")) as fh:
-                observed["memory.swap.max"] = fh.read().strip()
+            swap_path = os.path.join(slot_dir, "memory.swap.max")
+            observed["has_swap"] = os.path.exists(swap_path)
+            if observed["has_swap"]:
+                with open(swap_path) as fh:
+                    observed["memory.swap.max"] = fh.read().strip()
             with open(os.path.join(slot_dir, "memory.oom.group")) as fh:
                 observed["memory.oom.group"] = fh.read().strip()
             return True
@@ -384,7 +437,8 @@ test:
         observed.get("memory.max") == str(150 * MIB),
         f"100MiB x1.5 -> 150MiB (got {observed.get('memory.max')})",
     )
-    check(observed.get("memory.swap.max") == "0", "swap defaults to 0")
+    if observed.get("has_swap"):
+        check(observed.get("memory.swap.max") == "0", "swap defaults to 0")
     check(observed.get("memory.oom.group") == "1", "oom.group defaults to 1")
     check(
         "derived from memory_recycle_at=100MiB -> 150MiB" in capture.text,

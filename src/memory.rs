@@ -48,8 +48,9 @@ pub struct CgroupCpuStat {
     pub nr_throttled: u64,
 }
 
-#[cfg(target_os = "linux")]
-mod imp {
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod linux {
     use super::{CgroupCpuStat, CgroupMemoryEvents};
     use std::path::{Path, PathBuf};
 
@@ -62,12 +63,31 @@ mod imp {
     pub fn cgroup_v2_self_path() -> Option<PathBuf> {
         let mountpoint = cgroup2_mountpoint(&std::fs::read_to_string(PROC_MOUNTS).ok()?)?;
         let rel = self_cgroup_path(&std::fs::read_to_string(PROC_SELF_CGROUP).ok()?)?;
-        let path = PathBuf::from(&mountpoint).join(rel.trim_start_matches('/'));
-        if path.is_dir() {
-            return Some(path);
+        resolve_cgroup_path(Path::new(&mountpoint), &rel)
+    }
+
+    pub(super) fn resolve_cgroup_path(mountpoint: &Path, rel: &str) -> Option<PathBuf> {
+        // With cgroupns=host, the process reports a host path while the mount
+        // may start at the container's cgroup. Try the longest visible suffix
+        // first so workers retain their individual leaves in heartbeat data.
+        let mut suffix = Path::new(rel.trim_start_matches('/'));
+        while !suffix.as_os_str().is_empty() {
+            // Namespace-relative paths may contain `..`; never escape the
+            // mount when looking for a visible suffix.
+            if suffix
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                let path = mountpoint.join(suffix);
+                if path.is_dir() {
+                    return Some(path);
+                }
+            }
+            let mut components = suffix.components();
+            components.next();
+            suffix = components.as_path();
         }
-        // cgroupns=host inside a container: the path from /proc/self/cgroup is
-        // a host path that does not resolve against the container's mount.
+        // Preserve container-level metrics when no individual leaf is visible.
         let fallback = PathBuf::from(mountpoint);
         fallback.is_dir().then_some(fallback)
     }
@@ -153,6 +173,9 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+use linux as imp;
+
 #[cfg(not(target_os = "linux"))]
 mod imp {
     use super::{CgroupCpuStat, CgroupMemoryEvents};
@@ -186,9 +209,31 @@ pub use imp::{
     cgroup_memory_max, cgroup_memory_peak, cgroup_v2_self_path,
 };
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
-    use super::imp::{cgroup2_mountpoint, parse_keyed, parse_limit, self_cgroup_path};
+    use super::linux::{
+        cgroup2_mountpoint, parse_keyed, parse_limit, resolve_cgroup_path, self_cgroup_path,
+    };
+
+    #[test]
+    fn host_namespace_resolves_distinct_worker_leaves_under_container_mount() {
+        let root = std::env::temp_dir().join(format!("quebec-cgroup-{}", uuid::Uuid::new_v4()));
+        let first = root.join("workers/worker-0");
+        let second = root.join("workers/worker-1");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first_result =
+            resolve_cgroup_path(&root, "/system.slice/docker-abc.scope/workers/worker-0");
+        let second_result =
+            resolve_cgroup_path(&root, "/system.slice/docker-abc.scope/workers/worker-1");
+        let direct = resolve_cgroup_path(&root, "/workers/worker-0");
+        let fallback = resolve_cgroup_path(&root, "/system.slice/docker-abc.scope");
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(first_result, Some(first.clone()));
+        assert_eq!(second_result, Some(second));
+        assert_eq!(direct, Some(first));
+        assert_eq!(fallback, Some(root));
+    }
 
     #[test]
     fn reads_the_unified_line_only() {
