@@ -930,9 +930,29 @@ class Supervisor:
         # into its cgroup. Without it, everything the child allocates between
         # fork() and the migration is charged to the supervisor's cgroup and
         # stays there (v2 does not move existing charges).
-        barrier_r, barrier_w = os.pipe()
-
-        pid = os.fork()
+        barrier_r = barrier_w = None
+        try:
+            barrier_r, barrier_w = os.pipe()
+            pid = os.fork()
+        except OSError as exc:
+            for fd in (barrier_r, barrier_w):
+                if fd is not None:
+                    os.close(fd)
+            if placed_in_cgroup:
+                self._cgroup.destroy(role, index)
+            if self._starting:
+                raise
+            logger.error(
+                "Cannot fork %s[%d]: %s; leaving the slot down for now",
+                role,
+                index,
+                exc,
+            )
+            if not self._record_slot_crash(role, index):
+                self._pending_forks.add((role, index))
+            else:
+                self._pending_forks.discard((role, index))
+            return
         if pid == 0:
             # --- child ---
             global _active_supervisor

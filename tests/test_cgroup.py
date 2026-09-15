@@ -2045,3 +2045,41 @@ class TestCgroupReviewRegressions:
         sup._apply_pending_adjusts()
         assert (path / "memory.oom.group").read_text() == "0"
         assert not new.must_enforce()
+
+    @pytest.mark.parametrize("starting", [False, True])
+    @pytest.mark.parametrize("operation", ["pipe", "fork"])
+    def test_failed_spawn_cleans_up_and_runtime_retries(self, monkeypatch, starting, operation):
+        cg = MagicMock(enabled=True)
+        sup, _ = make_supervisor(cg, limits={})
+        sup._starting = starting
+        pipe = os.pipe
+        descriptors = []
+
+        def track_pipe():
+            pair = pipe()
+            descriptors.extend(pair)
+            return pair
+
+        def fail():
+            raise OSError(errno.EAGAIN, "try again")
+
+        monkeypatch.setattr(os, "pipe", track_pipe)
+        monkeypatch.setattr(os, operation, fail)
+        try:
+            if starting:
+                with pytest.raises(OSError, match="try again"):
+                    sup._fork_child(ROLE_WORKER, 0)
+            else:
+                sup._fork_child(ROLE_WORKER, 0)
+                assert (ROLE_WORKER, 0) in sup._pending_forks
+            cg.destroy.assert_called_once_with(ROLE_WORKER, 0)
+            assert sup._children == {}
+            for fd in descriptors:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+        finally:
+            for fd in descriptors:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
