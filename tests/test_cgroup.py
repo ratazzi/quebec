@@ -1905,6 +1905,54 @@ def test_supervisor_applies_the_pool_budget_to_the_cgroup():
 
 
 class TestCgroupReviewRegressions:
+    @pytest.mark.parametrize("overrides", [
+        {"memory_high": "max"},
+        {"memory_max": None},
+        {"memory_oom_group": None},
+    ])
+    def test_adjust_does_not_promote_derived_limits_to_explicit(self, overrides):
+        sup, _ = make_supervisor(
+            EnabledNoopCgroup("t"),
+            limits={"default_worker_max_rss_bytes": 1024},
+        )
+        new = sup.adjust_slot_limit(ROLE_WORKER, 0, **overrides)
+        assert not new.must_enforce()
+
+    def test_pool_budget_still_requires_derived_worker_placement(self):
+        cg = MagicMock(enabled=True)
+        cg.place.side_effect = CgroupError("unavailable")
+        sup, _ = make_supervisor(
+            cg, workers_pool_memory_max=2048,
+            limits={"default_worker_max_rss_bytes": 1024},
+        )
+        with pytest.raises(CgroupError):
+            sup._place_in_cgroup(123, ROLE_WORKER, 0, sup._slot_limits[(ROLE_WORKER, 0)])
+
+    @pytest.mark.parametrize("extra", [{}, {"memory_high": 128}, {"memory_swap_max": 0}, {"memory_oom_group": False}])
+    @pytest.mark.parametrize("stage", ["probe", "prepare", "create", "place"])
+    def test_derived_failure_policy(self, extra, stage):
+        raw = {"worker": [{"worker_max_rss_bytes": 1024, **extra}]}
+        cg = MagicMock(enabled=stage != "probe")
+        cg.reason = "unavailable"
+        getattr(cg, stage).side_effect = CgroupError("unavailable")
+
+        def attempt():
+            sup, _ = make_supervisor(cg, plan={ROLE_WORKER: 1}, limits=raw)
+            limits = sup._slot_limits[(ROLE_WORKER, 0)]
+            if stage == "prepare":
+                sup._setup_cgroup_root()
+                assert not sup._cgroup.enabled
+            elif stage == "create":
+                assert not sup._create_slot_cgroup(ROLE_WORKER, 0, limits)
+            elif stage == "place":
+                assert sup._place_in_cgroup(123, ROLE_WORKER, 0, limits)
+
+        if extra:
+            with pytest.raises((RuntimeError, CgroupError)):
+                attempt()
+        else:
+            attempt()
+
     def test_clear_oom_group_on_disabled_backend(self):
         sup, _ = make_supervisor(DisabledCgroup("unavailable"), limits={})
         new = sup.adjust_slot_limit(ROLE_WORKER, 0, memory_oom_group=None)

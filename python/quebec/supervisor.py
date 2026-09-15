@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 from .cgroup import (
+    DERIVE_FACTOR,
     EMPTY_LIMITS,
     UNLIMITED,
     CgroupError,
@@ -602,6 +603,10 @@ class Supervisor:
             if "memory_oom_group" in provided
             else current.memory_oom_group
         )
+        swap_defaulted = current.swap_defaulted and "memory_swap_max" not in provided
+        oom_group_defaulted = (
+            current.oom_group_defaulted and "memory_oom_group" not in provided
+        )
         reset_oom_group = (
             memory_oom_group is None
             if "memory_oom_group" in provided
@@ -613,19 +618,23 @@ class Supervisor:
         if isinstance(memory_max, int):
             if "memory_swap_max" not in provided and memory_swap_max is None:
                 memory_swap_max = 0
+                swap_defaulted = True
             if (
                 "memory_oom_group" not in provided
                 and memory_oom_group is None
                 and not reset_oom_group
             ):
                 memory_oom_group = True
+                oom_group_defaulted = True
 
         new = Limits(
             memory_max=memory_max,
             memory_high=memory_high,
             memory_swap_max=memory_swap_max,
             memory_oom_group=memory_oom_group,
-            derived=False,
+            derived=current.derived and "memory_max" not in provided,
+            swap_defaulted=swap_defaulted,
+            oom_group_defaulted=oom_group_defaulted,
             reset_oom_group=reset_oom_group,
         )
         if new.must_enforce() and not self._cgroup.enabled:
@@ -752,7 +761,7 @@ class Supervisor:
                         index,
                         (entry.get("worker_max_rss_bytes") or 0) // (1024 * 1024),
                         (limits.memory_max or 0) // (1024 * 1024),
-                        1.5,
+                        DERIVE_FACTOR,
                     )
                 resolved[(role, index)] = limits
         return resolved

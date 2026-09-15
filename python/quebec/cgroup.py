@@ -101,22 +101,26 @@ class Limits:
     memory_oom_group: Optional[bool] = None
     #: True when `memory_max` was derived from `memory_recycle_at`.
     derived: bool = False
+    #: Companion defaults are not explicit requests from the user.
+    swap_defaulted: bool = False
+    oom_group_defaulted: bool = False
     #: A runtime clear must write zero without becoming an explicit limit.
     reset_oom_group: bool = False
 
     def must_enforce(self) -> bool:
-        """Whether these limits actually change kernel behaviour.
+        """Whether explicitly requested limits change kernel behaviour.
 
         The single judgement behind every "is this failure fatal?" decision.
         An explicit `max` asks the kernel for nothing, so failing to apply it
         is not worth aborting over; a numeric limit, or an explicit
         `memory_oom_group`, does change what happens and must be enforced.
+        A derived ceiling and its companion defaults remain best-effort.
         """
         return (
-            is_limit_value(self.memory_max)
+            (is_limit_value(self.memory_max) and not self.derived)
             or is_limit_value(self.memory_high)
-            or is_limit_value(self.memory_swap_max)
-            or self.memory_oom_group is not None
+            or (is_limit_value(self.memory_swap_max) and not self.swap_defaulted)
+            or (self.memory_oom_group is not None and not self.oom_group_defaulted)
         )
 
 
@@ -194,9 +198,8 @@ def resolve_memory_max(
 
     An explicit value always wins. Otherwise the soft RSS recycle line is
     scaled up to a hard limit, rounded up to whole MiB. Callers must only
-    invoke this once the cgroup probe has succeeded — a derived limit that
-    cannot be applied is a startup error, and a machine without cgroups must
-    keep booting.
+    invoke this once the cgroup probe has succeeded. Derived limits are
+    best-effort: a machine where cgroups cannot be used must keep booting.
     """
     # An explicit `max` is a decision too: never derive over the top of it.
     if explicit is not None:
@@ -248,6 +251,12 @@ def limits_from_config(entry: Optional[Dict], *, derive: bool) -> Limits:
         memory_swap_max=swap_max,
         memory_oom_group=oom_group,
         derived=derived,
+        swap_defaulted=(
+            is_limit_value(memory_max) and entry.get("memory_swap_max") is None
+        ),
+        oom_group_defaulted=(
+            is_limit_value(memory_max) and entry.get("memory_oom_group") is None
+        ),
     )
 
 
