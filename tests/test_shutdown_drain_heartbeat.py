@@ -16,8 +16,9 @@ import time
 
 import pytest
 import quebec
+from sqlalchemy import text
 
-from .helpers import observe_sqlite, readonly_connect, wait_until
+from .helpers import create_database_engine, observe_sqlite, wait_until
 
 SHUTDOWN_GRACE = 30.0
 JOB_SECONDS = 4.0
@@ -38,17 +39,17 @@ class SlowJob(quebec.BaseClass):
 def _heartbeat_of(conn, prefix: str):
     return observe_sqlite(
         lambda: conn.execute(
-            f"SELECT last_heartbeat_at FROM {prefix}_processes WHERE kind = 'Worker'"
+            text(f"SELECT last_heartbeat_at FROM {prefix}_processes WHERE kind = 'Worker'")
         ).fetchone()
     )
 
 
 def test_the_heartbeat_keeps_beating_while_draining(
-    temp_db_path, test_prefix, tmp_path
+    db_url, test_prefix, tmp_path
 ) -> None:
     marker = tmp_path / "job-started"
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         process_heartbeat_interval=0.1,
         # Long enough that the drain is still running well after SIGTERM, so
@@ -69,7 +70,8 @@ def test_the_heartbeat_keeps_beating_while_draining(
         except BaseException:  # noqa: BLE001 - must not unwind into pytest
             os._exit(1)
 
-    sql = readonly_connect(temp_db_path)
+    engine = create_database_engine(db_url, readonly=True)
+    sql = engine.connect()
     try:
         # Wait until the job is actually inside perform(), so SIGTERM lands
         # while there is something to drain.
@@ -94,6 +96,7 @@ def test_the_heartbeat_keeps_beating_while_draining(
         )
     finally:
         sql.close()
+        engine.dispose()
         deadline = time.monotonic() + SHUTDOWN_GRACE
         while time.monotonic() < deadline:
             waited, _status = os.waitpid(child, os.WNOHANG)

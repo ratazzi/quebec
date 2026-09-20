@@ -374,17 +374,17 @@ def _insert_failed_execution(
     """Create a jobs row + failed_executions row directly, simulating what
     the failed jobs list would show in the control plane.
     """
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             "(queue_name, class_name, arguments, priority, concurrency_key, "
             " created_at, updated_at) "
             "VALUES ('default', :cn, '[]', 0, :ck, "
             "        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            " RETURNING id"
         ),
         {"cn": class_name, "ck": concurrency_key},
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_failed_executions "

@@ -8,15 +8,15 @@ Tests that Scheduler correctly loads recurring.yml and writes to database.
 import os
 import tempfile
 import quebec
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
-from .helpers import observe_sqlite, wait_until
+from .helpers import create_database_engine, observe_sqlite, wait_until
 
 
 class TestRecurringConfig:
     """Test recurring tasks configuration loading via Scheduler."""
 
-    def test_scheduler_loads_recurring_yaml(self, temp_db_path, test_prefix):
+    def test_scheduler_loads_recurring_yaml(self, db_url, test_prefix):
         """Scheduler should load recurring.yml and insert tasks into database."""
         qc = None
         engine = None
@@ -45,7 +45,6 @@ test:
             os.environ["QUEBEC_ENV"] = "test"
 
             # Create Quebec instance with unique prefix
-            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 
@@ -59,8 +58,7 @@ test:
             # Start scheduler (spawns async task)
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
-            engine = create_engine(sa_url)
+            engine = create_database_engine(db_url, readonly=True)
 
             def fetch_tasks():
                 with engine.connect() as conn:
@@ -103,7 +101,7 @@ test:
             os.environ.pop("QUEBEC_RECURRING_SCHEDULE", None)
             os.environ.pop("QUEBEC_ENV", None)
 
-    def test_recurring_task_with_complex_args(self, temp_db_path, test_prefix):
+    def test_recurring_task_with_complex_args(self, db_url, test_prefix):
         """Recurring task with complex args should be properly stored."""
         qc = None
         engine = None
@@ -125,7 +123,6 @@ test:
             os.environ["QUEBEC_RECURRING_SCHEDULE"] = recurring_path
             os.environ["QUEBEC_ENV"] = "test"
 
-            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 
@@ -138,8 +135,7 @@ test:
             # Start scheduler
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
-            engine = create_engine(sa_url)
+            engine = create_database_engine(db_url, readonly=True)
 
             def fetch_task():
                 with engine.connect() as conn:
@@ -180,7 +176,7 @@ test:
             os.environ.pop("QUEBEC_RECURRING_SCHEDULE", None)
             os.environ.pop("QUEBEC_ENV", None)
 
-    def test_loads_correct_environment(self, temp_db_path, test_prefix):
+    def test_loads_correct_environment(self, db_url, test_prefix):
         """Should load tasks for the specified environment only."""
         qc = None
         engine = None
@@ -209,7 +205,6 @@ test:
             os.environ["QUEBEC_RECURRING_SCHEDULE"] = recurring_path
             os.environ["QUEBEC_ENV"] = "production"
 
-            db_url = f"sqlite:///{temp_db_path}?mode=rwc"
             qc = quebec.Quebec(db_url, table_name_prefix=test_prefix)
             qc.create_tables()
 
@@ -221,8 +216,7 @@ test:
 
             qc.spawn_scheduler()
 
-            sa_url = f"sqlite:///file:{temp_db_path}?mode=ro&uri=true"
-            engine = create_engine(sa_url)
+            engine = create_database_engine(db_url, readonly=True)
 
             def fetch_tasks():
                 with engine.connect() as conn:

@@ -39,9 +39,9 @@ class SlowJob(quebec.BaseClass):
             fh.write("x")
 
 
-def _make_quebec(temp_db_path, test_prefix, tmp_path, **kwargs):
+def _make_quebec(db_url, test_prefix, tmp_path, **kwargs):
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         process_heartbeat_interval=0.1,
         shutdown_timeout=SHORT_SHUTDOWN,
@@ -77,12 +77,12 @@ def _kill_quietly(pid: int) -> None:
 
 
 def test_an_orphan_drains_on_the_orphan_budget(
-    temp_db_path, test_prefix, tmp_path
+    db_url, test_prefix, tmp_path
 ) -> None:
     """The job outlives shutdown_timeout, so finishing proves the longer
     orphan budget was used."""
     qc = _make_quebec(
-        temp_db_path,
+        db_url,
         test_prefix,
         tmp_path,
         orphan_drain_timeout=JOB_SECONDS + 10,
@@ -90,10 +90,12 @@ def test_an_orphan_drains_on_the_orphan_budget(
     started = tmp_path / "started"
     done = tmp_path / "done"
     worker_pid_file = tmp_path / "worker.pid"
-    ready = tmp_path / "watching"
 
     # A stands in for the supervisor: it forks the worker, waits until the
-    # worker has latched onto its ppid, then dies — orphaning it.
+    # worker has latched onto its ppid and started the job, then dies —
+    # orphaning it. Waiting only for the ppid latch races the first claim:
+    # if the ppid check fires before the job is running, graceful shutdown
+    # releases the claimed job and nothing ever starts.
     stand_in = os.fork()
     if stand_in == 0:
         try:
@@ -102,11 +104,10 @@ def test_an_orphan_drains_on_the_orphan_budget(
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 qc.reset_after_fork()
                 qc.watch_parent_pid()
-                ready.write_text("x")
                 qc.run(spawn=["worker"], create_tables=False)
                 os._exit(0)
             worker_pid_file.write_text(str(worker))
-            while not ready.exists():
+            while not started.exists():
                 time.sleep(0.02)
             os._exit(0)
         except BaseException:  # noqa: BLE001 - must not unwind into pytest
@@ -132,12 +133,12 @@ def test_an_orphan_drains_on_the_orphan_budget(
 
 
 def test_a_supervised_worker_still_uses_the_short_budget(
-    temp_db_path, test_prefix, tmp_path
+    db_url, test_prefix, tmp_path
 ) -> None:
     """The orphan budget must not leak into the ordinary SIGTERM path, where
     the supervisor is waiting to SIGKILL the remainder."""
     qc = _make_quebec(
-        temp_db_path,
+        db_url,
         test_prefix,
         tmp_path,
         orphan_drain_timeout=JOB_SECONDS + 10,

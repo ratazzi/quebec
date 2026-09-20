@@ -1,6 +1,5 @@
-"""Transaction boundaries, on SQLite and optionally TEST_POSTGRESQL_URL."""
+"""Transaction boundaries on every selected database backend."""
 
-import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,19 +8,9 @@ import pytest
 import quebec
 
 
-@pytest.fixture(
-    params=["sqlite"] + (["postgres"] if os.getenv("TEST_POSTGRESQL_URL") else [])
-)
-def transactional_qc(request, temp_db_path, test_prefix):
-    url = (
-        os.environ["TEST_POSTGRESQL_URL"]
-        if request.param == "postgres"
-        else f"sqlite:///{temp_db_path}?mode=rwc"
-    )
-    qc = quebec.Quebec(url, table_name_prefix=test_prefix)
-    qc.create_tables()
-    yield qc, request.param
-    qc.close()
+@pytest.fixture
+def transactional_qc(qc, db_url):
+    return qc, "postgres" if db_url.startswith("postgresql:") else "sqlite"
 
 
 class Work(quebec.BaseClass):

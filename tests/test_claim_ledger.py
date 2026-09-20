@@ -42,16 +42,16 @@ def _seed_claimed(session, prefix: str, process_id: int) -> int:
     was lost. Returns the new claimed_executions.id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             f"(queue_name, class_name, arguments, priority, active_job_id, "
             f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
             f"VALUES ('default', 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
             f"{now_sql}, {now_sql})"
+            " RETURNING id"
         )
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "
@@ -74,17 +74,17 @@ def _seed_orphan(session, prefix: str, *, queue_name: str = "default") -> int:
     Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             f"(queue_name, class_name, arguments, priority, active_job_id, "
             f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
             f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
             f"{now_sql}, {now_sql})"
+            " RETURNING id"
         ),
         {"queue": queue_name},
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "
@@ -104,15 +104,15 @@ def _seed_stale_process(session, prefix: str) -> int:
     ``now - process_alive_threshold`` (default 300s), so a year-2000 heartbeat
     is reliably stale. Returns the new processes.id.
     """
-    session.execute(
+    process_id = session.execute(
         text(
             f"INSERT INTO {prefix}_processes "
             f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
             f"VALUES ('Worker', '2000-01-01 00:00:00', 4242, 'stale-host', NULL, "
             f"'2000-01-01 00:00:00', 'Worker-4242')"
+            " RETURNING id"
         )
-    )
-    process_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.commit()
     return process_id
 
@@ -127,17 +127,17 @@ def _seed_claimed_for_process(
     queues in ``experimental_queue_concurrency``). Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             f"(queue_name, class_name, arguments, priority, active_job_id, "
             f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
             f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
             f"{now_sql}, {now_sql})"
+            " RETURNING id"
         ),
         {"queue": queue_name},
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "

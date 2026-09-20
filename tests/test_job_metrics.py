@@ -32,7 +32,7 @@ def test_close_flushes_recordings(qc, tmp_path, monkeypatch, automatic_stop):
 
 @pytest.mark.skipif(os.name != "posix", reason="Unix worker signals")
 @pytest.mark.parametrize("exit_mode", ["sigterm", "signal_stop", "recycle", "fork"])
-def test_worker_exit_flushes_recording(tmp_path, exit_mode):
+def test_worker_exit_flushes_recording(tmp_path, exit_mode, db_url):
     path = tmp_path / "exit.csv"
     script = textwrap.dedent("""
         import os, signal, sys, time
@@ -78,7 +78,7 @@ def test_worker_exit_flushes_recording(tmp_path, exit_mode):
             sys.executable,
             "-c",
             script,
-            f"sqlite:///{tmp_path / 'exit.db'}?mode=rwc",
+            db_url,
             str(path),
             exit_mode,
         ],
@@ -144,10 +144,10 @@ def test_metric_exposes_faults_and_process_rss_context(qc) -> None:
 
 @pytest.mark.skipif(not LINUX, reason="Linux RSS sampling")
 def test_supervised_single_thread_worker_attributes_rss(
-    sqlite_url, test_prefix
+    db_url, test_prefix
 ) -> None:
     qc = quebec.Quebec(
-        sqlite_url,
+        db_url,
         table_name_prefix=test_prefix,
         worker_threads=1,
     )
@@ -326,9 +326,9 @@ def test_per_class_summary_aggregates_in_process(qc) -> None:
     assert qc.job_metrics_summary() == {}
 
 
-def test_metrics_state_is_per_quebec_instance(sqlite_url, tmp_path) -> None:
-    qc1 = quebec.Quebec(sqlite_url, table_name_prefix="metrics_one")
-    qc2 = quebec.Quebec(sqlite_url, table_name_prefix="metrics_two")
+def test_metrics_state_is_per_quebec_instance(db_url, tmp_path) -> None:
+    qc1 = quebec.Quebec(db_url, table_name_prefix="metrics_one")
+    qc2 = quebec.Quebec(db_url, table_name_prefix="metrics_two")
     try:
         assert qc1.create_tables() is True
         assert qc2.create_tables() is True

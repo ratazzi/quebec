@@ -24,9 +24,9 @@ def _no_env_override(monkeypatch):
     monkeypatch.delenv("QUEBEC_FORCE_OVERRIDE_QUEUE", raising=False)
 
 
-def test_enqueue_is_rewritten_to_forced_queue(temp_db_path, test_prefix) -> None:
+def test_enqueue_is_rewritten_to_forced_queue(db_url, test_prefix) -> None:
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         force_override_queue="pinned",
     )
@@ -40,13 +40,13 @@ def test_enqueue_is_rewritten_to_forced_queue(temp_db_path, test_prefix) -> None
 
 
 def test_wildcard_chars_are_sanitized_from_forced_queue(
-    temp_db_path, test_prefix
+    db_url, test_prefix
 ) -> None:
     # A '*' in the forced name would be enqueued literally but reinterpreted
     # as a wildcard prefix on the consumption side, silently widening the
     # pinned worker to other branches' queues.
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         force_override_queue="branch*",
     )
@@ -59,8 +59,8 @@ def test_wildcard_chars_are_sanitized_from_forced_queue(
     qc.close()
 
 
-def test_worker_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
-    dsn = f"sqlite:///{temp_db_path}?mode=rwc"
+def test_worker_only_consumes_forced_queue(db_url, test_prefix) -> None:
+    dsn = db_url
 
     # Another branch (no override) enqueues into its own queue.
     plain = quebec.Quebec(dsn, table_name_prefix=test_prefix)
@@ -92,8 +92,8 @@ def test_worker_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
     plain.close()
 
 
-def test_worker_batch_only_consumes_forced_queue(temp_db_path, test_prefix) -> None:
-    dsn = f"sqlite:///{temp_db_path}?mode=rwc"
+def test_worker_batch_only_consumes_forced_queue(db_url, test_prefix) -> None:
+    dsn = db_url
 
     plain = quebec.Quebec(dsn, table_name_prefix=test_prefix)
     assert plain.create_tables() is True

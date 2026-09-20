@@ -35,17 +35,17 @@ def _insert_claimed(session, prefix: str, process_id: int, job_class: str = "Tes
     Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             f"(queue_name, class_name, arguments, priority, active_job_id, "
             f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
             f"VALUES ('default', :class_name, '[]', 0, 'ajid', NULL, NULL, NULL, "
             f"{now_sql}, {now_sql})"
+            " RETURNING id"
         ),
         {"class_name": job_class},
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "

@@ -17,7 +17,7 @@ class WildcardJob(quebec.BaseClass):
 
 
 @pytest.fixture
-def wildcard_qc(tmp_path, monkeypatch, temp_db_path, test_prefix):
+def wildcard_qc(tmp_path, monkeypatch, db_url, test_prefix):
     queue_yml = tmp_path / "queue.yml"
     queue_yml.write_text(
         """
@@ -31,7 +31,7 @@ development:
     monkeypatch.delenv("QUEBEC_ENV", raising=False)
 
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc", table_name_prefix=test_prefix
+        db_url, table_name_prefix=test_prefix
     )
     assert qc.create_tables() is True
     qc.register_job(WildcardJob)
