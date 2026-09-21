@@ -241,15 +241,13 @@ impl NotifyManager {
     where
         C: ConnectionTrait,
     {
-        // PostgreSQL NOTIFY doesn't support parameterized queries, so we need to escape and format directly
-        let escaped_message = message.replace("'", "''"); // Escape single quotes
-        let sql = format!("NOTIFY {channel_name}, '{escaped_message}'");
-
+        // pg_notify accepts bound text values, preserving the same channel
+        // spelling PgListener subscribes to (including case and punctuation).
         match db
             .execute(Statement::from_sql_and_values(
                 db.get_database_backend(),
-                sql,
-                vec![],
+                "SELECT pg_notify($1, $2)",
+                [channel_name.into(), message.into()],
             ))
             .await
         {

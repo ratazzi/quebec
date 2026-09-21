@@ -70,8 +70,8 @@ def marks(tmp_path):
     return directory
 
 
-def _quebec_with_hook(sqlite_url, marks):
-    qc = quebec.Quebec(sqlite_url)
+def _quebec_with_hook(db_url, marks):
+    qc = quebec.Quebec(db_url)
     assert qc.create_tables()
 
     # Registered before any fork, exactly as an application's main() would.
@@ -82,8 +82,8 @@ def _quebec_with_hook(sqlite_url, marks):
     return qc
 
 
-def test_the_hook_runs_when_a_worker_starts(sqlite_url, marks) -> None:
-    qc = _quebec_with_hook(sqlite_url, marks)
+def test_the_hook_runs_when_a_worker_starts(db_url, marks) -> None:
+    qc = _quebec_with_hook(db_url, marks)
     child = _fork_worker(qc)
     try:
         wait_until(
@@ -100,14 +100,14 @@ def test_the_hook_runs_when_a_worker_starts(sqlite_url, marks) -> None:
 
 
 def test_each_forked_worker_runs_the_hook_in_its_own_process(
-    sqlite_url, marks
+    db_url, marks
 ) -> None:
     """Registered once in the parent, run once per child — never in the parent.
 
     An application that does this setup before the fork instead gets one shared
     result for the whole fleet, which is the bug this hook exists to avoid.
     """
-    qc = _quebec_with_hook(sqlite_url, marks)
+    qc = _quebec_with_hook(db_url, marks)
     parent_pid = os.getpid()
     children: list[int] = []
     try:

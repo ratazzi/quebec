@@ -3,12 +3,31 @@ from __future__ import annotations
 import sqlite3
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import TypeVar
 
 import sqlalchemy.exc
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 
 T = TypeVar("T")
+
+
+@contextmanager
+def database_engine(db_url: str, *, readonly: bool = False):
+    """Open a verification engine, preserving PostgreSQL connection options."""
+    engine = create_database_engine(db_url, readonly=readonly)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def create_database_engine(db_url: str, *, readonly: bool = False):
+    """Create an observer engine; the caller must dispose it after use."""
+    if db_url.startswith("sqlite:"):
+        path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+        db_url = f"sqlite:///file:{path}?mode=ro&uri=true" if readonly else f"sqlite:///{path}"
+    return create_engine(db_url)
 
 # Python's ``sqlite3`` and Quebec's Rust sqlite are two independent SQLite
 # libraries inside one process. POSIX advisory locks are owned by the process,

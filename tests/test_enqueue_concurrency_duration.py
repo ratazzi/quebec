@@ -42,6 +42,6 @@ def test_enqueue_preserves_concurrency_duration(qc_with_sqlalchemy, bulk, durati
         row = session.execute(text(
             f"SELECT expires_at, created_at FROM {prefix}_{table}"
         )).one()
-        expires = datetime.fromisoformat(row.expires_at)
-        created = datetime.fromisoformat(row.created_at)
+        expires = datetime.fromisoformat(str(row.expires_at))
+        created = datetime.fromisoformat(str(row.created_at))
         assert abs((expires - created).total_seconds() - expected) < 1

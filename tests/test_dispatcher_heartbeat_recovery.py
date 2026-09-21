@@ -1,16 +1,16 @@
 """A transient heartbeat write failure must not stop scheduled-job dispatch."""
 
-import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import quebec
+from sqlalchemy import text
 
-from .helpers import observe_sqlite, readonly_connect, wait_until
+from .helpers import create_database_engine, database_engine, observe_sqlite, wait_until
 
 
-def test_dispatcher_recovers_after_heartbeat_error(temp_db_path, test_prefix):
+def test_dispatcher_recovers_after_heartbeat_error(db_url, test_prefix):
     qc = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         process_heartbeat_interval=0.05,
         dispatcher_polling_interval=0.02,
@@ -31,21 +31,35 @@ def test_dispatcher_recovers_after_heartbeat_error(temp_db_path, test_prefix):
     # while the dispatcher runs would race Quebec's own writes, because the two
     # sqlite libraries in this process cannot see each other's file locks.
     fault_until = datetime.now(timezone.utc) + timedelta(seconds=1)
-    setup = sqlite3.connect(temp_db_path)
-    setup.execute(f"""
-        CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
-        WHEN julianday('now') < julianday('{fault_until:%Y-%m-%d %H:%M:%S.%f}')
-        BEGIN SELECT RAISE(FAIL, 'transient heartbeat failure'); END
-    """)
-    setup.commit()
-    setup.close()
+    with database_engine(db_url) as engine, engine.begin() as setup:
+        if setup.dialect.name == "postgresql":
+            setup.execute(text(f"""
+                CREATE FUNCTION fail_heartbeat() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF clock_timestamp() < TIMESTAMPTZ '{fault_until.isoformat()}' THEN
+                        RAISE EXCEPTION 'transient heartbeat failure';
+                    END IF;
+                    RETURN NEW;
+                END $$
+            """))
+            setup.execute(text(f"""
+                CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
+                FOR EACH ROW EXECUTE FUNCTION fail_heartbeat()
+            """))
+        else:
+            setup.execute(text(f"""
+                CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
+                WHEN julianday('now') < julianday('{fault_until:%Y-%m-%d %H:%M:%S.%f}')
+                BEGIN SELECT RAISE(FAIL, 'transient heartbeat failure'); END
+            """))
 
-    sql = readonly_connect(temp_db_path)
+    engine = create_database_engine(db_url, readonly=True)
+    sql = engine.connect()
 
     def count(table):
         return observe_sqlite(
             lambda: sql.execute(
-                f"SELECT COUNT(*) FROM {test_prefix}_{table}"
+                text(f"SELECT COUNT(*) FROM {test_prefix}_{table}")
             ).fetchone()[0]
         )
 
@@ -60,4 +74,5 @@ def test_dispatcher_recovers_after_heartbeat_error(temp_db_path, test_prefix):
         assert count("scheduled_executions") == 0
     finally:
         sql.close()
+        engine.dispose()
         qc.close()

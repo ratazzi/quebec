@@ -10,16 +10,16 @@ scheduler skips every occurrence of a paused task.
 from __future__ import annotations
 
 import os
-import sqlite3
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import inspect, text
 
 import quebec
 
-from .helpers import observe_sqlite, readonly_connect, wait_until
+from .helpers import database_engine, observe_sqlite, wait_until
 
 
 class TickJob(quebec.BaseClass):
@@ -27,53 +27,41 @@ class TickJob(quebec.BaseClass):
         return None
 
 
-def _db_path(db_url: str) -> str:
-    assert db_url.startswith("sqlite:///")
-    return db_url.removeprefix("sqlite:///").split("?", 1)[0]
-
-
 def _columns(db_url: str, table: str) -> list[str]:
-    conn = readonly_connect(_db_path(db_url))
-    try:
+    with database_engine(db_url, readonly=True) as engine:
         return observe_sqlite(
-            lambda: [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+            lambda: [col["name"] for col in inspect(engine).get_columns(table)]
         )
-    finally:
-        conn.close()
 
 
 def _count(db_url: str, table: str) -> int:
-    conn = readonly_connect(_db_path(db_url))
-    try:
+    with database_engine(db_url, readonly=True) as engine, engine.connect() as conn:
         return observe_sqlite(
-            lambda: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            lambda: conn.execute(text(f'SELECT COUNT(*) FROM "{table}"')).scalar_one()
         )
-    finally:
-        conn.close()
 
 
 def _paused_at(db_url: str, prefix: str, key: str):
-    conn = readonly_connect(_db_path(db_url))
-    try:
+    with database_engine(db_url, readonly=True) as engine, engine.connect() as conn:
         return observe_sqlite(
             lambda: conn.execute(
-                f'SELECT paused_at FROM "{prefix}_recurring_tasks" WHERE "key" = ?',
-                (key,),
-            ).fetchone()[0]
+                text(f'SELECT paused_at FROM "{prefix}_recurring_tasks" WHERE "key" = :key'),
+                {"key": key},
+            ).scalar_one()
         )
-    finally:
-        conn.close()
 
 
 def _seed_task(db_url: str, prefix: str, key: str, class_name: str) -> None:
-    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
-    with sqlite3.connect(_db_path(db_url)) as conn:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with database_engine(db_url) as engine, engine.begin() as conn:
         conn.execute(
-            f'INSERT INTO "{prefix}_recurring_tasks" '
-            '("key", schedule, class_name, arguments, queue_name, priority, '
-            '"static", created_at, updated_at) '
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (key, "every minute", class_name, "[]", "default", 0, 1, now, now),
+            text(
+                f'INSERT INTO "{prefix}_recurring_tasks" '
+                '("key", schedule, class_name, arguments, queue_name, priority, '
+                '"static", created_at, updated_at) '
+                "VALUES (:key, 'every minute', :class_name, '[]', 'default', 0, :static, :now, :now)"
+            ),
+            {"key": key, "class_name": class_name, "static": True, "now": now},
         )
 
 
@@ -214,8 +202,7 @@ def test_run_now_ignores_the_pause(db_url, test_prefix) -> None:
         qc.close()
 
 
-def test_scheduler_skips_occurrences_while_paused(temp_db_path, test_prefix) -> None:
-    db_url = f"sqlite:///{temp_db_path}?mode=rwc"
+def test_scheduler_skips_occurrences_while_paused(db_url, test_prefix) -> None:
     jobs_table = f"{test_prefix}_jobs"
     executions_table = f"{test_prefix}_recurring_executions"
 
@@ -270,18 +257,15 @@ test:
         # Plain cron semantics, as with un-commenting a crontab line: the
         # first run after resuming is the very next occurrence after the
         # resume — not a replay of a skipped one, and not the one after next.
-        conn = readonly_connect(_db_path(db_url))
-        try:
-            (first_run_at,) = observe_sqlite(
+        with database_engine(db_url, readonly=True) as engine, engine.connect() as conn:
+            first_run_at = observe_sqlite(
                 lambda: conn.execute(
-                    f'SELECT MIN(run_at) FROM "{executions_table}" WHERE run_at > ?',
-                    (resumed_at.isoformat(sep=" "),),
-                ).fetchone()
+                    text(f'SELECT MIN(run_at) FROM "{executions_table}" WHERE run_at > :resumed'),
+                    {"resumed": resumed_at},
+                ).scalar_one()
             )
-        finally:
-            conn.close()
         assert first_run_at is not None
-        delay = datetime.fromisoformat(first_run_at) - resumed_at
+        delay = datetime.fromisoformat(str(first_run_at)) - resumed_at
         assert timedelta(0) < delay <= timedelta(seconds=2), delay
     finally:
         if qc is not None:
@@ -291,12 +275,11 @@ test:
         os.environ.pop("QUEBEC_ENV", None)
 
 
-def test_scheduler_restart_keeps_the_pause(temp_db_path, test_prefix) -> None:
+def test_scheduler_restart_keeps_the_pause(db_url, test_prefix) -> None:
     """A starting scheduler upserts the static tasks from YAML and deletes
     the ones no longer configured. Neither may touch `paused_at`: a paused
     task must still be paused after a restart, not silently running again.
     """
-    db_url = f"sqlite:///{temp_db_path}?mode=rwc"
     jobs_table = f"{test_prefix}_jobs"
     tasks_table = f"{test_prefix}_recurring_tasks"
 
@@ -357,12 +340,11 @@ test:
 
 
 def test_scheduler_honours_a_pause_after_its_own_probe_failed(
-    temp_db_path, test_prefix
+    db_url, test_prefix
 ) -> None:
     """A scheduler whose startup probe failed must not ignore pauses forever:
     once another process adds the column and pauses the task, this scheduler
     has to notice within the re-probe interval and stop enqueueing."""
-    db_url = f"sqlite:///{temp_db_path}?mode=rwc"
     jobs_table = f"{test_prefix}_jobs"
     reprobe_secs = 5  # RECURRING_PAUSE_REPROBE_SECS in src/context.rs
 

@@ -383,14 +383,14 @@ def test_parse_timestamp_handles_negative_fractional(qc_with_sqlalchemy) -> None
     # but AFTER the fixed -0.5 bound (23:59:59.500). Comparison is on
     # failed_executions.created_at, which the find_all query bounds via
     # `>= since` / `<= until`.
-    session.execute(
+    job_id = session.execute(
         text(
             f"INSERT INTO {prefix}_jobs "
             f"(queue_name, class_name, arguments, priority, created_at, updated_at) "
             f"VALUES ('default', 'X', '[]', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            " RETURNING id"
         )
-    )
-    job_id = session.execute(text("SELECT last_insert_rowid()")).scalar()
+    ).scalar_one()
     session.execute(
         text(
             f"INSERT INTO {prefix}_failed_executions "

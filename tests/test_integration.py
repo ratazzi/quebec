@@ -8,7 +8,7 @@ after operations. Each test uses a unique table prefix for isolation.
 
 import pytest
 import quebec
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 
 def test_baseclass_inherit():
@@ -193,12 +193,7 @@ class TestTablePrefix:
         engine = create_engine(sa_url)
         with engine.connect() as conn:
             # This should work if tables exist
-            result = conn.execute(
-                text(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'myapp_%'"
-                )
-            )
-            tables = [row[0] for row in result]
+            tables = inspect(conn).get_table_names()
 
             expected_tables = [
                 "myapp_jobs",

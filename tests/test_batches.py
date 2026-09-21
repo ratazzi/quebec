@@ -9,14 +9,13 @@ is involved.
 from __future__ import annotations
 
 import json
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
 import quebec
 from quebec.context import current_batch_id
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 
 class Record(quebec.BaseClass):
@@ -179,7 +178,7 @@ def _parse(ts) -> datetime:
 def test_schema_created_and_idempotent(env) -> None:
     qc, session, prefix = env["qc"], env["session"], env["prefix"]
     assert qc.create_tables() is True  # second run is a no-op
-    cols = {r[1] for r in session.execute(text(f"PRAGMA table_info({prefix}_jobs)"))}
+    cols = {col["name"] for col in inspect(env["engine"]).get_columns(f"{prefix}_jobs")}
     assert "batch_id" in cols
     assert _count(env, "batches") == 0
     assert _count(env, "batch_executions") == 0
@@ -191,7 +190,7 @@ def test_batch_id_added_to_legacy_jobs_table(env) -> None:
     session.execute(text(f"ALTER TABLE {prefix}_jobs DROP COLUMN batch_id"))
     session.commit()
     assert env["qc"].create_tables() is True
-    cols = {r[1] for r in session.execute(text(f"PRAGMA table_info({prefix}_jobs)"))}
+    cols = {col["name"] for col in inspect(env["engine"]).get_columns(f"{prefix}_jobs")}
     assert "batch_id" in cols
 
 
@@ -565,11 +564,9 @@ def test_batches_unavailable_on_legacy_schema(env) -> None:
     assert _count(env, "jobs", "WHERE finished_at IS NOT NULL") == 1
 
     # A fresh connection without the column still reads job rows.
-    con = sqlite3.connect(db_url.split("///", 1)[1].split("?")[0])
     assert "batch_id" not in {
-        r[1] for r in con.execute(f"PRAGMA table_info({prefix}_jobs)")
+        col["name"] for col in inspect(env["engine"]).get_columns(f"{prefix}_jobs")
     }
-    con.close()
 
 
 def test_find_batch_by_uuid_and_progress(env) -> None:

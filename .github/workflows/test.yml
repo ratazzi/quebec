@@ -40,8 +40,28 @@ jobs:
         run: cargo check --all-targets
 
   pytest:
-    name: Pytest
+    name: Pytest (${{ matrix.database }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [postgresql, sqlite]
+
+    services:
+      postgres:
+        image: ${{ matrix.database == 'postgresql' && 'postgres:18' || '' }}
+        env:
+          POSTGRES_USER: quebec_test
+          POSTGRES_PASSWORD: quebec_test
+          POSTGRES_DB: quebec_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U quebec_test -d quebec_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     steps:
       - uses: actions/checkout@v6
@@ -72,4 +92,5 @@ jobs:
       - name: Run pytest
         env:
           QUEBEC_SKIP_IMPORT_HOOK: "1"
-        run: uv run pytest --ignore=tests/step_defs
+          TEST_POSTGRESQL_URL: ${{ matrix.database == 'postgresql' && 'postgresql://quebec_test:quebec_test@127.0.0.1:5432/quebec_test' || '' }}
+        run: uv run pytest --database=${{ matrix.database }} --ignore=tests/step_defs

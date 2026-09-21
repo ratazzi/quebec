@@ -77,8 +77,8 @@ def _reap(pid: int) -> int:
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork()")
 @pytest.mark.filterwarnings("ignore:.*multi-threaded.*fork:DeprecationWarning")
-def test_forked_worker_child_does_not_crash(sqlite_url):
-    qc = quebec.Quebec(sqlite_url)
+def test_forked_worker_child_does_not_crash(db_url):
+    qc = quebec.Quebec(db_url)
     assert qc.create_tables()
 
     # Give the children a pipe for their log output. Under pytest's default fd
@@ -96,6 +96,7 @@ def test_forked_worker_child_does_not_crash(sqlite_url):
         os.close(write_fd)
         drain.join(timeout=SHUTDOWN_GRACE)
         os.close(read_fd)
+        qc.close()
 
 
 def _run_fork_rounds(qc, write_fd: int) -> None:

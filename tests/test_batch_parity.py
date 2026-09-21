@@ -1,24 +1,24 @@
 import json
-import sqlite3
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
 import quebec
+from sqlalchemy import text
+
+from .helpers import database_engine
 
 RAILS_CALLBACK = Path(__file__).parent / "fixtures" / "rails_batch_callback.json"
 
 
 @pytest.fixture
-def env(tmp_path):
-    path = tmp_path / "probe.db"
-    qc = quebec.Quebec(f"sqlite:///{path}?mode=rwc", table_name_prefix="probe")
-    qc.create_tables()
-    db = sqlite3.connect(path)
+def env(db_url):
+    qc = quebec.Quebec(db_url, table_name_prefix="probe")
     try:
-        yield qc, db
+        qc.create_tables()
+        with database_engine(db_url) as engine, engine.connect() as db:
+            yield qc, db
     finally:
-        db.close()
         qc.close()
 
 
@@ -54,7 +54,7 @@ class LimitedCallback(quebec.BaseClass):
 
 
 def count(db, table):
-    return db.execute(f"SELECT COUNT(*) FROM probe_{table}").fetchone()[0]
+    return db.execute(text(f"SELECT COUNT(*) FROM probe_{table}")).fetchone()[0]
 
 
 def test_exception_rolls_back_batch_and_jobs(env):
@@ -96,7 +96,8 @@ def test_real_rails_timestamp_is_not_discarded(env):
     batch = qc.batch()
     callback = RAILS_CALLBACK.read_text()
     db.execute(
-        "UPDATE probe_batches SET on_finish = ? WHERE id = ?", (callback, batch.id)
+        text("UPDATE probe_batches SET on_finish = :callback WHERE id = :id"),
+        {"callback": callback, "id": batch.id}
     )
     db.commit()
     qc._batch_start(batch.id)
@@ -114,8 +115,8 @@ def test_rails_callback_applies_registered_concurrency(env):
     assert "concurrency_key" not in callback
     batch = qc.batch()
     db.execute(
-        "UPDATE probe_batches SET on_finish = ? WHERE id = ?",
-        (json.dumps(callback), batch.id),
+        text("UPDATE probe_batches SET on_finish = :callback WHERE id = :id"),
+        {"callback": json.dumps(callback), "id": batch.id},
     )
     db.commit()
     qc._batch_start(batch.id)
@@ -223,12 +224,12 @@ def test_callback_concurrency_resolves_batch_and_rails_keywords(env):
     )
     batch = qc.batch()
     db.execute(
-        "UPDATE probe_batches SET on_finish = ? WHERE id = ?",
-        (json.dumps(callback), batch.id),
+        text("UPDATE probe_batches SET on_finish = :callback WHERE id = :id"),
+        {"callback": json.dumps(callback), "id": batch.id},
     )
     db.commit()
     qc._batch_start(batch.id)
-    key = db.execute("SELECT concurrency_key FROM probe_jobs").fetchone()[0]
+    key = db.execute(text("SELECT concurrency_key FROM probe_jobs")).fetchone()[0]
     assert key.endswith(f"/{batch.id}/north")
     qc.drain_one().perform()
     assert performed == [(batch.id, "north")]
@@ -248,16 +249,13 @@ def test_callback_timezone_and_legacy_naive_timestamp(env, timestamp, expected):
     callback["scheduled_at"] = timestamp
     batch = qc.batch()
     db.execute(
-        "UPDATE probe_batches SET on_finish = ? WHERE id = ?",
-        (json.dumps(callback), batch.id),
+        text("UPDATE probe_batches SET on_finish = :callback WHERE id = :id"),
+        {"callback": json.dumps(callback), "id": batch.id},
     )
     db.commit()
     qc._batch_start(batch.id)
-    assert (
-        db.execute("SELECT scheduled_at FROM probe_jobs")
-        .fetchone()[0]
-        .startswith(expected)
-    )
+    scheduled_at = db.execute(text("SELECT scheduled_at FROM probe_jobs")).scalar_one()
+    assert str(scheduled_at).startswith(expected)
 
 
 def test_invalid_callback_timestamp_rolls_back_completion(env):
@@ -267,8 +265,8 @@ def test_invalid_callback_timestamp_rolls_back_completion(env):
     callback["scheduled_at"] = "not-a-date"
     batch = qc.batch()
     db.execute(
-        "UPDATE probe_batches SET on_finish = ? WHERE id = ?",
-        (json.dumps(callback), batch.id),
+        text("UPDATE probe_batches SET on_finish = :callback WHERE id = :id"),
+        {"callback": json.dumps(callback), "id": batch.id},
     )
     db.commit()
     with pytest.raises(RuntimeError, match="scheduled_at"):
@@ -324,10 +322,20 @@ def test_callback_around_hook_receives_database_error(env):
             pass
 
     qc.register_job(DatabaseErrorCallback)
-    db.execute("""
-        CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions
-        BEGIN SELECT RAISE(FAIL, 'injected callback write failure'); END
-    """)
+    if db.dialect.name == "postgresql":
+        db.execute(text("""
+            CREATE FUNCTION reject_ready() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'injected callback write failure'; END $$
+        """))
+        db.execute(text("""
+            CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions
+            FOR EACH ROW EXECUTE FUNCTION reject_ready()
+        """))
+    else:
+        db.execute(text("""
+            CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions
+            BEGIN SELECT RAISE(FAIL, 'injected callback write failure'); END
+        """))
     db.commit()
     with (
         pytest.raises(RuntimeError, match="injected callback write failure"),

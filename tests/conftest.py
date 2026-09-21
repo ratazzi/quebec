@@ -8,6 +8,7 @@ import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
 if os.environ.get("QUEBEC_SKIP_IMPORT_HOOK", "0") != "1":
@@ -57,30 +58,58 @@ def sqlite_memory_url():
     return "sqlite::memory:"
 
 
-@pytest.fixture(params=["sqlite"])
+def pytest_addoption(parser):
+    parser.addoption(
+        "--database",
+        action="append",
+        choices=["postgresql", "sqlite"],
+        help="Database backend to test; repeat to run both. PostgreSQL requires TEST_POSTGRESQL_URL.",
+    )
+
+
+def pytest_configure(config):
+    backends = config.getoption("database")
+    if backends is None:
+        backends = ["postgresql", "sqlite"] if os.getenv("TEST_POSTGRESQL_URL") else ["sqlite"]
+    config._quebec_databases = list(dict.fromkeys(backends))
+    if "postgresql" in backends and not os.getenv("TEST_POSTGRESQL_URL"):
+        raise pytest.UsageError("--database=postgresql requires TEST_POSTGRESQL_URL")
+
+
+def pytest_generate_tests(metafunc):
+    if "db_url" in metafunc.fixturenames:
+        metafunc.parametrize("db_url", metafunc.config._quebec_databases, indirect=True)
+
+
+@pytest.fixture
 def db_url(request, temp_db_path):
-    """
-    Parametrized database URL fixture.
+    """Run shared tests on each selected backend, isolating PostgreSQL by schema.
 
-    To test with multiple databases, add to params:
-    params=['sqlite', 'postgresql', 'mysql']
-
-    And set environment variables:
-    - TEST_POSTGRESQL_URL=postgresql://user:pass@localhost/test_db
-    - TEST_MYSQL_URL=mysql://user:pass@localhost/test_db
+    Only the generated schema is dropped; the supplied database is never dropped.
+    The URL carries search_path so additional Quebec instances and subprocesses
+    in a test see the same tables without depending on connection-local setup.
     """
     if request.param == "sqlite":
-        return f"sqlite:///{temp_db_path}?mode=rwc"
-    elif request.param == "postgresql":
-        url = os.environ.get("TEST_POSTGRESQL_URL")
-        if not url:
-            pytest.skip("TEST_POSTGRESQL_URL not set")
-        return url
-    elif request.param == "mysql":
-        url = os.environ.get("TEST_MYSQL_URL")
-        if not url:
-            pytest.skip("TEST_MYSQL_URL not set")
-        return url
+        yield f"sqlite:///{temp_db_path}?mode=rwc"
+        return
+
+    url = make_url(os.environ["TEST_POSTGRESQL_URL"])
+    if url.drivername != "postgresql":
+        raise pytest.UsageError("TEST_POSTGRESQL_URL must use postgresql://")
+    schema = f"quebec_test_{uuid.uuid4().hex}"
+    engine = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with engine.connect() as connection:
+            connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        options = url.query.get("options", "")
+        scoped_url = url.update_query_dict({"options": f"{options} -csearch_path={schema}".strip()})
+        try:
+            yield scoped_url.render_as_string(hide_password=False)
+        finally:
+            with engine.connect() as connection:
+                connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture

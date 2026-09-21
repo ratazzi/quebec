@@ -1848,16 +1848,11 @@ impl PyQuebec {
                     futures::future::join_all(tasks),
                 )
                 .await;
-                // Drop DB connection pool (releases all connections)
+                // AppContext and executions retain Arc references to the pool.
+                // Close the shared pool explicitly; try_unwrap cannot succeed
+                // while self.ctx still owns it.
                 if let Some(conn) = db {
-                    match Arc::try_unwrap(conn) {
-                        Ok(owned) => {
-                            owned.close().await.ok();
-                        }
-                        Err(_) => warn!(
-                            "DB connection pool has other references, skipping explicit close"
-                        ),
-                    }
+                    conn.close_by_ref().await.ok();
                 }
             });
             self.ctx.job_metrics.recorder().stop();

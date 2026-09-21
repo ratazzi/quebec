@@ -10,10 +10,10 @@ the adapter's own Location rewrite, so they check the handlers themselves.
 
 from __future__ import annotations
 
-import sqlite3
 from datetime import timedelta
 
 import pytest
+from sqlalchemy import text
 
 import quebec
 
@@ -40,15 +40,6 @@ def _request(qc, method: str, path: str, headers: dict[str, str] | None = None):
     return status, location
 
 
-def _scheduled_execution_id(db_url: str, prefix: str) -> int:
-    path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
-    with sqlite3.connect(path) as conn:
-        (execution_id,) = conn.execute(
-            f'SELECT id FROM "{prefix}_scheduled_executions"'
-        ).fetchone()
-    return execution_id
-
-
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -65,11 +56,15 @@ def test_queue_actions_redirect_within_the_mount(qc, path, expected) -> None:
 
 
 def test_scheduled_job_cancel_redirects_within_the_mount(
-    qc, db_url, test_prefix
+    qc_with_sqlalchemy
 ) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    prefix = qc_with_sqlalchemy["prefix"]
     qc.register_job(QuietJob)
     QuietJob.set(wait=timedelta(hours=1)).perform_later(qc)
-    execution_id = _scheduled_execution_id(db_url, test_prefix)
+    execution_id = qc_with_sqlalchemy["session"].execute(
+        text(f'SELECT id FROM "{prefix}_scheduled_executions"')
+    ).scalar_one()
 
     status, location = _request(qc, "POST", f"/scheduled-jobs/{execution_id}/cancel")
     assert status == 303

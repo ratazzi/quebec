@@ -219,7 +219,7 @@ def test_batch_retries_after_rate_limit_routes_a_candidate(db_url, test_prefix) 
 
 
 @pytest.fixture
-def ordered_queue_qc(tmp_path, monkeypatch, temp_db_path, test_prefix):
+def ordered_queue_qc(tmp_path, monkeypatch, db_url, test_prefix):
     queue_yml = tmp_path / "queue.yml"
     queue_yml.write_text(
         """
@@ -235,7 +235,7 @@ development:
     monkeypatch.delenv("QUEBEC_ENV", raising=False)
 
     instance = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         experimental_global_priority=True,
     )
@@ -262,7 +262,7 @@ def test_explicit_queue_list_still_wins_over_priority(ordered_queue_qc) -> None:
 
 
 @pytest.fixture
-def wildcard_qc(tmp_path, monkeypatch, temp_db_path, test_prefix):
+def wildcard_qc(tmp_path, monkeypatch, db_url, test_prefix):
     queue_yml = tmp_path / "queue.yml"
     queue_yml.write_text(
         """
@@ -276,7 +276,7 @@ development:
     monkeypatch.delenv("QUEBEC_ENV", raising=False)
 
     instance = quebec.Quebec(
-        f"sqlite:///{temp_db_path}?mode=rwc",
+        db_url,
         table_name_prefix=test_prefix,
         experimental_global_priority=True,
     )
@@ -304,7 +304,7 @@ def test_wildcard_prefix_keeps_queue_order(wildcard_qc) -> None:
     first.perform()
 
 
-def test_batch_stops_when_db_collation_folds_queue_names(db_url, test_prefix) -> None:
+def test_batch_stops_when_db_collation_folds_queue_names(sqlite_url, test_prefix) -> None:
     """The `IN` list is shrunk by exact Rust string comparison, but the DB
     matches names under its own collation. A case-insensitive collation (the
     MySQL default) folds `Foo` and `foo` into one distinct name, so a full
@@ -312,7 +312,7 @@ def test_batch_stops_when_db_collation_folds_queue_names(db_url, test_prefix) ->
     must notice the list did not shrink and stop instead of re-polling the
     same row forever. SQLite reproduces this with `COLLATE NOCASE`.
     """
-    assert db_url.startswith("sqlite:///")
+    db_url = sqlite_url
     path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
     with sqlite3.connect(path) as conn:
         conn.execute(

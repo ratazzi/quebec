@@ -26,7 +26,7 @@ def test_recurring_rejects_invalid_concurrency_key(qc_with_sqlalchemy, failure):
     session.execute(text(
         f"INSERT INTO {prefix}_recurring_tasks "
         '(key, schedule, class_name, arguments, queue_name, priority, "static", created_at, updated_at) '
-        "VALUES ('broken', 'every minute', :class_name, '[]', 'default', 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        "VALUES ('broken', 'every minute', :class_name, '[]', 'default', 0, TRUE, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
     ), {"class_name": BrokenKeyJob.__qualname__})
     session.commit()
 

@@ -80,7 +80,7 @@ class TestScheduledJobs:
         assert scheduled_at_str is not None
 
         # Verify scheduled time is approximately 1 hour in the future
-        scheduled_at = datetime.fromisoformat(scheduled_at_str)
+        scheduled_at = datetime.fromisoformat(str(scheduled_at_str))
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         diff = (scheduled_at - now).total_seconds()
         assert 3550 < diff < 3650  # Allow 50 seconds tolerance
@@ -112,7 +112,7 @@ class TestScheduledJobs:
         scheduled_at_str = result.scalar()
         assert scheduled_at_str is not None
 
-        scheduled_at = datetime.fromisoformat(scheduled_at_str)
+        scheduled_at = datetime.fromisoformat(str(scheduled_at_str))
         expected = future_time.replace(tzinfo=None)
         diff = abs((scheduled_at - expected).total_seconds())
         assert diff < 2  # Within 2 seconds
