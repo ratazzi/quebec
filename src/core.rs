@@ -47,6 +47,22 @@ impl JobDestination {
     }
 }
 
+const MYSQL_DEADLOCK_RETRIES: u32 = 4;
+
+fn is_mysql_deadlock(error: &TransactionError<DbErr>) -> bool {
+    let TransactionError::Transaction(
+        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(source)))
+        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(source))),
+    ) = error
+    else {
+        return false;
+    };
+
+    source
+        .try_downcast_ref::<SqlxMySqlError>()
+        .is_some_and(|error| error.number() == 1213)
+}
+
 #[derive(Debug)]
 pub struct Quebec {
     pub ctx: Arc<AppContext>,
@@ -79,16 +95,30 @@ impl Quebec {
         let db = self.ctx.get_db().await?;
         let ctx = self.ctx.clone();
 
-        let (job_models, ready_queues, released_batches) = db
-            .transaction::<_, (Vec<quebec_jobs::Model>, HashSet<String>, Vec<i64>), DbErr>(|txn| {
-                let ctx = ctx.clone();
-                let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60));
-                let jobs = Arc::clone(&jobs);
-                Box::pin(async move { enqueue_all_jobs(txn, &ctx, &jobs, duration).await })
-            })
-            .await
-            .map_err(crate::error::QuebecError::from)?;
+        let mut attempt = 0;
+        let (job_models, ready_queues, released_batches) = loop {
+            let result = db
+                .transaction::<_, (Vec<quebec_jobs::Model>, HashSet<String>, Vec<i64>), DbErr>(
+                    |txn| {
+                        let ctx = ctx.clone();
+                        let duration =
+                            chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                                .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                        let jobs = Arc::clone(&jobs);
+                        Box::pin(async move { enqueue_all_jobs(txn, &ctx, &jobs, duration).await })
+                    },
+                )
+                .await;
+            match result {
+                Ok(value) => break value,
+                Err(error) if attempt < MYSQL_DEADLOCK_RETRIES && is_mysql_deadlock(&error) => {
+                    attempt += 1;
+                    warn!(attempt, "Retrying bulk enqueue after MySQL deadlock");
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
+                }
+                Err(error) => return Err(crate::error::QuebecError::from(error)),
+            }
+        };
 
         // Send NOTIFY only for queues that have ready jobs (consistent with perform_later).
         // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
@@ -130,16 +160,28 @@ impl Quebec {
         let ctx = self.ctx.clone();
         trace!("job: {:?}", job);
 
-        let (job_model, destination, released_batch) = db
-            .transaction::<_, (quebec_jobs::Model, JobDestination, Option<i64>), DbErr>(|txn| {
-                let ctx = ctx.clone();
-                let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(60));
-                let job = job.clone();
-                Box::pin(async move { enqueue_job(txn, &ctx, &job, duration).await })
-            })
-            .await
-            .map_err(crate::error::QuebecError::from)?;
+        let mut attempt = 0;
+        let (job_model, destination, released_batch) = loop {
+            let result = db
+                .transaction::<_, (quebec_jobs::Model, JobDestination, Option<i64>), DbErr>(|txn| {
+                    let ctx = ctx.clone();
+                    let duration =
+                        chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(60));
+                    let job = job.clone();
+                    Box::pin(async move { enqueue_job(txn, &ctx, &job, duration).await })
+                })
+                .await;
+            match result {
+                Ok(value) => break value,
+                Err(error) if attempt < MYSQL_DEADLOCK_RETRIES && is_mysql_deadlock(&error) => {
+                    attempt += 1;
+                    warn!(attempt, "Retrying enqueue after MySQL deadlock");
+                    tokio::time::sleep(std::time::Duration::from_millis(10 * attempt as u64)).await;
+                }
+                Err(error) => return Err(crate::error::QuebecError::from(error)),
+            }
+        };
 
         if destination.should_notify()
             && crate::notify::should_send_notify(&self.ctx, &job_model.queue_name)
