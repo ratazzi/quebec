@@ -1319,9 +1319,25 @@ pub mod ready_executions {
         params.push((limit as i64).into());
         let limit_placeholder = placeholder(params.len());
 
-        let sql = format!(
-            r#"SELECT * FROM {tq}{table_name}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_placeholder} {lock_clause}"#
-        );
+        let sql = if backend == DbBackend::MySql {
+            // MySQL can choose a full table scan for this small LIMIT after
+            // refreshing table statistics, even though the ordering index
+            // exists. The optimizer hint is ignored if an older schema lacks
+            // the index, so it cannot make claiming unavailable.
+            let raw_index_name = if queue_name.is_some() {
+                format!("idx_{table_name}_queue_priority_job")
+            } else {
+                format!("idx_{table_name}_priority_job")
+            };
+            let index_name = quote_identifier(backend, &index_name(backend, &raw_index_name));
+            format!(
+                r#"SELECT /*+ INDEX(r {index_name}) */ * FROM {tq}{table_name}{tq} AS r {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_placeholder} {lock_clause}"#
+            )
+        } else {
+            format!(
+                r#"SELECT * FROM {tq}{table_name}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT {limit_placeholder} {lock_clause}"#
+            )
+        };
 
         let stmt = Statement::from_sql_and_values(backend, sql, params);
         quebec_ready_executions::Model::find_by_statement(stmt)
@@ -1585,6 +1601,40 @@ pub mod ready_executions {
                     .or_else(|| r.try_get_by_index(0).ok())
             })
             .flatten())
+    }
+
+    #[cfg(test)]
+    mod index_hint_tests {
+        use super::*;
+        use sea_orm::MockDatabase;
+        use std::collections::BTreeMap;
+
+        #[tokio::test]
+        async fn mysql_claim_uses_the_matching_order_index_hint() {
+            let db = MockDatabase::new(DbBackend::MySql)
+                .append_query_results([
+                    Vec::<BTreeMap<String, Value>>::new(),
+                    Vec::<BTreeMap<String, Value>>::new(),
+                ])
+                .into_connection();
+            let tables = TableConfig::with_prefix("perf");
+            assert!(find_many_for_update(&db, &tables, None, true, 4)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(find_many_for_update(&db, &tables, Some("fast"), true, 4)
+                .await
+                .unwrap()
+                .is_empty());
+            let log = db.into_transaction_log();
+            assert_eq!(log.len(), 2);
+            let all = &log[0].statements()[0].sql;
+            let exact = &log[1].statements()[0].sql;
+            assert!(all.contains("INDEX(r `idx_perf_ready_executions_priority_job`)"));
+            assert!(exact.contains("INDEX(r `idx_perf_ready_executions_queue_priority_job`)"));
+            assert!(all.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(exact.contains("WHERE `queue_name` = ?"));
+        }
     }
 }
 
