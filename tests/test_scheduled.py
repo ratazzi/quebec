@@ -3,10 +3,14 @@
 Integration tests for scheduled jobs and queue priority.
 """
 
+import time
 from datetime import datetime, timedelta, timezone
+
 import quebec
 from quebec import BaseClass
 from sqlalchemy import text
+
+from .helpers import observe_sqlite, readonly_connect, wait_until
 
 
 class TestScheduledJobs:
@@ -237,3 +241,68 @@ class TestQueuePriority:
             )
         )
         assert result.scalar() == 1
+
+
+def test_dispatcher_promotes_mixed_due_jobs(qc_with_sqlalchemy):
+    """Bulk promotion preserves ready and blocked outcomes in one due batch."""
+    qc = qc_with_sqlalchemy["qc"]
+    engine = qc_with_sqlalchemy["engine"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    db_url = qc_with_sqlalchemy["db_url"]
+
+    class Plain(BaseClass):
+        def perform(self, value):
+            pass
+
+    class Gated(BaseClass):
+        concurrency_limit = 1
+
+        def concurrency_key(self, key):
+            return key
+
+        def perform(self, key):
+            pass
+
+    qc.register_job(Plain)
+    qc.register_job(Gated)
+    qc.perform_all_later(
+        [
+            Plain.set(wait=0.2).build(0),
+            Gated.set(wait=0.2).build("shared"),
+            Gated.set(wait=0.2).build("shared"),
+            Gated.set(wait=0.2).build("unique"),
+        ]
+    )
+
+    def snapshot():
+        tables = ("ready_executions", "blocked_executions", "scheduled_executions")
+        if db_url.startswith("sqlite:"):
+            db_path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+
+            def read_counts():
+                with readonly_connect(db_path) as observer:
+                    return tuple(
+                        observer.execute(
+                            f"SELECT COUNT(*) FROM {prefix}_{table}"
+                        ).fetchone()[0]
+                        for table in tables
+                    )
+
+            return observe_sqlite(read_counts)
+
+        with engine.connect() as observer:
+            return tuple(
+                observer.execute(
+                    text(f"SELECT COUNT(*) FROM {prefix}_{table}")
+                ).scalar_one()
+                for table in tables
+            )
+
+    assert snapshot() == (0, 0, 4)
+    time.sleep(0.35)
+    qc.spawn_dispatcher()
+    wait_until(
+        lambda: snapshot() == (3, 1, 0),
+        timeout=5,
+        message="dispatcher did not preserve mixed ready/blocked routing",
+    )

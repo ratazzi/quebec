@@ -1073,6 +1073,28 @@ pub mod ready_executions {
             return Ok(());
         }
 
+        let now = chrono::Utc::now().naive_utc();
+        let rows: Vec<_> = data
+            .iter()
+            .map(|&(job_id, queue_name, priority)| (job_id, queue_name, priority, now))
+            .collect();
+        insert_all_with_created_at(db, table_config, &rows).await
+    }
+
+    /// Bulk insert while preserving the time each job became ready.
+    /// Concurrency decisions may take substantial time before the final INSERT.
+    pub async fn insert_all_with_created_at<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, &str, i32, chrono::NaiveDateTime)],
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         let backend = db.get_database_backend();
         let cols_per_row: usize = 4;
         let max_params = match backend {
@@ -1080,8 +1102,6 @@ pub mod ready_executions {
             _ => 65535,
         };
         let chunk_size = max_params / cols_per_row;
-        let now = chrono::Utc::now().naive_utc();
-
         for chunk in data.chunks(chunk_size) {
             let table = Alias::new(&table_config.ready_executions);
             let mut query = Query::insert()
@@ -1094,12 +1114,12 @@ pub mod ready_executions {
                 ])
                 .to_owned();
 
-            for &(job_id, queue_name, priority) in chunk {
+            for &(job_id, queue_name, priority, created_at) in chunk {
                 query.values_panic([
                     job_id.into(),
                     queue_name.into(),
                     priority.into(),
-                    now.into(),
+                    created_at.into(),
                 ]);
             }
 
@@ -2119,6 +2139,58 @@ pub mod blocked_executions {
         }
 
         execute_insert(db, query).await
+    }
+
+    /// Bulk insert blocked execution records. SQLite uses at most 166 rows
+    /// per statement (six values each, below its 999-variable limit).
+    pub async fn insert_all<C>(
+        db: &C,
+        table_config: &TableConfig,
+        data: &[(i64, &str, i32, &str, chrono::NaiveDateTime)],
+    ) -> Result<(), DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let backend = db.get_database_backend();
+        let max_params = if backend == DbBackend::Sqlite {
+            999
+        } else {
+            65535
+        };
+        let chunk_size = max_params / 6;
+        let now = chrono::Utc::now().naive_utc();
+        for chunk in data.chunks(chunk_size) {
+            let table = Alias::new(&table_config.blocked_executions);
+            let mut query = Query::insert()
+                .into_table(table)
+                .columns([
+                    col("job_id"),
+                    col("queue_name"),
+                    col("priority"),
+                    col("concurrency_key"),
+                    col("expires_at"),
+                    col("created_at"),
+                ])
+                .to_owned();
+            for &(job_id, queue_name, priority, concurrency_key, expires_at) in chunk {
+                query.values_panic([
+                    job_id.into(),
+                    queue_name.into(),
+                    priority.into(),
+                    concurrency_key.into(),
+                    expires_at.into(),
+                    now.into(),
+                ]);
+            }
+            let (sql, values) = build_insert_sql(backend, &query);
+            db.execute(Statement::from_sql_and_values(backend, sql, values))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Find blocked executions by concurrency key

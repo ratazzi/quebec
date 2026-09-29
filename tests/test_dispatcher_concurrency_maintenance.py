@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import quebec
 from sqlalchemy import text
 
-from .helpers import wait_until
+from .helpers import observe_sqlite, readonly_connect, wait_until
 
 
 class SweepConcurrentJob(quebec.BaseClass):
@@ -20,6 +20,17 @@ class SweepConcurrentJob(quebec.BaseClass):
         return "sweep-resource"
 
     def perform(self) -> None:
+        pass
+
+
+class SweepManyKeysJob(quebec.BaseClass):
+    concurrency_limit = 1
+
+    @staticmethod
+    def concurrency_key(value: int) -> str:
+        return f"sweep-{value}"
+
+    def perform(self, value: int) -> None:
         pass
 
 
@@ -97,10 +108,88 @@ def test_maintenance_sweep_reclaims_crashed_holder(
     session.commit()
 
     qc.spawn_dispatcher()
+
+    def reclaimed() -> bool:
+        db_url = qc_with_sqlalchemy["db_url"]
+        if db_url.startswith("sqlite:"):
+            db_path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+
+            def read_counts() -> bool:
+                with readonly_connect(db_path) as observer:
+                    blocked = observer.execute(
+                        f"SELECT COUNT(*) FROM {prefix}_blocked_executions"
+                    ).fetchone()[0]
+                    ready = observer.execute(
+                        f"SELECT COUNT(*) FROM {prefix}_ready_executions"
+                    ).fetchone()[0]
+                return blocked == 0 and ready == 1
+
+            return observe_sqlite(read_counts)
+
+        session.expire_all()
+        return (
+            db_assert.count_blocked_executions() == 0
+            and db_assert.count_ready_executions() == 1
+        )
+
     wait_until(
-        lambda: (session.expire_all() or True)
-        and db_assert.count_blocked_executions() == 0
-        and db_assert.count_ready_executions() == 1,
+        reclaimed,
         timeout=5,
         message="maintenance sweep did not reclaim the crashed holder",
     )
+
+
+def test_maintenance_sweep_reclaims_multiple_keys(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    db_url = qc_with_sqlalchemy["db_url"]
+    qc.register_job(SweepManyKeysJob)
+    qc.perform_all_later([SweepManyKeysJob.build(index // 2) for index in range(16)])
+    assert db_assert.count_ready_executions() == 8
+    assert db_assert.count_blocked_executions() == 8
+
+    past = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
+    session.execute(text(f"DELETE FROM {prefix}_ready_executions"))
+    session.execute(
+        text(f"UPDATE {prefix}_semaphores SET expires_at = :past"), {"past": past}
+    )
+    session.execute(
+        text(f"UPDATE {prefix}_blocked_executions SET expires_at = :past"),
+        {"past": past},
+    )
+    session.commit()
+    qc.spawn_dispatcher()
+
+    def all_reclaimed() -> bool:
+        if db_url.startswith("sqlite:"):
+            db_path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+
+            def read_counts() -> bool:
+                with readonly_connect(db_path) as observer:
+                    blocked = observer.execute(
+                        f"SELECT COUNT(*) FROM {prefix}_blocked_executions"
+                    ).fetchone()[0]
+                    ready = observer.execute(
+                        f"SELECT COUNT(*) FROM {prefix}_ready_executions"
+                    ).fetchone()[0]
+                return blocked == 0 and ready == 8
+
+            return observe_sqlite(read_counts)
+        with qc_with_sqlalchemy["engine"].connect() as observer:
+            blocked = observer.execute(
+                text(f"SELECT COUNT(*) FROM {prefix}_blocked_executions")
+            ).scalar_one()
+            ready = observer.execute(
+                text(f"SELECT COUNT(*) FROM {prefix}_ready_executions")
+            ).scalar_one()
+        return blocked == 0 and ready == 8
+
+    wait_until(all_reclaimed, timeout=5, message="not all expired keys were reclaimed")
+    with qc_with_sqlalchemy["engine"].connect() as observer:
+        semaphores = observer.execute(
+            text(f"SELECT COUNT(*) FROM {prefix}_semaphores WHERE value = 0")
+        ).scalar_one()
+    assert semaphores == 8

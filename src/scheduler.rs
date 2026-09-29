@@ -660,13 +660,9 @@ impl Scheduler {
             for (key, mut value) in entry {
                 value.key = Some(key);
 
-                let ret = db
-                    .transaction::<_, ExecResult, DbErr>(|txn| {
-                        let tc = table_config.clone();
-                        let v = value.clone();
-                        Box::pin(async move { upsert_task(txn, &tc, v).await })
-                    })
-                    .await?;
+                // The UPSERT is one atomic statement. A separate transaction
+                // for every task adds two database round trips during startup.
+                let ret = upsert_task(db, table_config, value.clone()).await?;
 
                 trace!("Upsert task: {:?}", ret);
                 scheduled.push(value);
