@@ -175,37 +175,39 @@ impl ControlPlane {
         // The finished set is unbounded; the nav badge shows "…" instead of an
         // exact count (Mission Control parity), so no COUNT is issued here.
 
-        // Per-queue ready-execution counts + paused-state snapshot, so the
-        // /stats turbo-stream can update each row of the queues table in sync
-        // with the top nav counters. Two extra queries (one GROUP BY on the
-        // ready table, one full table read of pauses) — both cheap because the
-        // working sets are small by design.
-        let queue_counts_map =
-            query_builder::ready_executions::count_by_queue(db, table_config).await?;
-        let paused_queue_names =
-            query_builder::pauses::find_all_queue_names(db, table_config).await?;
-        let all_queue_names = self.get_queue_names().await?;
+        // The queues page already fetched the full queue snapshot. Other
+        // pages need their own snapshot for Turbo Stream updates.
+        if context.get("queue_counts").is_none() {
+            let queue_counts_map =
+                query_builder::ready_executions::count_by_queue(db, table_config).await?;
+            let paused_queue_names =
+                query_builder::pauses::find_all_queue_names(db, table_config).await?;
+            let all_queue_names = self.get_queue_names().await?;
 
-        let queue_counts: Vec<QueueInfo> = all_queue_names
-            .into_iter()
-            .map(|name| QueueInfo {
-                slug: queue_slug(&name),
-                jobs_count: *queue_counts_map.get(&name).unwrap_or(&0),
-                status: if paused_queue_names.contains(&name) {
-                    "paused".to_string()
-                } else {
-                    "active".to_string()
-                },
-                concurrency_limit: self.ctx.experimental_queue_concurrency.get(&name).copied(),
-                name,
-            })
-            .collect();
-        context.insert("queue_counts", &queue_counts);
+            let queue_counts: Vec<QueueInfo> = all_queue_names
+                .into_iter()
+                .map(|name| QueueInfo {
+                    slug: queue_slug(&name),
+                    jobs_count: *queue_counts_map.get(&name).unwrap_or(&0),
+                    status: if paused_queue_names.contains(&name) {
+                        "paused".to_string()
+                    } else {
+                        "active".to_string()
+                    },
+                    concurrency_limit: self.ctx.experimental_queue_concurrency.get(&name).copied(),
+                    name,
+                })
+                .collect();
+            context.insert("queue_counts", &queue_counts);
+        }
+
+        context.insert("_nav_stats_complete", &true);
 
         Ok(())
     }
 
     /// Check if a queue is paused using query_builder
+    #[allow(dead_code)] // Public Rust helper; queue details now reuse the navigation pause snapshot.
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
         let db = self.ctx.get_db().await?;
         let db = db.as_ref();
@@ -446,9 +448,12 @@ impl ControlPlane {
         // glance which queue this process is pinned to.
         context.insert("force_override_queue", &self.ctx.force_override_queue);
 
-        // Add navigation stats
-        if let Err(e) = self.populate_nav_stats(context).await {
-            error!("Failed to populate navigation stats: {}", e);
+        // Stats and SSE handlers already populated this context. Preserve
+        // their explicit error handling without querying twice.
+        if context.get("_nav_stats_complete").is_none() {
+            if let Err(e) = self.populate_nav_stats(context).await {
+                error!("Failed to populate navigation stats: {}", e);
+            }
         }
 
         // In debug compilation mode, reload templates

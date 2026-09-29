@@ -19,8 +19,22 @@ BASE = "/quebec"
 BADGE_CLASS = "px-1 py-0.5 text-xs rounded-full bg-gray-200 text-gray-800"
 
 
-def _get(qc, path: str) -> tuple[int, str]:
-    req = quebec.AsgiRequest("GET", path, "", [], b"", BASE)
+class NavWork(quebec.BaseClass):
+    queue_as = "perf"
+
+    def perform(self, value):
+        return None
+
+
+class OtherNavWork(quebec.BaseClass):
+    queue_as = "other"
+
+    def perform(self, value):
+        return None
+
+
+def _get(qc, path: str, query: str = "") -> tuple[int, str]:
+    req = quebec.AsgiRequest("GET", path, query, [], b"", BASE)
     status, _headers, body = qc.handle_control_plane_request(req)
     return status, bytes(body).decode()
 
@@ -46,7 +60,67 @@ def test_count_streams_carry_the_number_alone(qc) -> None:
             f"{target} streams a badge into a badge; the update replaces inner "
             f"HTML, so this nests two pills: {payload!r}"
         )
-        assert payload.strip().isdigit(), f"{target} should stream a number: {payload!r}"
+        assert payload.strip().isdigit(), (
+            f"{target} should stream a number: {payload!r}"
+        )
+
+
+def test_stats_stream_keeps_queue_and_scheduled_counts(qc) -> None:
+    qc.register_job(NavWork)
+    qc.perform_all_later([NavWork.build(1), NavWork.set(wait=3600).build(2)])
+
+    status, body = _get(qc, "/stats")
+    assert status == 200
+    assert re.search(
+        r'<turbo-stream action="update" target="scheduled-jobs-count">\s*'
+        r"<template>1</template>",
+        body,
+    )
+    assert re.search(
+        r'<turbo-stream action="update" target="queue-count-perf">\s*'
+        r"<template>\s*<div[^>]*>1</div>",
+        body,
+    )
+
+
+def test_queues_page_keeps_unfiltered_nav_snapshot(qc) -> None:
+    qc.register_job(NavWork)
+    qc.register_job(OtherNavWork)
+    qc.perform_all_later([NavWork.build(1), OtherNavWork.build(2)])
+    assert qc.pause_queue("other") is True
+
+    status, body = _get(qc, "/queues", "status=paused")
+    assert status == 200
+    assert 'id="queue-count-other"' in body
+    assert 'id="queue-count-perf"' not in body
+    assert re.search(r'id="queue-count-other"[^>]*>\s*<div[^>]*>1</div>', body)
+    assert re.search(r'id="queue-status-other"[^>]*>\s*<span[^>]*>\s*Paused', body)
+
+    status, stream = _get(qc, "/stats")
+    assert status == 200
+    assert 'target="queue-count-other"' in stream
+    assert 'target="queue-count-perf"' in stream
+
+
+def test_queue_detail_keeps_count_and_pause_status(qc) -> None:
+    qc.register_job(NavWork)
+    qc.register_job(OtherNavWork)
+    qc.perform_all_later(
+        [NavWork.build(i) for i in range(12)] + [OtherNavWork.build(1)]
+    )
+    assert qc.pause_queue("perf") is True
+
+    status, body = _get(qc, "/queues/perf")
+    assert status == 200
+    assert "Queue: perf" in body
+    assert "Status: <span" in body and ">paused</span>" in body
+    assert "/queues/perf/resume" in body
+    assert "?page=2" in body
+
+    status, next_page = _get(qc, "/queues/perf", "page=2")
+    assert status == 200
+    assert "Queue: perf" in next_page
+    assert "No ready jobs in this queue" not in next_page
 
 
 def test_every_rendered_badge_is_also_refreshed(qc) -> None:

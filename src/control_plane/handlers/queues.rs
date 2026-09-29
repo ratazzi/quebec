@@ -80,6 +80,11 @@ impl ControlPlane {
                 name,
                 jobs_count: count,
             })
+            .collect();
+        let mut context = tera::Context::new();
+        context.insert("queue_counts", &queue_infos);
+        let queue_infos: Vec<QueueInfo> = queue_infos
+            .into_iter()
             .filter(|queue| {
                 // Apply status filter if provided
                 if let Some(ref filter_status) = pagination.status {
@@ -92,7 +97,6 @@ impl ControlPlane {
         debug!("Processed queue data in {:?}", start.elapsed());
 
         let start = Instant::now();
-        let mut context = tera::Context::new();
         context.insert("current_page_num", &pagination.page);
         context.insert("total_pages", &1);
         context.insert("queues", &queue_infos);
@@ -222,11 +226,33 @@ impl ControlPlane {
         let page = pagination.page;
         let offset = (page - 1) * state.page_size;
 
-        // Get queue status
-        let is_paused = state
-            .is_queue_paused(&queue_name)
+        // The navigation needs the full ready-count snapshot. Reuse its count
+        // for this queue instead of scanning ready executions a second time.
+        let queue_counts_map = query_builder::ready_executions::count_by_queue(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let paused_queue_names = query_builder::pauses::find_all_queue_names(db, table_config)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let all_queue_names = state
+            .get_queue_names()
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let queue_counts: Vec<QueueInfo> = all_queue_names
+            .into_iter()
+            .map(|name| QueueInfo {
+                slug: queue_slug(&name),
+                jobs_count: *queue_counts_map.get(&name).unwrap_or(&0),
+                status: if paused_queue_names.contains(&name) {
+                    "paused".to_string()
+                } else {
+                    "active".to_string()
+                },
+                concurrency_limit: state.ctx.experimental_queue_concurrency.get(&name).copied(),
+                name,
+            })
+            .collect();
+        let is_paused = paused_queue_names.contains(&queue_name);
 
         // Count and fetch ready executions for this queue. This matches the
         // /queues list size (and Mission Control's Queue#size + Queue#jobs):
@@ -234,10 +260,11 @@ impl ControlPlane {
         // scheduled / claimed / failed jobs are surfaced through their own
         // top-nav tabs to avoid the "list shows 0 but detail shows blocked"
         // double-counting confusion.
-        let total_jobs =
-            query_builder::ready_executions::count_by_queue_name(db, table_config, &queue_name)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_jobs = queue_counts_map
+            .get(&queue_name)
+            .copied()
+            .unwrap_or(0)
+            .max(0) as u64;
 
         let ready_rows = query_builder::ready_executions::find_by_queue_paginated(
             db,
@@ -274,6 +301,7 @@ impl ControlPlane {
         let total_pages = total_pages.max(1);
 
         let mut context = tera::Context::new();
+        context.insert("queue_counts", &queue_counts);
         context.insert("queue_name", &queue_name);
         context.insert("queue_status", if is_paused { "paused" } else { "active" });
         context.insert("jobs", &queue_jobs);
