@@ -79,7 +79,9 @@ impl Supervisor {
         reason: Option<&str>,
     ) -> Result<u64> {
         let db = self.ctx.get_db().await?;
-        fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), process_id, reason).await
+        let (failed, _) =
+            fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), process_id, reason).await?;
+        Ok(failed)
     }
 
     /// Convenience: look up by (pid, hostname) and fail. Returns 0 if no such row.
@@ -118,21 +120,20 @@ impl Supervisor {
         )
         .await?;
 
-        let pruned = stale.len();
-        if pruned > 0 {
+        if !stale.is_empty() {
             info!(
-                "Supervisor maintenance: pruning {} stale process(es) (no heartbeat since {})",
-                pruned, threshold
+                "Supervisor maintenance: checking {} stale process candidate(s) (no heartbeat since {})",
+                stale.len(), threshold
             );
         }
+        let mut pruned = 0usize;
         for p in stale {
-            if let Err(e) =
-                fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), p.id, None).await
-            {
-                warn!(
+            match fail_claimed_by_process_id_inner(&self.ctx, db.as_ref(), p.id, None).await {
+                Ok((_, deleted)) => pruned += deleted as usize,
+                Err(e) => warn!(
                     "Supervisor maintenance: failed to prune process {}: {}",
                     p.id, e
-                );
+                ),
             }
         }
 
@@ -160,7 +161,7 @@ impl Supervisor {
             // so one bad row is logged and skipped, left for the next
             // maintenance tick / another process to retry.
             let result = db
-                .transaction::<_, Option<i64>, DbErr>(|txn| {
+                .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                     Box::pin(async move {
                         Worker::fail_claimed_execution(
                             &ctx,
@@ -176,10 +177,11 @@ impl Supervisor {
                 .await;
 
             match result {
-                Ok(released) => {
+                Ok((true, released)) => {
                     crate::core::finish_released_batches(&self.ctx, db.as_ref(), released).await;
                     orphaned_count += 1
                 }
+                Ok((false, _)) => {}
                 Err(e) => warn!(
                     "Supervisor maintenance: failed to reclaim orphaned execution {} (job {}): {}; leaving it for a later sweep",
                     exec_id, job_id, e
@@ -196,7 +198,7 @@ async fn fail_claimed_by_process_id_inner(
     db: &DatabaseConnection,
     process_id: i64,
     reason: Option<&str>,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let table_config = ctx.table_config.clone();
     let process = query_builder::processes::find_by_id(db, &table_config, process_id).await?;
     let (process_pid, process_hostname) = match &process {
@@ -206,7 +208,7 @@ async fn fail_claimed_by_process_id_inner(
                 "Supervisor: process row {} not found, nothing to fail",
                 process_id
             );
-            return Ok(0);
+            return Ok((0, 0));
         }
     };
 
@@ -238,7 +240,7 @@ async fn fail_claimed_by_process_id_inner(
         let job_id = execution.job_id;
         let execution_id = execution.id;
         let result = db
-            .transaction::<_, Option<i64>, DbErr>(|txn| {
+            .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                 Box::pin(async move {
                     Worker::fail_claimed_execution(
                         &txn_ctx,
@@ -254,10 +256,11 @@ async fn fail_claimed_by_process_id_inner(
             .await;
 
         match result {
-            Ok(released) => {
+            Ok((true, released)) => {
                 crate::core::finish_released_batches(ctx, db, released).await;
                 failed += 1
             }
+            Ok((false, _)) => {}
             Err(e) => warn!(
                 "Supervisor: failed to fail claimed execution {} (job {}) for process {}: {}; leaving it for the orphan-sweep",
                 execution_id, job_id, process_id, e
@@ -267,7 +270,7 @@ async fn fail_claimed_by_process_id_inner(
 
     // Prune the process row even if some rows failed: this hands the leftovers
     // to the orphan-sweep.
-    query_builder::processes::prune(db, &table_config, process_id).await?;
+    let deleted = query_builder::processes::prune(db, &table_config, process_id).await?;
 
     warn!(
         "Supervisor reaped process {} (pid={}, host={:?}), failed {} of {} claimed job(s)",
@@ -278,7 +281,7 @@ async fn fail_claimed_by_process_id_inner(
         claimed.len()
     );
 
-    Ok(failed)
+    Ok((failed, deleted))
 }
 
 #[async_trait]

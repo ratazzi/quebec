@@ -1854,7 +1854,10 @@ impl Execution {
                 .await
                 {
                     Ok(None) => {
-                        transaction_result = Ok((failed, None));
+                        // The cleanup transaction committed, but its COMMIT
+                        // acknowledgement was lost. Its post-commit batch
+                        // check may not have run; retry that idempotent check.
+                        transaction_result = Ok((failed, job.batch_id));
                         break;
                     }
                     Ok(Some(_)) => {} // still present: safe to re-run the closure
@@ -2026,25 +2029,31 @@ impl Execution {
                 );
             }) {
                 // Try fail_claimed_execution first (marks failed + deletes claimed + releases semaphore)
-                let fail_result = Worker::fail_claimed_execution(
-                    &self.ctx,
-                    cleanup_db.as_ref(),
-                    &table_config_orig,
-                    job_id,
-                    claimed_id,
-                    "Emergency cleanup: after_executed transaction failed after all retries",
-                )
-                .await;
-                if let Ok(released) = fail_result {
+                let cleanup_ctx = self.ctx.clone();
+                let cleanup_tables = table_config_orig.clone();
+                let fail_result = cleanup_db
+                    .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
+                        Box::pin(async move {
+                            Worker::fail_claimed_execution(
+                                &cleanup_ctx,
+                                txn,
+                                &cleanup_tables,
+                                job_id,
+                                claimed_id,
+                                "Emergency cleanup: after_executed transaction failed after all retries",
+                            )
+                            .await
+                        })
+                    })
+                    .await;
+                if let Ok((_, released)) = fail_result {
                     crate::core::finish_released_batches(&self.ctx, cleanup_db.as_ref(), released)
                         .await;
                 }
                 if let Err(e) = fail_result {
                     // Fallback: at minimum delete the claimed record to unblock the worker.
-                    // `fail_claimed_execution` can return Err *after* the claimed
-                    // row was already deleted (the post-delete unblock/slot
-                    // release failed), so the fallback delete's row count is not
-                    // a reliable signal of whether the row still exists.
+                    // The transactional attempt rolled back; a delete-only
+                    // fallback still lets the worker drain if recovery fails.
                     warn!(
                     "fail_claimed_execution also failed for job {}: {:?}, falling back to delete claimed only",
                     job_id, e
@@ -3966,7 +3975,7 @@ impl Worker {
             // the next sweep tick / another process to retry, instead of
             // propagating and leaving every other orphan un-reclaimed.
             let result = db
-                .transaction::<_, Option<i64>, DbErr>(|txn| {
+                .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                     Box::pin(async move {
                         Self::fail_claimed_execution(
                             &ctx,
@@ -3982,7 +3991,7 @@ impl Worker {
                 .await;
 
             match result {
-                Ok(released) => {
+                Ok((true, released)) => {
                     crate::core::finish_released_batches(&self.ctx, db.as_ref(), released).await;
                     reclaimed += 1;
                     debug!(
@@ -3990,6 +3999,7 @@ impl Worker {
                         job_id, process_id
                     );
                 }
+                Ok((false, _)) => {}
                 Err(e) => {
                     warn!(
                         "Failed to reclaim orphaned execution {} (job {}, claimed by process {:?}): {:?}; leaving it for a later sweep",
@@ -4082,7 +4092,7 @@ impl Worker {
                 let job_id = execution.job_id;
                 let execution_id = execution.id;
                 let result = db
-                    .transaction::<_, Option<i64>, DbErr>(|txn| {
+                    .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                         Box::pin(async move {
                             Self::fail_claimed_execution(
                                 &ctx,
@@ -4098,11 +4108,12 @@ impl Worker {
                     .await;
 
                 match result {
-                    Ok(released) => {
+                    Ok((true, released)) => {
                         crate::core::finish_released_batches(&self.ctx, db.as_ref(), released)
                             .await;
                         failed += 1
                     }
+                    Ok((false, _)) => {}
                     Err(e) => warn!(
                         "Failed to fail claimed execution {} (job {}) for stale process {}: {:?}; leaving it for the orphan-sweep",
                         execution_id, job_id, process_id, e
@@ -4566,7 +4577,7 @@ impl Worker {
         let table_config = ctx.table_config.clone();
         let ctx = ctx.clone();
         match db
-            .transaction::<_, Option<i64>, DbErr>(|txn| {
+            .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
                 let table_config = table_config.clone();
                 let ctx = ctx.clone();
                 let error_msg = error_msg.to_string();
@@ -4584,7 +4595,7 @@ impl Worker {
             })
             .await
         {
-            Ok(released) => {
+            Ok((_, released)) => {
                 crate::core::finish_released_batches(&ctx, db.as_ref(), released).await;
                 // Claim row failed + deleted: drop the ledger entry so it stops
                 // counting against in-flight / blocking drain exit.
@@ -4604,9 +4615,11 @@ impl Worker {
         }
     }
 
-    /// Fail a single claimed execution: insert failure record, delete claim, release semaphore.
+    /// Fail a single claimed execution, if it still exists. The delete is the
+    /// ownership gate: a concurrent recovery that finds no row must not release
+    /// its queue slot or semaphore a second time.
     /// Returns the batch the job belonged to, for a completion check once the
-    /// caller's transaction has committed.
+    /// caller's transaction has committed. Returns whether this call owned it.
     pub(crate) async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
         db: &C,
@@ -4614,15 +4627,19 @@ impl Worker {
         job_id: i64,
         execution_id: i64,
         error_msg: &str,
-    ) -> std::result::Result<Option<i64>, DbErr>
+    ) -> std::result::Result<(bool, Option<i64>), DbErr>
     where
         C: ConnectionTrait,
     {
+        if query_builder::claimed_executions::delete_by_id(db, table_config, execution_id).await?
+            == 0
+        {
+            return Ok((false, None));
+        }
         query_builder::failed_executions::insert(db, table_config, job_id, Some(error_msg)).await?;
         let released_batch = crate::batch::release_job(ctx, db, job_id).await?;
-        query_builder::claimed_executions::delete_by_id(db, table_config, execution_id).await?;
         Self::unblock_next_job(ctx, db, table_config, job_id).await?;
-        Ok(released_batch)
+        Ok((true, released_batch))
     }
 
     /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.

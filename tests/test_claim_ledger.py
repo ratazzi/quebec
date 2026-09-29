@@ -853,6 +853,43 @@ def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_pr
             ).scalar()
             == 1
         )
+
+        # Repair the injected failure and verify the next maintenance tick
+        # reclaims the one row whose earlier transaction rolled back.
+        assert qc.create_tables() is True
+        session.execute(
+            text(
+                f"INSERT INTO {test_prefix}_semaphores "
+                f"(key, value, expires_at, created_at, updated_at) "
+                f"VALUES ('queue:locked', 0, CURRENT_TIMESTAMP, "
+                f"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        session.commit()
+        pruned, orphaned = qc.supervisor_run_maintenance(None)
+        assert (pruned, orphaned) == (0, 1)
+        session.expire_all()
+        assert (
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {test_prefix}_claimed_executions")
+            ).scalar()
+            == 0
+        )
+        assert (
+            session.execute(
+                text(f"SELECT COUNT(*) FROM {test_prefix}_failed_executions")
+            ).scalar()
+            == 2
+        )
+        assert (
+            session.execute(
+                text(
+                    f"SELECT value FROM {test_prefix}_semaphores "
+                    f"WHERE key = 'queue:locked'"
+                )
+            ).scalar()
+            == 1
+        )
     finally:
         session.close()
         engine.dispose()
