@@ -1639,7 +1639,9 @@ impl PyQuebec {
 
         let scheduler = self.scheduler.clone();
         let handle = self.rt.spawn(async move {
-            let _ = scheduler.run().await;
+            if let Err(error) = scheduler.run().await {
+                error!("Scheduler exited with error: {}", error);
+            }
         });
         self.handles
             .lock()

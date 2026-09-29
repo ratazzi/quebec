@@ -123,15 +123,15 @@ where
                 AS new_vals
                 ON DUPLICATE KEY UPDATE
                     `updated_at` = CASE
-                        WHEN `schedule` <=> new_vals.`schedule`
-                            AND `command` <=> new_vals.`command`
-                            AND `class_name` <=> new_vals.`class_name`
-                            AND `arguments` <=> new_vals.`arguments`
-                            AND `queue_name` <=> new_vals.`queue_name`
-                            AND `priority` <=> new_vals.`priority`
-                            AND `static` <=> new_vals.`static`
-                            AND `description` <=> new_vals.`description`
-                        THEN `updated_at`
+                        WHEN `{table}`.`schedule` <=> new_vals.`schedule`
+                            AND `{table}`.`command` <=> new_vals.`command`
+                            AND `{table}`.`class_name` <=> new_vals.`class_name`
+                            AND `{table}`.`arguments` <=> new_vals.`arguments`
+                            AND `{table}`.`queue_name` <=> new_vals.`queue_name`
+                            AND `{table}`.`priority` <=> new_vals.`priority`
+                            AND `{table}`.`static` <=> new_vals.`static`
+                            AND `{table}`.`description` <=> new_vals.`description`
+                        THEN `{table}`.`updated_at`
                         ELSE CURRENT_TIMESTAMP
                     END,
                     `schedule` = new_vals.`schedule`,
@@ -1041,6 +1041,38 @@ impl ProcessTrait for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mysql_upsert_qualifies_existing_recurring_columns() {
+        use sea_orm::{MockDatabase, MockExecResult};
+
+        let db = MockDatabase::new(DbBackend::MySql)
+            .append_exec_results([MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let entry = ScheduledEntry {
+            class: "Work".to_string(),
+            schedule: "every second".to_string(),
+            args: None,
+            key: Some("tick".to_string()),
+            queue: Some("perf".to_string()),
+            priority: None,
+        };
+        upsert_task(
+            &db,
+            &crate::context::TableConfig::with_prefix("test"),
+            entry,
+        )
+        .await
+        .unwrap();
+        let statements = db.into_transaction_log();
+        let sql = &statements[0].statements()[0].sql;
+        assert!(sql.contains("`test_recurring_tasks`.`schedule` <=> new_vals.`schedule`"));
+        assert!(sql.contains("THEN `test_recurring_tasks`.`updated_at`"));
+        assert!(sql.contains("ON DUPLICATE KEY UPDATE"));
+    }
 
     fn run_with_env<F: FnOnce() -> R, R>(value: &str, f: F) -> R {
         // QUEBEC_ENV is read inside parse_env_config_strict; pin it for the

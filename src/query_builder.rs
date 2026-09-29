@@ -21,6 +21,21 @@ pub(crate) fn quote_identifier(backend: DbBackend, identifier: &str) -> String {
     }
 }
 
+/// Keep generated MySQL index identifiers within its 64-character limit.
+/// Short names retain their historical spelling; long names use a stable
+/// suffix so distinct indexes on one table do not collide when truncated.
+pub(crate) fn index_name(backend: DbBackend, name: &str) -> String {
+    if backend != DbBackend::MySql || name.chars().count() <= 64 {
+        return name.to_owned();
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in name.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{}_{hash:016x}", name.chars().take(47).collect::<String>())
+}
+
 #[cfg(test)]
 mod identifier_tests {
     use super::*;
@@ -42,6 +57,24 @@ mod identifier_tests {
             quote_identifier(DbBackend::MySql, "quoted`name"),
             "`quoted``name`"
         );
+    }
+
+    #[test]
+    fn mysql_generated_index_name_is_stable_and_bounded() {
+        let short = "idx_solid_queue_ready_executions_priority_job";
+        assert_eq!(index_name(DbBackend::MySql, short), short);
+        let long = "idx_mbu_expired_16_2_1_7b484e_blocked_executions_key_priority_job";
+        let shortened = index_name(DbBackend::MySql, long);
+        assert_eq!(shortened.chars().count(), 64);
+        assert_eq!(shortened, index_name(DbBackend::MySql, long));
+        assert_ne!(
+            shortened,
+            index_name(
+                DbBackend::MySql,
+                "idx_mbu_expired_16_2_1_7b484e_blocked_executions_expires_at_key"
+            )
+        );
+        assert_eq!(index_name(DbBackend::Postgres, long), long);
     }
 }
 
