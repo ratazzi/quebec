@@ -357,7 +357,15 @@ pub fn build_job_params(overrides: Value) -> Value {
 pub fn get_executions(arguments: Option<&str>) -> i32 {
     arguments
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
-        .and_then(|v| v.get("executions")?.as_i64())
+        .as_ref()
+        .map(get_executions_from_value)
+        .unwrap_or(0)
+}
+
+pub fn get_executions_from_value(arguments: &Value) -> i32 {
+    arguments
+        .get("executions")
+        .and_then(Value::as_i64)
         .unwrap_or(0) as i32
 }
 
@@ -366,6 +374,10 @@ pub fn get_executions(arguments: Option<&str>) -> i32 {
 /// object for the double-wrapped shape.
 pub fn get_callback_batch_id(arguments: Option<&str>) -> Option<i64> {
     let value = arguments.and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+    get_callback_batch_id_from_value(&value)
+}
+
+pub fn get_callback_batch_id_from_value(value: &Value) -> Option<i64> {
     value
         .get("callback_batch_id")
         .or_else(|| value.get("arguments")?.get("callback_batch_id"))
@@ -504,4 +516,48 @@ where
     Err(crate::error::QuebecError::Config(format!(
         "Environment '{environment}' not found in config. Available environments: {available:?}"
     )))
+}
+
+#[cfg(test)]
+mod job_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn parsed_job_metadata_matches_string_accessors() {
+        let cases = [
+            (None, 0, None),
+            (Some("invalid json"), 0, None),
+            (Some("[]"), 0, None),
+            (
+                Some(r#"{"executions":3,"callback_batch_id":7}"#),
+                3,
+                Some(7),
+            ),
+            (
+                Some(r#"{"arguments":{"callback_batch_id":9},"executions":2}"#),
+                2,
+                Some(9),
+            ),
+            (
+                Some(r#"{"callback_batch_id":null,"arguments":{"callback_batch_id":9}}"#),
+                0,
+                None,
+            ),
+            (
+                Some(r#"{"executions":"3","callback_batch_id":"7"}"#),
+                0,
+                None,
+            ),
+        ];
+
+        for (text, expected_executions, expected_batch_id) in cases {
+            let value = text
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .unwrap_or_else(|| Value::Array(vec![]));
+            assert_eq!(get_executions(text), expected_executions);
+            assert_eq!(get_callback_batch_id(text), expected_batch_id);
+            assert_eq!(get_executions_from_value(&value), expected_executions);
+            assert_eq!(get_callback_batch_id_from_value(&value), expected_batch_id);
+        }
+    }
 }
