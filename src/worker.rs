@@ -4677,13 +4677,12 @@ impl Worker {
                 })
         });
 
-        if release_semaphore(db, table_config, key.clone(), limit, duration)
-            .await
-            .unwrap_or(false)
-        {
-            Worker::release_next_blocked_job(ctx, db, key, limit, false)
-                .await
-                .ok();
+        // Propagate database errors. Every caller runs this inside a
+        // transaction; after a failed statement (e.g. a MySQL deadlock, which
+        // rolls the transaction back) the caller must not report success, or
+        // emergency cleanup skips its delete-only fallback and the claim stays.
+        if release_semaphore(db, table_config, key.clone(), limit, duration).await? {
+            Worker::release_next_blocked_job(ctx, db, key, limit, false).await?;
         }
 
         Ok(())
@@ -6017,5 +6016,66 @@ mod argument_conversion_tests {
                 expected
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unblock_next_job_tests {
+    use super::*;
+    use sea_orm::{ConnectOptions, DbBackend, MockDatabase, MockExecResult};
+
+    fn keyed_job() -> quebec_jobs::Model {
+        let now = chrono::Utc::now().naive_utc();
+        quebec_jobs::Model {
+            id: 1,
+            queue_name: "default".into(),
+            class_name: "KeyedJob".into(),
+            arguments: None,
+            priority: 0,
+            active_job_id: Some("keyed-1".into()),
+            scheduled_at: Some(now),
+            finished_at: None,
+            concurrency_key: Some("KeyedJob/k".into()),
+            created_at: now,
+            updated_at: now,
+            batch_id: None,
+        }
+    }
+
+    fn context() -> Arc<AppContext> {
+        Python::initialize();
+        let url = "postgres://localhost/quebec_unblock_test";
+        Arc::new(AppContext::new(
+            crate::database_url::DatabaseUrl::parse(url).unwrap(),
+            None,
+            ConnectOptions::new(url),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn semaphore_release_error_propagates() {
+        let ctx = context();
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([vec![keyed_job()]])
+            .append_exec_errors([DbErr::Custom("deadlock".into())])
+            .into_connection();
+        let result = Worker::unblock_next_job(&ctx, &db, &ctx.table_config, 1).await;
+        assert!(matches!(result, Err(DbErr::Custom(message)) if message == "deadlock"));
+    }
+
+    #[tokio::test]
+    async fn blocked_promotion_error_propagates() {
+        let ctx = context();
+        let db = MockDatabase::new(DbBackend::Postgres)
+            .append_query_results([vec![keyed_job()]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_errors([DbErr::Custom("deadlock".into())])
+            .into_connection();
+        let result = Worker::unblock_next_job(&ctx, &db, &ctx.table_config, 1).await;
+        assert!(matches!(result, Err(DbErr::Custom(message)) if message == "deadlock"));
     }
 }
