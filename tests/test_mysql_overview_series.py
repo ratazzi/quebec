@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit
 
 import pytest
-
 import quebec
 
 
@@ -32,6 +31,22 @@ class MySqlOtherQueueWork(quebec.BaseClass):
         return None
 
 
+def _prepared_statement_counts(observer, prefix):
+    # Statement IDs are connection-local. Include the owning thread and match
+    # the literal unique table prefix so other clients cannot affect the budget.
+    with observer.cursor() as cursor:
+        cursor.execute(
+            "SELECT OWNER_THREAD_ID, STATEMENT_ID, SQL_TEXT, COUNT_EXECUTE "
+            "FROM performance_schema.prepared_statements_instances "
+            "WHERE LOCATE(%s, SQL_TEXT) > 0",
+            (f"{prefix}_",),
+        )
+        return {
+            (thread_id, statement_id): (sql, count)
+            for thread_id, statement_id, sql, count in cursor.fetchall()
+        }
+
+
 @pytest.mark.skipif(
     not os.getenv("TEST_MYSQL_URL"), reason="requires disposable TEST_MYSQL_URL"
 )
@@ -43,6 +58,11 @@ def test_mysql_overview_chart_uses_one_grouped_read():
         raise ValueError("TEST_MYSQL_URL must use mysql://")
     prefix = f"mo_{uuid.uuid4().hex[:10]}"
     qc = quebec.Quebec(dsn, table_name_prefix=prefix, use_listen_notify=False)
+    unrelated_qc = quebec.Quebec(
+        dsn,
+        table_name_prefix=f"noise_{uuid.uuid4().hex[:10]}",
+        use_listen_notify=False,
+    )
     observer = pymysql.connect(
         host=parsed.hostname,
         port=parsed.port or 3306,
@@ -54,6 +74,8 @@ def test_mysql_overview_chart_uses_one_grouped_read():
     try:
         qc.create_tables()
         qc.register_job(MySqlOverviewWork)
+        unrelated_qc.create_tables()
+        unrelated_qc.register_job(MySqlOverviewWork)
         qc.perform_all_later([MySqlOverviewWork.build(value) for value in range(3)])
         with observer.cursor() as cursor:
             cursor.execute(f"SELECT id FROM {prefix}_jobs ORDER BY id")
@@ -74,9 +96,12 @@ def test_mysql_overview_chart_uses_one_grouped_read():
             (168, 2, 28),
             (720, 3, 30),
         ):
-            with observer.cursor() as cursor:
-                cursor.execute("SHOW GLOBAL STATUS LIKE 'Com_stmt_execute'")
-                before = int(cursor.fetchone()[1])
+            before = _prepared_statement_counts(observer, prefix)
+            # These binary-protocol executions used to pollute the global
+            # counter, even though they touch none of this request's tables.
+            unrelated_qc.perform_all_later(
+                [MySqlOverviewWork.build(value) for value in range(40)]
+            )
             request = quebec.AsgiRequest(
                 "GET", "/", f"hours={hours}", [], b"", "/quebec"
             )
@@ -92,20 +117,24 @@ def test_mysql_overview_chart_uses_one_grouped_read():
             assert sorted(value for value in counts if value) == (
                 [1, 1] if hours in (24, 168) else [1, 2]
             )
-            with observer.cursor() as cursor:
-                cursor.execute("SHOW GLOBAL STATUS LIKE 'Com_stmt_execute'")
-                assert int(cursor.fetchone()[1]) - before < 30
-                cursor.execute(
-                    "SELECT SQL_TEXT FROM performance_schema.prepared_statements_instances WHERE SQL_TEXT LIKE %s",
-                    (f"%{prefix}_jobs%",),
+            after = _prepared_statement_counts(observer, prefix)
+            executions = [
+                (sql, count - before.get(key, (None, 0))[1])
+                for key, (sql, count) in after.items()
+            ]
+            assert 0 < sum(count for _sql, count in executions) < 30
+            assert (
+                sum(
+                    count
+                    for sql, count in executions
+                    if "TIMESTAMPDIFF(MICROSECOND" in sql.upper()
                 )
-                assert any(
-                    sql and "TIMESTAMPDIFF(MICROSECOND" in sql.upper()
-                    for (sql,) in cursor.fetchall()
-                )
+                == 1
+            )
     finally:
         observer.close()
         qc.close()
+        unrelated_qc.close()
 
 
 @pytest.mark.skipif(

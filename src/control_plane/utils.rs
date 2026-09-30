@@ -207,7 +207,6 @@ impl ControlPlane {
     }
 
     /// Check if a queue is paused using query_builder
-    #[allow(dead_code)] // Public Rust helper; queue details now reuse the navigation pause snapshot.
     pub async fn is_queue_paused(&self, queue_name: &str) -> Result<bool, DbErr> {
         let db = self.ctx.get_db().await?;
         let db = db.as_ref();

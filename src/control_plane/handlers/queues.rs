@@ -226,8 +226,8 @@ impl ControlPlane {
         let page = pagination.page;
         let offset = (page - 1) * state.page_size;
 
-        // The navigation needs the full ready-count snapshot. Reuse its count
-        // for this queue instead of scanning ready executions a second time.
+        // Reuse the full ready-count and pause snapshots for navigation only.
+        // Detail queries must retain the database's queue-name collation.
         let queue_counts_map = query_builder::ready_executions::count_by_queue(db, table_config)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -252,7 +252,10 @@ impl ControlPlane {
                 name,
             })
             .collect();
-        let is_paused = paused_queue_names.contains(&queue_name);
+        let is_paused = state
+            .is_queue_paused(&queue_name)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         // Count and fetch ready executions for this queue. This matches the
         // /queues list size (and Mission Control's Queue#size + Queue#jobs):
@@ -260,11 +263,10 @@ impl ControlPlane {
         // scheduled / claimed / failed jobs are surfaced through their own
         // top-nav tabs to avoid the "list shows 0 but detail shows blocked"
         // double-counting confusion.
-        let total_jobs = queue_counts_map
-            .get(&queue_name)
-            .copied()
-            .unwrap_or(0)
-            .max(0) as u64;
+        let total_jobs =
+            query_builder::ready_executions::count_by_queue_name(db, table_config, &queue_name)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
         let ready_rows = query_builder::ready_executions::find_by_queue_paginated(
             db,
