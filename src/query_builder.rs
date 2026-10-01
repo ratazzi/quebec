@@ -3309,10 +3309,10 @@ pub mod processes {
 
     /// Find prunable (stale) processes with heartbeat before threshold.
     /// These are processes that have stopped sending heartbeats. When
-    /// `use_skip_locked` is set the rows are taken with `FOR UPDATE SKIP
-    /// LOCKED` so concurrent supervisors (multi-host deployments) do not
-    /// double-prune the same row. Mirrors Solid Queue's
-    /// `Process.prunable.non_blocking_lock`.
+    /// `use_skip_locked` is set the SELECT uses `FOR UPDATE SKIP LOCKED`.
+    /// Callers currently do not hold a transaction across selection and
+    /// pruning, so this only avoids rows locked during the SELECT itself;
+    /// concurrent supervisors can still select the same stale process.
     pub async fn find_prunable<C>(
         db: &C,
         table_config: &TableConfig,

@@ -13,6 +13,96 @@ import pytest
 import quebec
 
 
+def test_concurrent_orphan_recovery_releases_queue_slots_once(
+    db_url, test_prefix
+) -> None:
+    """Two supervisors can scan one orphan but only its delete winner owns the slot."""
+    if not db_url.startswith("postgresql"):
+        pytest.skip("Concurrent orphan scan requires PostgreSQL")
+
+    import psycopg2
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    prefix = test_prefix
+    orphan_count = 128
+    supervisors = [
+        quebec.Quebec(
+            db_url,
+            table_name_prefix=prefix,
+            use_listen_notify=False,
+            experimental_queue_concurrency={"default": orphan_count + 1},
+        )
+        for _ in range(2)
+    ]
+    try:
+        supervisors[0].create_tables()
+        with psycopg2.connect(db_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f'INSERT INTO "{prefix}_processes" '
+                    "(kind, last_heartbeat_at, pid, hostname, created_at, name) "
+                    "VALUES ('Worker', NOW(), 12345, 'live', NOW(), 'live') RETURNING id"
+                )
+                live_process_id = cursor.fetchone()[0]
+                cursor.execute(
+                    f'INSERT INTO "{prefix}_jobs" '
+                    "(queue_name, class_name, arguments, priority, active_job_id, created_at, updated_at) "
+                    "SELECT 'default', 'CrashJob', '[]', 0, 'orphan-' || g::text, NOW(), NOW() "
+                    "FROM generate_series(1, %s) AS g RETURNING id",
+                    (orphan_count,),
+                )
+                orphan_job_ids = [row[0] for row in cursor.fetchall()]
+                cursor.execute(
+                    f'INSERT INTO "{prefix}_jobs" '
+                    "(queue_name, class_name, arguments, priority, active_job_id, created_at, updated_at) "
+                    "VALUES ('default', 'LiveJob', '[]', 0, 'live', NOW(), NOW()) RETURNING id"
+                )
+                live_job_id = cursor.fetchone()[0]
+                cursor.executemany(
+                    f'INSERT INTO "{prefix}_claimed_executions" '
+                    "(job_id, process_id, created_at) VALUES (%s, NULL, NOW())",
+                    [(job_id,) for job_id in orphan_job_ids],
+                )
+                cursor.execute(
+                    f'INSERT INTO "{prefix}_claimed_executions" '
+                    "(job_id, process_id, created_at) VALUES (%s, %s, NOW())",
+                    (live_job_id, live_process_id),
+                )
+                cursor.execute(
+                    f'INSERT INTO "{prefix}_semaphores" '
+                    '("key", value, expires_at, created_at, updated_at) '
+                    "VALUES ('queue:default', 0, NOW() + INTERVAL '1 hour', NOW(), NOW())"
+                )
+
+        gate = Barrier(3)
+
+        def maintain(supervisor):
+            gate.wait(timeout=10)
+            return supervisor.supervisor_run_maintenance(None)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(maintain, supervisor) for supervisor in supervisors]
+            gate.wait(timeout=10)
+            results = [future.result(timeout=30) for future in futures]
+
+        assert sum(orphaned for _, orphaned in results) == orphan_count
+        with psycopg2.connect(db_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f'SELECT value FROM "{prefix}_semaphores" WHERE "key" = %s',
+                    ("queue:default",),
+                )
+                assert cursor.fetchone()[0] == orphan_count
+                cursor.execute(f'SELECT count(*) FROM "{prefix}_claimed_executions"')
+                assert cursor.fetchone()[0] == 1
+                cursor.execute(f'SELECT count(*) FROM "{prefix}_failed_executions"')
+                assert cursor.fetchone()[0] == orphan_count
+    finally:
+        for supervisor in supervisors:
+            supervisor.close()
+
+
 class PlainJob(quebec.BaseClass):
     queue_as = "default"
     calls: list[int] = []
