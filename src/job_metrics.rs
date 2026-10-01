@@ -447,15 +447,17 @@ fn env_u64(key: &str, default: u64) -> u64 {
 }
 
 /// Default output file: `$QUEBEC_JOB_METRICS_DIR` (or the OS temp dir) /
-/// `quebec-job-metrics-<pid>-<timestamp>.csv`.
+/// `quebec-job-metrics-<pid>-<timestamp>-<sequence>.csv`.
 pub fn default_output_path() -> PathBuf {
+    static NEXT_OUTPUT_ID: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::var_os("QUEBEC_JOB_METRICS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+    let sequence = NEXT_OUTPUT_ID.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(
-        "quebec-job-metrics-{}-{stamp}.csv",
-        std::process::id()
+        "quebec-job-metrics-{}-{stamp}-{sequence}.csv",
+        std::process::id(),
     ))
 }
 
@@ -878,7 +880,7 @@ impl Aggregator {
 
 #[cfg(test)]
 mod tests {
-    use super::{Aggregator, JobObservation, JobRecord, Recorder};
+    use super::{default_output_path, Aggregator, JobObservation, JobRecord, Recorder};
     use std::time::{Duration, Instant};
 
     fn record() -> JobRecord {
@@ -904,6 +906,27 @@ mod tests {
 
     fn rows(path: &std::path::Path) -> usize {
         csv::Reader::from_path(path).unwrap().records().count()
+    }
+
+    #[test]
+    fn default_output_paths_are_unique_under_concurrency() {
+        let paths = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| (0..1000).map(|_| default_output_path()).collect::<Vec<_>>())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "default metrics output paths collided"
+        );
     }
 
     #[test]
