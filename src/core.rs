@@ -296,6 +296,27 @@ pub(crate) async fn enqueue_job(
         concurrency_duration,
     )
     .await?;
+    if destination == JobDestination::Ready {
+        query_builder::ready_executions::insert(
+            txn,
+            table_config,
+            job_model.id,
+            &job_model.queue_name,
+            job_model.priority,
+        )
+        .await?;
+    } else if destination == JobDestination::Blocked {
+        query_builder::blocked_executions::insert(
+            txn,
+            table_config,
+            job_model.id,
+            &job_model.queue_name,
+            job_model.priority,
+            concurrency_key,
+            now + job.concurrency_duration.unwrap_or(concurrency_duration),
+        )
+        .await?;
+    }
 
     Ok((job_model, destination, released_batch))
 }
@@ -347,7 +368,6 @@ async fn route_job(
                 job_model,
                 job,
                 concurrency_key,
-                now,
                 job.concurrency_duration.unwrap_or(concurrency_duration),
             )
             .await;
@@ -355,16 +375,7 @@ async fn route_job(
         info!(job_id, concurrency_key, "Semaphore acquired");
     }
 
-    // Job is ready for immediate execution
-    query_builder::ready_executions::insert(
-        txn,
-        table_config,
-        job_id,
-        &job_model.queue_name,
-        job_model.priority,
-    )
-    .await?;
-
+    // Caller inserts ready now (single enqueue) or with the bulk ready rows.
     Ok((JobDestination::Ready, None))
 }
 
@@ -375,7 +386,6 @@ async fn handle_concurrency_conflict(
     job_model: &quebec_jobs::Model,
     job: &ActiveJob,
     concurrency_key: &str,
-    now: chrono::NaiveDateTime,
     concurrency_duration: chrono::Duration,
 ) -> std::result::Result<(JobDestination, Option<i64>), DbErr> {
     let table_config = &ctx.table_config;
@@ -408,17 +418,7 @@ async fn handle_concurrency_conflict(
                 job.concurrency_limit.unwrap_or(1),
                 concurrency_duration.num_seconds()
             );
-            let expires_at = now + concurrency_duration;
-            query_builder::blocked_executions::insert(
-                txn,
-                table_config,
-                job_id,
-                &job_model.queue_name,
-                job_model.priority,
-                concurrency_key,
-                expires_at,
-            )
-            .await?;
+            // Caller writes blocked now (single) or with the bulk blocked rows.
             Ok((JobDestination::Blocked, None))
         }
     }
@@ -474,9 +474,10 @@ async fn enqueue_all_jobs(
     }
     let mut released_batches: Vec<i64> = Vec::new();
 
-    // Phase 2: route each job to ready / scheduled / concurrency
-    // Collect bulk inserts for ready and scheduled, route concurrency jobs individually
-    let mut ready_data: Vec<(i64, &str, i32)> = Vec::new();
+    // Phase 2: decide each destination, retaining per-job semaphore decisions
+    // while collecting ready, blocked, and scheduled rows for bulk insertion.
+    let mut ready_data: Vec<(i64, &str, i32, chrono::NaiveDateTime)> = Vec::new();
+    let mut blocked_data: Vec<(i64, &str, i32, &str, chrono::NaiveDateTime)> = Vec::new();
     let mut scheduled_data: Vec<(i64, &str, i32, chrono::NaiveDateTime)> = Vec::new();
     let mut ready_queues: HashSet<String> = HashSet::new();
 
@@ -526,6 +527,22 @@ async fn enqueue_all_jobs(
             .await?;
             if destination.should_notify() {
                 ready_queues.insert(model.queue_name.clone());
+                ready_data.push((
+                    model.id,
+                    &model.queue_name,
+                    model.priority,
+                    chrono::Utc::now().naive_utc(),
+                ));
+            } else if destination == JobDestination::Blocked {
+                blocked_data.push((
+                    model.id,
+                    &model.queue_name,
+                    model.priority,
+                    concurrency_key,
+                    now + prepared
+                        .concurrency_duration
+                        .unwrap_or(concurrency_duration),
+                ));
             }
             released_batches.extend(released);
             continue;
@@ -533,12 +550,21 @@ async fn enqueue_all_jobs(
 
         // No concurrency, immediately ready
         ready_queues.insert(model.queue_name.clone());
-        ready_data.push((model.id, &model.queue_name, model.priority));
+        ready_data.push((
+            model.id,
+            &model.queue_name,
+            model.priority,
+            chrono::Utc::now().naive_utc(),
+        ));
     }
 
-    // Phase 3: bulk insert ready and scheduled executions
+    // Phase 3: bulk insert the chosen execution destinations
+    if !blocked_data.is_empty() {
+        query_builder::blocked_executions::insert_all(txn, table_config, &blocked_data).await?;
+    }
     if !ready_data.is_empty() {
-        query_builder::ready_executions::insert_all(txn, table_config, &ready_data).await?;
+        query_builder::ready_executions::insert_all_with_created_at(txn, table_config, &ready_data)
+            .await?;
     }
     if !scheduled_data.is_empty() {
         query_builder::scheduled_executions::insert_all(txn, table_config, &scheduled_data).await?;

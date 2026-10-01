@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import quebec
 from sqlalchemy import text
 
-from .helpers import wait_until
+from .helpers import observe_sqlite, readonly_connect, wait_until
 
 
 class ConcurrentJob(quebec.BaseClass):
@@ -39,6 +40,43 @@ class RetryConcurrentJob(quebec.BaseClass):
 
     def perform(self, value: int) -> None:
         raise ValueError(f"retry me: {value}")
+
+
+class SharedEightJob(quebec.BaseClass):
+    concurrency_limit = 8
+
+    @staticmethod
+    def concurrency_key(value: int) -> str:
+        return "parallel-completion"
+
+    def perform(self, value: int) -> None:
+        pass
+
+
+def _wait_for_scheduled_clear(ctx, prefix: str, message: str) -> None:
+    db_url = ctx["db_url"]
+
+    def no_scheduled() -> bool:
+        if db_url.startswith("sqlite:"):
+            db_path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
+
+            def count_rows() -> int:
+                with readonly_connect(db_path) as observer:
+                    return observer.execute(
+                        f"SELECT COUNT(*) FROM {prefix}_scheduled_executions"
+                    ).fetchone()[0]
+
+            return observe_sqlite(count_rows) == 0
+
+        with ctx["engine"].connect() as observer:
+            return (
+                observer.execute(
+                    text(f"SELECT COUNT(*) FROM {prefix}_scheduled_executions")
+                ).scalar_one()
+                == 0
+            )
+
+    wait_until(no_scheduled, timeout=5, message=message)
 
 
 def test_first_job_goes_to_ready_second_goes_to_blocked(
@@ -80,6 +118,37 @@ def test_completing_first_job_releases_semaphore(qc_with_sqlalchemy) -> None:
     # Semaphore released (value back to 1)
     sem = session.execute(text(f"SELECT value FROM {prefix}_semaphores")).fetchone()
     assert sem.value == 1
+
+
+def test_parallel_completions_promote_all_blocked_jobs(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    qc.register_job(SharedEightJob)
+    qc.perform_all_later([SharedEightJob.build(index) for index in range(16)])
+
+    first = qc.drain_batch(8)
+    assert len(first) == 8
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda execution: execution.perform(), first))
+
+    # Concurrent releases of the same semaphore must each promote one of the
+    # eight blocked jobs, without losing a slot or promoting a job twice.
+    second = qc.drain_batch(8)
+    assert len(second) == 8
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda execution: execution.perform(), second))
+
+    assert db_assert.count_ready_executions() == 0
+    assert db_assert.count_blocked_executions() == 0
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 0
+    with qc_with_sqlalchemy["engine"].connect() as observer:
+        value = observer.execute(
+            text(f"SELECT value FROM {prefix}_semaphores")
+        ).scalar_one()
+    assert value == 8
 
 
 def test_semaphore_created_on_first_concurrent_job(qc_with_sqlalchemy) -> None:
@@ -300,12 +369,10 @@ def test_due_scheduled_job_respects_held_semaphore(
     assert db_assert.count_ready_executions() == 1
     assert db_assert.count_scheduled_executions() == 1
 
+    session.rollback()  # Release the observer's read transaction before dispatch.
     qc.spawn_dispatcher()
-    wait_until(
-        lambda: (session.expire_all() or True)
-        and db_assert.count_scheduled_executions() == 0,
-        timeout=5,
-        message="dispatcher did not process due scheduled job",
+    _wait_for_scheduled_clear(
+        qc_with_sqlalchemy, prefix, "dispatcher did not process due scheduled job"
     )
 
     assert db_assert.count_ready_executions() == 1
@@ -347,12 +414,10 @@ def test_automatic_retry_promotion_respects_held_semaphore(
     blocker = RetryConcurrentJob.perform_later(qc, 2)
     assert db_assert.count_ready_executions() == 1
 
+    session.rollback()  # Release the observer's read transaction before dispatch.
     qc.spawn_dispatcher()
-    wait_until(
-        lambda: (session.expire_all() or True)
-        and db_assert.count_scheduled_executions() == 0,
-        timeout=5,
-        message="dispatcher did not process due retry job",
+    _wait_for_scheduled_clear(
+        qc_with_sqlalchemy, prefix, "dispatcher did not process due retry job"
     )
 
     assert db_assert.count_ready_executions() == 1

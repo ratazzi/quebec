@@ -3803,6 +3803,10 @@ impl PyQuebec {
                         break;
                     }
 
+                    if deleted < batch_size {
+                        continue;
+                    }
+
                     // Sleep briefly between batches (same as worker's clear_finished_jobs)
                     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
                 }

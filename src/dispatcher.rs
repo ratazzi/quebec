@@ -157,196 +157,9 @@ impl Dispatcher {
                     let Ok(polling_db) = self.ctx.get_db().await.inspect_err(|e| {
                         warn!("Failed to get DB for polling: {}", e);
                     }) else { continue };
-                    let ctx = self.ctx.clone(); // Clone ctx for the async closure
-
-                    // Dispatch scheduled jobs in their own transaction.
-                    let transaction_result = polling_db.transaction::<_, (std::collections::HashSet<String>, Vec<i64>), DbErr>(|txn| {
-                        Box::pin(async move {
-                          // Dispatch scheduled jobs
-                          // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
-                          // This matches Solid Queue's implementation
-                          let scheduled_executions = query_builder::scheduled_executions::find_due(
-                              txn,
-                              &ctx.table_config,
-                              batch_size,
-                              ctx.use_skip_locked,
-                          ).await;
-
-                          if scheduled_executions.is_err() {
-                              warn!("Error fetching scheduled jobs: {:?}", scheduled_executions.err());
-                              return Ok((std::collections::HashSet::new(), Vec::new()));
-                          }
-                          let scheduled_executions = scheduled_executions?;
-                          let size = scheduled_executions.len();
-
-                          // Collect queue names for NOTIFY
-                          let mut notified_queues = std::collections::HashSet::new();
-                          // Batched jobs discarded on promotion, re-checked after commit.
-                          let mut released_batches: Vec<i64> = Vec::new();
-
-                          // Batch fetch all jobs at once (eliminates N+1)
-                          let job_ids: Vec<i64> = scheduled_executions.iter().map(|se| se.job_id).collect();
-                          let jobs = query_builder::jobs::find_by_ids(txn, &ctx.table_config, job_ids.clone()).await?;
-                          let job_map: std::collections::HashMap<i64, _> = jobs.into_iter().map(|j| (j.id, j)).collect();
-
-                          // Split scheduled-due jobs into two groups so we can
-                          // bulk-promote the unrestricted ones but still enforce
-                          // concurrency limits on the rest (matches Solid Queue's
-                          // `Job.dispatch_all` partition between
-                          // `dispatch_all_at_once` and `dispatch_all_one_by_one`).
-                          // Without this split, every retry / wait_until / wait
-                          // path bypassed the semaphore at promotion time and
-                          // could violate the declared concurrency_limit.
-                          let mut ready_data: Vec<(i64, &str, i32)> = Vec::new();
-                          let mut concurrency_limited: Vec<&_> = Vec::new();
-                          for se in &scheduled_executions {
-                              let Some(job) = job_map.get(&se.job_id) else {
-                                  warn!("Job {} not found for scheduled execution {}", se.job_id, se.id);
-                                  continue;
-                              };
-                              let has_key = job
-                                  .concurrency_key
-                                  .as_deref()
-                                  .map(|k| !k.is_empty())
-                                  .unwrap_or(false);
-                              if has_key {
-                                  concurrency_limited.push(job);
-                              } else {
-                                  ready_data.push((se.job_id, &job.queue_name, job.priority));
-                                  notified_queues.insert(job.queue_name.clone());
-                              }
-                          }
-
-                          // Bulk insert the unrestricted ones in a single round-trip.
-                          if !ready_data.is_empty() {
-                              query_builder::ready_executions::insert_all(
-                                  txn,
-                                  &ctx.table_config,
-                                  &ready_data,
-                              )
-                              .await?;
-                          }
-
-                          // Concurrency-limited ones go one-by-one so each can
-                          // acquire the semaphore and route to ready / blocked /
-                          // discarded per its on_conflict policy.
-                          for job in concurrency_limited {
-                              let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
-                              let (limit, duration_opt, on_conflict) = {
-                                  #[cfg(feature = "python")]
-                                  {
-                                      ctx.runnables
-                                          .read()
-                                          .ok()
-                                          .and_then(|runnables| {
-                                              runnables.get(&job.class_name).map(|r| {
-                                                  (
-                                                      r.concurrency_limit.unwrap_or(1),
-                                                      r.concurrency_duration
-                                                          .map(|s| chrono::Duration::seconds(s as i64)),
-                                                      r.concurrency_on_conflict,
-                                                  )
-                                              })
-                                          })
-                                          .unwrap_or((1, None, ConcurrencyConflict::Block))
-                                  }
-                                  #[cfg(not(feature = "python"))]
-                                  {
-                                      (1, None, ConcurrencyConflict::Block)
-                                  }
-                              };
-
-                              let acquired = acquire_semaphore(
-                                  txn,
-                                  &ctx.table_config,
-                                  concurrency_key.to_string(),
-                                  limit,
-                                  duration_opt,
-                              )
-                              .await?;
-
-                              if acquired {
-                                  query_builder::ready_executions::insert(
-                                      txn,
-                                      &ctx.table_config,
-                                      job.id,
-                                      &job.queue_name,
-                                      job.priority,
-                                  )
-                                  .await?;
-                                  notified_queues.insert(job.queue_name.clone());
-                              } else {
-                                  let duration = duration_opt.unwrap_or_else(|| {
-                                      chrono::Duration::from_std(
-                                          ctx.default_concurrency_control_period,
-                                      )
-                                      .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                                  });
-                                  match on_conflict {
-                                      ConcurrencyConflict::Discard => {
-                                          warn!(
-                                              job_id = job.id,
-                                              concurrency_key,
-                                              "Scheduled job `{}' discarded due to concurrency limit",
-                                              job.class_name
-                                          );
-                                          query_builder::jobs::mark_finished(
-                                              txn,
-                                              &ctx.table_config,
-                                              job.id,
-                                          )
-                                          .await?;
-                                          released_batches.extend(
-                                              crate::batch::release_batched_job(
-                                                  txn,
-                                                  &ctx.table_config,
-                                                  &job,
-                                              )
-                                              .await?,
-                                          );
-                                      }
-                                      ConcurrencyConflict::Block => {
-                                          let now = chrono::Utc::now().naive_utc();
-                                          info!(
-                                              job_id = job.id,
-                                              concurrency_key,
-                                              "Scheduled job `{}' blocked due to concurrency limit",
-                                              job.class_name
-                                          );
-                                          query_builder::blocked_executions::insert(
-                                              txn,
-                                              &ctx.table_config,
-                                              job.id,
-                                              &job.queue_name,
-                                              job.priority,
-                                              concurrency_key,
-                                              now + duration,
-                                          )
-                                          .await?;
-                                      }
-                                  }
-                              }
-                          }
-
-                          // Delete all scheduled_executions rows we processed
-                          // (regardless of whether each landed in ready, blocked,
-                          // or finished).
-                          query_builder::scheduled_executions::delete_by_job_ids(
-                              txn,
-                              &ctx.table_config,
-                              &job_ids,
-                          )
-                          .await?;
-
-                          if size > 0 {
-                              info!("Dispatch scheduled jobs size: {}", size);
-                          }
-
-                          Ok((notified_queues, released_batches))
-                        })
-                    })
-                    .instrument(tracing::info_span!("polling", component = "dispatcher"))
-                    .await;
+                    let transaction_result =
+                        Self::dispatch_due_batch(polling_db.as_ref(), self.ctx.clone(), batch_size)
+                            .await;
 
                     // Send NOTIFY for each unique queue after transaction commits.
                     // `should_send_notify` enforces backend + use_listen_notify + per-queue throttle.
@@ -365,6 +178,217 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// Promote one batch of due scheduled executions in its own transaction.
+    async fn dispatch_due_batch(
+        polling_db: &DatabaseConnection,
+        ctx: Arc<AppContext>,
+        batch_size: u64,
+    ) -> std::result::Result<(std::collections::HashSet<String>, Vec<i64>), TransactionError<DbErr>>
+    {
+        // Dispatch scheduled jobs in their own transaction.
+        polling_db
+            .transaction::<_, (std::collections::HashSet<String>, Vec<i64>), DbErr>(|txn| {
+                Box::pin(async move {
+                    // Dispatch scheduled jobs
+                    // Use FOR UPDATE SKIP LOCKED to avoid conflicts between multiple dispatchers
+                    // This matches Solid Queue's implementation
+                    let scheduled_executions = query_builder::scheduled_executions::find_due(
+                        txn,
+                        &ctx.table_config,
+                        batch_size,
+                        ctx.use_skip_locked,
+                    )
+                    .await;
+
+                    if scheduled_executions.is_err() {
+                        warn!(
+                            "Error fetching scheduled jobs: {:?}",
+                            scheduled_executions.err()
+                        );
+                        return Ok((std::collections::HashSet::new(), Vec::new()));
+                    }
+                    let scheduled_executions = scheduled_executions?;
+                    let size = scheduled_executions.len();
+
+                    // Collect queue names for NOTIFY
+                    let mut notified_queues = std::collections::HashSet::new();
+                    // Batched jobs discarded on promotion, re-checked after commit.
+                    let mut released_batches: Vec<i64> = Vec::new();
+
+                    // Batch fetch all jobs at once (eliminates N+1)
+                    let job_ids: Vec<i64> =
+                        scheduled_executions.iter().map(|se| se.job_id).collect();
+                    let jobs =
+                        query_builder::jobs::find_by_ids(txn, &ctx.table_config, job_ids.clone())
+                            .await?;
+                    let job_map: std::collections::HashMap<i64, _> =
+                        jobs.into_iter().map(|j| (j.id, j)).collect();
+
+                    // Split scheduled-due jobs into two groups so we can
+                    // bulk-promote the unrestricted ones but still enforce
+                    // concurrency limits on the rest (matches Solid Queue's
+                    // `Job.dispatch_all` partition between
+                    // `dispatch_all_at_once` and `dispatch_all_one_by_one`).
+                    // Without this split, every retry / wait_until / wait
+                    // path bypassed the semaphore at promotion time and
+                    // could violate the declared concurrency_limit.
+                    let mut ready_data: Vec<(i64, &str, i32, chrono::NaiveDateTime)> = Vec::new();
+                    let mut concurrency_limited: Vec<&_> = Vec::new();
+                    for se in &scheduled_executions {
+                        let Some(job) = job_map.get(&se.job_id) else {
+                            warn!(
+                                "Job {} not found for scheduled execution {}",
+                                se.job_id, se.id
+                            );
+                            continue;
+                        };
+                        let has_key = job
+                            .concurrency_key
+                            .as_deref()
+                            .map(|k| !k.is_empty())
+                            .unwrap_or(false);
+                        if has_key {
+                            concurrency_limited.push(job);
+                        } else {
+                            ready_data.push((
+                                se.job_id,
+                                &job.queue_name,
+                                job.priority,
+                                chrono::Utc::now().naive_utc(),
+                            ));
+                            notified_queues.insert(job.queue_name.clone());
+                        }
+                    }
+
+                    // Concurrency-limited ones go one-by-one so each can
+                    // acquire the semaphore and route to ready / blocked /
+                    // discarded per its on_conflict policy.
+                    for job in concurrency_limited {
+                        let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
+                        let (limit, duration_opt, on_conflict) = {
+                            #[cfg(feature = "python")]
+                            {
+                                ctx.runnables
+                                    .read()
+                                    .ok()
+                                    .and_then(|runnables| {
+                                        runnables.get(&job.class_name).map(|r| {
+                                            (
+                                                r.concurrency_limit.unwrap_or(1),
+                                                r.concurrency_duration
+                                                    .map(|s| chrono::Duration::seconds(s as i64)),
+                                                r.concurrency_on_conflict,
+                                            )
+                                        })
+                                    })
+                                    .unwrap_or((1, None, ConcurrencyConflict::Block))
+                            }
+                            #[cfg(not(feature = "python"))]
+                            {
+                                (1, None, ConcurrencyConflict::Block)
+                            }
+                        };
+
+                        let acquired = acquire_semaphore(
+                            txn,
+                            &ctx.table_config,
+                            concurrency_key.to_string(),
+                            limit,
+                            duration_opt,
+                        )
+                        .await?;
+
+                        if acquired {
+                            ready_data.push((
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                                chrono::Utc::now().naive_utc(),
+                            ));
+                            notified_queues.insert(job.queue_name.clone());
+                        } else {
+                            let duration = duration_opt.unwrap_or_else(|| {
+                                chrono::Duration::from_std(ctx.default_concurrency_control_period)
+                                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
+                            });
+                            match on_conflict {
+                                ConcurrencyConflict::Discard => {
+                                    warn!(
+                                        job_id = job.id,
+                                        concurrency_key,
+                                        "Scheduled job `{}' discarded due to concurrency limit",
+                                        job.class_name
+                                    );
+                                    query_builder::jobs::mark_finished(
+                                        txn,
+                                        &ctx.table_config,
+                                        job.id,
+                                    )
+                                    .await?;
+                                    released_batches.extend(
+                                        crate::batch::release_batched_job(
+                                            txn,
+                                            &ctx.table_config,
+                                            &job,
+                                        )
+                                        .await?,
+                                    );
+                                }
+                                ConcurrencyConflict::Block => {
+                                    let now = chrono::Utc::now().naive_utc();
+                                    info!(
+                                        job_id = job.id,
+                                        concurrency_key,
+                                        "Scheduled job `{}' blocked due to concurrency limit",
+                                        job.class_name
+                                    );
+                                    query_builder::blocked_executions::insert(
+                                        txn,
+                                        &ctx.table_config,
+                                        job.id,
+                                        &job.queue_name,
+                                        job.priority,
+                                        concurrency_key,
+                                        now + duration,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+
+                    // The semaphore decision remains per job; all admitted jobs
+                    // can share one ready insert in this transaction.
+                    if !ready_data.is_empty() {
+                        query_builder::ready_executions::insert_all_with_created_at(
+                            txn,
+                            &ctx.table_config,
+                            &ready_data,
+                        )
+                        .await?;
+                    }
+
+                    // Delete all scheduled_executions rows we processed
+                    // (regardless of whether each landed in ready, blocked,
+                    // or finished).
+                    query_builder::scheduled_executions::delete_by_job_ids(
+                        txn,
+                        &ctx.table_config,
+                        &job_ids,
+                    )
+                    .await?;
+
+                    if size > 0 {
+                        info!("Dispatch scheduled jobs size: {}", size);
+                    }
+
+                    Ok((notified_queues, released_batches))
+                })
+            })
+            .instrument(tracing::info_span!("polling", component = "dispatcher"))
+            .await
     }
 
     /// Unblock jobs whose concurrency keys have expired, mirroring Solid Queue's

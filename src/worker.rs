@@ -4178,6 +4178,10 @@ impl Worker {
                 deleted, total_deleted
             );
 
+            if deleted < batch_size {
+                continue;
+            }
+
             // Sleep briefly between batches to reduce database pressure
             tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         }
@@ -4203,6 +4207,9 @@ impl Worker {
                 batches_deleted += deleted;
                 if deleted == 0 {
                     break;
+                }
+                if deleted < batch_size {
+                    continue;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
             }
