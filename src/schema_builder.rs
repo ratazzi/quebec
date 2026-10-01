@@ -10,6 +10,7 @@ use sea_orm::sea_query::{
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 use crate::context::TableConfig;
+use crate::query_builder::index_name;
 
 // Time columns use `.date_time()`, never `.timestamp()`: on MySQL, TIMESTAMP
 // caps at 2038-01-19 and applies session time-zone conversion to the naive
@@ -478,30 +479,36 @@ pub async fn create_indexes<C>(db: &C, table_config: &TableConfig) -> Result<(),
 where
     C: ConnectionTrait,
 {
+    let backend = db.get_database_backend();
+    let name = |raw: String| index_name(backend, &raw);
+    let recurring_unique_index_name = name(format!(
+        "index_{}_on_task_key_and_run_at",
+        table_config.recurring_executions
+    ));
     let mut indexes = vec![
         // Jobs indexes
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_queue_priority", table_config.jobs))
+            .name(name(format!("idx_{}_queue_priority", table_config.jobs)))
             .table(tbl(&table_config.jobs))
             .col(col("queue_name"))
             .col(col("priority"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_class_name", table_config.jobs))
+            .name(name(format!("idx_{}_class_name", table_config.jobs)))
             .table(tbl(&table_config.jobs))
             .col(col("class_name"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_finished_at", table_config.jobs))
+            .name(name(format!("idx_{}_finished_at", table_config.jobs)))
             .table(tbl(&table_config.jobs))
             .col(col("finished_at"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_batch_id", table_config.jobs))
+            .name(name(format!("idx_{}_batch_id", table_config.jobs)))
             .table(tbl(&table_config.jobs))
             .col(col("batch_id"))
             .to_owned(),
@@ -509,19 +516,25 @@ where
         Index::create()
             .if_not_exists()
             .unique()
-            .name(&format!("idx_{}_active_job_batch_id", table_config.batches))
+            .name(name(format!(
+                "idx_{}_active_job_batch_id",
+                table_config.batches
+            )))
             .table(tbl(&table_config.batches))
             .col(col("active_job_batch_id"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_finished_at", table_config.batches))
+            .name(name(format!("idx_{}_finished_at", table_config.batches)))
             .table(tbl(&table_config.batches))
             .col(col("finished_at"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_batch_id", table_config.batch_executions))
+            .name(name(format!(
+                "idx_{}_batch_id",
+                table_config.batch_executions
+            )))
             .table(tbl(&table_config.batch_executions))
             .col(col("batch_id"))
             .to_owned(),
@@ -529,10 +542,10 @@ where
         // Covering index for poll: WHERE queue_name = ? ORDER BY priority, job_id LIMIT N
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_queue_priority_job",
                 table_config.ready_executions
-            ))
+            )))
             .table(tbl(&table_config.ready_executions))
             .col(col("queue_name"))
             .col(col("priority"))
@@ -542,10 +555,10 @@ where
         // Covering index for release: WHERE concurrency_key = ? ORDER BY priority, job_id LIMIT 1
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_key_priority_job",
                 table_config.blocked_executions
-            ))
+            )))
             .table(tbl(&table_config.blocked_executions))
             .col(col("concurrency_key"))
             .col(col("priority"))
@@ -554,10 +567,10 @@ where
         // Maintenance index: WHERE expires_at < ? DISTINCT concurrency_key
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_expires_at_key",
                 table_config.blocked_executions
-            ))
+            )))
             .table(tbl(&table_config.blocked_executions))
             .col(col("expires_at"))
             .col(col("concurrency_key"))
@@ -566,10 +579,10 @@ where
         // Covering index for dispatch: WHERE scheduled_at <= ? ORDER BY scheduled_at, priority, job_id
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_dispatch",
                 table_config.scheduled_executions
-            ))
+            )))
             .table(tbl(&table_config.scheduled_executions))
             .col(col("scheduled_at"))
             .col(col("priority"))
@@ -578,10 +591,10 @@ where
         // Poll-all index: ORDER BY priority, job_id (no queue filter)
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_priority_job",
                 table_config.ready_executions
-            ))
+            )))
             .table(tbl(&table_config.ready_executions))
             .col(col("priority"))
             .col(col("job_id"))
@@ -589,10 +602,10 @@ where
         // Claimed executions: process cleanup index
         Index::create()
             .if_not_exists()
-            .name(&format!(
+            .name(name(format!(
                 "idx_{}_process_job",
                 table_config.claimed_executions
-            ))
+            )))
             .table(tbl(&table_config.claimed_executions))
             .col(col("process_id"))
             .col(col("job_id"))
@@ -601,13 +614,16 @@ where
         // Processes indexes
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_kind", table_config.processes))
+            .name(name(format!("idx_{}_kind", table_config.processes)))
             .table(tbl(&table_config.processes))
             .col(col("kind"))
             .to_owned(),
         Index::create()
             .if_not_exists()
-            .name(&format!("idx_{}_last_heartbeat", table_config.processes))
+            .name(name(format!(
+                "idx_{}_last_heartbeat",
+                table_config.processes
+            )))
             .table(tbl(&table_config.processes))
             .col(col("last_heartbeat_at"))
             .to_owned(),
@@ -616,10 +632,7 @@ where
         Index::create()
             .if_not_exists()
             .unique()
-            .name(&format!(
-                "index_{}_on_task_key_and_run_at",
-                table_config.recurring_executions
-            ))
+            .name(recurring_unique_index_name.clone())
             .table(tbl(&table_config.recurring_executions))
             .col(col("task_key"))
             .col(col("run_at"))
@@ -650,7 +663,7 @@ where
         indexes.push(
             Index::create()
                 .if_not_exists()
-                .name(&format!("idx_{}_key_value", table_config.semaphores))
+                .name(name(format!("idx_{}_key_value", table_config.semaphores)))
                 .table(tbl(&table_config.semaphores))
                 .col(col("key"))
                 .col(col("value"))
@@ -659,7 +672,7 @@ where
         indexes.push(
             Index::create()
                 .if_not_exists()
-                .name(&format!("idx_{}_expires_at", table_config.semaphores))
+                .name(name(format!("idx_{}_expires_at", table_config.semaphores)))
                 .table(tbl(&table_config.semaphores))
                 .col(col("expires_at"))
                 .to_owned(),
@@ -674,7 +687,7 @@ where
         };
 
         // Check if this is the critical unique index for recurring_executions
-        let is_recurring_unique_index = sql.contains("task_key_and_run_at");
+        let is_recurring_unique_index = sql.contains(&recurring_unique_index_name);
 
         match db
             .execute(Statement::from_string(
