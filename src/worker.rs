@@ -57,6 +57,18 @@ fn reported_worker_rss_bytes(
     }
 }
 
+struct JsonValueRef<'a>(&'a serde_json::Value);
+
+impl<'a, 'py> pyo3::IntoPyObject<'py> for JsonValueRef<'a> {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = PyErr;
+
+    fn into_pyobject(self, py: Python<'py>) -> PyResult<Self::Output> {
+        Ok(json_to_py(py, self.0)?.into_bound(py))
+    }
+}
+
 fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::String(s) => Ok(s.into_pyobject(py)?.into()),
@@ -73,10 +85,7 @@ fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> 
         }
         serde_json::Value::Bool(b) => Ok(PyBool::new(py, *b).as_ref().into_pyobject(py)?.into()),
         serde_json::Value::Array(arr) => {
-            let py_list = PyList::empty(py);
-            for item in arr {
-                py_list.append(json_to_py(py, item)?)?;
-            }
+            let py_list = PyList::new(py, arr.iter().map(JsonValueRef))?;
             Ok(py_list.into_pyobject(py)?.into())
         }
         serde_json::Value::Object(obj) => {
@@ -384,50 +393,43 @@ impl Runnable {
             //
             // Solid Queue / Quebec wraps the args dict more than once
             // depending on the enqueue path (perform_later vs scheduler);
-            // mirror Execution::parse_job_arguments_from_json (worker.rs:634)
+            // mirror Execution::parse_job_arguments_from_json
             // and walk nested `arguments` keys until we reach the Array.
-            let mut v = serde_json::from_str::<serde_json::Value>(arguments_json)
+            let parsed = serde_json::from_str::<serde_json::Value>(arguments_json)
                 .unwrap_or(serde_json::Value::Null);
-            while let serde_json::Value::Object(ref o) = v {
+            let mut v = &parsed;
+            while let serde_json::Value::Object(o) = v {
                 match o.get("arguments") {
-                    Some(serde_json::Value::Array(_)) => {
-                        v = o["arguments"].clone();
+                    Some(next @ serde_json::Value::Array(_)) => {
+                        v = next;
                         break;
                     }
-                    Some(serde_json::Value::Object(_)) => v = o["arguments"].clone(),
+                    Some(next @ serde_json::Value::Object(_)) => v = next,
                     _ => break,
                 }
             }
             let args_array = match v {
-                serde_json::Value::Array(arr) => arr,
-                _ => Vec::new(),
+                serde_json::Value::Array(arr) => arr.as_slice(),
+                _ => &[],
             };
 
             // Split off `_quebec_kwargs` marker dict at tail (mirrors
             // parse_job_arguments_from_json on the Execution side).
-            let (positional, kwargs_map): (Vec<serde_json::Value>, Option<serde_json::Map<_, _>>) =
-                match args_array.last() {
-                    Some(serde_json::Value::Object(obj)) if obj.contains_key("_quebec_kwargs") => {
-                        let mut p = args_array.clone();
-                        p.pop();
-                        let mut kw = obj.clone();
-                        kw.remove("_quebec_kwargs");
-                        kw.remove("_aj_symbol_keys");
-                        (p, Some(kw))
-                    }
-                    _ => (args_array, None),
-                };
+            let (positional, kwargs_map) = match args_array.last() {
+                Some(serde_json::Value::Object(obj)) if obj.contains_key("_quebec_kwargs") => {
+                    (&args_array[..args_array.len() - 1], Some(obj))
+                }
+                _ => (args_array, None),
+            };
 
-            let py_list = pyo3::types::PyList::empty(py);
-            for v in &positional {
-                py_list.append(json_to_py(py, v)?)?;
-            }
-            let py_args = pyo3::types::PyTuple::new(py, py_list.iter())?;
+            let py_args = pyo3::types::PyTuple::new(py, positional.iter().map(JsonValueRef))?;
 
             let py_kwargs = pyo3::types::PyDict::new(py);
             if let Some(kw) = kwargs_map {
                 for (k, v) in kw {
-                    py_kwargs.set_item(k, json_to_py(py, &v)?)?;
+                    if k != "_quebec_kwargs" && k != "_aj_symbol_keys" {
+                        py_kwargs.set_item(k, json_to_py(py, v)?)?;
+                    }
                 }
             }
 
@@ -616,19 +618,24 @@ impl Runnable {
     ) -> Option<Bound<'py, PyAny>> {
         let instance = self.handler.bind(py).call0().ok()?;
         instance.setattr("id", job.id).ok();
-        Self::inject_batch_ids(&instance, job).ok();
+        Self::inject_batch_ids(&instance, job, None).ok();
         Some(instance)
     }
 
     /// Stamp the batch ids `BaseClass.batch` reads: the member batch from the
     /// jobs row, and for callback jobs the batch that enqueued them (carried
     /// only in the serialized envelope, as in Active Job).
-    fn inject_batch_ids(instance: &Bound<'_, PyAny>, job: &quebec_jobs::Model) -> PyResult<()> {
+    fn inject_batch_ids(
+        instance: &Bound<'_, PyAny>,
+        job: &quebec_jobs::Model,
+        parsed_arguments: Option<&serde_json::Value>,
+    ) -> PyResult<()> {
         instance.setattr("_batch_id", job.batch_id)?;
-        instance.setattr(
-            "_callback_batch_id",
-            crate::utils::get_callback_batch_id(job.arguments.as_deref()),
-        )
+        let callback_batch_id = parsed_arguments.map_or_else(
+            || crate::utils::get_callback_batch_id(job.arguments.as_deref()),
+            crate::utils::get_callback_batch_id_from_value,
+        );
+        instance.setattr("_callback_batch_id", callback_batch_id)
     }
 
     /// Invoke an error-strategy handler with `(job, error)`. Logs and swallows
@@ -777,9 +784,9 @@ impl Runnable {
         let bound = self.handler.bind(py);
         let instance = bound.call0()?;
         instance.setattr("id", job.id)?;
-        let executions = crate::utils::get_executions(job.arguments.as_deref());
+        let executions = crate::utils::get_executions_from_value(&original_args);
         instance.setattr("executions", executions)?;
-        Self::inject_batch_ids(&instance, job)?;
+        Self::inject_batch_ids(&instance, job, Some(&original_args))?;
 
         // Check if the job class inherits from Continuable mixin
         // We check for _continuation attribute (defined in Continuable class) and verify it's None
@@ -901,28 +908,29 @@ impl Runnable {
         py: Python,
         json_args: &serde_json::Value,
     ) -> PyResult<(Py<PyTuple>, Py<PyDict>)> {
-        let mut v = json_args.clone();
+        let mut v = json_args;
 
         // Unwrap nested "arguments" key until we reach the actual Array.
         // Flat (SQ/scheduler): {"arguments": [1, 2], ...}
         // Double-nested (perform_later → enqueue_job): {"arguments": {"arguments": [1, 2], ...}, ...}
-        while let serde_json::Value::Object(ref o) = v {
+        while let serde_json::Value::Object(o) = v {
             match o.get("arguments") {
-                Some(serde_json::Value::Array(_)) => {
-                    v = o["arguments"].clone();
+                Some(next @ serde_json::Value::Array(_)) => {
+                    v = next;
                     break;
                 }
-                Some(serde_json::Value::Object(_)) => v = o["arguments"].clone(),
+                Some(next @ serde_json::Value::Object(_)) => v = next,
                 _ => break,
             }
         }
 
         // If not an array, wrap it
+        let empty = serde_json::Value::Array(vec![]);
         if !v.is_array() {
-            v = serde_json::Value::Array(vec![]);
+            v = &empty;
         }
 
-        let binding = json_to_py(py, &v)?;
+        let binding = json_to_py(py, v)?;
         let args = binding.cast_bound::<pyo3::types::PyList>(py).map_err(|e| {
             PyException::new_err(format!("Failed to convert arguments to PyList: {e:?}"))
         })?;
@@ -5798,5 +5806,199 @@ mod tests {
         let last = AtomicU64::new(0);
 
         assert_eq!(reported_worker_rss_bytes(&last, None), None);
+    }
+}
+
+#[cfg(test)]
+mod argument_conversion_tests {
+    use super::*;
+
+    fn model() -> quebec_jobs::Model {
+        let now = chrono::Utc::now().naive_utc();
+        quebec_jobs::Model {
+            id: 1,
+            queue_name: "default".into(),
+            class_name: "MetadataJob".into(),
+            arguments: Some(r#"{"arguments":[7,{"region":"east","_quebec_kwargs":true}],"executions":0,"continuation":{},"resumptions":0}"#.into()),
+            priority: 0,
+            active_job_id: Some("metadata-1".into()),
+            scheduled_at: Some(now),
+            finished_at: None,
+            concurrency_key: None,
+            created_at: now,
+            updated_at: now,
+            batch_id: None,
+        }
+    }
+
+    #[test]
+    fn argument_conversion_preserves_nested_and_keyword_shapes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let flat = serde_json::json!({
+                "arguments": [7, {"region": "east", "_quebec_kwargs": true}],
+                "continuation": {"completed": []},
+            });
+            let flat_before = flat.clone();
+            let (args, kwargs) = Runnable::parse_job_arguments_from_json(py, &flat).unwrap();
+            assert_eq!(args.bind(py).len(), 1);
+            assert_eq!(
+                args.bind(py).get_item(0).unwrap().extract::<i64>().unwrap(),
+                7
+            );
+            assert_eq!(
+                kwargs
+                    .bind(py)
+                    .get_item("region")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "east"
+            );
+            assert_eq!(kwargs.bind(py).len(), 1);
+            assert_eq!(flat, flat_before);
+
+            let nested = serde_json::json!({
+                "arguments": {"arguments": [9, {
+                    "region": "west", "_aj_ruby2_keywords": ["region"],
+                    "_aj_symbol_keys": ["region"]
+                }]}
+            });
+            let (args, kwargs) = Runnable::parse_job_arguments_from_json(py, &nested).unwrap();
+            assert_eq!(args.bind(py).len(), 1);
+            assert_eq!(
+                args.bind(py).get_item(0).unwrap().extract::<i64>().unwrap(),
+                9
+            );
+            assert_eq!(
+                kwargs
+                    .bind(py)
+                    .get_item("region")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "west"
+            );
+            assert_eq!(kwargs.bind(py).len(), 1);
+
+            let positional_dict = serde_json::json!({"arguments": [{"plain": true}]});
+            let (args, kwargs) =
+                Runnable::parse_job_arguments_from_json(py, &positional_dict).unwrap();
+            assert_eq!(args.bind(py).len(), 1);
+            assert!(args
+                .bind(py)
+                .get_item(0)
+                .unwrap()
+                .cast::<PyDict>()
+                .unwrap()
+                .contains("plain")
+                .unwrap());
+            assert_eq!(kwargs.bind(py).len(), 0);
+
+            let nested_list = serde_json::json!({
+                "arguments": [[1, true, null, {"inner": [2, 3]}]]
+            });
+            let (args, kwargs) = Runnable::parse_job_arguments_from_json(py, &nested_list).unwrap();
+            let outer_item = args.bind(py).get_item(0).unwrap();
+            let outer = outer_item.cast::<PyList>().unwrap();
+            assert_eq!(outer.len(), 4);
+            assert_eq!(outer.get_item(0).unwrap().extract::<i64>().unwrap(), 1);
+            assert!(outer.get_item(1).unwrap().extract::<bool>().unwrap());
+            assert!(outer.get_item(2).unwrap().is_none());
+            let dict_item = outer.get_item(3).unwrap();
+            let dict = dict_item.cast::<PyDict>().unwrap();
+            let inner_item = dict.get_item("inner").unwrap().unwrap();
+            let inner = inner_item.cast::<PyList>().unwrap();
+            assert_eq!(inner.len(), 2);
+            assert_eq!(inner.get_item(0).unwrap().extract::<i64>().unwrap(), 2);
+            assert_eq!(inner.get_item(1).unwrap().extract::<i64>().unwrap(), 3);
+            assert_eq!(kwargs.bind(py).len(), 0);
+
+            let missing_array = serde_json::json!({"arguments": {"unexpected": 1}});
+            let (args, kwargs) =
+                Runnable::parse_job_arguments_from_json(py, &missing_array).unwrap();
+            assert_eq!(args.bind(py).len(), 0);
+            assert_eq!(kwargs.bind(py).len(), 0);
+        });
+    }
+
+    #[test]
+    fn parsed_metadata_reaches_python_job() {
+        Python::initialize();
+        let (class, observed) = Python::attach(|py| {
+            let class = py.eval(
+                c"type('MetadataJob', (), {'seen': [], 'perform': lambda self, value, region=None: type(self).seen.append((self.executions, self._batch_id, self._callback_batch_id))})",
+                None,
+                None,
+            )?;
+            let observed = class.getattr("seen")?.unbind();
+            Ok::<_, PyErr>((class.unbind(), observed))
+        })
+        .unwrap();
+        let mut runnable = Runnable::new("MetadataJob".into(), class, "default".into(), 0);
+        let mut job = model();
+        job.batch_id = Some(17);
+
+        job.arguments = Some(r#"{"arguments":[7,{"region":"east","_quebec_kwargs":true}],"executions":4,"callback_batch_id":23,"continuation":{},"resumptions":0}"#.into());
+        runnable.invoke(&mut job, None).unwrap();
+
+        job.arguments = Some(r#"{"arguments":{"arguments":[7,{"region":"east","_quebec_kwargs":true}],"callback_batch_id":31},"executions":2,"continuation":{},"resumptions":0}"#.into());
+        runnable.invoke(&mut job, None).unwrap();
+
+        job.arguments = Some(r#"{"arguments":{"arguments":[7,{"region":"east","_quebec_kwargs":true}],"callback_batch_id":31},"callback_batch_id":null,"executions":1,"continuation":{},"resumptions":0}"#.into());
+        runnable.invoke(&mut job, None).unwrap();
+
+        Python::attach(|py| {
+            let observed = observed.bind(py).cast::<PyList>().unwrap();
+            let values: Vec<(i32, Option<i64>, Option<i64>)> = observed
+                .iter()
+                .map(|item| item.extract().unwrap())
+                .collect();
+            assert_eq!(
+                values,
+                vec![
+                    (4, Some(17), Some(23)),
+                    (2, Some(17), Some(31)),
+                    (1, Some(17), None),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn rate_limit_key_preserves_argument_marker_shapes() {
+        Python::initialize();
+        let runnable = Python::attach(|py| {
+            let class = py.eval(
+                c"type('RateKeyShape', (), {'rate_limit_key': lambda self, *args, **kwargs: str(len(args)) + ':' + str(len(kwargs))})",
+                None,
+                None,
+            )?;
+            Ok::<_, PyErr>(Runnable::new(
+                "RateKeyShape".into(), class.unbind(), "default".into(), 0,
+            ))
+        })
+        .unwrap();
+        let cases = [
+            ("invalid json", "0:0"),
+            (r#"{"arguments":[{"plain":true}]}"#, "1:0"),
+            (r#"{"arguments":[{"_aj_ruby2_keywords":true}]}"#, "1:0"),
+            (
+                r#"{"arguments":[1,{"region":"east","_quebec_kwargs":true,"_aj_symbol_keys":["region"]}]}"#,
+                "1:1",
+            ),
+            (
+                r#"{"arguments":{"arguments":[1,{"region":"east","_quebec_kwargs":true}]}}"#,
+                "1:1",
+            ),
+        ];
+        for (arguments, expected) in cases {
+            assert_eq!(
+                runnable.compute_rate_limit_key(arguments).unwrap(),
+                expected
+            );
+        }
     }
 }

@@ -147,6 +147,33 @@ def test_callable_queue_as_uses_filtered_kwargs(qc_with_sqlalchemy, db_assert) -
     assert db_assert.count_jobs() == 1
 
 
+def test_callable_queue_as_uses_plain_kwargs_for_single_and_bulk(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    qc.register_job(DynamicQueueJob)
+
+    single = DynamicQueueJob.perform_later(qc, "us", kind="emails")
+    bulk = qc.perform_all_later([DynamicQueueJob.build("eu", kind="imports")])[0]
+    rows = [
+        get_job_by_active_job_id(session, prefix, job.active_job_id)
+        for job in (single, bulk)
+    ]
+
+    assert [row["queue_name"] for row in rows] == ["us-emails", "eu-imports"]
+    arguments = [json.loads(row["arguments"])["arguments"] for row in rows]
+    arguments = [
+        value["arguments"] if isinstance(value, dict) else value for value in arguments
+    ]
+    assert arguments == [
+        ["us", {"kind": "emails", "_quebec_kwargs": True}],
+        ["eu", {"kind": "imports", "_quebec_kwargs": True}],
+    ]
+    assert db_assert.count_jobs() == 2
+
+
 def test_enqueue_hooks_are_invoked_for_regular_enqueue(
     qc_with_sqlalchemy, db_assert
 ) -> None:

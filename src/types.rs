@@ -706,12 +706,8 @@ impl PyQuebec {
             vec![]
         };
 
-        if let Some(Value::Object(kwargs_map)) = &kwargs_json {
-            let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
-                .iter()
-                .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+        if let Some(Value::Object(mut real_kwargs)) = kwargs_json {
+            real_kwargs.retain(|key, _| !is_job_builder_internal_kwarg(key));
             if !real_kwargs.is_empty() {
                 real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
                 arguments_array.push(Value::Object(real_kwargs));
@@ -2670,13 +2666,8 @@ impl PyQuebec {
         // Append kwargs as last dict element with _quebec_kwargs marker.
         // On the worker side, only dicts with this marker are extracted as kwargs;
         // plain dict positional args are left untouched.
-        if let Some(Value::Object(kwargs_map)) = &kwargs_json {
-            let mut real_kwargs: serde_json::Map<String, Value> = kwargs_map
-                .iter()
-                .filter(|(key, _)| !is_job_builder_internal_kwarg(key.as_str()))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-
+        if let Some(Value::Object(mut real_kwargs)) = kwargs_json {
+            real_kwargs.retain(|key, _| !is_job_builder_internal_kwarg(key));
             if !real_kwargs.is_empty() {
                 real_kwargs.insert("_quebec_kwargs".to_string(), Value::Bool(true));
                 arguments_array.push(Value::Object(real_kwargs));
@@ -5104,4 +5095,44 @@ async fn recurring_task_exists(
         .ok_or_else(|| {
             pyo3::exceptions::PyLookupError::new_err(format!("No recurring task with key {key:?}"))
         })
+}
+
+#[cfg(test)]
+mod keyword_argument_tests {
+    use super::*;
+    use pyo3::types::PyList;
+
+    #[test]
+    fn prepare_descriptor_keeps_keyword_payload_and_filters_internal_options() {
+        Python::initialize();
+        Python::attach(|py| -> PyResult<()> {
+            let quebec = PyQuebec::new("sqlite::memory:".to_string(), None)?;
+            let class = py.eval(
+                c"type('KeywordPayloadJob', (), {'queue_as': 'default', 'priority': 0})",
+                None,
+                None,
+            )?;
+            let args = PyTuple::new(py, [7_i64])?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("numbers", PyList::new(py, 0..1_024)?)?;
+            kwargs.set_item("_meta", "user-value")?;
+            kwargs.set_item("_queue", "internal-option")?;
+            let prepared =
+                quebec.prepare_descriptor(py, &class, &args, &kwargs, &PyDict::new(py), false)?;
+            let payload: serde_json::Value = serde_json::from_str(&prepared.arguments).unwrap();
+            let items = payload["arguments"].as_array().unwrap();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0], serde_json::json!(7));
+            let keywords = items[1].as_object().unwrap();
+            assert_eq!(
+                keywords["numbers"],
+                serde_json::json!((0..1_024).collect::<Vec<_>>())
+            );
+            assert_eq!(keywords["_meta"], "user-value");
+            assert_eq!(keywords["_quebec_kwargs"], true);
+            assert!(!keywords.contains_key("_queue"));
+            Ok(())
+        })
+        .unwrap();
+    }
 }
