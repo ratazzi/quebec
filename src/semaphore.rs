@@ -17,6 +17,41 @@ where
     let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2)); // Default to 2 minutes
     let key_col = quote_identifier(db.get_database_backend(), "key");
 
+    if db.get_database_backend() == DatabaseBackend::MySql {
+        // INSERT IGNORE takes a shared lock on an existing key. Concurrent
+        // transactions then deadlock when both try to upgrade it in the
+        // following UPDATE. The duplicate-key UPDATE takes an exclusive lock
+        // directly. Assign value last: MySQL evaluates assignments in order.
+        let sql = format!(
+            "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+             expires_at = IF({table}.value > 0, ?, {table}.expires_at), \
+             updated_at = IF({table}.value > 0, ?, {table}.updated_at), \
+             value = IF({table}.value > 0, {table}.value - 1, {table}.value)",
+            table = table_config.semaphores
+        );
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::MySql,
+                sql,
+                vec![
+                    key.into(),
+                    (concurrency_limit - 1).into(),
+                    expires_at.into(),
+                    now.into(),
+                    now.into(),
+                    expires_at.into(),
+                    now.into(),
+                ],
+            ))
+            .await?;
+        // SQLx enables CLIENT_FOUND_ROWS, so a no-op duplicate reports one
+        // affected row just like an INSERT. With this table's auto-increment
+        // ID, MySQL returns zero insert ID only for the unchanged full row.
+        return Ok(result.last_insert_id() != 0);
+    }
+
     // First, try to create a new semaphore (attempt_creation)
     let create_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres => {
@@ -34,13 +69,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::MySql => {
-            format!(
-                "INSERT IGNORE INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
-                table_config.semaphores
-            )
-        }
+        DatabaseBackend::MySql => unreachable!(),
     };
 
     let create_result = db
@@ -124,6 +153,42 @@ where
         .await?;
 
     Ok(decrement_result.rows_affected() > 0)
+}
+
+/// Re-acquire a MySQL semaphore slot that was just released in this transaction.
+/// The successful release already locked an existing row. An UPDATE avoids
+/// the auto-increment PRIMARY insert-intention lock taken by the generic UPSERT
+/// while we hold the blocked-execution ordering-index lock.
+pub async fn reacquire_released_semaphore<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: &str,
+    duration: Option<chrono::Duration>,
+) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if db.get_database_backend() != DatabaseBackend::MySql {
+        return Err(DbErr::Custom(
+            "reacquire_released_semaphore requires MySQL".into(),
+        ));
+    }
+    let now = chrono::Utc::now().naive_utc();
+    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let key_col = quote_identifier(DatabaseBackend::MySql, "key");
+    let sql = format!(
+        "UPDATE {} SET value = value - 1, expires_at = ?, updated_at = ? \
+         WHERE {key_col} = ? AND value > 0",
+        table_config.semaphores
+    );
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DatabaseBackend::MySql,
+            sql,
+            vec![expires_at.into(), now.into(), key.to_string().into()],
+        ))
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Convenience function to acquire semaphore using ConcurrencyConstraint

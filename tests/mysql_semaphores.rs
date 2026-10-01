@@ -16,12 +16,19 @@ fn executed(rows_affected: u64) -> MockExecResult {
 #[tokio::test]
 async fn mysql_semaphore_statements_quote_key() {
     let db = MockDatabase::new(DbBackend::MySql)
-        .append_exec_results([executed(0), executed(1), executed(0), executed(1)])
+        .append_exec_results([
+            MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            },
+            executed(0),
+            executed(1),
+        ])
         .into_connection();
     let tc = TableConfig::default();
     let key = "customer's semaphore";
 
-    // Exercise both acquisition statements and both release statements.
+    // Acquire in one statement, then exercise both release statements.
     assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
         .await
         .unwrap());
@@ -30,8 +37,8 @@ async fn mysql_semaphore_statements_quote_key() {
         .unwrap());
 
     let log = db.into_transaction_log();
-    assert_eq!(log.len(), 4);
-    let key_uses = ["(`key`,", "WHERE `key` =", "WHERE `key` =", "WHERE `key` ="];
+    assert_eq!(log.len(), 3);
+    let key_uses = ["(`key`,", "WHERE `key` =", "WHERE `key` ="];
     for (transaction, key_use) in log.iter().zip(key_uses) {
         for statement in transaction.statements() {
             assert!(statement.sql.contains(key_use), "{}", statement.sql);
@@ -39,6 +46,27 @@ async fn mysql_semaphore_statements_quote_key() {
             assert!(statement.values.as_ref().unwrap().0.contains(&key.into()));
         }
     }
+    assert!(log[0].statements()[0]
+        .sql
+        .contains("ON DUPLICATE KEY UPDATE"));
+    assert!(log[0].statements()[0].sql.contains("value = IF("));
+    assert_eq!(log[0].statements()[0].values.as_ref().unwrap().0.len(), 7);
+}
+
+#[tokio::test]
+async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
+    let db = MockDatabase::new(DbBackend::MySql)
+        .append_exec_results([MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .into_connection();
+    assert!(
+        !acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 1, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.into_transaction_log().len(), 1);
 }
 
 #[tokio::test]

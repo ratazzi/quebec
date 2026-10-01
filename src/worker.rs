@@ -1943,27 +1943,26 @@ impl Execution {
                                 concurrency_duration,
                             )
                             .await
-                            .inspect(|&released| {
-                                if released {
-                                    trace!("Released semaphore for key: {}", key);
-                                }
-                            })
                             .inspect_err(|e| {
                                 warn!("Failed to release semaphore for key {}: {:?}", key, e)
-                            })
-                            .unwrap_or(false);
+                            })?;
 
                             // Step 2: Immediately try to release next blocked job (like Solid Queue)
                             if released {
-                                Worker::release_next_blocked_job(&ctx, txn, key, concurrency_limit)
-                                    .await
-                                    .inspect_err(|e| {
-                                        warn!(
-                                            "Failed to release next blocked job for key {}: {:?}",
-                                            key, e
-                                        )
-                                    })
-                                    .ok();
+                                Worker::release_next_blocked_job(
+                                    &ctx,
+                                    txn,
+                                    key,
+                                    concurrency_limit,
+                                    true,
+                                )
+                                .await
+                                .inspect_err(|e| {
+                                    warn!(
+                                        "Failed to release next blocked job for key {}: {:?}",
+                                        key, e
+                                    )
+                                })?;
                             }
                         }
 
@@ -3014,10 +3013,10 @@ impl Worker {
                     .await?;
 
                     if released {
-                        // Promoting one blocked job is an optimization (dispatcher's
-                        // periodic sweep also handles blocked→ready); keep it
-                        // best-effort so it can't poison the rate-route txn.
-                        Self::release_next_blocked_job(ctx, txn, key, limit)
+                        // A database error here may have rolled back the whole
+                        // MySQL transaction. Propagate it so the caller does not
+                        // commit an already-aborted rate-route operation.
+                        Self::release_next_blocked_job(ctx, txn, key, limit, true)
                             .await
                             .inspect_err(|e| {
                                 warn!(
@@ -3026,8 +3025,7 @@ impl Worker {
                                     "rate-limit: failed to release next blocked: {:?}",
                                     e
                                 )
-                            })
-                            .ok();
+                            })?;
                     }
                 }
                 Ok(RateGateResult::Routed)
@@ -4651,7 +4649,7 @@ impl Worker {
             .await
             .unwrap_or(false)
         {
-            Worker::release_next_blocked_job(ctx, db, key, limit)
+            Worker::release_next_blocked_job(ctx, db, key, limit, false)
                 .await
                 .ok();
         }
@@ -4787,11 +4785,12 @@ impl Worker {
         db: &C,
         concurrency_key: &str,
         concurrency_limit: i32,
+        reuse_released_slot: bool,
     ) -> std::result::Result<bool, DbErr>
     where
         C: ConnectionTrait,
     {
-        use crate::semaphore::acquire_semaphore;
+        use crate::semaphore::{acquire_semaphore, reacquire_released_semaphore};
 
         let table_config = &ctx.table_config;
 
@@ -4826,15 +4825,23 @@ impl Worker {
                 .map(|s| chrono::Duration::seconds(s as i64))
         });
 
-        // Try to acquire semaphore for this blocked job
-        let acquired = acquire_semaphore(
-            db,
-            table_config,
-            concurrency_key.to_string(),
-            concurrency_limit,
-            concurrency_duration,
-        )
-        .await?;
+        // A successful release in the same MySQL transaction already locked
+        // an existing semaphore row. Re-acquire by UPDATE so this blocked-row
+        // lock cannot cycle with a producer's UPSERT insert-intention gap lock.
+        let acquired = if reuse_released_slot && db.get_database_backend() == DatabaseBackend::MySql
+        {
+            reacquire_released_semaphore(db, table_config, concurrency_key, concurrency_duration)
+                .await?
+        } else {
+            acquire_semaphore(
+                db,
+                table_config,
+                concurrency_key.to_string(),
+                concurrency_limit,
+                concurrency_duration,
+            )
+            .await?
+        };
 
         if !acquired {
             // Semaphore not available (shouldn't happen normally since we just released one)
