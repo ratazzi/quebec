@@ -278,6 +278,20 @@ async def test_sse_keeps_polling_fallback(anyio_backend):
 
 
 @pytest.mark.anyio
+async def test_real_asgi_events_falls_back_to_stats(anyio_backend, qc_with_sqlalchemy):
+    app = qc_with_sqlalchemy["qc"].asgi_app()
+
+    events = await call_app(app, path="/quebec/events", root_path="/quebec")
+    assert events[0]["status"] == 204
+
+    stats = await call_app(app, path="/quebec/stats", root_path="/quebec")
+    assert stats[0]["status"] == 200
+    assert b"<turbo-stream" in b"".join(
+        message["body"] for message in stats if message["type"] == "http.response.body"
+    )
+
+
+@pytest.mark.anyio
 async def test_real_rust_router_accepts_concurrent_asgi_requests(
     anyio_backend,
     qc_with_sqlalchemy,

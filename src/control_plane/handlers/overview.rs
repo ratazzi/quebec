@@ -5,10 +5,10 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use sea_orm::sea_query::{
-    Alias, Expr, MysqlQueryBuilder, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
+    Alias, Expr, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
 };
 use sea_orm::Order;
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -242,55 +242,188 @@ impl ControlPlane {
         // Determine time interval based on selected time range
         let (interval_hours, format_string) = overview_chart_interval(hours);
 
-        // Generate time series data
-        for i in 0..(hours / interval_hours) {
+        let bucket_count = hours / interval_hours;
+        // Keep the labels and half-open bucket boundaries identical across
+        // backends. PostgreSQL uses date_bin; SQLite and MySQL count all
+        // buckets in one CASE aggregate.
+        let finished_col =
+            query_builder::quote_identifier(db.get_database_backend(), "finished_at");
+        let mut chart_values: Vec<Value> = Vec::with_capacity((bucket_count * 2 + 2) as usize);
+        let mut chart_counts = Vec::with_capacity(bucket_count as usize);
+        for i in 0..bucket_count {
             let end_time = now - chrono::Duration::hours(i * interval_hours);
             let start_time = end_time - chrono::Duration::hours(interval_hours);
-
             time_labels.push(end_time.format(format_string).to_string());
+            let first = chart_values.len() + 1;
+            chart_values.push(start_time.into());
+            chart_values.push(end_time.into());
+            let (start_param, end_param) = match db.get_database_backend() {
+                DbBackend::Postgres => (format!("${first}"), format!("${}", first + 1)),
+                DbBackend::Sqlite | DbBackend::MySql => ("?".to_string(), "?".to_string()),
+            };
+            let bucket_col =
+                query_builder::quote_identifier(db.get_database_backend(), &format!("bucket_{i}"));
+            chart_counts.push(format!(
+                "COUNT(CASE WHEN {finished_col} >= {start_param} AND {finished_col} < {end_param} THEN 1 END) AS {bucket_col}"
+            ));
+        }
 
-            // Query number of jobs completed in this time period using query_builder
-            let period_jobs = query_builder::jobs::count_finished_in_range(
-                db,
-                table_config,
-                start_time,
-                Some(end_time),
-            )
-            .await
-            .unwrap_or(0);
+        // date_bin and TIMESTAMPDIFF align bins with the exact oldest
+        // boundary. PostgreSQL before 14 falls through to CASE below.
+        let binned_counts = if db.get_database_backend() == DbBackend::Postgres {
+            let oldest = now - chrono::Duration::hours(bucket_count * interval_hours);
+            let table_name =
+                query_builder::quote_identifier(DbBackend::Postgres, &table_config.jobs);
+            let sql = format!(
+                "SELECT date_bin($1::interval, \"finished_at\", $2::timestamp) AS bucket, COUNT(*) AS count FROM {table_name} WHERE \"finished_at\" >= $3 AND \"finished_at\" < $4 GROUP BY bucket",
+            );
+            let stmt = Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                sql,
+                [
+                    format!("{interval_hours} hours").into(),
+                    oldest.into(),
+                    oldest.into(),
+                    now.into(),
+                ],
+            );
+            db.query_all(stmt).await.ok().and_then(|rows| {
+                let mut counts = vec![0u64; bucket_count as usize];
+                for row in rows {
+                    let start: NaiveDateTime = row.try_get("", "bucket").ok()?;
+                    let count: i64 = row.try_get("", "count").ok()?;
+                    // PostgreSQL timestamps have microsecond precision while
+                    // `oldest` may have sub-microsecond nanoseconds. Round to
+                    // the nearest stride, then verify the residual is tiny.
+                    let offset_us = (start - oldest).num_microseconds()?;
+                    let stride_us = interval_hours * 3_600_000_000;
+                    let index = (offset_us + stride_us / 2).div_euclid(stride_us);
+                    if index < 0
+                        || index >= bucket_count
+                        || (offset_us - index * stride_us).abs() > 2
+                    {
+                        return None;
+                    }
+                    counts[(bucket_count - 1 - index) as usize] = count as u64;
+                }
+                Some(counts)
+            })
+        } else if db.get_database_backend() == DbBackend::MySql {
+            let oldest = now - chrono::Duration::hours(bucket_count * interval_hours);
+            let stride_us = interval_hours * 3_600_000_000;
+            let table_name = query_builder::quote_identifier(DbBackend::MySql, &table_config.jobs);
+            let sql = format!(
+                "SELECT TIMESTAMPDIFF(MICROSECOND, ?, {finished_col}) DIV ? AS bucket, COUNT(*) AS count \
+                 FROM {table_name} WHERE {finished_col} >= ? AND {finished_col} < ? GROUP BY bucket"
+            );
+            let stmt = Statement::from_sql_and_values(
+                DbBackend::MySql,
+                sql,
+                [oldest.into(), stride_us.into(), oldest.into(), now.into()],
+            );
+            db.query_all(stmt).await.ok().and_then(|rows| {
+                let mut counts = vec![0u64; bucket_count as usize];
+                for row in rows {
+                    let index: i64 = row.try_get("", "bucket").ok()?;
+                    let count: i64 = row.try_get("", "count").ok()?;
+                    if index < 0 || index >= bucket_count {
+                        return None;
+                    }
+                    counts[(bucket_count - 1 - index) as usize] = count as u64;
+                }
+                Some(counts)
+            })
+        } else {
+            None
+        };
 
-            jobs_processed_data.push(period_jobs);
+        let grouped_counts = if binned_counts.is_some() {
+            binned_counts
+        } else if matches!(
+            db.get_database_backend(),
+            DbBackend::Postgres | DbBackend::Sqlite | DbBackend::MySql
+        ) {
+            let oldest = now - chrono::Duration::hours(bucket_count * interval_hours);
+            let first = chart_values.len() + 1;
+            chart_values.push(oldest.into());
+            chart_values.push(now.into());
+            let (start_param, end_param) = match db.get_database_backend() {
+                DbBackend::Postgres => (format!("${first}"), format!("${}", first + 1)),
+                DbBackend::Sqlite | DbBackend::MySql => ("?".to_string(), "?".to_string()),
+            };
+            let table_name =
+                query_builder::quote_identifier(db.get_database_backend(), &table_config.jobs);
+            let sql = format!(
+                "SELECT {} FROM {table_name} WHERE {finished_col} >= {start_param} AND {finished_col} < {end_param}",
+                chart_counts.join(", "),
+            );
+            let stmt = Statement::from_sql_and_values(db.get_database_backend(), sql, chart_values);
+            db.query_one(stmt).await.ok().flatten().and_then(|row| {
+                (0..bucket_count)
+                    .map(|i| row.try_get::<i64>("", &format!("bucket_{i}")))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .ok()
+                    .map(|counts| counts.into_iter().map(|count| count as u64).collect())
+            })
+        } else {
+            None
+        };
+
+        if let Some(counts) = grouped_counts {
+            jobs_processed_data = counts;
+        } else {
+            for i in 0..bucket_count {
+                let end_time = now - chrono::Duration::hours(i * interval_hours);
+                let start_time = end_time - chrono::Duration::hours(interval_hours);
+                jobs_processed_data.push(
+                    query_builder::jobs::count_finished_in_range(
+                        db,
+                        table_config,
+                        start_time,
+                        Some(end_time),
+                    )
+                    .await
+                    .unwrap_or(0),
+                );
+            }
         }
 
         // Reverse arrays to display in chronological order
         time_labels.reverse();
         jobs_processed_data.reverse();
 
-        // Get job type distribution
-        let job_types_query = SeaQuery::select()
-            .column(Alias::new("class_name"))
-            .expr_as(
-                Expr::col(Alias::new("class_name")).count(),
-                Alias::new("count"),
-            )
-            .from(Alias::new(&table_config.jobs))
-            .and_where(Expr::col(Alias::new("created_at")).gt(period_start))
-            .group_by_col(Alias::new("class_name"))
-            .order_by(Alias::new("count"), Order::Desc)
-            .limit(7)
-            .to_owned();
-
-        let (job_types_sql, job_types_values) = match db.get_database_backend() {
-            DbBackend::Postgres => job_types_query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => job_types_query.build(SqliteQueryBuilder),
-            DbBackend::MySql => job_types_query.build(MysqlQueryBuilder),
+        // MySQL's class_name index requires a row lookup for created_at on
+        // every job. Scan the clustered primary key instead; stable tie
+        // ordering keeps the seven displayed classes independent of the plan.
+        let job_types_stmt = if db.get_database_backend() == DbBackend::MySql {
+            let jobs_table =
+                query_builder::quote_identifier(db.get_database_backend(), &table_config.jobs);
+            let sql = format!(
+                "SELECT `class_name`, COUNT(`class_name`) AS `count` FROM {jobs_table} \
+                 FORCE INDEX(PRIMARY) WHERE `created_at` > ? GROUP BY `class_name` \
+                 ORDER BY `count` DESC, `class_name` ASC LIMIT 7"
+            );
+            Statement::from_sql_and_values(db.get_database_backend(), sql, [period_start.into()])
+        } else {
+            let job_types_query = SeaQuery::select()
+                .column(Alias::new("class_name"))
+                .expr_as(
+                    Expr::col(Alias::new("class_name")).count(),
+                    Alias::new("count"),
+                )
+                .from(Alias::new(&table_config.jobs))
+                .and_where(Expr::col(Alias::new("created_at")).gt(period_start))
+                .group_by_col(Alias::new("class_name"))
+                .order_by(Alias::new("count"), Order::Desc)
+                .limit(7)
+                .to_owned();
+            let (sql, values) = match db.get_database_backend() {
+                DbBackend::Postgres => job_types_query.build(PostgresQueryBuilder),
+                DbBackend::Sqlite => job_types_query.build(SqliteQueryBuilder),
+                DbBackend::MySql => unreachable!(),
+            };
+            Statement::from_sql_and_values(db.get_database_backend(), sql, values)
         };
-
-        let job_types_stmt = Statement::from_sql_and_values(
-            db.get_database_backend(),
-            &job_types_sql,
-            job_types_values,
-        );
 
         let job_types_result = db
             .query_all(job_types_stmt)
@@ -314,28 +447,32 @@ impl ControlPlane {
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(EXTRACT(EPOCH FROM (j.finished_at - j.created_at))) as avg_duration,
-                     COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
+                     COUNT(f.job_id) as failed_jobs,
                      COUNT(*) as total_jobs
-                   FROM "{}" j WHERE j.created_at > $1 GROUP BY j.queue_name"#,
-                failed_table, table_config.jobs
+                   FROM "{}" j LEFT JOIN "{}" f ON f.job_id = j.id
+                   WHERE j.created_at > $1 GROUP BY j.queue_name"#,
+                table_config.jobs, failed_table
             ),
             DbBackend::Sqlite => format!(
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN (julianday(j.finished_at) - julianday(j.created_at)) * 86400 END) as avg_duration,
                      COUNT(CASE WHEN EXISTS (SELECT 1 FROM "{}" f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
-                     COUNT(*) as total_jobs
+                    COUNT(*) as total_jobs
                    FROM "{}" j WHERE j.created_at > ? GROUP BY j.queue_name"#,
                 failed_table, table_config.jobs
             ),
+            // failed_executions.job_id is unique, so this join keeps one row
+            // per job while avoiding a dependent EXISTS lookup per job.
             DbBackend::MySql => format!(
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN TIMESTAMPDIFF(SECOND, j.created_at, j.finished_at) END) as avg_duration,
-                     COUNT(CASE WHEN EXISTS (SELECT 1 FROM `{}` f WHERE f.job_id = j.id) THEN 1 END) as failed_jobs,
+                     COUNT(f.job_id) as failed_jobs,
                      COUNT(*) as total_jobs
-                   FROM `{}` j WHERE j.created_at > ? GROUP BY j.queue_name"#,
-                failed_table, table_config.jobs
+                   FROM `{}` j LEFT JOIN `{}` f ON f.job_id = j.id
+                   WHERE j.created_at > ? GROUP BY j.queue_name"#,
+                table_config.jobs, failed_table
             ),
         });
 
