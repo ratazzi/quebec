@@ -117,6 +117,33 @@ class DiscardingJob(quebec.BaseClass):
         type(self).discard_events.append("after_discard")
 
 
+def _discard_and_reraise(job, exc):
+    DiscardReraisingJob.discard_events.append(f"handler {exc}")
+    raise exc
+
+
+class DiscardReraisingJob(quebec.BaseClass):
+    discard_events: list[str] = []
+    discard_on = [quebec.DiscardStrategy((ValueError,), _discard_and_reraise)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"discard {value}")
+
+    def after_discard(self) -> None:
+        type(self).discard_events.append("after_discard")
+
+
+def _discard_and_raise_other(job, exc):
+    raise RuntimeError(f"discard handler saw {exc}")
+
+
+class DiscardHandlerRaisesOtherJob(quebec.BaseClass):
+    discard_on = [quebec.DiscardStrategy((ValueError,), _discard_and_raise_other)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"original {value}")
+
+
 class RescuingJob(quebec.BaseClass):
     rescued: list[str] = []
     rescue_from = [
@@ -253,6 +280,47 @@ def test_discard_strategy_marks_job_finished_without_failed_execution(
     assert db_assert.count_ready_executions() == 0
     assert db_assert.count_claimed_executions() == 0
     assert db_assert.count_failed_executions() == 0
+
+
+def test_discard_handler_reraise_records_failed_execution(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+
+    DiscardReraisingJob.discard_events = []
+    qc.register_job(DiscardReraisingJob)
+
+    DiscardReraisingJob.perform_later(qc, 2)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # As in ActiveJob, an exception escaping the discard handler fails the job
+    # and skips after_discard.
+    assert DiscardReraisingJob.discard_events == ["handler discard 2"]
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 1
+    error = _failed_error(qc_with_sqlalchemy)
+    assert error["exception_class"] == "ValueError"
+    assert error["message"] == "discard 2"
+
+
+def test_discard_handler_error_is_recorded_but_not_counted(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(DiscardHandlerRaisesOtherJob)
+
+    enqueued = DiscardHandlerRaisesOtherJob.perform_later(qc, 3)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # The handler's RuntimeError is recorded as the failure, but it is counted
+    # against the job's own ValueError, never a RuntimeError retry_on budget.
+    error = _failed_error(qc_with_sqlalchemy)
+    assert error["exception_class"] == "RuntimeError"
+    assert error["message"] == "discard handler saw original 3"
+    payload = json.loads(db_assert.get_job(enqueued.id)["arguments"])
+    assert payload["exception_executions"] == {"[ValueError]": 1}
 
 
 def test_rescue_strategy_finishes_job_without_failed_execution(

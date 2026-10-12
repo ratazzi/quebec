@@ -658,17 +658,23 @@ impl Runnable {
             .inspect_err(|handler_error| warn!("Error in {label} handler: {handler_error}"))
     }
 
-    /// Handle discard - directly mark task as completed without recording failure information
+    /// Handle discard - directly mark task as completed without recording failure information.
+    /// As in ActiveJob's `discard_on ... do |job, error|`, an error raised by the
+    /// handler propagates: the job fails with it and `after_discard` is skipped.
     fn handle_discard(
         &self,
         py: Python,
         strategy: &DiscardStrategy,
         error: &PyErr,
-        job: quebec_jobs::Model,
+        job: &mut quebec_jobs::Model,
     ) -> Result<quebec_jobs::Model> {
         // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
-            let _ = self.call_strategy_handler(py, handler, &job, error, "discard");
+            if let Err(handler_error) =
+                self.call_strategy_handler(py, handler, job, error, "discard")
+            {
+                return self.handle_handler_failure(py, job, error, &handler_error);
+            }
         }
 
         let error_name = error
@@ -679,7 +685,7 @@ impl Runnable {
 
         // Call after_discard hook on the job instance — only if overridden
         if !self.hooks.after_discard {
-            return Ok(job);
+            return Ok(job.clone());
         }
         let bound = self.handler.bind(py);
         if let Ok(instance) = bound.call0() {
@@ -690,7 +696,7 @@ impl Runnable {
         }
 
         // Return success directly, indicating task was discarded and marked as completed
-        Ok(job)
+        Ok(job.clone())
     }
 
     /// Handle retry exhaustion — run the strategy's handler and mark the job
@@ -1074,7 +1080,7 @@ impl Runnable {
         // 2. Check if should discard
         if let Some(discard_strategy) = self.should_discard(py, &bound, error)? {
             warn!("Job will be discarded");
-            return self.handle_discard(py, &discard_strategy, error, job.clone());
+            return self.handle_discard(py, &discard_strategy, error, job);
         }
 
         // 3. Check if there's rescue handling

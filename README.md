@@ -327,6 +327,8 @@ def alert_and_fail(job, error):
 quebec.RetryStrategy((ConnectionError,), attempts=3, handler=alert_and_fail)
 ```
 
+`discard_on` handlers follow the same rule: an exception raised by the handler fails the job (and `after_discard` is not called) instead of discarding it.
+
 ### Concurrency Control
 
 Limit how many jobs with the same key can run simultaneously:
