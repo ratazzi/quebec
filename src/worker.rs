@@ -638,8 +638,9 @@ impl Runnable {
         instance.setattr("_callback_batch_id", callback_batch_id)
     }
 
-    /// Invoke an error-strategy handler with `(job, error)`. Logs and swallows
-    /// any error raised inside the handler.
+    /// Invoke an error-strategy handler with `(job, error)`. An error raised
+    /// inside the handler is logged and returned so the caller can decide
+    /// whether it fails the job.
     fn call_strategy_handler(
         &self,
         py: Python,
@@ -647,13 +648,14 @@ impl Runnable {
         job: &quebec_jobs::Model,
         error: &PyErr,
         label: &str,
-    ) {
+    ) -> PyResult<()> {
         let job_arg = self
             .build_job_instance(py, job)
             .unwrap_or_else(|| py.None().into_bound(py));
-        if let Err(handler_error) = handler.call1(py, (job_arg, error.value(py))) {
-            warn!("Error in {label} handler: {handler_error}");
-        }
+        handler
+            .call1(py, (job_arg, error.value(py)))
+            .map(|_| ())
+            .inspect_err(|handler_error| warn!("Error in {label} handler: {handler_error}"))
     }
 
     /// Handle discard - directly mark task as completed without recording failure information
@@ -666,7 +668,7 @@ impl Runnable {
     ) -> Result<quebec_jobs::Model> {
         // Call discard handler (if any)
         if let Some(handler) = &strategy.handler {
-            self.call_strategy_handler(py, handler, &job, error, "discard");
+            let _ = self.call_strategy_handler(py, handler, &job, error, "discard");
         }
 
         let error_name = error
@@ -694,15 +696,20 @@ impl Runnable {
     /// Handle retry exhaustion — run the strategy's handler and mark the job
     /// completed without recording a failure. Mirrors ActiveJob's
     /// `retry_on ... do |job, error|` block, which fires once attempts are used up.
+    /// As in ActiveJob, an error raised by the handler (e.g. re-raising
+    /// `error`) propagates and fails the job with that error.
     fn handle_retry_exhausted(
         &self,
         py: Python,
         strategy: &RetryStrategy,
         error: &PyErr,
-        job: quebec_jobs::Model,
+        job: &mut quebec_jobs::Model,
     ) -> Result<quebec_jobs::Model> {
         if let Some(handler) = &strategy.handler {
-            self.call_strategy_handler(py, handler, &job, error, "retry");
+            if let Err(handler_error) = self.call_strategy_handler(py, handler, job, error, "retry")
+            {
+                return self.handle_handler_failure(py, job, error, &handler_error);
+            }
         }
 
         let error_name = error
@@ -711,7 +718,7 @@ impl Runnable {
             .map_or_else(|_| "unknown error".to_string(), |s| s.to_string());
         info!("Job retries exhausted for {error_name}, handled by retry handler");
 
-        Ok(job)
+        Ok(job.clone())
     }
 
     /// Create error payload
@@ -1057,7 +1064,7 @@ impl Runnable {
             // Attempts exhausted with a handler — run it and complete the job,
             // matching ActiveJob's `retry_on ... do |job, error|` block.
             Some(RetryDecision::Exhausted { strategy }) if strategy.handler.is_some() => {
-                return self.handle_retry_exhausted(py, &strategy, error, job.clone());
+                return self.handle_retry_exhausted(py, &strategy, error, job);
             }
             // Exhausted without a handler (or no match) — fall through to
             // discard / rescue / default failure handling.
@@ -1185,6 +1192,19 @@ impl Runnable {
         job: &mut quebec_jobs::Model,
         error: &PyErr,
     ) -> Result<quebec_jobs::Model> {
+        self.handle_handler_failure(py, job, error, error)
+    }
+
+    /// Fail the job with `raised` — the error that escaped an error-strategy
+    /// handler — while counting the job's own `error` in exception_executions,
+    /// so a handler's error never spends another `retry_on` budget.
+    fn handle_handler_failure(
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
+        raised: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         let error_type = error
             .get_type(py)
             .qualname()
@@ -1194,7 +1214,7 @@ impl Runnable {
             job.arguments.as_deref(),
             Some(&exception_key),
         ));
-        let error_payload = self.create_error_payload(py, error);
+        let error_payload = self.create_error_payload(py, raised);
         Err(QuebecError::generic(error_payload))
     }
 }

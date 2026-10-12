@@ -317,6 +317,16 @@ class PaymentJob(quebec.BaseClass):
 
 Multiple `RetryStrategy` entries can target different exception types with independent wait/attempts. The optional `handler` fires only when a strategy's attempts are exhausted (mirroring ActiveJob's `retry_on ... do |job, error|` block) and is called with `(job, error)`. `discard_on` and `rescue_from` handlers use the same `(job, error)` signature.
 
+When the handler returns normally the error counts as handled: the job is marked finished and no failed execution is recorded. To alert and still keep the job in Failed jobs (so it can be retried after a fix), re-raise from the handler — as in ActiveJob, an exception escaping the handler fails the job with that exception:
+
+```python
+def alert_and_fail(job, error):
+    send_alert(job, error)
+    raise error
+
+quebec.RetryStrategy((ConnectionError,), attempts=3, handler=alert_and_fail)
+```
+
 ### Concurrency Control
 
 Limit how many jobs with the same key can run simultaneously:
