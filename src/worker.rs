@@ -1767,6 +1767,7 @@ impl Execution {
                 queue: job.queue_name.clone(),
                 status: if result.is_ok() { "executed" } else { "failed" },
                 duration_ms: (duration_ms * 1000.0).round() / 1000.0,
+                delay_ms: (delay_ms * 1000.0).round() / 1000.0,
                 minor_faults,
                 major_faults,
                 process_rss_start_kb,

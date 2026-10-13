@@ -184,6 +184,8 @@ def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
 
     AllocatingJob.perform_later(qc, 40, 150)
     FailingJob.perform_later(qc)
+    # Let the jobs wait in the queue so delay_ms has something to measure.
+    time.sleep(0.05)
     _run_one(qc)
     _run_one(qc)
 
@@ -205,6 +207,7 @@ def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
         "queue",
         "status",
         "duration_ms",
+        "delay_ms",
         "minor_faults",
         "major_faults",
         "process_rss_start_kb",
@@ -218,6 +221,7 @@ def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
     assert first["queue"] == "default"
     assert len(first["jid"]) > 0
     assert float(first["duration_ms"]) >= 0
+    assert float(first["delay_ms"]) >= 50
     assert first["process_rss_single_job"] == "false"
     if LINUX:
         assert int(first["minor_faults"]) > 0
