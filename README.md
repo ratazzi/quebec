@@ -510,9 +510,11 @@ kill -USR2 <worker pid>   # start recording; send again to stop
 or from code: `qc.start_job_metrics(path=None)`, `qc.stop_job_metrics()`, `qc.toggle_job_metrics()`, `qc.job_metrics_path`. Under the fork supervisor the signal is forwarded to every worker child, and each child writes its own file. Columns:
 
 ```
-ts_ms,pid,tid,jid,class,queue,status,duration_ms,minor_faults,major_faults,process_rss_start_kb,process_rss_peak_kb,process_rss_end_kb,process_rss_peak_delta_kb,process_rss_single_job,active_jobs
+ts_ms,pid,tid,jid,class,queue,status,duration_ms,delay_ms,minor_faults,major_faults,process_rss_start_kb,process_rss_peak_kb,process_rss_end_kb,process_rss_peak_delta_kb,process_rss_single_job,active_jobs
 ```
 
+`delay_ms` is how long the job waited between being due (`scheduled_at`, or
+`created_at` if it was not scheduled) and starting to run.
 `active_jobs` shows how many jobs the process owned when the row was recorded.
 Aggregate attributable samples with whatever reads CSV, e.g.
 

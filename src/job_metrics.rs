@@ -288,6 +288,9 @@ pub struct JobRecord {
     pub queue: String,
     pub status: &'static str,
     pub duration_ms: f64,
+    /// Time from when the job was due (`scheduled_at`, else `created_at`) to
+    /// when it started running.
+    pub delay_ms: f64,
     pub minor_faults: Option<u64>,
     pub major_faults: Option<u64>,
     /// Process RSS at the job boundaries and the sampled peak in between.
@@ -303,7 +306,7 @@ pub struct JobRecord {
 
 impl JobRecord {
     /// CSV header, in field order. Keep in sync with the struct.
-    pub const COLUMNS: [&'static str; 16] = [
+    pub const COLUMNS: [&'static str; 17] = [
         "ts_ms",
         "pid",
         "tid",
@@ -312,6 +315,7 @@ impl JobRecord {
         "queue",
         "status",
         "duration_ms",
+        "delay_ms",
         "minor_faults",
         "major_faults",
         "process_rss_start_kb",
@@ -893,6 +897,7 @@ mod tests {
             queue: "default".into(),
             status: "executed",
             duration_ms: 1.0,
+            delay_ms: 1.0,
             minor_faults: None,
             major_faults: None,
             process_rss_start_kb: None,
