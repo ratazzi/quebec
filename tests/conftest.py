@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import uuid
@@ -266,6 +267,26 @@ class DBAssert:
         """Check if job has finished_at set."""
         job = self.get_job(job_id)
         return job and job.get("finished_at") is not None
+
+    def get_failed_execution(self, job_id):
+        """Get a job's failed execution, or None."""
+        result = self.session.execute(
+            text(
+                f"SELECT * FROM {self._table('failed_executions')} WHERE job_id = :job_id"
+            ),
+            {"job_id": job_id},
+        )
+        row = result.fetchone()
+        return dict(row._mapping) if row else None
+
+    def failed_execution_error(self, job_id):
+        """Decoded error payload of a job's failed execution, or None."""
+        failed = self.get_failed_execution(job_id)
+        return json.loads(failed["error"]) if failed else None
+
+    def job_arguments(self, job_id):
+        """Decoded serialized arguments of a job."""
+        return json.loads(self.get_job(job_id)["arguments"])
 
     def job_is_failed(self, job_id):
         """Check if job has a failed execution record."""

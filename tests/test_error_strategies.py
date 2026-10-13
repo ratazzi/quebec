@@ -340,3 +340,78 @@ def test_rescue_strategy_finishes_job_without_failed_execution(
     assert db_assert.count_ready_executions() == 0
     assert db_assert.count_claimed_executions() == 0
     assert db_assert.count_failed_executions() == 0
+
+
+def _rescue_and_raise_other(job, exc):
+    raise RuntimeError(f"rescue handler saw {exc}")
+
+
+class RescueHandlerRaisesJob(quebec.BaseClass):
+    rescue_from = [quebec.RescueStrategy((ValueError,), _rescue_and_raise_other)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"original {value}")
+
+
+def test_rescue_handler_error_is_the_recorded_failure(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(RescueHandlerRaisesJob)
+
+    enqueued = RescueHandlerRaisesJob.perform_later(qc, 11)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # As in ActiveJob, the exception escaping the rescue_from handler is what
+    # fails the job, not the error it was rescuing.
+    error = db_assert.failed_execution_error(enqueued.id)
+    assert error["exception_class"] == "RuntimeError"
+    assert error["message"] == "rescue handler saw original 11"
+
+
+class RescueHandlerRaisesRetriedErrorJob(quebec.BaseClass):
+    # The rescue handler raises an error that has its own retry_on budget.
+    attempts_seen = 0
+    retry_on = [
+        quebec.RetryStrategy(
+            (RuntimeError,), wait=timedelta(seconds=1), attempts=2, handler=None
+        )
+    ]
+    rescue_from = [quebec.RescueStrategy((ValueError,), _rescue_and_raise_other)]
+
+    def perform(self, value: int) -> None:
+        type(self).attempts_seen += 1
+        if type(self).attempts_seen == 1:
+            raise ValueError(f"original {value}")
+        raise RuntimeError(f"retried {value}")
+
+
+def test_rescue_handler_error_does_not_spend_its_retry_budget(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+
+    RescueHandlerRaisesRetriedErrorJob.attempts_seen = 0
+    qc.register_job(RescueHandlerRaisesRetriedErrorJob)
+
+    enqueued = RescueHandlerRaisesRetriedErrorJob.perform_later(qc, 4)
+    qc.drain_one().perform()
+    session.expire_all()
+
+    # The handler's RuntimeError is what gets recorded, but the failure is
+    # counted against the job's own ValueError, not RuntimeError's retry_on.
+    assert db_assert.failed_execution_error(enqueued.id)["exception_class"] == (
+        "RuntimeError"
+    )
+    payload = db_assert.job_arguments(enqueued.id)
+    assert payload["exception_executions"] == {"[ValueError]": 1}
+
+    # After a manual retry, the first RuntimeError still gets its retry.
+    assert qc.retry_failed(enqueued.id) is True
+    qc.drain_one().perform()
+    session.expire_all()
+
+    assert db_assert.count_scheduled_executions() == 1
+    assert db_assert.count_failed_executions() == 0

@@ -1167,7 +1167,8 @@ impl Runnable {
         Ok(job.clone())
     }
 
-    /// Apply rescue strategy
+    /// Apply rescue strategy. As in ActiveJob's `rescue_from`, an error raised
+    /// by the handler propagates and fails the job with that error.
     fn apply_rescue_strategy(
         &self,
         py: Python,
@@ -1185,8 +1186,8 @@ impl Runnable {
             }
             Err(rescue_error) => {
                 warn!("Error in rescue handler: {}", rescue_error);
-                // Rescue failed, continue to failure handling
-                self.handle_job_failure(py, job, error)
+                // Rescue failed: fail the job with the handler's error
+                self.handle_handler_failure(py, job, error, &rescue_error)
             }
         }
     }
