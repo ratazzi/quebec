@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 
 import quebec
+from sqlalchemy import text
 
 
 class RetryExhaustingJob(quebec.BaseClass):
@@ -53,6 +55,55 @@ class MixedSpecJob(quebec.BaseClass):
 
     def perform(self, value: int) -> None:
         raise ValueError(f"mixed {value}")
+
+
+def _alert_and_reraise(job, exc):
+    RetryReraisingJob.handled.append(str(exc))
+    raise exc
+
+
+class RetryReraisingJob(quebec.BaseClass):
+    # Re-raising from the exhaustion handler keeps the failure, as in ActiveJob.
+    handled: list[str] = []
+    retry_on = [
+        quebec.RetryStrategy(
+            (ValueError,),
+            wait=timedelta(seconds=1),
+            attempts=1,
+            handler=_alert_and_reraise,
+        )
+    ]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"reraise {value}")
+
+
+def _raise_other(job, exc):
+    raise RuntimeError(f"handler saw {exc}")
+
+
+class RetryHandlerRaisesOtherJob(quebec.BaseClass):
+    retry_on = [
+        quebec.RetryStrategy(
+            (ValueError,),
+            wait=timedelta(seconds=1),
+            attempts=1,
+            handler=_raise_other,
+        )
+    ]
+
+    def perform(self, value: int) -> None:
+        raise ValueError(f"original {value}")
+
+
+def _failed_error(qc_with_sqlalchemy) -> dict:
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    session.expire_all()
+    row = session.execute(
+        text(f"SELECT error FROM {prefix}_failed_executions")
+    ).scalar_one()
+    return json.loads(row)
 
 
 class DiscardingJob(quebec.BaseClass):
@@ -139,6 +190,50 @@ def test_mixed_exception_tuple_still_matches_valid_class(
     assert MixedSpecJob.handled == ["mixed 3"]
     assert db_assert.count_failed_executions() == 0
     assert db_assert.count_scheduled_executions() == 0
+
+
+def test_retry_handler_reraise_records_failed_execution(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+
+    RetryReraisingJob.handled = []
+    qc.register_job(RetryReraisingJob)
+
+    RetryReraisingJob.perform_later(qc, 5)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # The handler ran, then its re-raise propagated: the job fails like any
+    # unhandled error instead of being marked finished.
+    assert RetryReraisingJob.handled == ["reraise 5"]
+    assert db_assert.count_scheduled_executions() == 0
+    assert db_assert.count_claimed_executions() == 0
+    assert db_assert.count_failed_executions() == 1
+    error = _failed_error(qc_with_sqlalchemy)
+    assert error["exception_class"] == "ValueError"
+    assert error["message"] == "reraise 5"
+
+
+def test_retry_handler_error_is_the_recorded_failure(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(RetryHandlerRaisesOtherJob)
+
+    enqueued = RetryHandlerRaisesOtherJob.perform_later(qc, 6)
+    execution = qc.drain_one()
+    execution.perform()
+
+    # As in ActiveJob, the exception escaping the handler is what fails the job.
+    assert db_assert.count_failed_executions() == 1
+    error = _failed_error(qc_with_sqlalchemy)
+    assert error["exception_class"] == "RuntimeError"
+    assert error["message"] == "handler saw original 6"
+    # The failure still counts against the job's own error, so the handler's
+    # RuntimeError never spends a retry_on budget of its own.
+    payload = json.loads(db_assert.get_job(enqueued.id)["arguments"])
+    assert payload["exception_executions"] == {"[ValueError]": 1}
 
 
 def test_discard_strategy_marks_job_finished_without_failed_execution(
