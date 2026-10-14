@@ -108,6 +108,8 @@ pub struct HookFlags {
     pub around_perform: bool,
     pub after_perform: bool,
     pub after_discard: bool,
+    /// `after_discard(self, error)` rather than the older `after_discard(self)`.
+    pub after_discard_takes_error: bool,
 }
 
 /// Outcome of `Worker::try_consume_rate_for_candidate`.
@@ -608,8 +610,8 @@ impl Runnable {
 
     /// Build the job instance handed to error-strategy handlers as the first
     /// argument, mirroring ActiveJob's `yield self, error` (the block's first
-    /// parameter is the job instance). Constructed the same way as the
-    /// `after_discard` hook: instantiate the job class and stamp its id.
+    /// parameter is the job instance), and the instance `after_discard` runs
+    /// on: instantiate the job class and stamp its id.
     /// Falls back to `None` so the handler still receives `error`.
     fn build_job_instance<'py>(
         &self,
@@ -658,9 +660,10 @@ impl Runnable {
             .inspect_err(|handler_error| warn!("Error in {label} handler: {handler_error}"))
     }
 
-    /// Handle discard - directly mark task as completed without recording failure information.
-    /// As in ActiveJob's `discard_on ... do |job, error|`, an error raised by the
-    /// handler propagates: the job fails with it and `after_discard` is skipped.
+    /// Handle discard - run the handler and `after_discard`, then mark the job
+    /// completed without recording a failure. As in ActiveJob's
+    /// `discard_on ... do |job, error|`, an error raised by the handler
+    /// propagates: the job fails with it and `after_discard` is skipped.
     fn handle_discard(
         &self,
         py: Python,
@@ -683,20 +686,50 @@ impl Runnable {
             .map_or_else(|_| "unknown error".to_string(), |s| s.to_string());
         info!("Job discarded due to {}", error_name);
 
-        // Call after_discard hook on the job instance — only if overridden
-        if !self.hooks.after_discard {
-            return Ok(job.clone());
-        }
-        let bound = self.handler.bind(py);
-        if let Ok(instance) = bound.call0() {
-            instance.setattr("id", job.id).ok();
-            if let Err(e) = instance.call_method0("after_discard") {
-                error!("after_discard hook error: {:?}", e);
-            }
-        }
+        self.finish_given_up(py, job, error)
+    }
 
-        // Return success directly, indicating task was discarded and marked as completed
-        Ok(job.clone())
+    /// Complete a job that was given up after its error was handled (discarded,
+    /// or retries exhausted with a handler): run `after_discard`, then mark the
+    /// job finished. A hook error fails the job instead.
+    fn finish_given_up(
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
+        match self.run_after_discard(py, job, error) {
+            Ok(()) => Ok(job.clone()),
+            Err(hook_error) => self.handle_handler_failure(py, job, error, &hook_error),
+        }
+    }
+
+    /// Run the job's `after_discard` hook, mirroring ActiveJob's
+    /// `run_after_discard_procs`: it fires whenever the job is given up for
+    /// good — discarded, retries exhausted, or failed with no strategy
+    /// handling the error — and receives that error when the hook accepts an
+    /// argument. A hook error is returned so the caller fails the job with it,
+    /// as ActiveJob re-raises it.
+    fn run_after_discard(
+        &self,
+        py: Python,
+        job: &quebec_jobs::Model,
+        error: &PyErr,
+    ) -> PyResult<()> {
+        if !self.hooks.after_discard {
+            return Ok(());
+        }
+        let Some(instance) = self.build_job_instance(py, job) else {
+            return Ok(());
+        };
+        let result = if self.hooks.after_discard_takes_error {
+            instance.call_method1("after_discard", (error.value(py),))
+        } else {
+            instance.call_method0("after_discard")
+        };
+        result
+            .map(|_| ())
+            .inspect_err(|hook_error| warn!("Error in after_discard hook: {hook_error}"))
     }
 
     /// Handle retry exhaustion — run the strategy's handler and mark the job
@@ -724,7 +757,7 @@ impl Runnable {
             .map_or_else(|_| "unknown error".to_string(), |s| s.to_string());
         info!("Job retries exhausted for {error_name}, handled by retry handler");
 
-        Ok(job.clone())
+        self.finish_given_up(py, job, error)
     }
 
     /// Create error payload
@@ -1088,8 +1121,12 @@ impl Runnable {
             return self.apply_rescue_strategy(py, job, &rescue_strategy, error);
         }
 
-        // 4. Default failure handling
-        self.handle_job_failure(py, job, error)
+        // 4. Default failure handling. Nothing handled the error, so the job is
+        // given up: as in ActiveJob's `perform_now`, run after_discard first.
+        match self.run_after_discard(py, job, error) {
+            Ok(()) => self.handle_job_failure(py, job, error),
+            Err(hook_error) => self.handle_handler_failure(py, job, error, &hook_error),
+        }
     }
 
     /// Handle JobInterrupted - re-enqueue with continuation state
@@ -1203,8 +1240,9 @@ impl Runnable {
     }
 
     /// Fail the job with `raised` — the error that escaped an error-strategy
-    /// handler — while counting the job's own `error` in exception_executions,
-    /// so a handler's error never spends another `retry_on` budget.
+    /// handler or `after_discard` — while counting the job's own `error` in
+    /// exception_executions, so a handler's error never spends another
+    /// `retry_on` budget.
     fn handle_handler_failure(
         &self,
         py: Python,
@@ -2607,6 +2645,20 @@ impl Worker {
             .unwrap_or(false)
     }
 
+    /// Whether a hook method accepts an argument after `self` (or `*args`), so
+    /// a hook can take the error while zero-argument overrides keep working.
+    fn hook_takes_argument(cls: &Bound<'_, PyAny>, method: &str) -> bool {
+        const CO_VARARGS: u32 = 0x04;
+        cls.getattr(method)
+            .and_then(|func| func.getattr("__code__"))
+            .and_then(|code| {
+                let argcount = code.getattr("co_argcount")?.extract::<u32>()?;
+                let flags = code.getattr("co_flags")?.extract::<u32>()?;
+                Ok(argcount >= 2 || flags & CO_VARARGS != 0)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn register_start_handler(&self, py: Python, handler: Py<PyAny>) -> PyResult<()> {
         self.register_handler(py, handler, &self.start_handlers, "start")
     }
@@ -2852,6 +2904,7 @@ impl Worker {
                 around_perform: Self::has_hook_override(&bound, "around_perform"),
                 after_perform: Self::has_hook_override(&bound, "after_perform"),
                 after_discard: Self::has_hook_override(&bound, "after_discard"),
+                after_discard_takes_error: Self::hook_takes_argument(&bound, "after_discard"),
             };
             if hooks.before_enqueue
                 || hooks.around_enqueue
