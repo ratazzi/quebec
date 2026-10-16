@@ -329,6 +329,22 @@ quebec.RetryStrategy((ConnectionError,), attempts=3, handler=alert_and_fail)
 
 `discard_on` handlers follow the same rule: an exception raised by the handler fails the job (and `after_discard` is not called) instead of discarding it.
 
+#### `after_discard`
+
+`after_discard` runs once a job is given up for good, as in ActiveJob 7.1: when `discard_on` matches, when `retry_on` runs out of attempts, or when the job fails with no strategy handling the error. It does not run while retries remain, when `rescue_from` handles the error, or when a handler raises. It is the natural place to alert on final failures, without taking part in error handling: a job that failed still lands in Failed jobs and can be retried.
+
+```python
+class PaymentJob(quebec.BaseClass):
+    retry_on = [quebec.RetryStrategy((ConnectionError,), attempts=3, handler=None)]
+
+    def after_discard(self, error):
+        send_alert(self, error)
+```
+
+The older `def after_discard(self)` form, without the error, still works. An exception raised by `after_discard` fails the job with that exception, as ActiveJob re-raises it.
+
+Unlike ActiveJob, a `retry_on` strategy that runs out of attempts without a handler still falls through to `discard_on` / `rescue_from`. If a `rescue_from` handles the error there, `after_discard` does not run.
+
 ### Concurrency Control
 
 Limit how many jobs with the same key can run simultaneously:
