@@ -1,4 +1,5 @@
 use crate::context::{ConcurrencyConstraint, TableConfig};
+use crate::dialect::Dialect;
 use crate::query_builder::quote_identifier;
 use chrono::NaiveDateTime;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
@@ -32,7 +33,7 @@ where
             table = table_config.semaphores
         );
         let result = db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 DatabaseBackend::MySql,
                 sql,
                 vec![
@@ -53,8 +54,8 @@ where
     }
 
     // First, try to create a new semaphore (attempt_creation)
-    let create_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let create_sql = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             format!(
                 "INSERT INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5) \
@@ -62,18 +63,18 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::Sqlite => {
+        Dialect::Sqlite => {
             format!(
                 "INSERT OR IGNORE INTO {} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
                 table_config.semaphores
             )
         }
-        DatabaseBackend::MySql => unreachable!(),
+        Dialect::MySql => unreachable!(),
     };
 
     let create_result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             create_sql,
             vec![
@@ -99,8 +100,8 @@ where
     // callers to wait for `expires_at` to elapse before the dispatcher's
     // delete_expired sweep cleared the row — turning concurrency_duration
     // into a minimum cooldown rather than a crash-safety TTL.
-    let decrement_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let decrement_sql = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             format!(
                 "UPDATE {} SET \
              value = value - 1, \
@@ -110,7 +111,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::Sqlite => {
+        Dialect::Sqlite => {
             format!(
                 "UPDATE {} SET \
              value = value - 1, \
@@ -120,7 +121,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::MySql => {
+        Dialect::MySql => {
             format!(
                 "UPDATE {} SET \
              value = value - 1, \
@@ -133,19 +134,19 @@ where
     };
 
     // Note: Parameter order differs between Postgres ($1,$2,$3) and SQLite/MySQL (? ? ?)
-    let decrement_values = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let decrement_values = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             // Postgres: $1=key, $2=expires_at, $3=now
             vec![key.into(), expires_at.into(), now.into()]
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key (order in SQL)
             vec![expires_at.into(), now.into(), key.into()]
         }
     };
 
     let decrement_result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             decrement_sql,
             decrement_values,
@@ -182,7 +183,7 @@ where
         table_config.semaphores
     );
     let result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::MySql,
             sql,
             vec![expires_at.into(), now.into(), key.to_string().into()],
@@ -237,8 +238,8 @@ where
     // Try to increment the semaphore value if below max (limit)
     // value ranges from 0 to limit, where limit means all slots are free
     // This matches Solid Queue's: Semaphore.where(key: key, value: ...limit).update_all(...)
-    let increment_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let increment_sql = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             format!(
                 "UPDATE {} SET \
              value = value + 1, \
@@ -248,7 +249,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             format!(
                 "UPDATE {} SET \
              value = value + 1, \
@@ -262,8 +263,8 @@ where
 
     // Note: Parameter order differs between Postgres ($1,$2,$3,$4) and SQLite/MySQL (? ? ? ?)
     // Postgres uses positional params, SQLite/MySQL uses sequential order of appearance
-    let increment_values = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let increment_values = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             // Postgres: $1=key, $2=expires_at, $3=now, $4=limit
             vec![
                 key.clone().into(),
@@ -272,7 +273,7 @@ where
                 limit.into(),
             ]
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key, ?=limit (order in SQL)
             vec![
                 expires_at.into(),
@@ -284,7 +285,7 @@ where
     };
 
     let increment_result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             increment_sql,
             increment_values,
@@ -300,8 +301,8 @@ where
     // 1. The semaphore doesn't exist
     // 2. The value is already at limit - 1 (all slots free)
     // In case 2, just update expires_at to keep the semaphore alive (don't delete!)
-    let update_expires_sql = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let update_expires_sql = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             format!(
                 "UPDATE {} SET \
              expires_at = $2, \
@@ -310,7 +311,7 @@ where
                 table_config.semaphores
             )
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             format!(
                 "UPDATE {} SET \
              expires_at = ?, \
@@ -322,19 +323,19 @@ where
     };
 
     // Same parameter order issue as above
-    let update_values = match db.get_database_backend() {
-        DatabaseBackend::Postgres => {
+    let update_values = match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             // Postgres: $1=key, $2=expires_at, $3=now
             vec![key.into(), expires_at.into(), now.into()]
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             // SQLite/MySQL: ?=expires_at, ?=updated_at, ?=key (order in SQL)
             vec![expires_at.into(), now.into(), key.into()]
         }
     };
 
     let update_result = db
-        .execute(Statement::from_sql_and_values(
+        .execute_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
             update_expires_sql,
             update_values,
@@ -482,13 +483,13 @@ where
     C: ConnectionTrait,
 {
     let backend = db.get_database_backend();
-    let sql = match backend {
-        DatabaseBackend::Postgres => "SELECT EXTRACT(EPOCH FROM NOW())::BIGINT AS now_secs",
-        DatabaseBackend::MySql => "SELECT UNIX_TIMESTAMP() AS now_secs",
-        DatabaseBackend::Sqlite => "SELECT CAST(strftime('%s','now') AS INTEGER) AS now_secs",
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => "SELECT EXTRACT(EPOCH FROM NOW())::BIGINT AS now_secs",
+        Dialect::MySql => "SELECT UNIX_TIMESTAMP() AS now_secs",
+        Dialect::Sqlite => "SELECT CAST(strftime('%s','now') AS INTEGER) AS now_secs",
     };
     let row = db
-        .query_one(Statement::from_string(backend, sql.to_owned()))
+        .query_one_raw(Statement::from_string(backend, sql.to_owned()))
         .await?
         .ok_or_else(|| DbErr::Custom("rate-limit: server clock query returned no rows".into()))?;
     row.try_get::<i64>("", "now_secs")
@@ -507,30 +508,30 @@ where
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
     let key_col = quote_identifier(backend, "key");
-    let sql = match backend {
-        DatabaseBackend::Postgres => format!(
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => format!(
             "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES ($1, 1, $2, $3, $3) \
              ON CONFLICT ({key_col}) DO UPDATE SET value = {table}.value + 1, updated_at = $3"
         ),
-        DatabaseBackend::Sqlite => format!(
+        Dialect::Sqlite => format!(
             "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, 1, ?, ?, ?) \
              ON CONFLICT({key_col}) DO UPDATE SET value = value + 1, updated_at = excluded.updated_at"
         ),
-        DatabaseBackend::MySql => format!(
+        Dialect::MySql => format!(
             "INSERT INTO {table} ({key_col}, value, expires_at, created_at, updated_at) \
              VALUES (?, 1, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE value = value + 1, updated_at = VALUES(updated_at)"
         ),
     };
-    let values: Vec<sea_orm::Value> = match backend {
-        DatabaseBackend::Postgres => vec![key.into(), expires_at.into(), now.into()],
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+    let values: Vec<sea_orm::Value> = match Dialect::from(backend) {
+        Dialect::Postgres => vec![key.into(), expires_at.into(), now.into()],
+        Dialect::Sqlite | Dialect::MySql => {
             vec![key.into(), expires_at.into(), now.into(), now.into()]
         }
     };
-    db.execute(Statement::from_sql_and_values(backend, sql, values))
+    db.execute_raw(Statement::from_sql_and_values(backend, sql, values))
         .await?;
     Ok(())
 }
@@ -547,16 +548,16 @@ where
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
     let key_col = quote_identifier(backend, "key");
-    let sql = match backend {
-        DatabaseBackend::Postgres => {
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
             format!("SELECT {key_col}, value FROM {table} WHERE {key_col} IN ($1, $2)")
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             format!("SELECT {key_col}, value FROM {table} WHERE {key_col} IN (?, ?)")
         }
     };
     let rows = db
-        .query_all(Statement::from_sql_and_values(
+        .query_all_raw(Statement::from_sql_and_values(
             backend,
             sql,
             vec![curr_key.into(), prev_key.into()],
@@ -584,15 +585,15 @@ where
     let backend = db.get_database_backend();
     let table = &table_config.semaphores;
     let key_col = quote_identifier(backend, "key");
-    let sql = match backend {
-        DatabaseBackend::Postgres => {
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
             format!("UPDATE {table} SET value = value - 1 WHERE {key_col} = $1")
         }
-        DatabaseBackend::Sqlite | DatabaseBackend::MySql => {
+        Dialect::Sqlite | Dialect::MySql => {
             format!("UPDATE {table} SET value = value - 1 WHERE {key_col} = ?")
         }
     };
-    db.execute(Statement::from_sql_and_values(
+    db.execute_raw(Statement::from_sql_and_values(
         backend,
         sql,
         vec![key.into()],

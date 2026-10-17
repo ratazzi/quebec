@@ -209,7 +209,7 @@ mod tests {
         ));
         let state = TransactionState::new(ctx, db.begin().await.unwrap());
         let held = state.connection().unwrap();
-        held.execute(Statement::from_string(
+        held.execute_raw(Statement::from_string(
             DbBackend::Sqlite,
             "CREATE TABLE rollback_probe (id INTEGER)",
         ))
@@ -224,7 +224,7 @@ mod tests {
         drop(held);
 
         let row = db
-            .query_one(Statement::from_string(
+            .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
                 "SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'rollback_probe'",
             ))

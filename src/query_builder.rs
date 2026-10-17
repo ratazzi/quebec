@@ -7,15 +7,16 @@ use sea_orm::sea_query::{
     Alias, Asterisk, Cond, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
     PostgresQueryBuilder, Query, Returning, SelectStatement, SqliteQueryBuilder, UpdateStatement,
 };
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, FromQueryResult, Statement, Value};
+use sea_orm::{ConnectionTrait, DbBackend, DbErr, ExprTrait, FromQueryResult, Statement, Value};
 
 use crate::context::TableConfig;
+use crate::dialect::Dialect;
 
 /// Quote an SQL identifier with the delimiter required by the database backend.
 pub(crate) fn quote_identifier(backend: DbBackend, identifier: &str) -> String {
-    match backend {
-        DbBackend::MySql => format!("`{}`", identifier.replace('`', "``")),
-        DbBackend::Postgres | DbBackend::Sqlite => {
+    match Dialect::from(backend) {
+        Dialect::MySql => format!("`{}`", identifier.replace('`', "``")),
+        Dialect::Postgres | Dialect::Sqlite => {
             format!("\"{}\"", identifier.replace('"', "\"\""))
         }
     }
@@ -80,40 +81,40 @@ mod identifier_tests {
 
 /// Build SQL string from a SelectStatement based on database backend
 pub fn build_select_sql(backend: DbBackend, query: &SelectStatement) -> (String, Vec<Value>) {
-    let (sql, values) = match backend {
-        DbBackend::Postgres => query.build(PostgresQueryBuilder),
-        DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-        DbBackend::MySql => query.build(MysqlQueryBuilder),
+    let (sql, values) = match Dialect::from(backend) {
+        Dialect::Postgres => query.build(PostgresQueryBuilder),
+        Dialect::Sqlite => query.build(SqliteQueryBuilder),
+        Dialect::MySql => query.build(MysqlQueryBuilder),
     };
     (sql, values.into_iter().collect())
 }
 
 /// Build SQL string from an InsertStatement based on database backend
 pub fn build_insert_sql(backend: DbBackend, query: &InsertStatement) -> (String, Vec<Value>) {
-    let (sql, values) = match backend {
-        DbBackend::Postgres => query.build(PostgresQueryBuilder),
-        DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-        DbBackend::MySql => query.build(MysqlQueryBuilder),
+    let (sql, values) = match Dialect::from(backend) {
+        Dialect::Postgres => query.build(PostgresQueryBuilder),
+        Dialect::Sqlite => query.build(SqliteQueryBuilder),
+        Dialect::MySql => query.build(MysqlQueryBuilder),
     };
     (sql, values.into_iter().collect())
 }
 
 /// Build SQL string from an UpdateStatement based on database backend
 pub fn build_update_sql(backend: DbBackend, query: &UpdateStatement) -> (String, Vec<Value>) {
-    let (sql, values) = match backend {
-        DbBackend::Postgres => query.build(PostgresQueryBuilder),
-        DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-        DbBackend::MySql => query.build(MysqlQueryBuilder),
+    let (sql, values) = match Dialect::from(backend) {
+        Dialect::Postgres => query.build(PostgresQueryBuilder),
+        Dialect::Sqlite => query.build(SqliteQueryBuilder),
+        Dialect::MySql => query.build(MysqlQueryBuilder),
     };
     (sql, values.into_iter().collect())
 }
 
 /// Build SQL string from a DeleteStatement based on database backend
 pub fn build_delete_sql(backend: DbBackend, query: &DeleteStatement) -> (String, Vec<Value>) {
-    let (sql, values) = match backend {
-        DbBackend::Postgres => query.build(PostgresQueryBuilder),
-        DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-        DbBackend::MySql => query.build(MysqlQueryBuilder),
+    let (sql, values) = match Dialect::from(backend) {
+        Dialect::Postgres => query.build(PostgresQueryBuilder),
+        Dialect::Sqlite => query.build(SqliteQueryBuilder),
+        Dialect::MySql => query.build(MysqlQueryBuilder),
     };
     (sql, values.into_iter().collect())
 }
@@ -156,16 +157,16 @@ where
 
     // For PostgreSQL with RETURNING clause, we need to query the result
     // For SQLite and MySQL, use last_insert_id()
-    match db.get_database_backend() {
-        DbBackend::Postgres => {
+    match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres => {
             // PostgreSQL returns the ID via RETURNING clause as a query result
-            let row = db.query_one(stmt).await?;
+            let row = db.query_one_raw(stmt).await?;
             row.map(|r| r.try_get::<i64>("", "id"))
                 .transpose()?
                 .ok_or_else(|| DbErr::Custom("Insert did not return an ID".to_string()))
         }
-        DbBackend::Sqlite | DbBackend::MySql => {
-            let result = db.execute(stmt).await?;
+        Dialect::Sqlite | Dialect::MySql => {
+            let result = db.execute_raw(stmt).await?;
             Ok(result.last_insert_id() as i64)
         }
     }
@@ -183,8 +184,8 @@ where
     T: FromQueryResult,
     C: ConnectionTrait,
 {
-    match db.get_database_backend() {
-        DbBackend::Postgres | DbBackend::Sqlite => {
+    match Dialect::from(db.get_database_backend()) {
+        Dialect::Postgres | Dialect::Sqlite => {
             // Add RETURNING * for Postgres/SQLite
             query.returning(Returning::new().all());
             let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
@@ -193,12 +194,12 @@ where
                 DbErr::Custom("Insert with RETURNING did not return a row".to_string())
             })
         }
-        DbBackend::MySql => {
+        Dialect::MySql => {
             // MySQL doesn't support RETURNING, fall back to insert + select
             query.returning_col(col("id"));
             let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
             let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-            let result = db.execute(stmt).await?;
+            let result = db.execute_raw(stmt).await?;
             let id = result.last_insert_id() as i64;
 
             // Use the provided fallback select query
@@ -217,7 +218,7 @@ where
 {
     let (sql, values) = build_update_sql(db.get_database_backend(), &query);
     let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-    let result = db.execute(stmt).await?;
+    let result = db.execute_raw(stmt).await?;
     Ok(result.rows_affected())
 }
 
@@ -228,7 +229,7 @@ where
 {
     let (sql, values) = build_delete_sql(db.get_database_backend(), &query);
     let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-    let result = db.execute(stmt).await?;
+    let result = db.execute_raw(stmt).await?;
     Ok(result.rows_affected())
 }
 
@@ -239,7 +240,7 @@ where
 {
     let (sql, values) = build_select_sql(db.get_database_backend(), &query);
     let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-    let row = db.query_one(stmt).await?;
+    let row = db.query_one_raw(stmt).await?;
     match row {
         Some(row) => {
             let count: i64 = row.try_get_by_index(0)?;
@@ -302,7 +303,7 @@ where
     let backend = db.get_database_backend();
     let sql = distinct_column_sql(backend, table_name, column);
     let stmt = Statement::from_string(backend, sql);
-    let rows = db.query_all(stmt).await?;
+    let rows = db.query_all_raw(stmt).await?;
 
     rows.into_iter()
         .map(|row| row.try_get("", column))
@@ -882,8 +883,8 @@ pub mod jobs {
                 query.values_panic(values);
             }
 
-            match backend {
-                DbBackend::Postgres | DbBackend::Sqlite => {
+            match Dialect::from(backend) {
+                Dialect::Postgres | Dialect::Sqlite => {
                     query.returning(Returning::new().all());
                     let (sql, values) = build_insert_sql(backend, &query);
                     let stmt = Statement::from_sql_and_values(backend, &sql, values);
@@ -891,7 +892,7 @@ pub mod jobs {
                         quebec_jobs::Model::find_by_statement(stmt).all(db).await?;
                     all_models.extend(models);
                 }
-                DbBackend::MySql => {
+                Dialect::MySql => {
                     // MySQL doesn't support RETURNING.  SQLAlchemy's approach is
                     // to refuse bulk INSERT+RETURNING entirely on MySQL (raises
                     // InvalidRequestError).  We fall back to per-row insert_returning
@@ -936,14 +937,14 @@ pub mod jobs {
 
         // Use raw SQL with subquery to avoid SQLite's 999 bind variable limit
         // This pattern: DELETE FROM table WHERE id IN (SELECT id FROM table WHERE ... LIMIT ?)
-        let sql = match backend {
-            DbBackend::Postgres => format!(
+        let sql = match Dialect::from(backend) {
+            Dialect::Postgres => format!(
                 r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "finished_at" < $1 LIMIT $2)"#
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"DELETE FROM `{table_name}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table_name}` WHERE `finished_at` IS NOT NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "finished_at" < ? LIMIT ?)"#
             ),
         };
@@ -954,7 +955,7 @@ pub mod jobs {
             [finished_before.into(), (batch_size as i64).into()],
         );
 
-        let result = db.execute(stmt).await?;
+        let result = db.execute_raw(stmt).await?;
         Ok(result.rows_affected())
     }
 
@@ -1125,7 +1126,7 @@ pub mod ready_executions {
 
             let (sql, values) = build_insert_sql(backend, &query);
             let stmt = Statement::from_sql_and_values(backend, &sql, values);
-            db.execute(stmt).await?;
+            db.execute_raw(stmt).await?;
         }
 
         Ok(())
@@ -1233,16 +1234,16 @@ pub mod ready_executions {
 
         // Helper to generate placeholder based on backend
         let placeholder = |idx: usize| -> String {
-            match backend {
-                DbBackend::Postgres => format!("${idx}"),
-                DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+            match Dialect::from(backend) {
+                Dialect::Postgres => format!("${idx}"),
+                Dialect::MySql | Dialect::Sqlite => "?".to_string(),
             }
         };
 
         // Helper for column quoting
-        let (q, tq) = match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
-            DbBackend::MySql => ('`', '`'),
+        let (q, tq) = match Dialect::from(backend) {
+            Dialect::Postgres | Dialect::Sqlite => ('"', '"'),
+            Dialect::MySql => ('`', '`'),
         };
 
         // Build WHERE clause parts
@@ -1298,16 +1299,16 @@ pub mod ready_executions {
 
         // Helper to generate placeholder based on backend
         let placeholder = |idx: usize| -> String {
-            match backend {
-                DbBackend::Postgres => format!("${idx}"),
-                DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+            match Dialect::from(backend) {
+                Dialect::Postgres => format!("${idx}"),
+                Dialect::MySql | Dialect::Sqlite => "?".to_string(),
             }
         };
 
         // Helper for column quoting
-        let (q, tq) = match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
-            DbBackend::MySql => ('`', '`'),
+        let (q, tq) = match Dialect::from(backend) {
+            Dialect::Postgres | Dialect::Sqlite => ('"', '"'),
+            Dialect::MySql => ('`', '`'),
         };
 
         // Build WHERE clause parts
@@ -1402,15 +1403,15 @@ pub mod ready_executions {
         let mut params: Vec<sea_orm::Value> = Vec::new();
 
         let placeholder = |idx: usize| -> String {
-            match backend {
-                DbBackend::Postgres => format!("${idx}"),
-                DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+            match Dialect::from(backend) {
+                Dialect::Postgres => format!("${idx}"),
+                Dialect::MySql | Dialect::Sqlite => "?".to_string(),
             }
         };
 
-        let (q, tq) = match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => ('"', '"'),
-            DbBackend::MySql => ('`', '`'),
+        let (q, tq) = match Dialect::from(backend) {
+            Dialect::Postgres | Dialect::Sqlite => ('"', '"'),
+            Dialect::MySql => ('`', '`'),
         };
 
         let placeholders: Vec<String> = queues
@@ -1461,21 +1462,21 @@ pub mod ready_executions {
             .replace('_', "\\_");
         let like_pattern = format!("{escaped_prefix}%");
 
-        let sql = match db.get_database_backend() {
-            DbBackend::Postgres => format!(
+        let sql = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(
                 r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ESCAPE '\' ORDER BY "queue_name" ASC"#
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ESCAPE '\\' ORDER BY `queue_name` ASC"#
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ESCAPE '\' ORDER BY "queue_name" ASC"#
             ),
         };
 
         let stmt =
             Statement::from_sql_and_values(db.get_database_backend(), sql, [like_pattern.into()]);
-        let rows = db.query_all(stmt).await?;
+        let rows = db.query_all_raw(stmt).await?;
 
         rows.into_iter()
             .map(|row| row.try_get("", "queue_name"))
@@ -1530,14 +1531,14 @@ pub mod ready_executions {
             .group_by_col(col("queue_name"))
             .to_owned();
 
-        let (sql, values) = match db.get_database_backend() {
-            DbBackend::Postgres => query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        let (sql, values) = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => query.build(PostgresQueryBuilder),
+            Dialect::Sqlite => query.build(SqliteQueryBuilder),
+            Dialect::MySql => query.build(MysqlQueryBuilder),
         };
 
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        let rows = db.query_all(stmt).await?;
+        let rows = db.query_all_raw(stmt).await?;
 
         let mut out = std::collections::HashMap::with_capacity(rows.len());
         for row in rows {
@@ -1607,13 +1608,13 @@ pub mod ready_executions {
             .from(table)
             .to_owned();
 
-        let (sql, values) = match db.get_database_backend() {
-            DbBackend::Postgres => query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        let (sql, values) = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => query.build(PostgresQueryBuilder),
+            Dialect::Sqlite => query.build(SqliteQueryBuilder),
+            Dialect::MySql => query.build(MysqlQueryBuilder),
         };
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        let row = db.query_one(stmt).await?;
+        let row = db.query_one_raw(stmt).await?;
         Ok(row
             .and_then(|r| {
                 r.try_get("", "MIN(\"created_at\")")
@@ -1729,8 +1730,8 @@ pub mod claimed_executions {
                 query.values_panic([job_id.into(), process_id.into(), created_at.into()]);
             }
 
-            match backend {
-                DbBackend::Postgres | DbBackend::Sqlite => {
+            match Dialect::from(backend) {
+                Dialect::Postgres | Dialect::Sqlite => {
                     query.returning(Returning::new().all());
                     let (sql, values) = build_insert_sql(backend, &query);
                     let stmt = Statement::from_sql_and_values(backend, &sql, values);
@@ -1740,10 +1741,10 @@ pub mod claimed_executions {
                             .await?;
                     all_models.extend(models);
                 }
-                DbBackend::MySql => {
+                Dialect::MySql => {
                     let (sql, values) = build_insert_sql(backend, &query);
                     let stmt = Statement::from_sql_and_values(backend, &sql, values);
-                    db.execute(stmt).await?;
+                    db.execute_raw(stmt).await?;
                     // Fallback: fetch by job_ids
                     let job_ids: Vec<i64> = chunk.iter().map(|&(jid, _, _)| jid).collect();
                     let fetched = find_by_job_ids(db, table_config, &job_ids).await?;
@@ -2073,13 +2074,13 @@ pub mod claimed_executions {
             .from(table)
             .to_owned();
 
-        let (sql, values) = match db.get_database_backend() {
-            DbBackend::Postgres => query.build(PostgresQueryBuilder),
-            DbBackend::Sqlite => query.build(SqliteQueryBuilder),
-            DbBackend::MySql => query.build(MysqlQueryBuilder),
+        let (sql, values) = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => query.build(PostgresQueryBuilder),
+            Dialect::Sqlite => query.build(SqliteQueryBuilder),
+            Dialect::MySql => query.build(MysqlQueryBuilder),
         };
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        let row = db.query_one(stmt).await?;
+        let row = db.query_one_raw(stmt).await?;
         Ok(row
             .and_then(|r| {
                 r.try_get("", "MIN(\"created_at\")")
@@ -2187,7 +2188,7 @@ pub mod blocked_executions {
                 ]);
             }
             let (sql, values) = build_insert_sql(backend, &query);
-            db.execute(Statement::from_sql_and_values(backend, sql, values))
+            db.execute_raw(Statement::from_sql_and_values(backend, sql, values))
                 .await?;
         }
         Ok(())
@@ -2309,14 +2310,14 @@ pub mod blocked_executions {
         C: ConnectionTrait,
     {
         let table_name = &table_config.blocked_executions;
-        let sql = match db.get_database_backend() {
-            DbBackend::Postgres => format!(
+        let sql = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 // SQLite doesn't support SKIP LOCKED
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = ? ORDER BY "priority" ASC, "job_id" ASC LIMIT 1"#
             ),
@@ -2508,8 +2509,8 @@ pub mod failed_executions {
         let now = chrono::Utc::now().naive_utc();
 
         // Build database-specific INSERT with conflict handling
-        match backend {
-            DbBackend::Postgres => {
+        match Dialect::from(backend) {
+            Dialect::Postgres => {
                 // For PostgreSQL, use query_one to handle RETURNING properly
                 // When conflict occurs, no row is returned
                 let sql = format!(
@@ -2524,7 +2525,7 @@ pub mod failed_executions {
                     [job_id.into(), error.into(), now.into()],
                 );
 
-                match db.query_one(stmt).await? {
+                match db.query_one_raw(stmt).await? {
                     Some(row) => {
                         let id: i64 = row.try_get("", "id")?;
                         Ok(id)
@@ -2532,7 +2533,7 @@ pub mod failed_executions {
                     None => Ok(0), // Conflict - record already exists
                 }
             }
-            DbBackend::Sqlite => {
+            Dialect::Sqlite => {
                 let sql = format!(
                     r#"INSERT OR IGNORE INTO "{table}" ("job_id", "error", "created_at")
                        VALUES (?, ?, ?)"#
@@ -2542,10 +2543,10 @@ pub mod failed_executions {
                     sql,
                     [job_id.into(), error.into(), now.into()],
                 );
-                let result = db.execute(stmt).await?;
+                let result = db.execute_raw(stmt).await?;
                 Ok(result.last_insert_id() as i64)
             }
-            DbBackend::MySql => {
+            Dialect::MySql => {
                 let sql = format!(
                     r#"INSERT IGNORE INTO `{table}` (`job_id`, `error`, `created_at`)
                        VALUES (?, ?, ?)"#
@@ -2555,7 +2556,7 @@ pub mod failed_executions {
                     sql,
                     [job_id.into(), error.into(), now.into()],
                 );
-                let result = db.execute(stmt).await?;
+                let result = db.execute_raw(stmt).await?;
                 Ok(result.last_insert_id() as i64)
             }
         }
@@ -2897,7 +2898,7 @@ pub mod scheduled_executions {
 
             let (sql, values) = build_insert_sql(backend, &query);
             let stmt = Statement::from_sql_and_values(backend, &sql, values);
-            db.execute(stmt).await?;
+            db.execute_raw(stmt).await?;
         }
 
         Ok(())
@@ -2919,14 +2920,14 @@ pub mod scheduled_executions {
         if use_skip_locked {
             // Use raw SQL for FOR UPDATE SKIP LOCKED since sea-query SelectStatement
             // doesn't directly support lock behavior
-            let sql = match db.get_database_backend() {
-                DbBackend::Postgres => format!(
+            let sql = match Dialect::from(db.get_database_backend()) {
+                Dialect::Postgres => format!(
                     r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= $1 ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#
                 ),
-                DbBackend::MySql => format!(
+                Dialect::MySql => format!(
                     r#"SELECT * FROM `{table_name}` WHERE `scheduled_at` <= ? ORDER BY `scheduled_at` ASC, `priority` ASC, `job_id` ASC LIMIT ? FOR UPDATE SKIP LOCKED"#
                 ),
-                DbBackend::Sqlite => format!(
+                Dialect::Sqlite => format!(
                     // SQLite doesn't support SKIP LOCKED, fallback to regular query
                     r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= ? ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT ?"#
                 ),
@@ -3341,14 +3342,14 @@ pub mod processes {
                 None => ("", vec![heartbeat_threshold.into()]),
             };
 
-            let sql = match backend {
-                DbBackend::Postgres => format!(
+            let sql = match Dialect::from(backend) {
+                Dialect::Postgres => format!(
                     r#"SELECT * FROM "{table_name}" WHERE "last_heartbeat_at" < $1{where_extra} FOR UPDATE SKIP LOCKED"#
                 ),
-                DbBackend::MySql => format!(
+                Dialect::MySql => format!(
                     r#"SELECT * FROM `{table_name}` WHERE `last_heartbeat_at` < ?{where_extra} FOR UPDATE SKIP LOCKED"#
                 ),
-                DbBackend::Sqlite => unreachable!(),
+                Dialect::Sqlite => unreachable!(),
             };
             let stmt = Statement::from_sql_and_values(backend, sql, params);
             return quebec_processes::Model::find_by_statement(stmt)
@@ -3436,21 +3437,21 @@ pub mod recurring_executions {
         let now = chrono::Utc::now().naive_utc();
 
         // Build database-specific INSERT with conflict handling
-        let sql = match backend {
-            DbBackend::Postgres => {
+        let sql = match Dialect::from(backend) {
+            Dialect::Postgres => {
                 format!(
                     r#"INSERT INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
                        VALUES ($1, $2, $3, $4)
                        ON CONFLICT ("task_key", "run_at") DO NOTHING"#
                 )
             }
-            DbBackend::Sqlite => {
+            Dialect::Sqlite => {
                 format!(
                     r#"INSERT OR IGNORE INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
                        VALUES (?, ?, ?, ?)"#
                 )
             }
-            DbBackend::MySql => {
+            Dialect::MySql => {
                 format!(
                     r#"INSERT IGNORE INTO `{table}` (`job_id`, `task_key`, `run_at`, `created_at`)
                        VALUES (?, ?, ?, ?)"#
@@ -3466,7 +3467,7 @@ pub mod recurring_executions {
         ];
 
         let result = db
-            .execute(Statement::from_sql_and_values(backend, sql, values))
+            .execute_raw(Statement::from_sql_and_values(backend, sql, values))
             .await?;
 
         // rows_affected > 0 means insert succeeded, 0 means conflict (already exists)
@@ -3545,7 +3546,7 @@ pub mod semaphores {
 
             let (sql, values) = build_select_sql(backend, &query);
             let stmt = Statement::from_sql_and_values(backend, &sql, values);
-            let rows = db.query_all(stmt).await?;
+            let rows = db.query_all_raw(stmt).await?;
             for row in rows {
                 let key: String = row.try_get("", "key")?;
                 let value: i32 = row.try_get("", "value")?;
@@ -3589,13 +3590,13 @@ pub mod pauses {
         C: ConnectionTrait,
     {
         let table_name = &table_config.pauses;
-        let sql = match db.get_database_backend() {
-            DbBackend::Postgres => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
-            DbBackend::MySql => format!(r#"SELECT `queue_name` FROM `{table_name}`"#),
-            DbBackend::Sqlite => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
+        let sql = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
+            Dialect::MySql => format!(r#"SELECT `queue_name` FROM `{table_name}`"#),
+            Dialect::Sqlite => format!(r#"SELECT "queue_name" FROM "{table_name}""#),
         };
         let stmt = Statement::from_string(db.get_database_backend(), sql);
-        let rows = db.query_all(stmt).await?;
+        let rows = db.query_all_raw(stmt).await?;
 
         rows.into_iter()
             .map(|row| row.try_get("", "queue_name"))
@@ -3633,8 +3634,8 @@ pub mod pauses {
         let backend = db.get_database_backend();
         let table = &table_config.pauses;
 
-        match backend {
-            DbBackend::Postgres => {
+        match Dialect::from(backend) {
+            Dialect::Postgres => {
                 let sql = format!(
                     r#"INSERT INTO "{table}" ("queue_name", "created_at")
                        VALUES ($1, $2)
@@ -3646,7 +3647,7 @@ pub mod pauses {
                     sql,
                     [queue_name.into(), created_at.into()],
                 );
-                match db.query_one(stmt).await? {
+                match db.query_one_raw(stmt).await? {
                     Some(row) => {
                         let id: i64 = row.try_get("", "id")?;
                         Ok(id)
@@ -3654,7 +3655,7 @@ pub mod pauses {
                     None => Ok(0), // already paused
                 }
             }
-            DbBackend::Sqlite => {
+            Dialect::Sqlite => {
                 let sql = format!(
                     r#"INSERT OR IGNORE INTO "{table}" ("queue_name", "created_at")
                        VALUES (?, ?)"#
@@ -3664,14 +3665,14 @@ pub mod pauses {
                     sql,
                     [queue_name.into(), created_at.into()],
                 );
-                let result = db.execute(stmt).await?;
+                let result = db.execute_raw(stmt).await?;
                 if result.rows_affected() == 0 {
                     Ok(0) // already paused
                 } else {
                     Ok(result.last_insert_id() as i64)
                 }
             }
-            DbBackend::MySql => {
+            Dialect::MySql => {
                 let sql = format!(
                     r#"INSERT IGNORE INTO `{table}` (`queue_name`, `created_at`)
                        VALUES (?, ?)"#
@@ -3681,7 +3682,7 @@ pub mod pauses {
                     sql,
                     [queue_name.into(), created_at.into()],
                 );
-                let result = db.execute(stmt).await?;
+                let result = db.execute_raw(stmt).await?;
                 if result.rows_affected() == 0 {
                     Ok(0) // already paused
                 } else {
@@ -3766,7 +3767,7 @@ pub mod recurring_tasks {
             p1 = placeholder(backend, 1),
         );
         let stmt = Statement::from_sql_and_values(backend, sql, [key.into()]);
-        db.query_one(stmt)
+        db.query_one_raw(stmt)
             .await?
             .map(|row| row.try_get::<Option<chrono::NaiveDateTime>>("", "paused_at"))
             .transpose()
@@ -3835,7 +3836,7 @@ pub mod recurring_tasks {
             ),
         };
         let stmt = Statement::from_sql_and_values(backend, sql, values);
-        Ok(db.execute(stmt).await?.rows_affected())
+        Ok(db.execute_raw(stmt).await?.rows_affected())
     }
 
     /// Keys of every paused task, sorted.
@@ -3850,14 +3851,16 @@ pub mod recurring_tasks {
             table = quote_identifier(backend, &table_config.recurring_tasks),
             paused = quote_identifier(backend, "paused_at"),
         );
-        let rows = db.query_all(Statement::from_string(backend, sql)).await?;
+        let rows = db
+            .query_all_raw(Statement::from_string(backend, sql))
+            .await?;
         rows.into_iter().map(|row| row.try_get("", "key")).collect()
     }
 
     fn placeholder(backend: DbBackend, idx: usize) -> String {
-        match backend {
-            DbBackend::Postgres => format!("${idx}"),
-            DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+        match Dialect::from(backend) {
+            Dialect::Postgres => format!("${idx}"),
+            Dialect::MySql | Dialect::Sqlite => "?".to_string(),
         }
     }
 }
@@ -3968,7 +3971,7 @@ pub mod batches {
             .to_owned();
         let (sql, values) = build_select_sql(db.get_database_backend(), &query);
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        db.query_one(stmt)
+        db.query_one_raw(stmt)
             .await?
             .map(|row| {
                 Ok((
@@ -4060,7 +4063,7 @@ pub mod batches {
         };
         let stmt =
             Statement::from_sql_and_values(backend, sql, [now.into(), now.into(), id.into()]);
-        Ok(db.execute(stmt).await?.rows_affected())
+        Ok(db.execute_raw(stmt).await?.rows_affected())
     }
 
     /// Jobs of this batch that currently have a failed execution.
@@ -4126,14 +4129,14 @@ pub mod batches {
     {
         let table_name = &table_config.batches;
         let backend = db.get_database_backend();
-        let sql = match backend {
-            DbBackend::Postgres => format!(
+        let sql = match Dialect::from(backend) {
+            Dialect::Postgres => format!(
                 r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "failed_at" IS NULL AND "finished_at" < $1 LIMIT $2)"#
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"DELETE FROM `{table_name}` WHERE `id` IN (SELECT `id` FROM (SELECT `id` FROM `{table_name}` WHERE `finished_at` IS NOT NULL AND `failed_at` IS NULL AND `finished_at` < ? LIMIT ?) AS tmp)"#
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"DELETE FROM "{table_name}" WHERE "id" IN (SELECT "id" FROM "{table_name}" WHERE "finished_at" IS NOT NULL AND "failed_at" IS NULL AND "finished_at" < ? LIMIT ?)"#
             ),
         };
@@ -4142,7 +4145,7 @@ pub mod batches {
             sql,
             [finished_before.into(), (batch_size as i64).into()],
         );
-        Ok(db.execute(stmt).await?.rows_affected())
+        Ok(db.execute_raw(stmt).await?.rows_affected())
     }
 
     /// Started, unfinished batches with no tracking rows left, by id after
@@ -4215,7 +4218,7 @@ pub mod batches {
     {
         let (sql, values) = build_select_sql(db.get_database_backend(), &query);
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        db.query_all(stmt)
+        db.query_all_raw(stmt)
             .await?
             .iter()
             .map(|row| row.try_get::<i64>("", "id"))
@@ -4326,7 +4329,7 @@ pub mod batches {
     {
         let (sql, values) = build_select_sql(db.get_database_backend(), &query);
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        db.query_all(stmt)
+        db.query_all_raw(stmt)
             .await?
             .iter()
             .map(|row| {
@@ -4369,7 +4372,7 @@ pub mod batch_executions {
             }
             let (sql, values) = build_insert_sql(db.get_database_backend(), &query);
             let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-            inserted += db.execute(stmt).await?.rows_affected();
+            inserted += db.execute_raw(stmt).await?.rows_affected();
         }
         Ok(inserted)
     }
@@ -4390,7 +4393,7 @@ pub mod batch_executions {
             .to_owned();
         let (sql, values) = build_select_sql(db.get_database_backend(), &query);
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        Ok(db.query_one(stmt).await?.is_some())
+        Ok(db.query_one_raw(stmt).await?.is_some())
     }
 
     pub async fn count_for_batch<C>(
@@ -4422,8 +4425,8 @@ pub mod batch_executions {
     {
         let backend = db.get_database_backend();
         let table = quote_identifier(backend, &table_config.batch_executions);
-        match backend {
-            DbBackend::Postgres | DbBackend::Sqlite => {
+        match Dialect::from(backend) {
+            Dialect::Postgres | Dialect::Sqlite => {
                 let placeholder = if backend == DbBackend::Postgres {
                     "$1"
                 } else {
@@ -4433,18 +4436,18 @@ pub mod batch_executions {
                     "DELETE FROM {table} WHERE \"job_id\" = {placeholder} RETURNING \"batch_id\""
                 );
                 let stmt = Statement::from_sql_and_values(backend, sql, [job_id.into()]);
-                db.query_one(stmt)
+                db.query_one_raw(stmt)
                     .await?
                     .map(|row| row.try_get::<i64>("", "batch_id"))
                     .transpose()
             }
-            DbBackend::MySql => {
+            Dialect::MySql => {
                 let select = Statement::from_sql_and_values(
                     backend,
                     format!("SELECT `batch_id` FROM {table} WHERE `job_id` = ?"),
                     [job_id.into()],
                 );
-                let Some(row) = db.query_one(select).await? else {
+                let Some(row) = db.query_one_raw(select).await? else {
                     return Ok(None);
                 };
                 let batch_id: i64 = row.try_get("", "batch_id")?;
@@ -4453,7 +4456,7 @@ pub mod batch_executions {
                     format!("DELETE FROM {table} WHERE `job_id` = ?"),
                     [job_id.into()],
                 );
-                Ok((db.execute(delete).await?.rows_affected() > 0).then_some(batch_id))
+                Ok((db.execute_raw(delete).await?.rows_affected() > 0).then_some(batch_id))
             }
         }
     }
@@ -4526,7 +4529,7 @@ pub mod batch_executions {
     {
         let (sql, values) = build_select_sql(db.get_database_backend(), &query);
         let stmt = Statement::from_sql_and_values(db.get_database_backend(), &sql, values);
-        db.query_all(stmt)
+        db.query_all_raw(stmt)
             .await?
             .iter()
             .map(|row| {

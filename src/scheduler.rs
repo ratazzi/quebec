@@ -1,4 +1,5 @@
 use crate::context::{AppContext, ScheduledEntry};
+use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::notify::NotifyManager;
 use crate::process::{ProcessInfo, ProcessTrait};
@@ -6,8 +7,7 @@ use crate::query_builder;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sea_orm::{
-    ConnectionTrait, DbBackend, DbErr, ExecResult, Statement, TransactionError, TransactionTrait,
-    Value,
+    ConnectionTrait, DbErr, ExecResult, Statement, TransactionError, TransactionTrait, Value,
 };
 use serde_json::json;
 use serde_yaml;
@@ -48,8 +48,8 @@ where
         Value::from(None::<String>), // description - NULL
     ];
 
-    let sql = match backend {
-        DbBackend::Postgres => {
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
             // PostgreSQL: ON CONFLICT DO UPDATE with IS NOT DISTINCT FROM for NULL-safe comparison
             format!(
                 r#"INSERT INTO "{table}" (
@@ -80,7 +80,7 @@ where
                     "description" = excluded."description""#
             )
         }
-        DbBackend::Sqlite => {
+        Dialect::Sqlite => {
             // SQLite: ON CONFLICT DO UPDATE with IS for NULL-safe comparison
             format!(
                 r#"INSERT INTO "{table}" (
@@ -111,7 +111,7 @@ where
                     "description" = excluded."description""#
             )
         }
-        DbBackend::MySql => {
+        Dialect::MySql => {
             // MySQL 8.0.20+: Use alias syntax instead of deprecated VALUES()
             // https://dev.mysql.com/doc/refman/8.0/en/insert-on-duplicate.html
             format!(
@@ -149,7 +149,7 @@ where
     let cleaned_sql = sql.lines().map(str::trim).collect::<Vec<&str>>().join(" ");
 
     let ret = db
-        .execute(Statement::from_sql_and_values(backend, cleaned_sql, values))
+        .execute_raw(Statement::from_sql_and_values(backend, cleaned_sql, values))
         .await?;
 
     trace!("upsert_task: {:?}", ret);
@@ -678,14 +678,14 @@ impl Scheduler {
 
             let (sql, values): (String, Vec<Value>) = if synced_keys.is_empty() {
                 // All tasks removed from config — delete all static rows
-                let sql = match backend {
-                    sea_orm::DbBackend::Postgres => {
+                let sql = match Dialect::from(backend) {
+                    Dialect::Postgres => {
                         format!(r#"DELETE FROM "{table}" WHERE "static" = TRUE"#)
                     }
-                    sea_orm::DbBackend::MySql => {
+                    Dialect::MySql => {
                         format!(r#"DELETE FROM `{table}` WHERE `static` = 1"#)
                     }
-                    sea_orm::DbBackend::Sqlite => {
+                    Dialect::Sqlite => {
                         format!(r#"DELETE FROM "{table}" WHERE "static" = 1"#)
                     }
                 };
@@ -705,14 +705,14 @@ impl Scheduler {
                         .join(", "),
                 };
 
-                let sql = match backend {
-                    sea_orm::DbBackend::Postgres => format!(
+                let sql = match Dialect::from(backend) {
+                    Dialect::Postgres => format!(
                         r#"DELETE FROM "{table}" WHERE "static" = TRUE AND "key" NOT IN ({placeholders})"#,
                     ),
-                    sea_orm::DbBackend::MySql => format!(
+                    Dialect::MySql => format!(
                         r#"DELETE FROM `{table}` WHERE `static` = 1 AND `key` NOT IN ({placeholders})"#,
                     ),
-                    sea_orm::DbBackend::Sqlite => format!(
+                    Dialect::Sqlite => format!(
                         r#"DELETE FROM "{table}" WHERE "static" = 1 AND "key" NOT IN ({placeholders})"#,
                     ),
                 };
@@ -724,7 +724,7 @@ impl Scheduler {
 
             let stmt = sea_orm::Statement::from_sql_and_values(backend, &sql, values);
 
-            let deleted = db.execute(stmt).await?;
+            let deleted = db.execute_raw(stmt).await?;
             if deleted.rows_affected() > 0 {
                 info!(
                     "Removed {} stale recurring task(s) from database",
@@ -1037,6 +1037,7 @@ impl ProcessTrait for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::DbBackend;
 
     #[tokio::test]
     async fn mysql_upsert_qualifies_existing_recurring_columns() {

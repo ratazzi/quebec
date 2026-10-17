@@ -13,6 +13,7 @@ use crate::control_plane::{
     utils::clean_sql,
     ControlPlane,
 };
+use crate::dialect::Dialect;
 use crate::entities::quebec_batches;
 use crate::query_builder;
 
@@ -232,9 +233,9 @@ impl ControlPlane {
     ) -> Result<Vec<BatchJobInfo>, sea_orm::DbErr> {
         let tc = &state.ctx.table_config;
         let backend = db.get_database_backend();
-        let (p1, p2) = match backend {
-            DbBackend::Postgres => ("$1", "$2"),
-            DbBackend::MySql | DbBackend::Sqlite => ("?", "?"),
+        let (p1, p2) = match Dialect::from(backend) {
+            Dialect::Postgres => ("$1", "$2"),
+            Dialect::MySql | Dialect::Sqlite => ("?", "?"),
         };
         let sql = clean_sql(&format!(
             "SELECT j.id, j.class_name, j.queue_name, j.created_at, j.finished_at,
@@ -257,7 +258,7 @@ impl ControlPlane {
             be = tc.blocked_executions,
         ));
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 &sql,
                 [Value::from(batch_id), Value::from(MEMBER_LIMIT as i64)],
@@ -343,7 +344,7 @@ impl ControlPlane {
                 .map(|s| Value::from(s.clone()))
                 .collect();
             for row in db
-                .query_all(Statement::from_sql_and_values(backend, &sql, values))
+                .query_all_raw(Statement::from_sql_and_values(backend, &sql, values))
                 .await?
             {
                 let active_job_id: Option<String> = row.try_get("", "active_job_id")?;
