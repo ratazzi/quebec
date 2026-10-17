@@ -106,6 +106,18 @@ jobs:
       - name: Build extension
         run: uv run --no-sync maturin develop
 
+      # The suite creates and drops a database per test, so DDL commits
+      # dominate; skip the per-commit redo log and binlog fsyncs. The service
+      # cannot take mysqld flags, but both settings are dynamic.
+      - name: Relax MySQL durability
+        if: matrix.database == 'mysql'
+        run: >-
+          docker exec ${{ job.services.mysql.id }}
+          mysql -h127.0.0.1 -uroot -pquebec_test -e
+          "SET GLOBAL innodb_flush_log_at_trx_commit = 2;
+          SET GLOBAL sync_binlog = 0;
+          SELECT @@innodb_flush_log_at_trx_commit, @@sync_binlog"
+
       - name: Run pytest
         env:
           QUEBEC_SKIP_IMPORT_HOOK: "1"
