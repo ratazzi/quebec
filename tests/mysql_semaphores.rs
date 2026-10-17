@@ -122,7 +122,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
     let db = sea_orm::Database::connect(dsn).await.unwrap();
     let prefix = format!("mysql_audit_{}", std::process::id());
     let tc = TableConfig::with_prefix(&prefix);
-    let create = quebec::schema_builder::create_semaphores_table(&tc)
+    let create = quebec::schema_builder::create_semaphores_table(&tc, DbBackend::MySql)
         .to_string(sea_orm::sea_query::MysqlQueryBuilder);
     db.execute(Statement::from_string(DbBackend::MySql, create))
         .await

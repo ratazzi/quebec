@@ -121,7 +121,6 @@ def test_sweep_finishes_started_batch_without_rows(env) -> None:
     assert _count(env, "jobs", "WHERE class_name = 'OnFinish'") == 1
 
 
-@pytest.mark.mysql_datetime_precision
 def test_sweep_starts_batches_stalled_before_start(env) -> None:
     qc = env["qc"]
     stale = qc._batch_create(None, None, None, None, None)  # created, never started

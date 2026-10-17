@@ -682,7 +682,6 @@ class JitterSpreadJob(quebec.BaseClass):
         type(self).calls.append(value)
 
 
-@pytest.mark.mysql_datetime_precision
 def test_jitter_spreads_throttled_jobs_within_one_second_window(qc_with_sqlalchemy):
     """retry_at must use sub-second resolution. With integer-second jitter,
     every throttled job at window=1s landed on the exact same wall-clock

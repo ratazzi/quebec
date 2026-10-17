@@ -86,27 +86,6 @@ def pytest_configure(config):
     for name, env in _SERVER_BACKENDS.items():
         if name in backends and not os.getenv(env):
             raise pytest.UsageError(f"--database={name} requires {env}")
-    config.addinivalue_line(
-        "markers",
-        "mysql_datetime_precision: relies on sub-second timestamps, which MySQL's "
-        "DATETIME columns (no fractional precision) do not keep yet",
-    )
-
-
-def pytest_collection_modifyitems(config, items):
-    xfail = pytest.mark.xfail(
-        reason="MySQL time columns are DATETIME, not DATETIME(6), so timestamps "
-        "round to whole seconds",
-        strict=False,
-    )
-    for item in items:
-        callspec = getattr(item, "callspec", None)
-        if (
-            callspec is not None
-            and callspec.params.get("db_url") == "mysql"
-            and item.get_closest_marker("mysql_datetime_precision")
-        ):
-            item.add_marker(xfail)
 
 
 def pytest_generate_tests(metafunc):
