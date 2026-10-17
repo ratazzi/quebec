@@ -60,7 +60,7 @@ def _seed_recurring_task(session, prefix: str, key: str, class_name: str) -> Non
     session.execute(
         text(
             f"INSERT INTO {prefix}_recurring_tasks "
-            "(key, schedule, class_name, arguments, queue_name, priority, "
+            '("key", schedule, class_name, arguments, queue_name, priority, '
             '"static", created_at, updated_at) '
             "VALUES (:key, :schedule, :class_name, :arguments, :queue_name, "
             ":priority, :static, :created_at, :updated_at)"

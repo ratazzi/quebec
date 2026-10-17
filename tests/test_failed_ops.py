@@ -5,6 +5,8 @@ from __future__ import annotations
 import quebec
 from sqlalchemy import text
 
+from .helpers import insert_returning_id
+
 
 class FailingJob(quebec.ActiveJob):
     queue_as = "default"
@@ -383,14 +385,12 @@ def test_parse_timestamp_handles_negative_fractional(qc_with_sqlalchemy) -> None
     # but AFTER the fixed -0.5 bound (23:59:59.500). Comparison is on
     # failed_executions.created_at, which the find_all query bounds via
     # `>= since` / `<= until`.
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, created_at, updated_at) "
-            f"VALUES ('default', 'X', '[]', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-            " RETURNING id"
-        )
-    ).scalar_one()
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, created_at, updated_at) "
+        f"VALUES ('default', 'X', '[]', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_failed_executions "

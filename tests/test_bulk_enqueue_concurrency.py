@@ -1,5 +1,6 @@
 """Bulk enqueue keeps concurrency decisions and batch membership intact."""
 
+import pytest
 import quebec
 from sqlalchemy import text
 
@@ -108,6 +109,7 @@ def test_bulk_unique_keys_and_plain_jobs_share_one_batch(
     assert membership_count == 64
 
 
+@pytest.mark.mysql_datetime_precision
 def test_bulk_unique_keys_cross_ready_insert_chunk_boundary(
     qc_with_sqlalchemy, db_assert
 ) -> None:

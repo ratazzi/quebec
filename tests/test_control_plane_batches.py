@@ -7,6 +7,8 @@ import pytest
 import quebec
 from sqlalchemy import text
 
+from .helpers import drop_jobs_batch_id
+
 BASE = "/quebec"
 
 
@@ -158,8 +160,7 @@ def test_pages_degrade_without_batches_schema(env) -> None:
     Member.perform_later(qc, "plain")
     session.execute(text(f"DROP TABLE {prefix}_batch_executions"))
     session.execute(text(f"DROP TABLE {prefix}_batches"))
-    session.execute(text(f"DROP INDEX IF EXISTS idx_{prefix}_jobs_batch_id"))
-    session.execute(text(f"ALTER TABLE {prefix}_jobs DROP COLUMN batch_id"))
+    drop_jobs_batch_id(session, prefix)
     session.commit()
     with pytest.raises(RuntimeError):
         qc.batch()  # forces a fresh schema probe

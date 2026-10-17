@@ -171,6 +171,7 @@ def test_supervised_single_thread_worker_attributes_rss(
         qc.close()
 
 
+@pytest.mark.mysql_datetime_precision
 def test_csv_recorder_writes_one_row_per_job(qc, tmp_path) -> None:
     qc.register_job(AllocatingJob)
     qc.register_job(FailingJob)

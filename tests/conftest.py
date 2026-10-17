@@ -19,6 +19,8 @@ if os.environ.get("QUEBEC_SKIP_IMPORT_HOOK", "0") != "1":
 
 import quebec  # noqa: E402
 
+from .helpers import create_database_engine  # noqa: E402
+
 
 def generate_test_prefix():
     """Generate a unique table prefix for test isolation."""
@@ -59,22 +61,52 @@ def sqlite_memory_url():
     return "sqlite::memory:"
 
 
+_SERVER_BACKENDS = {"postgresql": "TEST_POSTGRESQL_URL", "mysql": "TEST_MYSQL_URL"}
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--database",
         action="append",
-        choices=["postgresql", "sqlite"],
-        help="Database backend to test; repeat to run both. PostgreSQL requires TEST_POSTGRESQL_URL.",
+        choices=["postgresql", "mysql", "sqlite"],
+        help=(
+            "Database backend to test; repeat to run several. PostgreSQL requires "
+            "TEST_POSTGRESQL_URL and MySQL requires TEST_MYSQL_URL."
+        ),
     )
 
 
 def pytest_configure(config):
     backends = config.getoption("database")
     if backends is None:
-        backends = ["postgresql", "sqlite"] if os.getenv("TEST_POSTGRESQL_URL") else ["sqlite"]
+        backends = [
+            name for name, env in _SERVER_BACKENDS.items() if os.getenv(env)
+        ] + ["sqlite"]
     config._quebec_databases = list(dict.fromkeys(backends))
-    if "postgresql" in backends and not os.getenv("TEST_POSTGRESQL_URL"):
-        raise pytest.UsageError("--database=postgresql requires TEST_POSTGRESQL_URL")
+    for name, env in _SERVER_BACKENDS.items():
+        if name in backends and not os.getenv(env):
+            raise pytest.UsageError(f"--database={name} requires {env}")
+    config.addinivalue_line(
+        "markers",
+        "mysql_datetime_precision: relies on sub-second timestamps, which MySQL's "
+        "DATETIME columns (no fractional precision) do not keep yet",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    xfail = pytest.mark.xfail(
+        reason="MySQL time columns are DATETIME, not DATETIME(6), so timestamps "
+        "round to whole seconds",
+        strict=False,
+    )
+    for item in items:
+        callspec = getattr(item, "callspec", None)
+        if (
+            callspec is not None
+            and callspec.params.get("db_url") == "mysql"
+            and item.get_closest_marker("mysql_datetime_precision")
+        ):
+            item.add_marker(xfail)
 
 
 def pytest_generate_tests(metafunc):
@@ -84,14 +116,18 @@ def pytest_generate_tests(metafunc):
 
 @pytest.fixture
 def db_url(request, temp_db_path):
-    """Run shared tests on each selected backend, isolating PostgreSQL by schema.
+    """Run shared tests on each selected backend, isolating server databases.
 
-    Only the generated schema is dropped; the supplied database is never dropped.
-    The URL carries search_path so additional Quebec instances and subprocesses
-    in a test see the same tables without depending on connection-local setup.
+    PostgreSQL gets a generated schema and MySQL a generated database; only
+    those are dropped, never the supplied database. The PostgreSQL URL carries
+    search_path so additional Quebec instances and subprocesses in a test see
+    the same tables without depending on connection-local setup.
     """
     if request.param == "sqlite":
         yield f"sqlite:///{temp_db_path}?mode=rwc"
+        return
+    if request.param == "mysql":
+        yield from _mysql_test_database()
         return
 
     url = make_url(os.environ["TEST_POSTGRESQL_URL"])
@@ -109,6 +145,26 @@ def db_url(request, temp_db_path):
         finally:
             with engine.connect() as connection:
                 connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+    finally:
+        engine.dispose()
+
+
+def _mysql_test_database():
+    url = make_url(os.environ["TEST_MYSQL_URL"])
+    if url.drivername != "mysql":
+        raise pytest.UsageError("TEST_MYSQL_URL must use mysql://")
+    database = f"quebec_test_{uuid.uuid4().hex}"
+    engine = create_engine(
+        url.set(drivername="mysql+pymysql"), isolation_level="AUTOCOMMIT"
+    )
+    try:
+        with engine.connect() as connection:
+            connection.execute(text(f"CREATE DATABASE `{database}`"))
+        try:
+            yield url.set(database=database).render_as_string(hide_password=False)
+        finally:
+            with engine.connect() as connection:
+                connection.execute(text(f"DROP DATABASE `{database}`"))
     finally:
         engine.dispose()
 
@@ -141,12 +197,7 @@ def qc_with_sqlalchemy(db_url, test_prefix, temp_db_path):
     instance = quebec.Quebec(db_url, table_name_prefix=test_prefix)
     assert instance.create_tables() is True
 
-    # Create SQLAlchemy engine for test verification.
-    # db_url already uses SQLAlchemy's 4-slash absolute form; just drop
-    # any sqlx-only query params (e.g. ?mode=rwc) that SA doesn't parse.
-    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-
-    engine = create_engine(sa_url)
+    engine = create_database_engine(db_url)
     Session = sessionmaker(bind=engine)
     session = Session()
 

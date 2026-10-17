@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import quebec
 from sqlalchemy import text
 
-from .helpers import observe_sqlite, readonly_connect, wait_until
+from .helpers import insert_returning_id, observe_sqlite, readonly_connect, wait_until
 
 
 class ConcurrentJob(quebec.BaseClass):
@@ -439,17 +439,15 @@ def _insert_failed_execution(
     """Create a jobs row + failed_executions row directly, simulating what
     the failed jobs list would show in the control plane.
     """
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            "(queue_name, class_name, arguments, priority, concurrency_key, "
-            " created_at, updated_at) "
-            "VALUES ('default', :cn, '[]', 0, :ck, "
-            "        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-            " RETURNING id"
-        ),
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        "(queue_name, class_name, arguments, priority, concurrency_key, "
+        " created_at, updated_at) "
+        "VALUES ('default', :cn, '[]', 0, :ck, "
+        "        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
         {"cn": class_name, "ck": concurrency_key},
-    ).scalar_one()
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_failed_executions "

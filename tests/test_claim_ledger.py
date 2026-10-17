@@ -21,8 +21,10 @@ empty. These tests pin those transitions deterministically.
 from __future__ import annotations
 
 import quebec
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
+
+from .helpers import create_database_engine, insert_returning_id
 
 
 def _claimed_id(session, prefix: str, job_id: int) -> int:
@@ -42,16 +44,14 @@ def _seed_claimed(session, prefix: str, process_id: int) -> int:
     was lost. Returns the new claimed_executions.id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, active_job_id, "
-            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
-            f"VALUES ('default', 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
-            f"{now_sql}, {now_sql})"
-            " RETURNING id"
-        )
-    ).scalar_one()
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, active_job_id, "
+        f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+        f"VALUES ('default', 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+        f"{now_sql}, {now_sql})",
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "
@@ -74,17 +74,15 @@ def _seed_orphan(session, prefix: str, *, queue_name: str = "default") -> int:
     Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, active_job_id, "
-            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
-            f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
-            f"{now_sql}, {now_sql})"
-            " RETURNING id"
-        ),
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, active_job_id, "
+        f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+        f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+        f"{now_sql}, {now_sql})",
         {"queue": queue_name},
-    ).scalar_one()
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "
@@ -104,15 +102,13 @@ def _seed_stale_process(session, prefix: str) -> int:
     ``now - process_alive_threshold`` (default 300s), so a year-2000 heartbeat
     is reliably stale. Returns the new processes.id.
     """
-    process_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_processes "
-            f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
-            f"VALUES ('Worker', '2000-01-01 00:00:00', 4242, 'stale-host', NULL, "
-            f"'2000-01-01 00:00:00', 'Worker-4242')"
-            " RETURNING id"
-        )
-    ).scalar_one()
+    process_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_processes "
+        f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
+        f"VALUES ('Worker', '2000-01-01 00:00:00', 4242, 'stale-host', NULL, "
+        f"'2000-01-01 00:00:00', 'Worker-4242')",
+    )
     session.commit()
     return process_id
 
@@ -127,17 +123,15 @@ def _seed_claimed_for_process(
     queues in ``experimental_queue_concurrency``). Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, active_job_id, "
-            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
-            f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
-            f"{now_sql}, {now_sql})"
-            " RETURNING id"
-        ),
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, active_job_id, "
+        f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+        f"VALUES (:queue, 'CrashJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+        f"{now_sql}, {now_sql})",
         {"queue": queue_name},
-    ).scalar_one()
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "
@@ -731,8 +725,7 @@ def test_should_drain_exit_with_lingering_claimed_row(db_url, test_prefix):
     qc = quebec.Quebec(db_url, table_name_prefix=test_prefix, quiet_then_exit=True)
     assert qc.create_tables() is True
 
-    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-    engine = create_engine(sa_url)
+    engine = create_database_engine(db_url)
     session = sessionmaker(bind=engine)()
     try:
         process_id = qc.register_worker_process()
@@ -790,8 +783,7 @@ def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_pr
     )
     assert qc.create_tables() is True
 
-    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-    engine = create_engine(sa_url)
+    engine = create_database_engine(db_url)
     session = sessionmaker(bind=engine)()
     try:
         bad_job = _seed_orphan(session, test_prefix, queue_name="locked")
@@ -860,7 +852,7 @@ def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_pr
         session.execute(
             text(
                 f"INSERT INTO {test_prefix}_semaphores "
-                f"(key, value, expires_at, created_at, updated_at) "
+                '("key", value, expires_at, created_at, updated_at) '
                 f"VALUES ('queue:locked', 0, CURRENT_TIMESTAMP, "
                 f"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
             )
@@ -885,7 +877,7 @@ def test_orphan_sweep_reclaims_remaining_rows_when_one_row_fails(db_url, test_pr
             session.execute(
                 text(
                     f"SELECT value FROM {test_prefix}_semaphores "
-                    f"WHERE key = 'queue:locked'"
+                    """WHERE "key" = 'queue:locked'"""
                 )
             ).scalar()
             == 1
@@ -927,8 +919,7 @@ def test_stale_process_pruning_is_per_row_best_effort(db_url, test_prefix):
     )
     assert qc.create_tables() is True
 
-    sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-    engine = create_engine(sa_url)
+    engine = create_database_engine(db_url)
     session = sessionmaker(bind=engine)()
     try:
         process_id = _seed_stale_process(session, test_prefix)
