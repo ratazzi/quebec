@@ -97,11 +97,14 @@ jobs:
             target
           key: ${{ runner.os }}-pytest-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      # The project itself is left out of the sync: uv would build it as a
+      # PEP 517 wheel, only for `maturin develop` to compile it again below.
+      # The later steps pass --no-sync for the same reason.
       - name: Sync dependencies
-        run: uv sync --all-extras
+        run: uv sync --all-extras --no-install-project
 
       - name: Build extension
-        run: uv run --with maturin maturin develop
+        run: uv run --no-sync maturin develop
 
       - name: Run pytest
         env:
@@ -109,4 +112,4 @@ jobs:
           TEST_POSTGRESQL_URL: ${{ matrix.database == 'postgresql' && 'postgresql://quebec_test:quebec_test@127.0.0.1:5432/quebec_test' || '' }}
           # root: each test creates and drops its own database.
           TEST_MYSQL_URL: ${{ matrix.database == 'mysql' && 'mysql://root:quebec_test@127.0.0.1:3306/quebec_test' || '' }}
-        run: uv run pytest --database=${{ matrix.database }} --ignore=tests/step_defs
+        run: uv run --no-sync pytest --database=${{ matrix.database }} --ignore=tests/step_defs
