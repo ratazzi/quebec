@@ -1,4 +1,5 @@
 use crate::context::*;
+use crate::dialect::Dialect;
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use crate::semaphore::acquire_semaphore;
@@ -402,9 +403,9 @@ impl Dispatcher {
         // Fetch distinct expired concurrency keys, ordered by key
         // (matches Solid Queue's `expired.order(:concurrency_key).distinct.limit`).
         let backend = db.get_database_backend();
-        let (p1, p2) = match backend {
-            DbBackend::Postgres => ("$1", "$2"),
-            DbBackend::MySql | DbBackend::Sqlite => ("?", "?"),
+        let (p1, p2) = match Dialect::from(backend) {
+            Dialect::Postgres => ("$1", "$2"),
+            Dialect::MySql | Dialect::Sqlite => ("?", "?"),
         };
         let sql = format!(
             "SELECT DISTINCT concurrency_key FROM {} WHERE expires_at < {} ORDER BY concurrency_key LIMIT {}",
@@ -412,7 +413,7 @@ impl Dispatcher {
         );
         let now = chrono::Utc::now().naive_utc();
         let rows = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 sql,
                 vec![now.into(), batch_size.into()],

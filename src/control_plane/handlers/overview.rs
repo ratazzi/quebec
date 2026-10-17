@@ -8,13 +8,14 @@ use sea_orm::sea_query::{
     Alias, Expr, PostgresQueryBuilder, Query as SeaQuery, SqliteQueryBuilder,
 };
 use sea_orm::Order;
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
+use sea_orm::{ConnectionTrait, DbBackend, ExprTrait, Statement, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, instrument};
 
 use crate::control_plane::{utils::clean_sql, ControlPlane};
+use crate::dialect::Dialect;
 use crate::query_builder;
 
 const DEFAULT_OVERVIEW_HOURS: i64 = 24;
@@ -93,18 +94,18 @@ impl ControlPlane {
 
         // Get average processing time of jobs in current period
         // Use database-specific SQL for duration calculation
-        let avg_duration_sql = clean_sql(&match db.get_database_backend() {
-            DbBackend::Postgres => format!(
+        let avg_duration_sql = clean_sql(&match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(
                 r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
                    FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > $1"#,
                 table_config.jobs
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
                    FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > ?"#,
                 table_config.jobs
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
                    FROM `{}` WHERE finished_at IS NOT NULL AND finished_at > ?"#,
                 table_config.jobs
@@ -118,24 +119,24 @@ impl ControlPlane {
         );
 
         let avg_duration: Option<f64> = db
-            .query_one(avg_duration_stmt)
+            .query_one_raw(avg_duration_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .and_then(|row| row.try_get("", "avg_duration").ok());
 
         // Get average processing time of jobs in previous period
-        let prev_avg_duration_sql = clean_sql(&match db.get_database_backend() {
-            DbBackend::Postgres => format!(
+        let prev_avg_duration_sql = clean_sql(&match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(
                 r#"SELECT AVG(EXTRACT(EPOCH FROM (finished_at - created_at))) as avg_duration
                    FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > $1 AND finished_at <= $2"#,
                 table_config.jobs
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"SELECT AVG((julianday(finished_at) - julianday(created_at)) * 86400) as avg_duration
                    FROM "{}" WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
                 table_config.jobs
             ),
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"SELECT AVG(TIMESTAMPDIFF(SECOND, created_at, finished_at)) as avg_duration
                    FROM `{}` WHERE finished_at IS NOT NULL AND finished_at > ? AND finished_at <= ?"#,
                 table_config.jobs
@@ -149,7 +150,7 @@ impl ControlPlane {
         );
 
         let prev_avg_duration: Option<f64> = db
-            .query_one(prev_avg_duration_stmt)
+            .query_one_raw(prev_avg_duration_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .and_then(|row| row.try_get("", "avg_duration").ok());
@@ -257,9 +258,9 @@ impl ControlPlane {
             let first = chart_values.len() + 1;
             chart_values.push(start_time.into());
             chart_values.push(end_time.into());
-            let (start_param, end_param) = match db.get_database_backend() {
-                DbBackend::Postgres => (format!("${first}"), format!("${}", first + 1)),
-                DbBackend::Sqlite | DbBackend::MySql => ("?".to_string(), "?".to_string()),
+            let (start_param, end_param) = match Dialect::from(db.get_database_backend()) {
+                Dialect::Postgres => (format!("${first}"), format!("${}", first + 1)),
+                Dialect::Sqlite | Dialect::MySql => ("?".to_string(), "?".to_string()),
             };
             let bucket_col =
                 query_builder::quote_identifier(db.get_database_backend(), &format!("bucket_{i}"));
@@ -287,7 +288,7 @@ impl ControlPlane {
                     now.into(),
                 ],
             );
-            db.query_all(stmt).await.ok().and_then(|rows| {
+            db.query_all_raw(stmt).await.ok().and_then(|rows| {
                 let mut counts = vec![0u64; bucket_count as usize];
                 for row in rows {
                     let start: NaiveDateTime = row.try_get("", "bucket").ok()?;
@@ -321,7 +322,7 @@ impl ControlPlane {
                 sql,
                 [oldest.into(), stride_us.into(), oldest.into(), now.into()],
             );
-            db.query_all(stmt).await.ok().and_then(|rows| {
+            db.query_all_raw(stmt).await.ok().and_then(|rows| {
                 let mut counts = vec![0u64; bucket_count as usize];
                 for row in rows {
                     let index: i64 = row.try_get("", "bucket").ok()?;
@@ -347,9 +348,9 @@ impl ControlPlane {
             let first = chart_values.len() + 1;
             chart_values.push(oldest.into());
             chart_values.push(now.into());
-            let (start_param, end_param) = match db.get_database_backend() {
-                DbBackend::Postgres => (format!("${first}"), format!("${}", first + 1)),
-                DbBackend::Sqlite | DbBackend::MySql => ("?".to_string(), "?".to_string()),
+            let (start_param, end_param) = match Dialect::from(db.get_database_backend()) {
+                Dialect::Postgres => (format!("${first}"), format!("${}", first + 1)),
+                Dialect::Sqlite | Dialect::MySql => ("?".to_string(), "?".to_string()),
             };
             let table_name =
                 query_builder::quote_identifier(db.get_database_backend(), &table_config.jobs);
@@ -358,7 +359,7 @@ impl ControlPlane {
                 chart_counts.join(", "),
             );
             let stmt = Statement::from_sql_and_values(db.get_database_backend(), sql, chart_values);
-            db.query_one(stmt).await.ok().flatten().and_then(|row| {
+            db.query_one_raw(stmt).await.ok().flatten().and_then(|row| {
                 (0..bucket_count)
                     .map(|i| row.try_get::<i64>("", &format!("bucket_{i}")))
                     .collect::<std::result::Result<Vec<_>, _>>()
@@ -417,16 +418,16 @@ impl ControlPlane {
                 .order_by(Alias::new("count"), Order::Desc)
                 .limit(7)
                 .to_owned();
-            let (sql, values) = match db.get_database_backend() {
-                DbBackend::Postgres => job_types_query.build(PostgresQueryBuilder),
-                DbBackend::Sqlite => job_types_query.build(SqliteQueryBuilder),
-                DbBackend::MySql => unreachable!(),
+            let (sql, values) = match Dialect::from(db.get_database_backend()) {
+                Dialect::Postgres => job_types_query.build(PostgresQueryBuilder),
+                Dialect::Sqlite => job_types_query.build(SqliteQueryBuilder),
+                Dialect::MySql => unreachable!(),
             };
             Statement::from_sql_and_values(db.get_database_backend(), sql, values)
         };
 
         let job_types_result = db
-            .query_all(job_types_stmt)
+            .query_all_raw(job_types_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -442,8 +443,8 @@ impl ControlPlane {
         // Get queue performance statistics (using raw SQL for complex aggregations)
         // Use database-specific SQL for compatibility
         let failed_table = &table_config.failed_executions;
-        let queue_performance_sql = clean_sql(&match db.get_database_backend() {
-            DbBackend::Postgres => format!(
+        let queue_performance_sql = clean_sql(&match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => format!(
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(EXTRACT(EPOCH FROM (j.finished_at - j.created_at))) as avg_duration,
@@ -453,7 +454,7 @@ impl ControlPlane {
                    WHERE j.created_at > $1 GROUP BY j.queue_name"#,
                 table_config.jobs, failed_table
             ),
-            DbBackend::Sqlite => format!(
+            Dialect::Sqlite => format!(
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN (julianday(j.finished_at) - julianday(j.created_at)) * 86400 END) as avg_duration,
@@ -464,7 +465,7 @@ impl ControlPlane {
             ),
             // failed_executions.job_id is unique, so this join keeps one row
             // per job while avoiding a dependent EXISTS lookup per job.
-            DbBackend::MySql => format!(
+            Dialect::MySql => format!(
                 r#"SELECT j.queue_name,
                      COUNT(CASE WHEN j.finished_at IS NOT NULL THEN 1 END) as jobs_processed,
                      AVG(CASE WHEN j.finished_at IS NOT NULL THEN TIMESTAMPDIFF(SECOND, j.created_at, j.finished_at) END) as avg_duration,
@@ -483,7 +484,7 @@ impl ControlPlane {
         );
 
         let queue_performance_result = db
-            .query_all(queue_performance_stmt)
+            .query_all_raw(queue_performance_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -551,9 +552,9 @@ impl ControlPlane {
         context.insert("failed_rate_change", &failed_rate_change);
 
         // Get recently failed jobs (using raw SQL for JOIN operations)
-        let p1 = match db.get_database_backend() {
-            DbBackend::Postgres => "$1",
-            DbBackend::MySql | DbBackend::Sqlite => "?",
+        let p1 = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => "$1",
+            Dialect::MySql | Dialect::Sqlite => "?",
         };
         let recent_failed_jobs_sql = clean_sql(&format!(
             r#"SELECT
@@ -577,7 +578,7 @@ impl ControlPlane {
         );
 
         let recent_failed_jobs_result = db
-            .query_all(recent_failed_jobs_stmt)
+            .query_all_raw(recent_failed_jobs_stmt)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

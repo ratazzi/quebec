@@ -142,7 +142,9 @@ impl NotifyManager {
                         }
 
                         // Exponential backoff
-                        let delay = std::time::Duration::from_secs(2_u64.pow(retry_count.min(5)));
+                        let delay = std::time::Duration::from_secs(
+                            2_u64.pow(std::cmp::min(retry_count, 5)),
+                        );
                         tokio::time::sleep(delay).await;
                     }
                 }
@@ -244,7 +246,7 @@ impl NotifyManager {
         // pg_notify accepts bound text values, preserving the same channel
         // spelling PgListener subscribes to (including case and punctuation).
         match db
-            .execute(Statement::from_sql_and_values(
+            .execute_raw(Statement::from_sql_and_values(
                 db.get_database_backend(),
                 "SELECT pg_notify($1, $2)",
                 [channel_name.into(), message.into()],

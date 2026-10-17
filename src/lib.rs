@@ -9,6 +9,7 @@ mod control_plane;
 #[cfg(feature = "python")]
 mod core;
 pub mod database_url;
+mod dialect;
 mod dispatcher;
 pub mod entities;
 mod error;

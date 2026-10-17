@@ -3,13 +3,14 @@ use axum::{
     http::StatusCode,
     response::{Html, Response},
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
+use sea_orm::{ConnectionTrait, Statement, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::context::ScheduledEntry;
 use crate::control_plane::{models::RecurringTaskInfo, utils::clean_sql, ControlPlane};
+use crate::dialect::Dialect;
 use crate::error::QuebecError;
 use crate::notify::NotifyManager;
 use crate::scheduler::enqueue_job;
@@ -50,7 +51,7 @@ impl ControlPlane {
         ));
 
         let result = db
-            .query_all(Statement::from_sql_and_values(backend, &sql, []))
+            .query_all_raw(Statement::from_sql_and_values(backend, &sql, []))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -163,9 +164,9 @@ impl ControlPlane {
         let db = db.as_ref();
         let table_config = &state.ctx.table_config;
         let backend = db.get_database_backend();
-        let p1 = match backend {
-            DbBackend::Postgres => "$1",
-            DbBackend::MySql | DbBackend::Sqlite => "?",
+        let p1 = match Dialect::from(backend) {
+            Dialect::Postgres => "$1",
+            Dialect::MySql | Dialect::Sqlite => "?",
         };
         let key_col = crate::query_builder::quote_identifier(backend, "key");
 
@@ -175,7 +176,7 @@ impl ControlPlane {
         ));
 
         let row = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 &sql,
                 [Value::from(id)],
@@ -262,7 +263,7 @@ impl ControlPlane {
         ));
 
         let result = db
-            .query_all(Statement::from_sql_and_values(backend, &sql, []))
+            .query_all_raw(Statement::from_sql_and_values(backend, &sql, []))
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
