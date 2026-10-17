@@ -15,6 +15,7 @@ import socket
 import sys
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -120,6 +121,14 @@ def _status_description(status: _ExitStatus) -> str:
     if status.signaled:
         return f"signal={status.signal}"
     return "status=unknown"
+
+
+def _close_fds(*fds: int) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _write_oom_score_adj(pid: int, value: int) -> bool:
@@ -411,6 +420,12 @@ class Supervisor:
         self._wakeup_r, self._wakeup_w = os.pipe()
         os.set_blocking(self._wakeup_r, False)
         os.set_blocking(self._wakeup_w, False)
+        # Close the pipe when the supervisor is collected (a running one is
+        # pinned by its signal handlers, so in practice: one that never ran).
+        # Calling it closes the pipe early; either way it runs only once.
+        self._close_wakeup = weakref.finalize(
+            self, _close_fds, self._wakeup_r, self._wakeup_w
+        )
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
         self._maintenance_thread: Optional[threading.Thread] = None
@@ -985,8 +1000,7 @@ class Supervisor:
                 signal.signal(signal.SIGTERM, signal.SIG_DFL)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
                 signal.signal(signal.SIGQUIT, signal.SIG_DFL)
-                os.close(self._wakeup_r)
-                os.close(self._wakeup_w)
+                self._close_wakeup()
                 # Only the supervisor (main PID) talks to systemd; drop the
                 # socket so a child can never feed the watchdog or send status.
                 os.environ.pop("NOTIFY_SOCKET", None)

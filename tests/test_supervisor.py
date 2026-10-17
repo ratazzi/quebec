@@ -504,6 +504,48 @@ class TestSupervisorClassValidation:
         Supervisor(qc, {"worker": [None, None, None]})
 
 
+def _fd_is_open(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
+class TestSupervisorWakeupPipe:
+    def test_collected_supervisor_closes_its_wakeup_pipe(self, qc):
+        import gc
+
+        from quebec.supervisor import Supervisor
+
+        sup = Supervisor(qc, {"worker": 1})
+        fds = (sup._wakeup_r, sup._wakeup_w)
+        assert all(_fd_is_open(fd) for fd in fds)
+
+        del sup
+        gc.collect()
+
+        assert not any(_fd_is_open(fd) for fd in fds)
+
+    def test_closing_early_does_not_close_reused_fds_later(self, qc):
+        import gc
+
+        from quebec.supervisor import Supervisor
+
+        # The forked child closes the pipe itself; collecting the supervisor
+        # afterwards must not close whatever reused those fd numbers.
+        sup = Supervisor(qc, {"worker": 1})
+        sup._close_wakeup()
+        reused = os.pipe()
+        try:
+            del sup
+            gc.collect()
+            assert all(_fd_is_open(fd) for fd in reused)
+        finally:
+            for fd in reused:
+                os.close(fd)
+
+
 class TestSupervisorStatusText:
     def test_status_text_reports_quiet(self, qc):
         """The systemd STATUS line reflects quiet mode; stopping wins over it."""
