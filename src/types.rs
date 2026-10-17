@@ -550,6 +550,38 @@ fn resolve_scheduled_at(
 static INSTANCE_MAP: PyOnceLock<RwLock<HashMap<String, Py<PyQuebec>>>> = PyOnceLock::new();
 
 impl PyQuebec {
+    /// Drop the job-class registry and each class's `quebec` back-reference to
+    /// this instance. `register_job_class` makes the two point at each other,
+    /// and the registry half lives behind an `Arc`, invisible to Python's GC —
+    /// so without this the instance, and with it the tokio runtime's worker
+    /// threads and driver fds, is never freed.
+    fn release_job_classes(&self, py: Python<'_>) {
+        let runnables = std::mem::take(
+            &mut *self
+                .ctx
+                .runnables
+                .write()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        runnables
+            .into_values()
+            .map(|runnable| runnable.handler.into_bound(py))
+            .filter(|class| self.is_class_bound_here(class))
+            .for_each(|class| {
+                let _ = class.delattr("quebec");
+            });
+    }
+
+    /// Whether `class.quebec` is this instance (a clone sharing its context),
+    /// not one the class was re-registered with since.
+    fn is_class_bound_here(&self, class: &Bound<'_, PyAny>) -> bool {
+        class
+            .getattr("quebec")
+            .ok()
+            .and_then(|attr| attr.extract::<PyRef<'_, PyQuebec>>().ok())
+            .is_some_and(|other| Arc::ptr_eq(&other.ctx, &self.ctx))
+    }
+
     /// Run an async future on the runtime, handling the case where we're already
     /// inside the runtime (e.g. job calling perform_later from within perform).
     fn block_on<F, T>(&self, future: F) -> T
@@ -1855,6 +1887,7 @@ impl PyQuebec {
             });
             self.ctx.job_metrics.recorder().stop();
         });
+        self.release_job_classes(py);
         Ok(())
     }
 
@@ -2543,8 +2576,12 @@ impl PyQuebec {
             ));
         }
 
+        // Bind `cls.quebec` only once the class is in the registry: a rejected
+        // class would otherwise pin this instance with nothing for `close` to
+        // release.
+        self.worker
+            .register_job_class(py, job_class.clone_ref(py))?;
         job_class.setattr(py, "quebec", self.clone().into_pyobject(py)?)?;
-        self.worker.register_job_class(py, job_class)?;
         Ok(())
     }
 
