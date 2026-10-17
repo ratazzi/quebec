@@ -18,35 +18,33 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
+from .helpers import insert_returning_id
+
 
 def _insert_process(session, prefix: str, *, kind: str, pid: int, hostname: str) -> int:
     """Insert a processes row with an explicit pid/hostname; return its id."""
-    row_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_processes "
-            f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
-            f"VALUES (:kind, CURRENT_TIMESTAMP, :pid, :hostname, NULL, "
-            f"CURRENT_TIMESTAMP, :name)"
-            " RETURNING id"
-        ),
+    row_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_processes "
+        f"(kind, last_heartbeat_at, pid, hostname, metadata, created_at, name) "
+        f"VALUES (:kind, CURRENT_TIMESTAMP, :pid, :hostname, NULL, "
+        f"CURRENT_TIMESTAMP, :name)",
         {"kind": kind, "pid": pid, "hostname": hostname, "name": f"{kind}-{pid}"},
-    ).scalar_one()
+    )
     session.commit()
     return row_id
 
 
 def _insert_claimed(session, prefix: str, process_id: int) -> int:
     """Insert a minimal job + claimed_execution for a process_id; return job_id."""
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, active_job_id, "
-            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
-            f"VALUES ('default', 'TestJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
-            f"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-            " RETURNING id"
-        )
-    ).scalar_one()
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, active_job_id, "
+        f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+        f"VALUES ('default', 'TestJob', '[]', 0, 'ajid', NULL, NULL, NULL, "
+        f"CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "

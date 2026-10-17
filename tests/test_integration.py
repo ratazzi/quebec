@@ -10,6 +10,8 @@ import pytest
 import quebec
 from sqlalchemy import inspect, text
 
+from .helpers import create_database_engine
+
 
 def test_baseclass_inherit():
     type("SubClass1", (quebec.BaseClass,), {})
@@ -124,7 +126,7 @@ class TestConcurrency:
 
         # Check semaphore was created (key format: class_name/key)
         result = session.execute(
-            text(f"SELECT * FROM {prefix}_semaphores WHERE key LIKE :key"),
+            text(f'SELECT * FROM {prefix}_semaphores WHERE "key" LIKE :key'),
             {"key": "%/limited_resource"},
         )
         semaphore = result.fetchone()
@@ -186,11 +188,7 @@ class TestTablePrefix:
 
         # The tables should be named myapp_jobs, myapp_ready_executions, etc.
         # We can verify by trying to query them
-        from sqlalchemy import create_engine
-
-        sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-
-        engine = create_engine(sa_url)
+        engine = create_database_engine(db_url)
         with engine.connect() as conn:
             # This should work if tables exist
             tables = inspect(conn).get_table_names()
@@ -239,11 +237,7 @@ class TestTablePrefix:
         Job2.perform_later(qc2, "data2")
 
         # Verify isolation
-        from sqlalchemy import create_engine
-
-        sa_url = db_url.split("?")[0] if db_url.startswith("sqlite:") else db_url
-
-        engine = create_engine(sa_url)
+        engine = create_database_engine(db_url)
         with engine.connect() as conn:
             # app1 should have 1 job
             result = conn.execute(text("SELECT COUNT(*) FROM app1_jobs"))

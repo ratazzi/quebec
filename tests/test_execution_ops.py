@@ -232,7 +232,7 @@ def _insert_recurring_task(session, prefix, key: str, class_name: str) -> None:
     session.execute(
         text(
             f"INSERT INTO {prefix}_recurring_tasks "
-            f"(key, schedule, class_name, queue_name, priority, static, "
+            '("key", schedule, class_name, queue_name, priority, static, '
             f"arguments, created_at, updated_at) VALUES "
             f"(:key, :schedule, :class_name, :queue_name, :priority, :static, "
             f":arguments, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"

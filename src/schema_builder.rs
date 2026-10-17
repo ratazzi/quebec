@@ -12,7 +12,7 @@ use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 use crate::context::TableConfig;
 use crate::query_builder::index_name;
 
-// Time columns use `.date_time()`, never `.timestamp()`: on MySQL, TIMESTAMP
+// Time columns are DATETIME-family, never `.timestamp()`: on MySQL, TIMESTAMP
 // caps at 2038-01-19 and applies session time-zone conversion to the naive
 // UTC values we store, while Solid Queue's Rails schema uses DATETIME.
 // Postgres and SQLite render the same type either way.
@@ -20,6 +20,20 @@ use crate::query_builder::index_name;
 /// Helper to create a column alias
 fn col(name: &str) -> Alias {
     Alias::new(name)
+}
+
+/// Helper to create a time column.
+///
+/// MySQL's bare DATETIME rounds to whole seconds, so it gets DATETIME(6) --
+/// what Rails (and so Solid Queue's schema) creates. Postgres `timestamp` and
+/// SQLite text already keep microseconds.
+fn time_col(name: &str, backend: DbBackend) -> ColumnDef {
+    let mut def = ColumnDef::new(col(name));
+    match backend {
+        DbBackend::MySql => def.custom(Alias::new("datetime(6)")),
+        DbBackend::Postgres | DbBackend::Sqlite => def.date_time(),
+    };
+    def
 }
 
 /// Helper to create a table alias
@@ -48,7 +62,7 @@ where
 }
 
 /// Create the jobs table
-pub fn create_jobs_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_jobs_table(table_config: &TableConfig, backend: DbBackend) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.jobs))
         .if_not_exists()
@@ -68,17 +82,20 @@ pub fn create_jobs_table(table_config: &TableConfig) -> TableCreateStatement {
                 .default(0),
         )
         .col(ColumnDef::new(col("active_job_id")).string())
-        .col(ColumnDef::new(col("scheduled_at")).date_time())
-        .col(ColumnDef::new(col("finished_at")).date_time())
+        .col(time_col("scheduled_at", backend))
+        .col(time_col("finished_at", backend))
         .col(ColumnDef::new(col("concurrency_key")).string())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
-        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
+        .col(time_col("updated_at", backend).not_null())
         .col(ColumnDef::new(col("batch_id")).big_integer())
         .to_owned()
 }
 
 /// Create the batches table (Solid Queue >= 1.5 `solid_queue_batches`)
-pub fn create_batches_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_batches_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.batches))
         .if_not_exists()
@@ -112,17 +129,20 @@ pub fn create_batches_table(table_config: &TableConfig) -> TableCreateStatement 
                 .not_null()
                 .default(0),
         )
-        .col(ColumnDef::new(col("enqueued_at")).date_time())
-        .col(ColumnDef::new(col("finished_at")).date_time())
-        .col(ColumnDef::new(col("failed_at")).date_time())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
-        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .col(time_col("enqueued_at", backend))
+        .col(time_col("finished_at", backend))
+        .col(time_col("failed_at", backend))
+        .col(time_col("created_at", backend).not_null())
+        .col(time_col("updated_at", backend).not_null())
         .to_owned()
 }
 
 /// Create the batch_executions table: one row per outstanding attempt of a
 /// batched job. Its disappearance is what drives batch completion.
-pub fn create_batch_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_batch_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.batch_executions))
         .if_not_exists()
@@ -139,7 +159,7 @@ pub fn create_batch_executions_table(table_config: &TableConfig) -> TableCreateS
                 .unique_key(),
         )
         .col(ColumnDef::new(col("batch_id")).big_integer().not_null())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.batch_executions), col("batch_id"))
@@ -158,7 +178,10 @@ pub fn create_batch_executions_table(table_config: &TableConfig) -> TableCreateS
 }
 
 /// Create the ready_executions table
-pub fn create_ready_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_ready_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.ready_executions))
         .if_not_exists()
@@ -181,7 +204,7 @@ pub fn create_ready_executions_table(table_config: &TableConfig) -> TableCreateS
                 .not_null()
                 .default(0),
         )
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.ready_executions), col("job_id"))
@@ -193,7 +216,10 @@ pub fn create_ready_executions_table(table_config: &TableConfig) -> TableCreateS
 }
 
 /// Create the claimed_executions table
-pub fn create_claimed_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_claimed_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.claimed_executions))
         .if_not_exists()
@@ -210,7 +236,7 @@ pub fn create_claimed_executions_table(table_config: &TableConfig) -> TableCreat
                 .unique_key(),
         )
         .col(ColumnDef::new(col("process_id")).big_integer())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.claimed_executions), col("job_id"))
@@ -222,7 +248,10 @@ pub fn create_claimed_executions_table(table_config: &TableConfig) -> TableCreat
 }
 
 /// Create the blocked_executions table
-pub fn create_blocked_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_blocked_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.blocked_executions))
         .if_not_exists()
@@ -246,8 +275,8 @@ pub fn create_blocked_executions_table(table_config: &TableConfig) -> TableCreat
                 .default(0),
         )
         .col(ColumnDef::new(col("concurrency_key")).string().not_null())
-        .col(ColumnDef::new(col("expires_at")).date_time().not_null())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("expires_at", backend).not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.blocked_executions), col("job_id"))
@@ -259,7 +288,10 @@ pub fn create_blocked_executions_table(table_config: &TableConfig) -> TableCreat
 }
 
 /// Create the scheduled_executions table
-pub fn create_scheduled_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_scheduled_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.scheduled_executions))
         .if_not_exists()
@@ -282,8 +314,8 @@ pub fn create_scheduled_executions_table(table_config: &TableConfig) -> TableCre
                 .not_null()
                 .default(0),
         )
-        .col(ColumnDef::new(col("scheduled_at")).date_time().not_null())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("scheduled_at", backend).not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.scheduled_executions), col("job_id"))
@@ -295,7 +327,10 @@ pub fn create_scheduled_executions_table(table_config: &TableConfig) -> TableCre
 }
 
 /// Create the failed_executions table
-pub fn create_failed_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_failed_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.failed_executions))
         .if_not_exists()
@@ -312,7 +347,7 @@ pub fn create_failed_executions_table(table_config: &TableConfig) -> TableCreate
                 .unique_key(),
         )
         .col(ColumnDef::new(col("error")).text())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.failed_executions), col("job_id"))
@@ -324,7 +359,10 @@ pub fn create_failed_executions_table(table_config: &TableConfig) -> TableCreate
 }
 
 /// Create the recurring_executions table
-pub fn create_recurring_executions_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_recurring_executions_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.recurring_executions))
         .if_not_exists()
@@ -341,8 +379,8 @@ pub fn create_recurring_executions_table(table_config: &TableConfig) -> TableCre
                 .unique_key(),
         )
         .col(ColumnDef::new(col("task_key")).string().not_null())
-        .col(ColumnDef::new(col("run_at")).date_time().not_null())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("run_at", backend).not_null())
+        .col(time_col("created_at", backend).not_null())
         .foreign_key(
             ForeignKey::create()
                 .from(tbl(&table_config.recurring_executions), col("job_id"))
@@ -354,7 +392,10 @@ pub fn create_recurring_executions_table(table_config: &TableConfig) -> TableCre
 }
 
 /// Create the recurring_tasks table
-pub fn create_recurring_tasks_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_recurring_tasks_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.recurring_tasks))
         .if_not_exists()
@@ -378,13 +419,16 @@ pub fn create_recurring_tasks_table(table_config: &TableConfig) -> TableCreateSt
                 .default(false),
         )
         .col(ColumnDef::new(col("description")).text())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
-        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
+        .col(time_col("updated_at", backend).not_null())
         .to_owned()
 }
 
 /// Create the processes table
-pub fn create_processes_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_processes_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.processes))
         .if_not_exists()
@@ -395,22 +439,21 @@ pub fn create_processes_table(table_config: &TableConfig) -> TableCreateStatemen
                 .primary_key(),
         )
         .col(ColumnDef::new(col("kind")).string().not_null())
-        .col(
-            ColumnDef::new(col("last_heartbeat_at"))
-                .date_time()
-                .not_null(),
-        )
+        .col(time_col("last_heartbeat_at", backend).not_null())
         .col(ColumnDef::new(col("supervisor_id")).big_integer())
         .col(ColumnDef::new(col("pid")).integer().not_null())
         .col(ColumnDef::new(col("hostname")).string())
         .col(ColumnDef::new(col("metadata")).text())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .col(ColumnDef::new(col("name")).string().not_null())
         .to_owned()
 }
 
 /// Create the semaphores table
-pub fn create_semaphores_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_semaphores_table(
+    table_config: &TableConfig,
+    backend: DbBackend,
+) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.semaphores))
         .if_not_exists()
@@ -422,14 +465,14 @@ pub fn create_semaphores_table(table_config: &TableConfig) -> TableCreateStateme
         )
         .col(ColumnDef::new(col("key")).string().not_null().unique_key())
         .col(ColumnDef::new(col("value")).integer().not_null().default(0))
-        .col(ColumnDef::new(col("expires_at")).date_time().not_null())
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
-        .col(ColumnDef::new(col("updated_at")).date_time().not_null())
+        .col(time_col("expires_at", backend).not_null())
+        .col(time_col("created_at", backend).not_null())
+        .col(time_col("updated_at", backend).not_null())
         .to_owned()
 }
 
 /// Create the pauses table
-pub fn create_pauses_table(table_config: &TableConfig) -> TableCreateStatement {
+pub fn create_pauses_table(table_config: &TableConfig, backend: DbBackend) -> TableCreateStatement {
     Table::create()
         .table(tbl(&table_config.pauses))
         .if_not_exists()
@@ -445,7 +488,7 @@ pub fn create_pauses_table(table_config: &TableConfig) -> TableCreateStatement {
                 .not_null()
                 .unique_key(),
         )
-        .col(ColumnDef::new(col("created_at")).date_time().not_null())
+        .col(time_col("created_at", backend).not_null())
         .to_owned()
 }
 
@@ -454,22 +497,24 @@ pub async fn create_all_tables<C>(db: &C, table_config: &TableConfig) -> Result<
 where
     C: ConnectionTrait,
 {
+    let backend = db.get_database_backend();
+
     // First create tables without foreign key dependencies
-    execute_create_table(db, create_jobs_table(table_config)).await?;
-    execute_create_table(db, create_recurring_tasks_table(table_config)).await?;
-    execute_create_table(db, create_processes_table(table_config)).await?;
-    execute_create_table(db, create_semaphores_table(table_config)).await?;
-    execute_create_table(db, create_pauses_table(table_config)).await?;
-    execute_create_table(db, create_batches_table(table_config)).await?;
+    execute_create_table(db, create_jobs_table(table_config, backend)).await?;
+    execute_create_table(db, create_recurring_tasks_table(table_config, backend)).await?;
+    execute_create_table(db, create_processes_table(table_config, backend)).await?;
+    execute_create_table(db, create_semaphores_table(table_config, backend)).await?;
+    execute_create_table(db, create_pauses_table(table_config, backend)).await?;
+    execute_create_table(db, create_batches_table(table_config, backend)).await?;
 
     // Then create tables with foreign keys to jobs
-    execute_create_table(db, create_ready_executions_table(table_config)).await?;
-    execute_create_table(db, create_claimed_executions_table(table_config)).await?;
-    execute_create_table(db, create_blocked_executions_table(table_config)).await?;
-    execute_create_table(db, create_scheduled_executions_table(table_config)).await?;
-    execute_create_table(db, create_failed_executions_table(table_config)).await?;
-    execute_create_table(db, create_recurring_executions_table(table_config)).await?;
-    execute_create_table(db, create_batch_executions_table(table_config)).await?;
+    execute_create_table(db, create_ready_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_claimed_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_blocked_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_scheduled_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_failed_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_recurring_executions_table(table_config, backend)).await?;
+    execute_create_table(db, create_batch_executions_table(table_config, backend)).await?;
 
     Ok(())
 }
@@ -904,7 +949,7 @@ where
     let backend = db.get_database_backend();
     let stmt = Table::alter()
         .table(tbl(table))
-        .add_column(ColumnDef::new(col("paused_at")).date_time().null())
+        .add_column(time_col("paused_at", backend).null())
         .to_owned();
     let sql = match backend {
         DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),

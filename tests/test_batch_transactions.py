@@ -10,7 +10,7 @@ import quebec
 
 @pytest.fixture
 def transactional_qc(qc, db_url):
-    return qc, "postgres" if db_url.startswith("postgresql:") else "sqlite"
+    return qc, "sqlite" if db_url.startswith("sqlite:") else "server"
 
 
 class Work(quebec.BaseClass):
@@ -72,9 +72,9 @@ def test_nested_creation_rolls_back_with_outer_context(transactional_qc):
         qc.drain_one()
 
 
-def test_parallel_postgres_batch_contexts_are_isolated(transactional_qc):
+def test_parallel_server_batch_contexts_are_isolated(transactional_qc):
     qc, backend = transactional_qc
-    if backend != "postgres":
+    if backend == "sqlite":
         pytest.skip("SQLite intentionally serializes writers")
     qc.register_job(Work)
     barrier = threading.Barrier(2, timeout=3)

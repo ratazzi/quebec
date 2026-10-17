@@ -46,6 +46,14 @@ def test_dispatcher_recovers_after_heartbeat_error(db_url, test_prefix):
                 CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
                 FOR EACH ROW EXECUTE FUNCTION fail_heartbeat()
             """))
+        elif setup.dialect.name == "mysql":
+            setup.execute(text(f"""
+                CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes
+                FOR EACH ROW
+                IF UTC_TIMESTAMP(6) < '{fault_until:%Y-%m-%d %H:%M:%S.%f}' THEN
+                    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'transient heartbeat failure';
+                END IF
+            """))
         else:
             setup.execute(text(f"""
                 CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON {test_prefix}_processes

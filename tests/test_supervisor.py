@@ -28,6 +28,8 @@ from quebec.supervisor import (
     _decode_status,
 )
 
+from .helpers import insert_returning_id
+
 
 def _insert_claimed(session, prefix: str, process_id: int, job_class: str = "TestJob"):
     """Insert a minimal job + claimed_execution row for a given process_id.
@@ -35,17 +37,15 @@ def _insert_claimed(session, prefix: str, process_id: int, job_class: str = "Tes
     Returns the new job_id.
     """
     now_sql = "CURRENT_TIMESTAMP"
-    job_id = session.execute(
-        text(
-            f"INSERT INTO {prefix}_jobs "
-            f"(queue_name, class_name, arguments, priority, active_job_id, "
-            f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
-            f"VALUES ('default', :class_name, '[]', 0, 'ajid', NULL, NULL, NULL, "
-            f"{now_sql}, {now_sql})"
-            " RETURNING id"
-        ),
+    job_id = insert_returning_id(
+        session,
+        f"INSERT INTO {prefix}_jobs "
+        f"(queue_name, class_name, arguments, priority, active_job_id, "
+        f"scheduled_at, finished_at, concurrency_key, created_at, updated_at) "
+        f"VALUES ('default', :class_name, '[]', 0, 'ajid', NULL, NULL, NULL, "
+        f"{now_sql}, {now_sql})",
         {"class_name": job_class},
-    ).scalar_one()
+    )
     session.execute(
         text(
             f"INSERT INTO {prefix}_claimed_executions "

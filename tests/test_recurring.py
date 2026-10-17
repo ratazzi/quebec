@@ -64,7 +64,7 @@ test:
                 with engine.connect() as conn:
                     result = conn.execute(
                         text(
-                            f"SELECT * FROM {test_prefix}_recurring_tasks ORDER BY key"
+                            f'SELECT * FROM {test_prefix}_recurring_tasks ORDER BY "key"'
                         )
                     )
                     return [dict(row._mapping) for row in result.fetchall()]
@@ -141,7 +141,7 @@ test:
                 with engine.connect() as conn:
                     result = conn.execute(
                         text(
-                            f"SELECT * FROM {test_prefix}_recurring_tasks WHERE key = 'complex_job'"
+                            f"SELECT * FROM {test_prefix}_recurring_tasks WHERE \"key\" = 'complex_job'"
                         )
                     )
                     return result.fetchone()
@@ -222,7 +222,7 @@ test:
                 with engine.connect() as conn:
                     result = conn.execute(
                         text(
-                            f"SELECT key, class_name FROM {test_prefix}_recurring_tasks"
+                            f'SELECT "key", class_name FROM {test_prefix}_recurring_tasks'
                         )
                     )
                     return {row[0]: row[1] for row in result.fetchall()}

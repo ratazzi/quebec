@@ -331,6 +331,12 @@ def test_callback_around_hook_receives_database_error(env):
             CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions
             FOR EACH ROW EXECUTE FUNCTION reject_ready()
         """))
+    elif db.dialect.name == "mysql":
+        db.execute(text("""
+            CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions
+            FOR EACH ROW
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'injected callback write failure'
+        """))
     else:
         db.execute(text("""
             CREATE TRIGGER reject_ready BEFORE INSERT ON probe_ready_executions

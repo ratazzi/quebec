@@ -83,7 +83,7 @@ class RecurringDatabaseHookJob(quebec.BaseClass):
             result = connection.execute(
                 text(
                     f"UPDATE {type(self).task_table} "
-                    "SET description = :description WHERE key = :key"
+                    'SET description = :description WHERE "key" = :key'
                 ),
                 {"description": "written-by-after-hook", "key": type(self).task_key},
             )
@@ -99,7 +99,7 @@ def _seed_recurring_task(session, prefix: str, key: str, class_name: str) -> Non
     session.execute(
         text(
             f"INSERT INTO {prefix}_recurring_tasks "
-            "(key, schedule, class_name, arguments, queue_name, priority, "
+            '("key", schedule, class_name, arguments, queue_name, priority, '
             '"static", created_at, updated_at) '
             "VALUES (:key, :schedule, :class_name, :arguments, :queue_name, "
             ":priority, :static, :created_at, :updated_at)"
@@ -193,7 +193,7 @@ def test_recurring_enqueue_post_hook_runs_after_transaction_commits(
     assert qc.run_recurring_now(task_key) is True
 
     description = session.execute(
-        text(f"SELECT description FROM {prefix}_recurring_tasks WHERE key = :key"),
+        text(f'SELECT description FROM {prefix}_recurring_tasks WHERE "key" = :key'),
         {"key": task_key},
     ).scalar_one()
     assert description == "written-by-after-hook"

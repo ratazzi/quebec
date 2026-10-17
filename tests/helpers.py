@@ -22,11 +22,44 @@ def database_engine(db_url: str, *, readonly: bool = False):
         engine.dispose()
 
 
+def insert_returning_id(session, sql: str, params: dict | None = None) -> int:
+    """Run a single-row INSERT and return the new row's id on every backend.
+
+    MySQL has no ``INSERT ... RETURNING``, so it reads the driver's lastrowid.
+    """
+    if session.get_bind().dialect.name == "mysql":
+        return session.execute(text(sql), params).lastrowid
+    return session.execute(text(f"{sql} RETURNING id"), params).scalar_one()
+
+
+def drop_jobs_batch_id(session, prefix: str) -> None:
+    """Strip ``jobs.batch_id`` to mimic a schema that predates batches.
+
+    MySQL has no ``DROP INDEX IF EXISTS`` and drops a column's single-column
+    index together with the column, so the explicit index drop is skipped there.
+    """
+    if session.get_bind().dialect.name != "mysql":
+        session.execute(text(f"DROP INDEX IF EXISTS idx_{prefix}_jobs_batch_id"))
+    session.execute(text(f"ALTER TABLE {prefix}_jobs DROP COLUMN batch_id"))
+
+
 def create_database_engine(db_url: str, *, readonly: bool = False):
-    """Create an observer engine; the caller must dispose it after use."""
+    """Create an observer engine; the caller must dispose it after use.
+
+    MySQL URLs are pinned to PyMySQL (``mysql://`` would pick MySQLdb) and to
+    READ COMMITTED: the default REPEATABLE READ would pin a long-lived observer
+    session to its first snapshot and hide every later Quebec commit. ANSI_QUOTES
+    lets test SQL quote identifiers (``"key"``) the same way on every backend.
+    """
     if db_url.startswith("sqlite:"):
         path = db_url.removeprefix("sqlite:///").split("?", 1)[0]
         db_url = f"sqlite:///file:{path}?mode=ro&uri=true" if readonly else f"sqlite:///{path}"
+    if db_url.startswith("mysql://"):
+        return create_engine(
+            db_url.replace("mysql://", "mysql+pymysql://", 1),
+            isolation_level="READ COMMITTED",
+            connect_args={"init_command": "SET SESSION sql_mode = CONCAT(@@sql_mode, ',ANSI_QUOTES')"},
+        )
     return create_engine(db_url)
 
 # Python's ``sqlite3`` and Quebec's Rust sqlite are two independent SQLite

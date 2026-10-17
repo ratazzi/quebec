@@ -17,6 +17,8 @@ import quebec
 from quebec.context import current_batch_id
 from sqlalchemy import inspect, text
 
+from .helpers import drop_jobs_batch_id
+
 
 class Record(quebec.BaseClass):
     values: list = []
@@ -186,8 +188,7 @@ def test_schema_created_and_idempotent(env) -> None:
 
 def test_batch_id_added_to_legacy_jobs_table(env) -> None:
     session, prefix = env["session"], env["prefix"]
-    session.execute(text(f"DROP INDEX IF EXISTS idx_{prefix}_jobs_batch_id"))
-    session.execute(text(f"ALTER TABLE {prefix}_jobs DROP COLUMN batch_id"))
+    drop_jobs_batch_id(session, prefix)
     session.commit()
     assert env["qc"].create_tables() is True
     cols = {col["name"] for col in inspect(env["engine"]).get_columns(f"{prefix}_jobs")}
@@ -548,8 +549,7 @@ def test_batches_unavailable_on_legacy_schema(env) -> None:
     )
     session.execute(text(f"DROP TABLE {prefix}_batch_executions"))
     session.execute(text(f"DROP TABLE {prefix}_batches"))
-    session.execute(text(f"DROP INDEX IF EXISTS idx_{prefix}_jobs_batch_id"))
-    session.execute(text(f"ALTER TABLE {prefix}_jobs DROP COLUMN batch_id"))
+    drop_jobs_batch_id(session, prefix)
     session.commit()
 
     with pytest.raises(RuntimeError, match="batches schema is not installed"):
