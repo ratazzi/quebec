@@ -5047,7 +5047,7 @@ impl Worker {
         }
 
         *over_limit_count = (*over_limit_count).saturating_add(1);
-        let confirmations = self.ctx.worker_memory_recycle_confirmations.max(1);
+        let confirmations = std::cmp::max(self.ctx.worker_memory_recycle_confirmations, 1);
         if *over_limit_count < confirmations {
             debug!(
                 "Worker RSS {} MiB exceeds configured limit {} MiB ({}/{})",
@@ -5496,7 +5496,7 @@ impl Worker {
         }
 
         let remaining_slots = worker_threads - in_flight;
-        let batch_size = (available as u64).min(remaining_slots);
+        let batch_size = std::cmp::min(available as u64, remaining_slots);
         if batch_size == 0 {
             debug!(
                 "[{}] no remaining slots (available={}, in_flight={}, limit={})",

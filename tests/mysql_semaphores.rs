@@ -124,7 +124,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
     let tc = TableConfig::with_prefix(&prefix);
     let create = quebec::schema_builder::create_semaphores_table(&tc, DbBackend::MySql)
         .to_string(sea_orm::sea_query::MysqlQueryBuilder);
-    db.execute(Statement::from_string(DbBackend::MySql, create))
+    db.execute_raw(Statement::from_string(DbBackend::MySql, create))
         .await
         .unwrap();
 
@@ -146,7 +146,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
         .unwrap());
     // Force a changed expiry so MySQL reports an affected row even when the
     // release only renews an already-full semaphore (second UPDATE path).
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::MySql,
         format!(
             "UPDATE `{}` SET expires_at = '2020-01-01 00:00:00', updated_at = '2020-01-01 00:00:00'",
@@ -188,7 +188,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
         .sum();
     assert_eq!(consumed, 1, "rejected rate token must be compensated");
 
-    db.execute(Statement::from_string(
+    db.execute_raw(Statement::from_string(
         DbBackend::MySql,
         format!("DROP TABLE `{}`", tc.semaphores),
     ))
