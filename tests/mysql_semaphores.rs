@@ -6,6 +6,10 @@ use quebec::semaphore::{
 };
 use sea_orm::{ConnectionTrait, DbBackend, MockDatabase, MockExecResult, Statement, Value};
 
+fn no_rows() -> Vec<BTreeMap<&'static str, Value>> {
+    Vec::new()
+}
+
 fn executed(rows_affected: u64) -> MockExecResult {
     MockExecResult {
         last_insert_id: 0,
@@ -16,6 +20,7 @@ fn executed(rows_affected: u64) -> MockExecResult {
 #[tokio::test]
 async fn mysql_semaphore_statements_quote_key() {
     let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([no_rows()])
         .append_exec_results([
             MockExecResult {
                 last_insert_id: 1,
@@ -28,7 +33,8 @@ async fn mysql_semaphore_statements_quote_key() {
     let tc = TableConfig::default();
     let key = "customer's semaphore";
 
-    // Acquire in one statement, then exercise both release statements.
+    // Read the missing key, create it in one UPSERT, then exercise both
+    // release statements.
     assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
         .await
         .unwrap());
@@ -37,8 +43,8 @@ async fn mysql_semaphore_statements_quote_key() {
         .unwrap());
 
     let log = db.into_transaction_log();
-    assert_eq!(log.len(), 3);
-    let key_uses = ["(`key`,", "WHERE `key` =", "WHERE `key` ="];
+    assert_eq!(log.len(), 4);
+    let key_uses = ["WHERE `key` =", "(`key`,", "WHERE `key` =", "WHERE `key` ="];
     for (transaction, key_use) in log.iter().zip(key_uses) {
         for statement in transaction.statements() {
             assert!(statement.sql.contains(key_use), "{}", statement.sql);
@@ -46,16 +52,19 @@ async fn mysql_semaphore_statements_quote_key() {
             assert!(statement.values.as_ref().unwrap().0.contains(&key.into()));
         }
     }
-    assert!(log[0].statements()[0]
+    assert!(log[0].statements()[0].sql.starts_with("SELECT value"));
+    assert!(log[1].statements()[0]
         .sql
         .contains("ON DUPLICATE KEY UPDATE"));
-    assert!(log[0].statements()[0].sql.contains("value = IF("));
-    assert_eq!(log[0].statements()[0].values.as_ref().unwrap().0.len(), 7);
+    assert!(log[1].statements()[0].sql.contains("value = IF("));
+    assert_eq!(log[1].statements()[0].values.as_ref().unwrap().0.len(), 7);
 }
 
 #[tokio::test]
 async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
+    // The row appears between the read and the UPSERT (creation race).
     let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([no_rows()])
         .append_exec_results([MockExecResult {
             last_insert_id: 0,
             rows_affected: 1,
@@ -66,7 +75,41 @@ async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
             .await
             .unwrap()
     );
-    assert_eq!(db.into_transaction_log().len(), 1);
+    assert_eq!(db.into_transaction_log().len(), 2);
+}
+
+#[tokio::test]
+async fn full_semaphore_is_rejected_without_writing() {
+    let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([vec![BTreeMap::from([("value", Value::from(0_i32))])]])
+        .into_connection();
+    assert!(
+        !acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, None)
+            .await
+            .unwrap()
+    );
+    let log = db.into_transaction_log();
+    assert_eq!(log.len(), 1);
+    assert!(log[0].statements()[0].sql.starts_with("SELECT value"));
+}
+
+#[tokio::test]
+async fn open_semaphore_decrements_without_upsert() {
+    let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([vec![BTreeMap::from([("value", Value::from(1_i32))])]])
+        .append_exec_results([executed(1)])
+        .into_connection();
+    assert!(
+        acquire_semaphore(&db, &TableConfig::default(), "open".into(), 2, None)
+            .await
+            .unwrap()
+    );
+    let log = db.into_transaction_log();
+    assert_eq!(log.len(), 2);
+    let update = &log[1].statements()[0].sql;
+    assert!(update.starts_with("UPDATE"), "{update}");
+    assert!(update.contains("value > 0"), "{update}");
+    assert!(!update.contains("ON DUPLICATE KEY"), "{update}");
 }
 
 #[tokio::test]
