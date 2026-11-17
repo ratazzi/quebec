@@ -17,6 +17,28 @@ where
     let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2)); // Default to 2 minutes
     let key_col = quote_identifier(db.get_database_backend(), "key");
 
+    // Read before writing, like Solid Queue's `Semaphore::Proxy#wait`. A plain
+    // SELECT never waits on row locks, so a full semaphore is rejected without
+    // queuing behind the transaction that currently holds the row (a worker
+    // releasing a slot, another enqueue). Writing first does wait: Postgres
+    // `ON CONFLICT DO NOTHING` blocks until a concurrent updater of the
+    // conflicting row finishes, and the MySQL UPSERT always takes an exclusive
+    // lock. Only a missing key falls through to the creation path below.
+    //
+    // Like Solid Queue, the read can see a slot that a worker is freeing but
+    // has not committed yet. The job then goes to blocked while the worker
+    // finds no blocked job to promote. The dispatcher's concurrency
+    // maintenance releases it once the blocked row expires
+    // (`concurrency_duration`), as Solid Queue's `BlockedExecution.unblock`
+    // does.
+    match find_value(db, table_config, &key).await? {
+        Some(value) if value > 0 => {
+            return attempt_decrement(db, table_config, key, expires_at, now).await
+        }
+        Some(_) => return Ok(false),
+        None => {}
+    }
+
     if db.get_database_backend() == DatabaseBackend::MySql {
         // INSERT IGNORE takes a shared lock on an existing key. Concurrent
         // transactions then deadlock when both try to upgrade it in the
@@ -99,6 +121,47 @@ where
     // callers to wait for `expires_at` to elapse before the dispatcher's
     // delete_expired sweep cleared the row — turning concurrency_duration
     // into a minimum cooldown rather than a crash-safety TTL.
+    attempt_decrement(db, table_config, key, expires_at, now).await
+}
+
+/// Current value of the semaphore row for `key`, if it exists.
+async fn find_value<C>(db: &C, table_config: &TableConfig, key: &str) -> Result<Option<i32>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let key_col = quote_identifier(backend, "key");
+    let placeholder = if backend == DatabaseBackend::Postgres {
+        "$1"
+    } else {
+        "?"
+    };
+    let sql = format!(
+        "SELECT value FROM {} WHERE {key_col} = {placeholder}",
+        table_config.semaphores
+    );
+    db.query_one(Statement::from_sql_and_values(
+        backend,
+        sql,
+        vec![key.to_string().into()],
+    ))
+    .await?
+    .map(|row| row.try_get::<i32>("", "value"))
+    .transpose()
+}
+
+/// Take one slot from an existing semaphore row if one is free.
+async fn attempt_decrement<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: String,
+    expires_at: NaiveDateTime,
+    now: NaiveDateTime,
+) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let key_col = quote_identifier(db.get_database_backend(), "key");
     let decrement_sql = match db.get_database_backend() {
         DatabaseBackend::Postgres => {
             format!(

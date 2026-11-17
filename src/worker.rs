@@ -4746,17 +4746,22 @@ impl Worker {
             return Ok(());
         };
 
-        let (limit, duration) = Python::attach(|_py| {
-            ctx.get_runnable(&job.class_name)
-                .ok()
-                .map_or((1, None), |r| {
+        // Read plain fields without the GIL: the queue slot released above
+        // keeps its semaphore row locked until this transaction commits.
+        let (limit, duration) = ctx
+            .runnables
+            .read()
+            .ok()
+            .and_then(|runnables| {
+                runnables.get(&job.class_name).map(|r| {
                     (
                         r.concurrency_limit.unwrap_or(1),
                         r.concurrency_duration
                             .map(|s| chrono::Duration::seconds(s as i64)),
                     )
                 })
-        });
+            })
+            .unwrap_or((1, None));
 
         // Propagate database errors. Every caller runs this inside a
         // transaction; after a failed statement (e.g. a MySQL deadlock, which
@@ -4930,12 +4935,19 @@ impl Worker {
         };
 
         // Get concurrency_duration from the runnable (like Solid Queue's job.concurrency_duration)
-        let concurrency_duration = Python::attach(|_py| {
-            ctx.get_runnable(&job.class_name)
-                .ok()
-                .and_then(|r| r.concurrency_duration)
-                .map(|s| chrono::Duration::seconds(s as i64))
-        });
+        // Read without the GIL: the caller's release holds the semaphore row
+        // lock until commit, and waiting on busy Python threads here would
+        // stall every enqueue onto this key.
+        let concurrency_duration = ctx
+            .runnables
+            .read()
+            .ok()
+            .and_then(|runnables| {
+                runnables
+                    .get(&job.class_name)
+                    .and_then(|r| r.concurrency_duration)
+            })
+            .map(|s| chrono::Duration::seconds(s as i64));
 
         // A successful release in the same MySQL transaction already locked
         // an existing semaphore row. Re-acquire by UPDATE so this blocked-row

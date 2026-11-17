@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+import pytest
 import quebec
 from sqlalchemy import text
 
@@ -91,6 +92,45 @@ def test_first_job_goes_to_ready_second_goes_to_blocked(
     ConcurrentJob.perform_later(qc, 2)
 
     assert db_assert.count_jobs() == 2
+    assert db_assert.count_ready_executions() == 1
+    assert db_assert.count_blocked_executions() == 1
+
+
+def test_full_semaphore_enqueue_does_not_wait_on_row_lock(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """A full key must not queue behind a transaction holding its semaphore row.
+
+    Mirrors Solid Queue's read-before-write: while a worker is mid-release
+    (row updated, not committed), enqueueing onto a full key is a plain read
+    and goes straight to blocked instead of waiting for that commit.
+    """
+    if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
+        pytest.skip("SQLite serializes all writers")
+    qc = qc_with_sqlalchemy["qc"]
+    engine = qc_with_sqlalchemy["engine"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    key = engine.dialect.identifier_preparer.quote("key")
+
+    ConcurrentJob.calls = []
+    qc.register_job(ConcurrentJob)
+    ConcurrentJob.perform_later(qc, 1)
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    with engine.connect() as holder:
+        holder.execute(
+            text(
+                f"UPDATE {prefix}_semaphores SET updated_at = updated_at "
+                f"WHERE {key} = :key"
+            ),
+            {"key": "ConcurrentJob/exclusive-resource"},
+        )
+        try:
+            pool.submit(ConcurrentJob.perform_later, qc, 2).result(timeout=2)
+        finally:
+            holder.rollback()
+            pool.shutdown(wait=True)
+
     assert db_assert.count_ready_executions() == 1
     assert db_assert.count_blocked_executions() == 1
 
