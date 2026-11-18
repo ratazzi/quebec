@@ -1630,7 +1630,12 @@ impl Execution {
         override_arguments: Option<&str>,
     ) -> std::result::Result<(), DbErr> {
         let table_config = &ctx.table_config;
-        let arguments = override_arguments.unwrap_or(arguments);
+        // The retry is a new job: the slot record belongs to this attempt,
+        // and the retry records its own when it acquires one (in Solid Queue
+        // the retry is re-serialized by Active Job and carries no record).
+        let arguments =
+            crate::concurrency_lock::without_lock(override_arguments.unwrap_or(arguments));
+        let arguments = arguments.as_str();
 
         let new_job_id = query_builder::jobs::insert(
             txn,
@@ -2011,11 +2016,12 @@ impl Execution {
                         // Release semaphore and unblock next job if job has concurrency control
                         // This must happen AFTER job execution completes (ensure block in Solid Queue)
                         if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
-                            // Step 1: Release semaphore (increment value)
-                            let released = release_semaphore(
+                            // Step 1: Give the slot back to the semaphore it came from
+                            let released = crate::concurrency_lock::release(
                                 txn,
                                 &table_config,
-                                key.clone(),
+                                &job,
+                                key,
                                 concurrency_limit,
                                 concurrency_duration,
                             )
@@ -3101,10 +3107,11 @@ impl Worker {
                     // above MUST stay consistent with the semaphore state —
                     // a silently-failed release would re-create the very slot
                     // leak this code path was added to prevent.
-                    let released = crate::semaphore::release_semaphore(
+                    let released = crate::concurrency_lock::release(
                         txn,
                         table_config,
-                        key.to_string(),
+                        &job,
+                        key,
                         limit,
                         duration,
                     )
@@ -4767,7 +4774,7 @@ impl Worker {
         // transaction; after a failed statement (e.g. a MySQL deadlock, which
         // rolls the transaction back) the caller must not report success, or
         // emergency cleanup skips its delete-only fallback and the claim stays.
-        if release_semaphore(db, table_config, key.clone(), limit, duration).await? {
+        if crate::concurrency_lock::release(db, table_config, &job, key, limit, duration).await? {
             Worker::release_next_blocked_job(ctx, db, key, limit, false).await?;
         }
 
@@ -4840,6 +4847,8 @@ impl Worker {
             return Ok(true);
         };
         let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        // Queue slots are taken and given back by key: they are not a job's
+        // concurrency slot and have no record on the job.
         crate::semaphore::acquire_semaphore(
             db,
             table_config,
@@ -4848,6 +4857,7 @@ impl Worker {
             duration,
         )
         .await
+        .map(|semaphore_id| semaphore_id.is_some())
     }
 
     /// EXPERIMENTAL: release the `queue:<name>` semaphore. No-op when the
@@ -4967,7 +4977,7 @@ impl Worker {
             .await?
         };
 
-        if !acquired {
+        let Some(semaphore_id) = acquired else {
             // Semaphore not available (shouldn't happen normally since we just released one)
             trace!(
                 "Could not acquire semaphore for blocked job {} (key: {})",
@@ -4975,7 +4985,9 @@ impl Worker {
                 concurrency_key
             );
             return Ok(false);
-        }
+        };
+        crate::concurrency_lock::record(db, table_config, &job, semaphore_id, concurrency_limit)
+            .await?;
 
         // Move to ready_executions
         query_builder::ready_executions::insert(
