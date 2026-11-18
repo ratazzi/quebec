@@ -12,6 +12,7 @@ use crate::control_plane::{
     models::{BlockedJobInfo, FilterOptions, Pagination},
     ControlPlane,
 };
+use crate::dispatcher::UnblockOutcome;
 use crate::query_builder;
 
 impl ControlPlane {
@@ -179,32 +180,32 @@ impl ControlPlane {
             }
         };
         let db = db.as_ref();
-        let table_config = state.ctx.table_config.clone();
         let redirect = state.referer_or(&headers, "/blocked-jobs");
 
-        match db
-            .transaction::<_, (), DbErr>(|txn| {
-                let table_config = table_config.clone();
-                Box::pin(async move {
-                    let _blocked_execution =
-                        query_builder::blocked_executions::find_by_id(txn, &table_config, id)
-                            .await?
-                            .ok_or_else(|| {
-                                DbErr::Custom(format!("Blocked execution with ID {id} not found"))
-                            })?;
-
-                    query_builder::blocked_executions::delete_by_id(txn, &table_config, id).await?;
-                    Ok(())
-                })
-            })
-            .await
+        // Solid Queue's BlockedExecution#release: promote only after acquiring
+        // the concurrency semaphore. Without a free slot the job stays blocked
+        // and is released once a slot frees up.
+        match crate::dispatcher::release_blocked_by(
+            &state.ctx,
+            db,
+            query_builder::blocked_executions::BlockedLookup::Id,
+            id,
+        )
+        .await
         {
-            Ok(_) => {
-                info!("Unblocked job ID: {}", id);
+            Ok(UnblockOutcome::Released) => {
+                info!("Unblocked blocked execution ID: {}", id);
                 Self::redirect_back(&redirect)
             }
-            Err(e) if e.to_string().contains("not found") => {
-                info!("Blocked job {} already gone: {}", id, e);
+            Ok(UnblockOutcome::StillBlocked) => {
+                info!(
+                    "Blocked execution {} stays blocked: no free concurrency slot",
+                    id
+                );
+                Self::redirect_back(&redirect)
+            }
+            Ok(UnblockOutcome::NotFound) => {
+                info!("Blocked job {} already gone", id);
                 Self::not_found_response()
             }
             Err(e) => {
@@ -285,31 +286,20 @@ impl ControlPlane {
             }
         };
         let db = db.as_ref();
-        let table_config = state.ctx.table_config.clone();
         let redirect = state.referer_without_page_or(&headers, "/blocked-jobs");
         let class_name = pagination.class_name.clone();
         let queue_name = pagination.queue_name.clone();
 
-        match db
-            .transaction::<_, u64, DbErr>(|txn| {
-                let table_config = table_config.clone();
-                let class_name = class_name.clone();
-                let queue_name = queue_name.clone();
-                Box::pin(async move {
-                    let count = query_builder::blocked_executions::delete_all(
-                        txn,
-                        &table_config,
-                        class_name.as_deref(),
-                        queue_name.as_deref(),
-                    )
-                    .await?;
-                    Ok(count)
-                })
-            })
-            .await
+        match crate::dispatcher::release_blocked_matching(
+            &state.ctx,
+            db,
+            class_name.as_deref(),
+            queue_name.as_deref(),
+        )
+        .await
         {
             Ok(count) => {
-                info!("Unblocked all {} blocked jobs", count);
+                info!("Unblocked {} blocked jobs", count);
                 Self::redirect_back(&redirect)
             }
             Err(e) => {
