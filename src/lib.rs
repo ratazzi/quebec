@@ -2,6 +2,7 @@
 mod batch;
 #[cfg(feature = "python")]
 mod batch_transaction;
+mod concurrency_lock;
 mod config;
 pub mod context;
 pub mod continuation;

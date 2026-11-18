@@ -10,6 +10,10 @@ fn no_rows() -> Vec<BTreeMap<&'static str, Value>> {
     Vec::new()
 }
 
+fn id_row(id: i64) -> Vec<BTreeMap<&'static str, Value>> {
+    vec![BTreeMap::from([("id", Value::from(id))])]
+}
+
 fn executed(rows_affected: u64) -> MockExecResult {
     MockExecResult {
         last_insert_id: 0,
@@ -20,7 +24,7 @@ fn executed(rows_affected: u64) -> MockExecResult {
 #[tokio::test]
 async fn mysql_semaphore_statements_quote_key() {
     let db = MockDatabase::new(DbBackend::MySql)
-        .append_query_results([no_rows()])
+        .append_query_results([no_rows(), id_row(1)])
         .append_exec_results([
             MockExecResult {
                 last_insert_id: 1,
@@ -33,18 +37,27 @@ async fn mysql_semaphore_statements_quote_key() {
     let tc = TableConfig::default();
     let key = "customer's semaphore";
 
-    // Read the missing key, create it in one UPSERT, then exercise both
-    // release statements.
-    assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
-        .await
-        .unwrap());
+    // Read the missing key, create it in one UPSERT, read back the id of the
+    // semaphore taken, then exercise both release statements.
+    assert_eq!(
+        acquire_semaphore(&db, &tc, key.into(), 2, None)
+            .await
+            .unwrap(),
+        Some(1)
+    );
     assert!(release_semaphore(&db, &tc, key.into(), 2, None)
         .await
         .unwrap());
 
     let log = db.into_transaction_log();
-    assert_eq!(log.len(), 4);
-    let key_uses = ["WHERE `key` =", "(`key`,", "WHERE `key` =", "WHERE `key` ="];
+    assert_eq!(log.len(), 5);
+    let key_uses = [
+        "WHERE `key` =",
+        "(`key`,",
+        "WHERE `key` =",
+        "WHERE `key` =",
+        "WHERE `key` =",
+    ];
     for (transaction, key_use) in log.iter().zip(key_uses) {
         for statement in transaction.statements() {
             assert!(statement.sql.contains(key_use), "{}", statement.sql);
@@ -58,6 +71,9 @@ async fn mysql_semaphore_statements_quote_key() {
         .contains("ON DUPLICATE KEY UPDATE"));
     assert!(log[1].statements()[0].sql.contains("value = IF("));
     assert_eq!(log[1].statements()[0].values.as_ref().unwrap().0.len(), 7);
+    // A locking read, so MySQL's snapshot cannot hand back a deleted semaphore.
+    assert!(log[2].statements()[0].sql.starts_with("SELECT id"));
+    assert!(log[2].statements()[0].sql.ends_with("FOR UPDATE"));
 }
 
 #[tokio::test]
@@ -71,9 +87,10 @@ async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
         }])
         .into_connection();
     assert!(
-        !acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 1, None)
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 1, None)
             .await
             .unwrap()
+            .is_none()
     );
     assert_eq!(db.into_transaction_log().len(), 2);
 }
@@ -84,9 +101,10 @@ async fn full_semaphore_is_rejected_without_writing() {
         .append_query_results([vec![BTreeMap::from([("value", Value::from(0_i32))])]])
         .into_connection();
     assert!(
-        !acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, None)
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, None)
             .await
             .unwrap()
+            .is_none()
     );
     let log = db.into_transaction_log();
     assert_eq!(log.len(), 1);
@@ -96,16 +114,20 @@ async fn full_semaphore_is_rejected_without_writing() {
 #[tokio::test]
 async fn open_semaphore_decrements_without_upsert() {
     let db = MockDatabase::new(DbBackend::MySql)
-        .append_query_results([vec![BTreeMap::from([("value", Value::from(1_i32))])]])
+        .append_query_results([
+            vec![BTreeMap::from([("value", Value::from(1_i32))])],
+            id_row(9),
+        ])
         .append_exec_results([executed(1)])
         .into_connection();
-    assert!(
+    assert_eq!(
         acquire_semaphore(&db, &TableConfig::default(), "open".into(), 2, None)
             .await
-            .unwrap()
+            .unwrap(),
+        Some(9)
     );
     let log = db.into_transaction_log();
-    assert_eq!(log.len(), 2);
+    assert_eq!(log.len(), 3);
     let update = &log[1].statements()[0].sql;
     assert!(update.starts_with("UPDATE"), "{update}");
     assert!(update.contains("value > 0"), "{update}");
@@ -174,13 +196,16 @@ async fn mysql_live_semaphore_and_rate_limit() {
     let key = "customer's semaphore";
     assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
         .await
-        .unwrap());
+        .unwrap()
+        .is_some());
     assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
         .await
-        .unwrap());
-    assert!(!acquire_semaphore(&db, &tc, key.into(), 2, None)
+        .unwrap()
+        .is_some());
+    assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
         .await
-        .unwrap());
+        .unwrap()
+        .is_none());
     assert!(release_semaphore(&db, &tc, key.into(), 2, None)
         .await
         .unwrap());

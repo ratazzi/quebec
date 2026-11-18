@@ -355,16 +355,17 @@ async fn route_job(
 
     // Handle concurrency control if configured
     if !concurrency_key.is_empty() {
+        let limit = job.concurrency_limit.unwrap_or(1);
         let acquired = acquire_semaphore(
             txn,
             table_config,
             concurrency_key.to_string(),
-            job.concurrency_limit.unwrap_or(1),
+            limit,
             job.concurrency_duration,
         )
         .await?;
 
-        if !acquired {
+        let Some(semaphore_id) = acquired else {
             return handle_concurrency_conflict(
                 txn,
                 ctx,
@@ -374,7 +375,8 @@ async fn route_job(
                 job.concurrency_duration.unwrap_or(concurrency_duration),
             )
             .await;
-        }
+        };
+        crate::concurrency_lock::record(txn, table_config, job_model, semaphore_id, limit).await?;
         info!(job_id, concurrency_key, "Semaphore acquired");
     }
 

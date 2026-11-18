@@ -949,15 +949,18 @@ mod semaphore {
 
         assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
 
         // Third acquire should fail (limit reached)
-        assert!(!acquire_semaphore(&db, &tc, key.to_string(), limit, None)
+        assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
 
         // Test ConcurrencyConstraint
         let constraint = ConcurrencyConstraint {
@@ -969,10 +972,12 @@ mod semaphore {
 
         assert!(acquire_semaphore_with_constraint(&db, &tc, &constraint)
             .await
-            .unwrap());
-        assert!(!acquire_semaphore_with_constraint(&db, &tc, &constraint)
+            .unwrap()
+            .is_some());
+        assert!(acquire_semaphore_with_constraint(&db, &tc, &constraint)
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -984,7 +989,8 @@ mod semaphore {
 
         assert!(acquire_semaphore(&db, &tc, key.to_string(), 1, duration)
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
 
         let sem = quebec_semaphores::Entity::find()
             .filter(quebec_semaphores::Column::Key.eq(key))
