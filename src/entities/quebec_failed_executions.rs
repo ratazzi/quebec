@@ -402,13 +402,16 @@ impl Retryable for Entity {
         }
 
         let taken = take_all_failed(txn, table_config, &failed_executions).await?;
-        let jobs = query_builder::jobs::find_by_ids(txn, table_config, taken).await?;
+        let mut jobs = query_builder::jobs::find_by_ids(txn, table_config, taken).await?;
 
         // Route each retried job through the concurrency check so the
         // declared limit is enforced even on bulk retry (matches Solid
         // Queue's `FailedExecution.retry_all` → `dispatch_jobs` →
-        // `Job.dispatch_all` partition between with/without
-        // concurrency-limit groups).
+        // `Job.dispatch_all`). Each holds its semaphore row until commit, so
+        // go by concurrency key, then id, as `dispatch_all_one_by_one` does.
+        jobs.sort_by(|a, b| {
+            (a.concurrency_key.as_deref(), a.id).cmp(&(b.concurrency_key.as_deref(), b.id))
+        });
         for job in &jobs {
             route_retried_job(txn, table_config, ctx, job).await?;
         }
