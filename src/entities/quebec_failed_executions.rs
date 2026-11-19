@@ -102,7 +102,8 @@ async fn route_retried_job(
     )
     .await?;
 
-    if acquired {
+    if let Some(semaphore_id) = acquired {
+        crate::concurrency_lock::record(txn, table_config, job, semaphore_id, limit).await?;
         query_builder::ready_executions::insert(
             txn,
             table_config,

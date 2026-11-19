@@ -4,13 +4,19 @@ use crate::query_builder::quote_identifier;
 use chrono::NaiveDateTime;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
+/// Take a slot on the semaphore for `key`, Solid Queue's `Semaphore.wait`.
+///
+/// Returns the id of the semaphore the slot was taken from, or `None` when no
+/// slot is free. Callers acquiring a job's concurrency slot record that id
+/// (see [`crate::concurrency_lock`]) so the job later gives the slot back to
+/// this very semaphore, not to whichever one holds the key by then.
 pub async fn acquire_semaphore<C>(
     db: &C,
     table_config: &TableConfig,
     key: String,
     concurrency_limit: i32,
     duration: Option<chrono::Duration>,
-) -> Result<bool, DbErr>
+) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -34,9 +40,11 @@ where
     // does.
     match find_value(db, table_config, &key).await? {
         Some(value) if value > 0 => {
-            return attempt_decrement(db, table_config, key, expires_at, now).await
+            let acquired =
+                attempt_decrement(db, table_config, key.clone(), expires_at, now).await?;
+            return id_if_acquired(acquired, db, table_config, &key).await;
         }
-        Some(_) => return Ok(false),
+        Some(_) => return Ok(None),
         None => {}
     }
 
@@ -59,7 +67,7 @@ where
                 DatabaseBackend::MySql,
                 sql,
                 vec![
-                    key.into(),
+                    key.clone().into(),
                     (concurrency_limit - 1).into(),
                     expires_at.into(),
                     now.into(),
@@ -72,7 +80,7 @@ where
         // SQLx enables CLIENT_FOUND_ROWS, so a no-op duplicate reports one
         // affected row just like an INSERT. With this table's auto-increment
         // ID, MySQL returns zero insert ID only for the unchanged full row.
-        return Ok(result.last_insert_id() != 0);
+        return id_if_acquired(result.last_insert_id() != 0, db, table_config, &key).await;
     }
 
     // First, try to create a new semaphore (attempt_creation)
@@ -111,7 +119,7 @@ where
 
     if create_result.rows_affected() > 0 {
         // Successfully created semaphore, we got it!
-        return Ok(true);
+        return acquired_semaphore_id(db, table_config, &key).await;
     }
 
     // Semaphore already exists, try to decrement if value > 0. The `WHERE
@@ -122,7 +130,60 @@ where
     // callers to wait for `expires_at` to elapse before the dispatcher's
     // delete_expired sweep cleared the row — turning concurrency_duration
     // into a minimum cooldown rather than a crash-safety TTL.
-    attempt_decrement(db, table_config, key, expires_at, now).await
+    let acquired = attempt_decrement(db, table_config, key.clone(), expires_at, now).await?;
+    id_if_acquired(acquired, db, table_config, &key).await
+}
+
+async fn id_if_acquired<C>(
+    acquired: bool,
+    db: &C,
+    table_config: &TableConfig,
+    key: &str,
+) -> Result<Option<i64>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if acquired {
+        acquired_semaphore_id(db, table_config, key).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Id of the semaphore for `key` that this transaction just took a slot on.
+///
+/// A locking read, like Solid Queue's `acquired_semaphore_id`: on MySQL with
+/// REPEATABLE READ a plain read uses the transaction's snapshot, which can
+/// still show a semaphore that expired and was deleted after the snapshot was
+/// taken, instead of the one just created. `FOR UPDATE` reads the latest
+/// committed row, and the row is already locked by our own write. SQLite has
+/// no row locks and no stale snapshot inside its write transaction.
+async fn acquired_semaphore_id<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: &str,
+) -> Result<Option<i64>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let key_col = quote_identifier(backend, "key");
+    let table = &table_config.semaphores;
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
+            format!("SELECT id FROM {table} WHERE {key_col} = $1 FOR UPDATE")
+        }
+        Dialect::MySql => format!("SELECT id FROM {table} WHERE {key_col} = ? FOR UPDATE"),
+        Dialect::Sqlite => format!("SELECT id FROM {table} WHERE {key_col} = ?"),
+    };
+    db.query_one_raw(Statement::from_sql_and_values(
+        backend,
+        sql,
+        vec![key.to_string().into()],
+    ))
+    .await?
+    .map(|row| row.try_get::<i64>("", "id"))
+    .transpose()
 }
 
 /// Current value of the semaphore row for `key`, if it exists.
@@ -227,7 +288,7 @@ pub async fn reacquire_released_semaphore<C>(
     table_config: &TableConfig,
     key: &str,
     duration: Option<chrono::Duration>,
-) -> Result<bool, DbErr>
+) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -251,7 +312,7 @@ where
             vec![expires_at.into(), now.into(), key.to_string().into()],
         ))
         .await?;
-    Ok(result.rows_affected() > 0)
+    id_if_acquired(result.rows_affected() > 0, db, table_config, key).await
 }
 
 /// Convenience function to acquire semaphore using ConcurrencyConstraint
@@ -259,7 +320,7 @@ pub async fn acquire_semaphore_with_constraint<C>(
     db: &C,
     table_config: &TableConfig,
     constraint: &ConcurrencyConstraint,
-) -> Result<bool, DbErr>
+) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -405,6 +466,67 @@ where
         .await?;
 
     Ok(update_result.rows_affected() > 0)
+}
+
+/// Give a slot back to the semaphore with this `id`, the one the job took it
+/// from: Solid Queue's `attempt_increment` on `semaphore_to_release`.
+///
+/// If that semaphore expired and was deleted, a semaphore now holding the same
+/// key belongs to other jobs, so nothing is given back and this returns false.
+/// Otherwise behaves like [`release_semaphore`].
+pub async fn release_semaphore_by_id<C>(
+    db: &C,
+    table_config: &TableConfig,
+    id: i64,
+    limit: i32,
+    duration: Option<chrono::Duration>,
+) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let now = chrono::Utc::now().naive_utc();
+    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let table = &table_config.semaphores;
+    let (increment_sql, touch_sql) = match Dialect::from(backend) {
+        Dialect::Postgres => (
+            format!(
+                "UPDATE {table} SET value = value + 1, expires_at = $1, updated_at = $2 \
+                 WHERE id = $3 AND value < $4"
+            ),
+            format!("UPDATE {table} SET expires_at = $1, updated_at = $2 WHERE id = $3"),
+        ),
+        Dialect::Sqlite | Dialect::MySql => (
+            format!(
+                "UPDATE {table} SET value = value + 1, expires_at = ?, updated_at = ? \
+                 WHERE id = ? AND value < ?"
+            ),
+            format!("UPDATE {table} SET expires_at = ?, updated_at = ? WHERE id = ?"),
+        ),
+    };
+
+    let incremented = db
+        .execute_raw(Statement::from_sql_and_values(
+            backend,
+            increment_sql,
+            vec![expires_at.into(), now.into(), id.into(), limit.into()],
+        ))
+        .await?
+        .rows_affected();
+    if incremented > 0 {
+        return Ok(true);
+    }
+
+    // Already at the limit: keep the row alive, as release_semaphore does.
+    let touched = db
+        .execute_raw(Statement::from_sql_and_values(
+            backend,
+            touch_sql,
+            vec![expires_at.into(), now.into(), id.into()],
+        ))
+        .await?
+        .rows_affected();
+    Ok(touched > 0)
 }
 
 // ──────────────────────────────────────────────────────────────────────

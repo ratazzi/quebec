@@ -301,7 +301,15 @@ impl Dispatcher {
                         )
                         .await?;
 
-                        if acquired {
+                        if let Some(semaphore_id) = acquired {
+                            crate::concurrency_lock::record(
+                                txn,
+                                &ctx.table_config,
+                                &job,
+                                semaphore_id,
+                                limit,
+                            )
+                            .await?;
                             ready_data.push((
                                 job.id,
                                 &job.queue_name,
@@ -496,38 +504,33 @@ fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
     }
 }
 
-/// Concurrency limit and duration for `job_id`'s class, from the registered
+/// Concurrency limit and duration for `job`'s class, from the registered
 /// runnable (Solid Queue's `job.concurrency_limit` / `concurrency_duration`).
 /// Falls back to `(1, None)` when the class is not registered in this process.
-async fn concurrency_settings<C>(
+fn concurrency_settings(
     ctx: &AppContext,
-    db: &C,
-    job_id: i64,
-) -> Result<(i32, Option<chrono::Duration>), DbErr>
-where
-    C: ConnectionTrait,
-{
+    job: &crate::entities::quebec_jobs::Model,
+) -> (i32, Option<chrono::Duration>) {
     #[cfg(feature = "python")]
     {
-        let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id).await?;
-        Ok(job
-            .and_then(|job| {
-                ctx.runnables.read().ok().and_then(|runnables| {
-                    runnables.get(&job.class_name).map(|r| {
-                        (
-                            r.concurrency_limit.unwrap_or(1),
-                            r.concurrency_duration
-                                .map(|s| chrono::Duration::seconds(s as i64)),
-                        )
-                    })
+        ctx.runnables
+            .read()
+            .ok()
+            .and_then(|runnables| {
+                runnables.get(&job.class_name).map(|r| {
+                    (
+                        r.concurrency_limit.unwrap_or(1),
+                        r.concurrency_duration
+                            .map(|s| chrono::Duration::seconds(s as i64)),
+                    )
                 })
             })
-            .unwrap_or((1, None)))
+            .unwrap_or((1, None))
     }
     #[cfg(not(feature = "python"))]
     {
-        let _ = (ctx, db, job_id);
-        Ok((1, None))
+        let _ = (ctx, job);
+        (1, None)
     }
 }
 
@@ -546,13 +549,19 @@ pub(crate) async fn release_blocked_execution<C>(
 where
     C: ConnectionTrait,
 {
+    let Some(job) =
+        query_builder::jobs::find_by_id(db, &ctx.table_config, execution.job_id).await?
+    else {
+        // The FK cascade removes blocked rows with their job, so this is a
+        // row deleted under us; nothing to release.
+        return Ok(false);
+    };
     // Semaphore.wait(job) sets the TTL from job.concurrency_duration; pass it
     // through instead of falling back to acquire_semaphore's default TTL.
-    let (concurrency_limit, concurrency_duration) =
-        concurrency_settings(ctx, db, execution.job_id).await?;
+    let (concurrency_limit, concurrency_duration) = concurrency_settings(ctx, &job);
     let key = execution.concurrency_key.clone();
 
-    if !acquire_semaphore(
+    let Some(semaphore_id) = acquire_semaphore(
         db,
         &ctx.table_config,
         key.clone(),
@@ -560,10 +569,12 @@ where
         concurrency_duration,
     )
     .await?
-    {
+    else {
         trace!("Failed to acquire semaphore for key: {key} (no available slots)");
         return Ok(false);
-    }
+    };
+    crate::concurrency_lock::record(db, &ctx.table_config, &job, semaphore_id, concurrency_limit)
+        .await?;
 
     query_builder::ready_executions::insert(
         db,

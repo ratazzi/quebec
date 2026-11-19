@@ -396,9 +396,18 @@ where
 
                 let blocked_by = if let Some(constraint) = &constraint {
                     use crate::semaphore::acquire_semaphore_with_constraint;
-                    if acquire_semaphore_with_constraint(txn, &txn_ctx.table_config, constraint)
-                        .await?
+                    if let Some(semaphore_id) =
+                        acquire_semaphore_with_constraint(txn, &txn_ctx.table_config, constraint)
+                            .await?
                     {
+                        crate::concurrency_lock::record(
+                            txn,
+                            &txn_ctx.table_config,
+                            &job,
+                            semaphore_id,
+                            constraint.limit,
+                        )
+                        .await?;
                         info!("Scheduler: Semaphore acquired for key: {}", constraint.key);
                         None
                     } else {
