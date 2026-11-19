@@ -4415,52 +4415,21 @@ impl Worker {
 
         let mut released = 0usize;
         for execution in claimed {
-            let table_config = table_config.clone();
             let ctx = self.ctx.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
 
             let result = db
-                .transaction::<_, (), DbErr>(|txn| {
+                .transaction::<_, bool, DbErr>(|txn| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
-                        if let Some(job) =
-                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                        {
-                            // Bypass class-level concurrency limits: the job
-                            // already holds the class-level semaphore slot from
-                            // when it was dispatched. Put it back to ready
-                            // directly so the dispatcher can re-claim it
-                            // without re-acquiring. Matches Solid Queue's
-                            // `dispatch_bypassing_concurrency_limits`.
-                            query_builder::ready_executions::insert(
-                                txn,
-                                &table_config,
-                                job.id,
-                                &job.queue_name,
-                                job.priority,
-                            )
-                            .await?;
-                            // EXPERIMENTAL queue-level slot was acquired at
-                            // claim time and must be released here — the next
-                            // worker that re-claims this job will re-acquire.
-                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                                .await?;
-                        } else {
-                            warn!(
-                                "Job {} not found, dropping claimed execution {}",
-                                job_id, execution_id
-                            );
-                        }
-
-                        query_builder::claimed_executions::delete_by_id(
-                            txn,
-                            &table_config,
-                            execution_id,
-                        )
-                        .await?;
-
-                        Ok(())
+                        // Bypass class-level concurrency limits: the job
+                        // already holds the class-level semaphore slot from
+                        // when it was dispatched. Put it back to ready
+                        // directly so the dispatcher can re-claim it without
+                        // re-acquiring. Matches Solid Queue's
+                        // `dispatch_bypassing_concurrency_limits`.
+                        Worker::requeue_claimed(&ctx, txn, job_id, execution_id).await
                     })
                 })
                 .await;
@@ -4471,16 +4440,18 @@ impl Worker {
             // whereas aborting would orphan every still-claimed row once
             // `on_stop` deletes this process's row.
             match result {
-                Ok(()) => {
-                    released += 1;
-                    // Claim requeued + row deleted: drop the ledger entry so
+                Ok(requeued) => {
+                    if requeued {
+                        released += 1;
+                        debug!("Released job {} back to ready state", job_id);
+                    }
+                    // Claim gone (requeued or finalized elsewhere): drop the ledger entry so
                     // close()/test-hook paths don't leak (the real
                     // graceful_shutdown exits the process, but those paths
                     // keep running). Also CAS-clear exclusive ownership in case
                     // the released row was an unowned exclusive sieve leftover.
                     self.ctx.ledger_remove(execution_id);
                     self.ctx.clear_exclusive_owner_if(execution_id);
-                    debug!("Released job {} back to ready state", job_id);
                 }
                 Err(e) => {
                     warn!(
@@ -4492,6 +4463,56 @@ impl Worker {
         }
 
         Ok(released)
+    }
+
+    /// Put a claimed execution's job back to ready, if the claim still exists
+    /// (Solid Queue's `ClaimedExecution#release`, guarded by
+    /// `unless_already_finalized`). The claimed-row delete comes first and is
+    /// the ownership gate: if a recovery path already failed the job and
+    /// removed the claim, the job must not also go back to ready, or it would
+    /// be both failed and run again.
+    ///
+    /// Returns whether the job went back to ready. Either way the claim is
+    /// gone afterwards.
+    async fn requeue_claimed<C>(
+        ctx: &Arc<AppContext>,
+        txn: &C,
+        job_id: i64,
+        execution_id: i64,
+    ) -> std::result::Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_config = &ctx.table_config;
+        if query_builder::claimed_executions::delete_by_id(txn, table_config, execution_id).await?
+            == 0
+        {
+            debug!(
+                "Claimed execution {} (job {}) already finalized, not requeuing",
+                execution_id, job_id
+            );
+            return Ok(false);
+        }
+        let Some(job) = query_builder::jobs::find_by_id(txn, table_config, job_id).await? else {
+            warn!(
+                "Job {} not found, dropping claimed execution {}",
+                job_id, execution_id
+            );
+            return Ok(false);
+        };
+        query_builder::ready_executions::insert(
+            txn,
+            table_config,
+            job.id,
+            &job.queue_name,
+            job.priority,
+        )
+        .await?;
+        // EXPERIMENTAL queue-level slot was acquired at claim time and must be
+        // released here — the next worker that re-claims this job will
+        // re-acquire.
+        Worker::release_queue_slot(ctx, txn, table_config, &job.queue_name).await?;
+        Ok(true)
     }
 
     /// Release a batch of claimed executions back to ready state (best-effort).
@@ -4513,64 +4534,46 @@ impl Worker {
             // No DB connection: nothing could be released, all rows fail.
             return claimed.to_vec();
         };
-        let table_config = ctx.table_config.clone();
         let mut failed: Vec<quebec_claimed_executions::Model> = Vec::new();
+        let mut requeued = 0usize;
         for row in claimed {
-            let table_config = table_config.clone();
             let ctx = ctx.clone();
             let job_id = row.job_id;
             let execution_id = row.id;
-            if let Err(e) = db
-                .transaction::<_, (), DbErr>(|txn| {
+            match db
+                .transaction::<_, bool, DbErr>(|txn| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
-                        if let Some(job) =
-                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                        {
-                            query_builder::ready_executions::insert(
-                                txn,
-                                &table_config,
-                                job.id,
-                                &job.queue_name,
-                                job.priority,
-                            )
-                            .await?;
-                            // EXPERIMENTAL queue-level slot release on
-                            // requeue (see `release_all_claimed_executions`).
-                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                                .await?;
-                        }
-                        query_builder::claimed_executions::delete_by_id(
-                            txn,
-                            &table_config,
-                            execution_id,
-                        )
-                        .await?;
-                        Ok(())
+                        Worker::requeue_claimed(&ctx, txn, job_id, execution_id).await
                     })
                 })
                 .await
             {
-                warn!(
-                    "Failed to release claimed execution {} back to ready: {:?}",
-                    execution_id, e
-                );
-                failed.push(row.clone());
-            } else {
-                // Requeued: the claim is gone, drop it from the ledger so it
-                // stops counting against in-flight / blocking drain exit.
-                ctx.ledger_remove(execution_id);
-                // CAS-clear exclusive ownership: if this row was the exclusive
-                // sieve's kept row (e.g. find_by_ids failure released it
-                // pre-dispatch), release the seat. CAS so non-exclusive rows
-                // and rows from older exclusives are no-ops.
-                ctx.clear_exclusive_owner_if(execution_id);
+                Err(e) => {
+                    warn!(
+                        "Failed to release claimed execution {} back to ready: {:?}",
+                        execution_id, e
+                    );
+                    failed.push(row.clone());
+                    continue;
+                }
+                Ok(true) => requeued += 1,
+                Ok(false) => {}
             }
+            // Requeued or finalized elsewhere: the claim is gone, drop it from
+            // the ledger so it stops counting against in-flight / blocking
+            // drain exit.
+            ctx.ledger_remove(execution_id);
+            // CAS-clear exclusive ownership: if this row was the exclusive
+            // sieve's kept row (e.g. find_by_ids failure released it
+            // pre-dispatch), release the seat. CAS so non-exclusive rows and
+            // rows from older exclusives are no-ops.
+            ctx.clear_exclusive_owner_if(execution_id);
         }
         if !claimed.is_empty() {
             info!(
                 "Released {}/{} claimed execution(s) back to ready state",
-                claimed.len() - failed.len(),
+                requeued,
                 claimed.len()
             );
         }
