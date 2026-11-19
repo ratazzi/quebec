@@ -1875,6 +1875,8 @@ impl Execution {
             .runnable
             .concurrency_duration
             .map(|s| chrono::Duration::seconds(s as i64));
+        // Solid Queue's `finished!`: keep the finished job, or delete it.
+        let preserve_finished_jobs = self.ctx.preserve_finished_jobs;
         // EXPERIMENTAL queue-level concurrency: release is delegated to
         // `Worker::release_queue_slot` which looks up the limit from `ctx`
         // at call time.
@@ -1987,7 +1989,7 @@ impl Execution {
                                 err.map(|e| e.to_string()).as_deref(),
                             )
                             .await?;
-                        } else {
+                        } else if preserve_finished_jobs {
                             // Only mark as finished for successful jobs (like Solid Queue)
                             query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
                         }
@@ -2047,6 +2049,13 @@ impl Execution {
                                     )
                                 })?;
                             }
+                        }
+
+                        // Solid Queue's `finished!` without preserve_finished_jobs:
+                        // the job is deleted outright. After the claimed row,
+                        // whose delete above is the ownership gate.
+                        if !failed && !preserve_finished_jobs {
+                            query_builder::jobs::delete_by_id(txn, &table_config, job_id).await?;
                         }
 
                         // EXPERIMENTAL: release queue-level semaphore
