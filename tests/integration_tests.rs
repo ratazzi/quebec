@@ -947,20 +947,38 @@ mod semaphore {
         let key = "test_concurrency_key";
         let limit = 2;
 
-        assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(acquire_semaphore(
+            &db,
+            &tc,
+            key.to_string(),
+            limit,
+            chrono::Duration::minutes(3)
+        )
+        .await
+        .unwrap()
+        .is_some());
+        assert!(acquire_semaphore(
+            &db,
+            &tc,
+            key.to_string(),
+            limit,
+            chrono::Duration::minutes(3)
+        )
+        .await
+        .unwrap()
+        .is_some());
 
         // Third acquire should fail (limit reached)
-        assert!(acquire_semaphore(&db, &tc, key.to_string(), limit, None)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(acquire_semaphore(
+            &db,
+            &tc,
+            key.to_string(),
+            limit,
+            chrono::Duration::minutes(3)
+        )
+        .await
+        .unwrap()
+        .is_none());
 
         // Test ConcurrencyConstraint
         let constraint = ConcurrencyConstraint {
@@ -970,14 +988,24 @@ mod semaphore {
             on_conflict: ConcurrencyConflict::default(),
         };
 
-        assert!(acquire_semaphore_with_constraint(&db, &tc, &constraint)
-            .await
-            .unwrap()
-            .is_some());
-        assert!(acquire_semaphore_with_constraint(&db, &tc, &constraint)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(acquire_semaphore_with_constraint(
+            &db,
+            &tc,
+            &constraint,
+            chrono::Duration::minutes(3)
+        )
+        .await
+        .unwrap()
+        .is_some());
+        assert!(acquire_semaphore_with_constraint(
+            &db,
+            &tc,
+            &constraint,
+            chrono::Duration::minutes(3)
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 
     #[tokio::test]
@@ -985,7 +1013,7 @@ mod semaphore {
         let (db, tc) = setup_db().await;
 
         let key = "expiring_semaphore";
-        let duration = Some(chrono::Duration::seconds(1));
+        let duration = chrono::Duration::seconds(1);
 
         assert!(acquire_semaphore(&db, &tc, key.to_string(), 1, duration)
             .await
@@ -1006,7 +1034,7 @@ mod semaphore {
     async fn test_delete_expired() {
         let (db, tc) = setup_db().await;
 
-        let duration = Some(chrono::Duration::seconds(-1)); // already expired
+        let duration = chrono::Duration::seconds(-1); // already expired
         acquire_semaphore(&db, &tc, "expired_key".to_string(), 1, duration)
             .await
             .unwrap();
@@ -1027,7 +1055,7 @@ mod semaphore {
         let mut results = Vec::new();
         for i in 0..num_operations {
             let key = format!("concurrent_key_{}", i % 10);
-            let result = acquire_semaphore(&db, &tc, key, 2, None).await;
+            let result = acquire_semaphore(&db, &tc, key, 2, chrono::Duration::minutes(3)).await;
             results.push(result);
         }
 

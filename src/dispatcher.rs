@@ -2,7 +2,7 @@ use crate::context::*;
 use crate::dialect::Dialect;
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
-use crate::semaphore::acquire_semaphore;
+use crate::semaphore::{acquire_semaphore, reacquire_released_semaphore};
 
 use crate::error::Result;
 use async_trait::async_trait;
@@ -268,36 +268,34 @@ impl Dispatcher {
                     // discarded per its on_conflict policy.
                     for job in concurrency_limited {
                         let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
-                        let (limit, duration_opt, on_conflict) = {
-                            #[cfg(feature = "python")]
-                            {
-                                ctx.runnables
-                                    .read()
-                                    .ok()
-                                    .and_then(|runnables| {
-                                        runnables.get(&job.class_name).map(|r| {
-                                            (
-                                                r.concurrency_limit.unwrap_or(1),
-                                                r.concurrency_duration
-                                                    .map(|s| chrono::Duration::seconds(s as i64)),
-                                                r.concurrency_on_conflict,
-                                            )
-                                        })
-                                    })
-                                    .unwrap_or((1, None, ConcurrencyConflict::Block))
-                            }
-                            #[cfg(not(feature = "python"))]
-                            {
-                                (1, None, ConcurrencyConflict::Block)
-                            }
+                        let Some(class) = ctx.class_concurrency(&job.class_name) else {
+                            // Class not registered here: skip its limits and
+                            // record that it holds no slot, like Solid Queue
+                            // does for a job whose class doesn't load.
+                            warn!(
+                                job_id = job.id,
+                                concurrency_key,
+                                "Job class `{}' is not registered; dispatching without its concurrency limit",
+                                job.class_name
+                            );
+                            crate::concurrency_lock::record_no_slot(txn, &ctx.table_config, job)
+                                .await?;
+                            ready_data.push((
+                                job.id,
+                                &job.queue_name,
+                                job.priority,
+                                chrono::Utc::now().naive_utc(),
+                            ));
+                            notified_queues.insert(job.queue_name.clone());
+                            continue;
                         };
 
                         let acquired = acquire_semaphore(
                             txn,
                             &ctx.table_config,
                             concurrency_key.to_string(),
-                            limit,
-                            duration_opt,
+                            class.limit,
+                            class.duration,
                         )
                         .await?;
 
@@ -305,9 +303,9 @@ impl Dispatcher {
                             crate::concurrency_lock::record(
                                 txn,
                                 &ctx.table_config,
-                                &job,
+                                job,
                                 semaphore_id,
-                                limit,
+                                class.limit,
                             )
                             .await?;
                             ready_data.push((
@@ -318,11 +316,7 @@ impl Dispatcher {
                             ));
                             notified_queues.insert(job.queue_name.clone());
                         } else {
-                            let duration = duration_opt.unwrap_or_else(|| {
-                                chrono::Duration::from_std(ctx.default_concurrency_control_period)
-                                    .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                            });
-                            match on_conflict {
+                            match class.on_conflict {
                                 ConcurrencyConflict::Discard => {
                                     warn!(
                                         job_id = job.id,
@@ -340,7 +334,7 @@ impl Dispatcher {
                                         crate::batch::release_batched_job(
                                             txn,
                                             &ctx.table_config,
-                                            &job,
+                                            job,
                                         )
                                         .await?,
                                     );
@@ -360,7 +354,7 @@ impl Dispatcher {
                                         &job.queue_name,
                                         job.priority,
                                         concurrency_key,
-                                        now + duration,
+                                        now + class.duration,
                                     )
                                     .await?;
                                 }
@@ -469,7 +463,8 @@ impl Dispatcher {
     /// Release a single blocked execution for `concurrency_key` in its own
     /// transaction, mirroring Solid Queue's `BlockedExecution.release_one` +
     /// `#release`: lock the head blocked row (FOR UPDATE SKIP LOCKED), acquire
-    /// the semaphore, then promote it to ready and delete the blocked row.
+    /// the semaphore, then promote it to ready and delete the blocked row
+    /// (see [`release_next_blocked`]).
     async fn release_one(
         db: &DatabaseConnection,
         ctx: &Arc<AppContext>,
@@ -478,21 +473,7 @@ impl Dispatcher {
         let ctx = ctx.clone();
         let key = concurrency_key.to_string();
         db.transaction::<_, bool, DbErr>(|txn| {
-            Box::pin(async move {
-                let Some(execution) =
-                    query_builder::blocked_executions::find_one_by_key_for_update(
-                        txn,
-                        &ctx.table_config,
-                        &key,
-                        ctx.use_skip_locked,
-                    )
-                    .await?
-                else {
-                    return Ok(false);
-                };
-
-                release_blocked_execution(&ctx, txn, &execution).await
-            })
+            Box::pin(async move { release_next_blocked(&ctx, txn, &key, false).await })
         })
         .await
         .map_err(flatten_txn_err)
@@ -505,36 +486,6 @@ fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
     }
 }
 
-/// Concurrency limit and duration for `job`'s class, from the registered
-/// runnable (Solid Queue's `job.concurrency_limit` / `concurrency_duration`).
-/// Falls back to `(1, None)` when the class is not registered in this process.
-fn concurrency_settings(
-    ctx: &AppContext,
-    job: &crate::entities::quebec_jobs::Model,
-) -> (i32, Option<chrono::Duration>) {
-    #[cfg(feature = "python")]
-    {
-        ctx.runnables
-            .read()
-            .ok()
-            .and_then(|runnables| {
-                runnables.get(&job.class_name).map(|r| {
-                    (
-                        r.concurrency_limit.unwrap_or(1),
-                        r.concurrency_duration
-                            .map(|s| chrono::Duration::seconds(s as i64)),
-                    )
-                })
-            })
-            .unwrap_or((1, None))
-    }
-    #[cfg(not(feature = "python"))]
-    {
-        let _ = (ctx, job);
-        (1, None)
-    }
-}
-
 /// Solid Queue's `BlockedExecution#release`: acquire the concurrency
 /// semaphore for the job and, only if that succeeds, promote it to ready and
 /// delete the blocked row. Without a free slot the job stays blocked.
@@ -542,11 +493,25 @@ fn concurrency_settings(
 /// The caller must already hold `execution`'s row lock in `db`'s transaction.
 /// This is the only way a blocked job becomes ready, so every job that
 /// reaches ready through it holds a slot that its completion later releases.
+///
+/// A job whose class isn't registered in this process is promoted without
+/// its limits and recorded as holding no slot, as dispatching or retrying it
+/// does. Solid Queue fails it with `ClassMissingError` here, but it can do so
+/// because every Rails process loads every job class; a Quebec process only
+/// knows the classes registered in it, and a dispatcher or control plane
+/// that lacks one must not fail a job a worker could run. A worker without
+/// the class fails it when it claims it, like Solid Queue's
+/// `ClaimedExecution#perform`.
+///
+/// `reuse_released_slot` is for a caller that just gave a slot back to this
+/// key's semaphore in the same transaction (see
+/// [`crate::semaphore::reacquire_released_semaphore`]).
 pub(crate) async fn release_blocked_execution<C>(
     ctx: &AppContext,
     db: &C,
     execution: &crate::entities::quebec_blocked_executions::Model,
-) -> Result<bool, DbErr>
+    reuse_released_slot: bool,
+) -> Result<BlockedRelease, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -555,28 +520,52 @@ where
     else {
         // The FK cascade removes blocked rows with their job, so this is a
         // row deleted under us; nothing to release.
-        return Ok(false);
+        return Ok(BlockedRelease::StillBlocked);
     };
-    // Semaphore.wait(job) sets the TTL from job.concurrency_duration; pass it
-    // through instead of falling back to acquire_semaphore's default TTL.
-    let (concurrency_limit, concurrency_duration) = concurrency_settings(ctx, &job);
     let key = execution.concurrency_key.clone();
 
-    let Some(semaphore_id) = acquire_semaphore(
-        db,
-        &ctx.table_config,
-        key.clone(),
-        concurrency_limit,
-        concurrency_duration,
-    )
-    .await?
-    else {
-        trace!("Failed to acquire semaphore for key: {key} (no available slots)");
-        return Ok(false);
+    let Some(class) = ctx.class_concurrency(&job.class_name) else {
+        return promote_without_limits(ctx, db, execution, &job).await;
     };
-    crate::concurrency_lock::record(db, &ctx.table_config, &job, semaphore_id, concurrency_limit)
-        .await?;
+    // MySQL: a slot given back in this transaction already locked an
+    // existing row. Re-acquire by UPDATE so this blocked-row lock
+    // cannot cycle with a producer's UPSERT insert-intention lock.
+    let acquired =
+        if reuse_released_slot && db.get_database_backend() == sea_orm::DatabaseBackend::MySql {
+            reacquire_released_semaphore(db, &ctx.table_config, &key, class.duration).await?
+        } else {
+            acquire_semaphore(
+                db,
+                &ctx.table_config,
+                key.clone(),
+                class.limit,
+                class.duration,
+            )
+            .await?
+        };
+    let Some(semaphore_id) = acquired else {
+        trace!("Failed to acquire semaphore for key: {key} (no available slots)");
+        return Ok(BlockedRelease::StillBlocked);
+    };
+    crate::concurrency_lock::record(db, &ctx.table_config, &job, semaphore_id, class.limit).await?;
+    promote_to_ready(ctx, db, execution).await?;
+    info!(
+        "Unblocked job {} for concurrency key: {}",
+        execution.job_id, key
+    );
+    Ok(BlockedRelease::Promoted)
+}
 
+/// Move a blocked execution to ready (Solid Queue's `promote_to_ready` +
+/// `destroy!`).
+async fn promote_to_ready<C>(
+    ctx: &AppContext,
+    db: &C,
+    execution: &crate::entities::quebec_blocked_executions::Model,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
     query_builder::ready_executions::insert(
         db,
         &ctx.table_config,
@@ -586,11 +575,81 @@ where
     )
     .await?;
     query_builder::blocked_executions::delete_by_id(db, &ctx.table_config, execution.id).await?;
-    info!(
-        "Unblocked job {} for concurrency key: {}",
-        execution.job_id, key
+    Ok(())
+}
+
+/// What [`release_blocked_execution`] did with a blocked job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockedRelease {
+    /// Took a slot; the job is now ready.
+    Promoted,
+    /// Its class isn't registered here: now ready without taking a slot.
+    Bypassed,
+    /// No free slot (or the row is gone); nothing changed.
+    StillBlocked,
+}
+
+impl BlockedRelease {
+    /// Whether the blocked row left blocked.
+    pub(crate) fn released(self) -> bool {
+        self != Self::StillBlocked
+    }
+}
+
+/// Promote a blocked job whose class isn't registered in this process past
+/// its limits, recorded as holding no slot (see [`release_blocked_execution`]).
+async fn promote_without_limits<C>(
+    ctx: &AppContext,
+    db: &C,
+    execution: &crate::entities::quebec_blocked_executions::Model,
+    job: &crate::entities::quebec_jobs::Model,
+) -> Result<BlockedRelease, DbErr>
+where
+    C: ConnectionTrait,
+{
+    warn!(
+        job_id = job.id,
+        concurrency_key = execution.concurrency_key,
+        "Job class `{}' is not registered; releasing the blocked job without its concurrency limit",
+        job.class_name
     );
-    Ok(true)
+    crate::concurrency_lock::record_no_slot(db, &ctx.table_config, job).await?;
+    promote_to_ready(ctx, db, execution).await?;
+    Ok(BlockedRelease::Bypassed)
+}
+
+/// Release the next blocked job for `concurrency_key`, in blocked order
+/// (Solid Queue's `BlockedExecution.release_one`). `reuse_released_slot` is
+/// set when a slot on it was given back in this transaction.
+///
+/// A job promoted without its limits ([`BlockedRelease::Bypassed`]) took no
+/// slot, so the one that may be free goes on to the job behind it rather
+/// than staying idle until concurrency maintenance. Returns whether any job
+/// left blocked.
+pub(crate) async fn release_next_blocked<C>(
+    ctx: &AppContext,
+    db: &C,
+    concurrency_key: &str,
+    reuse_released_slot: bool,
+) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let mut released = false;
+    while let Some(execution) = query_builder::blocked_executions::find_one_by_key_for_update(
+        db,
+        &ctx.table_config,
+        concurrency_key,
+        ctx.use_skip_locked,
+    )
+    .await?
+    {
+        match release_blocked_execution(ctx, db, &execution, reuse_released_slot).await? {
+            BlockedRelease::Bypassed => released = true,
+            outcome => return Ok(released || outcome.released()),
+        }
+    }
+    Ok(released)
 }
 
 /// Outcome of an explicit unblock request for one blocked execution.
@@ -621,11 +680,12 @@ pub(crate) async fn release_blocked_by(
             else {
                 return Ok(UnblockOutcome::NotFound);
             };
-            Ok(if release_blocked_execution(&ctx, txn, &execution).await? {
-                UnblockOutcome::Released
-            } else {
-                UnblockOutcome::StillBlocked
-            })
+            Ok(
+                match release_blocked_execution(&ctx, txn, &execution, false).await? {
+                    BlockedRelease::Promoted | BlockedRelease::Bypassed => UnblockOutcome::Released,
+                    BlockedRelease::StillBlocked => UnblockOutcome::StillBlocked,
+                },
+            )
         })
     })
     .await
