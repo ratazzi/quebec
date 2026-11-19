@@ -42,14 +42,16 @@ async fn mysql_semaphore_statements_quote_key() {
     let key = "customer's semaphore";
 
     // Read the missing key, create it in one UPSERT, read back the id of the
-    // semaphore taken, then exercise both release statements.
+    // semaphore taken, then exercise both release statements. The increment
+    // finds the semaphore already all free, so the release only renews it and
+    // gives nothing back.
     assert_eq!(
         acquire_semaphore(&db, &tc, key.into(), 2, ttl())
             .await
             .unwrap(),
         Some(1)
     );
-    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
+    assert!(!release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
 
@@ -270,8 +272,9 @@ async fn mysql_live_semaphore_and_rate_limit() {
     assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
-    // Force a changed expiry so MySQL reports an affected row even when the
-    // release only renews an already-full semaphore (second UPDATE path).
+    // Force a changed expiry so MySQL reports an affected row when the release
+    // only renews an already all-free semaphore (second UPDATE path). That
+    // gives no slot back.
     db.execute_raw(Statement::from_string(
         DbBackend::MySql,
         format!(
@@ -281,7 +284,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
     ))
     .await
     .unwrap();
-    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
+    assert!(!release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
     let values =
