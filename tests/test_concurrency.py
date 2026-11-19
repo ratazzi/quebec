@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
@@ -646,3 +647,71 @@ def test_manual_retry_all_promotes_when_slot_free(
     assert db_assert.count_ready_executions() == 1
     assert db_assert.count_blocked_executions() == 1
     assert db_assert.count_failed_executions() == 0
+
+
+def _rename_job_class(session, prefix: str, job_id: int, class_name: str) -> None:
+    session.execute(
+        text(f"UPDATE {prefix}_jobs SET class_name = :name WHERE id = :id"),
+        {"name": class_name, "id": job_id},
+    )
+    session.commit()
+
+
+def test_unblocking_a_job_whose_class_is_not_registered_here_readies_it(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """A process that doesn't know a job's class (say, a control plane in a
+    web process) can't tell whether some worker can run it, so unblocking
+    sends it to ready past its limits instead of failing it, recorded as
+    holding no slot, as dispatching it does."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    ConcurrentJob.calls = []
+    qc.register_job(ConcurrentJob)
+    ConcurrentJob.perform_later(qc, 1)
+    blocked = ConcurrentJob.perform_later(qc, 2)
+    _rename_job_class(session, prefix, blocked.id, "RegisteredElsewhereJob")
+
+    assert qc.unblock(blocked.id) is True
+
+    session.expire_all()
+    assert db_assert.count_blocked_executions() == 0
+    assert db_assert.count_ready_executions() == 2
+    assert db_assert.count_failed_executions() == 0
+    sem = session.execute(text(f"SELECT value FROM {prefix}_semaphores")).fetchone()
+    assert sem.value == 0, "the bypassed job must not take the slot"
+    arguments = session.execute(
+        text(f"SELECT arguments FROM {prefix}_jobs WHERE id = :id"),
+        {"id": blocked.id},
+    ).scalar()
+    lock = json.loads(arguments)["solid_queue_concurrency_lock"]
+    assert lock == {"semaphore_id": None, "limit": None}
+
+
+def test_slot_given_back_passes_an_unregistered_job_to_the_next_blocked(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """The unregistered head of the blocked queue goes to ready without the
+    slot, so the slot goes on to the job behind it rather than sitting free
+    until concurrency maintenance."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    ConcurrentJob.calls = []
+    qc.register_job(ConcurrentJob)
+    ConcurrentJob.perform_later(qc, 1)
+    unregistered = ConcurrentJob.perform_later(qc, 2)
+    ConcurrentJob.perform_later(qc, 3)
+    _rename_job_class(session, prefix, unregistered.id, "RegisteredElsewhereJob")
+
+    qc.drain_one().perform()
+
+    session.expire_all()
+    assert ConcurrentJob.calls == [1]
+    assert db_assert.count_blocked_executions() == 0
+    assert db_assert.count_ready_executions() == 2
+    sem = session.execute(text(f"SELECT value FROM {prefix}_semaphores")).fetchone()
+    assert sem.value == 0, "the registered job behind it took the slot"

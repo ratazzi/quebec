@@ -396,9 +396,13 @@ where
 
                 let blocked_by = if let Some(constraint) = &constraint {
                     use crate::semaphore::acquire_semaphore_with_constraint;
-                    if let Some(semaphore_id) =
-                        acquire_semaphore_with_constraint(txn, &txn_ctx.table_config, constraint)
-                            .await?
+                    if let Some(semaphore_id) = acquire_semaphore_with_constraint(
+                        txn,
+                        &txn_ctx.table_config,
+                        constraint,
+                        txn_ctx.concurrency_period(None),
+                    )
+                    .await?
                     {
                         crate::concurrency_lock::record(
                             txn,
@@ -438,13 +442,8 @@ where
                         }
                         crate::context::ConcurrencyConflict::Block => {
                             let block_now = chrono::Utc::now().naive_utc();
-                            let duration = constraint.duration.unwrap_or_else(|| {
-                                chrono::Duration::from_std(
-                                    txn_ctx.default_concurrency_control_period,
-                                )
-                                .unwrap_or_else(|_| chrono::Duration::seconds(60))
-                            });
-                            let expires_at = block_now + duration;
+                            let expires_at =
+                                block_now + txn_ctx.concurrency_period(constraint.duration);
                             query_builder::blocked_executions::insert(
                                 txn,
                                 &txn_ctx.table_config,

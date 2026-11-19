@@ -34,10 +34,10 @@ def test_enqueue_preserves_concurrency_duration(qc_with_sqlalchemy, bulk, durati
         DurationJob.perform_later(qc, 1)
 
     seconds = duration.total_seconds() if isinstance(duration, timedelta) else duration
-    expected_ttls = {
-        "semaphores": 120 if seconds is None else seconds,
-        "blocked_executions": 60 if seconds is None else seconds,
-    }
+    # Without a class duration both fall back to default_concurrency_control_period
+    # (3 minutes by default), like Solid Queue's job.concurrency_duration.
+    expected = 180 if seconds is None else seconds
+    expected_ttls = {"semaphores": expected, "blocked_executions": expected}
     for table, expected in expected_ttls.items():
         row = session.execute(text(
             f"SELECT expires_at, created_at FROM {prefix}_{table}"

@@ -557,7 +557,7 @@ def test_rate_throttle_releases_concurrency_key_slot(qc_with_sqlalchemy):
        * Reschedule path: dispatcher promotes the scheduled job, tries to
          re-acquire the same key, fails (slot still held by the very job
          being promoted), routes it to blocked_executions — job stalls
-         until concurrency_duration TTL (default 60s).
+         until concurrency_duration TTL (default 3 minutes).
        * Discard path: slot stays held for an already-finished job until
          TTL.
 

@@ -15,13 +15,13 @@ pub async fn acquire_semaphore<C>(
     table_config: &TableConfig,
     key: String,
     concurrency_limit: i32,
-    duration: Option<chrono::Duration>,
+    duration: chrono::Duration,
 ) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
 {
     let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2)); // Default to 2 minutes
+    let expires_at = now + duration;
     let key_col = quote_identifier(db.get_database_backend(), "key");
 
     // Read before writing, like Solid Queue's `Semaphore::Proxy#wait`. A plain
@@ -287,7 +287,7 @@ pub async fn reacquire_released_semaphore<C>(
     db: &C,
     table_config: &TableConfig,
     key: &str,
-    duration: Option<chrono::Duration>,
+    duration: chrono::Duration,
 ) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
@@ -298,7 +298,7 @@ where
         ));
     }
     let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let expires_at = now + duration;
     let key_col = quote_identifier(DatabaseBackend::MySql, "key");
     let sql = format!(
         "UPDATE {} SET value = value - 1, expires_at = ?, updated_at = ? \
@@ -315,11 +315,14 @@ where
     id_if_acquired(result.rows_affected() > 0, db, table_config, key).await
 }
 
-/// Convenience function to acquire semaphore using ConcurrencyConstraint
+/// Convenience function to acquire semaphore using ConcurrencyConstraint.
+/// `default_duration` applies when the constraint sets no duration
+/// (`AppContext::concurrency_period`).
 pub async fn acquire_semaphore_with_constraint<C>(
     db: &C,
     table_config: &TableConfig,
     constraint: &ConcurrencyConstraint,
+    default_duration: chrono::Duration,
 ) -> Result<Option<i64>, DbErr>
 where
     C: ConnectionTrait,
@@ -329,7 +332,7 @@ where
         table_config,
         constraint.key.clone(),
         constraint.limit,
-        constraint.duration,
+        constraint.duration.unwrap_or(default_duration),
     )
     .await
 }
@@ -349,13 +352,13 @@ pub async fn release_semaphore<C>(
     table_config: &TableConfig,
     key: String,
     limit: i32,
-    duration: Option<chrono::Duration>,
+    duration: chrono::Duration,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
     let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let expires_at = now + duration;
     let key_col = quote_identifier(db.get_database_backend(), "key");
 
     // Try to increment the semaphore value if below max (limit)
@@ -479,14 +482,14 @@ pub async fn release_semaphore_by_id<C>(
     table_config: &TableConfig,
     id: i64,
     limit: i32,
-    duration: Option<chrono::Duration>,
+    duration: chrono::Duration,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
 {
     let backend = db.get_database_backend();
     let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + duration.unwrap_or_else(|| chrono::Duration::minutes(2));
+    let expires_at = now + duration;
     let table = &table_config.semaphores;
     let (increment_sql, touch_sql) = match Dialect::from(backend) {
         Dialect::Postgres => (
