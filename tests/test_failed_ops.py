@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+from concurrent.futures import ThreadPoolExecutor, wait
+from datetime import datetime, timezone
+
+import pytest
 import quebec
 from sqlalchemy import text
 
@@ -106,8 +111,151 @@ def test_retry_failed_respects_held_semaphore(qc_with_sqlalchemy) -> None:
     assert blocked_job_id == failed.id
 
 
+def test_retry_failed_resets_execution_counters(qc_with_sqlalchemy) -> None:
+    """Solid Queue's ``reset_execution_counters``: retry_on attempts start over."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(FailingJob)
+    job = _enqueue_and_fail(qc, FailingJob)
+    args = json.loads(
+        session.execute(
+            text(f"SELECT arguments FROM {prefix}_jobs WHERE id = {job.id}")
+        ).scalar()
+    )
+    args["executions"] = 5
+    args["exception_executions"] = {"[ValueError]": 5}
+    session.execute(
+        text(f"UPDATE {prefix}_jobs SET arguments = :args WHERE id = {job.id}"),
+        {"args": json.dumps(args)},
+    )
+    session.commit()
+
+    assert qc.retry_failed(job.id) is True
+
+    session.expire_all()
+    args = json.loads(
+        session.execute(
+            text(f"SELECT arguments FROM {prefix}_jobs WHERE id = {job.id}")
+        ).scalar()
+    )
+    assert args["executions"] == 0
+    assert args["exception_executions"] == {}
+
+
 def test_retry_failed_unknown_id_returns_false(qc) -> None:
     assert qc.retry_failed(999_999) is False
+
+
+def _while_retry_in_progress(ctx, job_id, call, fails_again=False):
+    """Run ``call`` while another transaction holds a retry of ``job_id``.
+
+    The other transaction has taken the failed row (and put the job back to
+    ready) but not committed. ``call`` must wait for it, then find the row
+    gone. With ``fails_again``, the retried job has also failed again by
+    then, leaving a new failed row. Returns ``call``'s result.
+    """
+    engine = ctx["engine"]
+    prefix = ctx["prefix"]
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        with engine.connect() as retrier:
+            retrier.execute(
+                text(f"DELETE FROM {prefix}_failed_executions WHERE job_id = :id"),
+                {"id": job_id},
+            )
+            if fails_again:
+                retrier.execute(
+                    text(
+                        f"INSERT INTO {prefix}_failed_executions "
+                        "(job_id, error, created_at) VALUES (:id, 'failed again', :now)"
+                    ),
+                    {"id": job_id, "now": datetime.now(timezone.utc).replace(tzinfo=None)},
+                )
+            future = pool.submit(call)
+            done, _ = wait([future], timeout=0.5)
+            assert not done, "should wait for the retry in progress"
+            retrier.commit()
+        return future.result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_discard_failed_loses_to_a_retry_in_progress(qc_with_sqlalchemy) -> None:
+    """Discard takes the failed row before touching the job, like retry.
+
+    Otherwise a discard racing a retry marks finished a job the retry just
+    put back to ready.
+    """
+    if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
+        pytest.skip("SQLite serializes all writers")
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(FailingJob)
+    job = _enqueue_and_fail(qc, FailingJob)
+
+    discarded = _while_retry_in_progress(
+        qc_with_sqlalchemy, job.id, lambda: qc.discard_failed(job.id)
+    )
+
+    assert discarded is False
+    session.expire_all()
+    finished_at = session.execute(
+        text(f"SELECT finished_at FROM {prefix}_jobs WHERE id = {job.id}")
+    ).scalar()
+    assert finished_at is None
+
+
+def test_retry_failed_loses_to_a_retry_in_progress(qc_with_sqlalchemy) -> None:
+    """The losing retry returns False, as for a job with no failed row."""
+    if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
+        pytest.skip("SQLite serializes all writers")
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(FailingJob)
+    job = _enqueue_and_fail(qc, FailingJob)
+
+    retried = _while_retry_in_progress(
+        qc_with_sqlalchemy, job.id, lambda: qc.retry_failed(job.id)
+    )
+
+    assert retried is False
+    session.expire_all()
+    assert _count(session, prefix, "ready_executions") == 0
+
+
+@pytest.mark.parametrize("operation", ["retry_all_failed", "discard_all_failed"])
+def test_bulk_operation_leaves_a_failure_newer_than_its_selection(
+    qc_with_sqlalchemy, operation
+) -> None:
+    """A bulk retry or discard takes only the failed rows it selected. If one
+    of those jobs was retried and failed again meanwhile, its new failed row
+    is not one the operation chose, and stays."""
+    if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
+        pytest.skip("SQLite serializes all writers")
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(FailingJob)
+    job = _enqueue_and_fail(qc, FailingJob)
+
+    count = _while_retry_in_progress(
+        qc_with_sqlalchemy, job.id, getattr(qc, operation), fails_again=True
+    )
+
+    assert count == 0
+    session.expire_all()
+    error = session.execute(
+        text(f"SELECT error FROM {prefix}_failed_executions WHERE job_id = :id"),
+        {"id": job.id},
+    ).scalar()
+    assert error == "failed again"
 
 
 def test_discard_failed_marks_finished_and_removes_execution(
