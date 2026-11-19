@@ -4935,6 +4935,7 @@ impl Worker {
             db,
             table_config,
             concurrency_key,
+            ctx.use_skip_locked,
         )
         .await?;
 
