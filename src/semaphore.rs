@@ -458,8 +458,10 @@ where
 }
 
 /// Release a semaphore, incrementing its value up to the limit.
-/// When value reaches limit (all slots free), keeps the record and updates expires_at.
-/// This matches Solid Queue's behavior in Semaphore#signal -> attempt_increment.
+/// When value is already at the limit (all slots free), keeps the record and
+/// refreshes expires_at. Returns whether a slot was given back, like Solid
+/// Queue's `Semaphore#signal` -> `attempt_increment`: refreshing a semaphore
+/// that was already all free gives nothing back.
 ///
 /// Semaphore value model (matching Solid Queue):
 /// - value = limit: all slots are free
@@ -580,15 +582,14 @@ where
         }
     };
 
-    let update_result = db
-        .execute_raw(Statement::from_sql_and_values(
-            db.get_database_backend(),
-            update_expires_sql,
-            update_values,
-        ))
-        .await?;
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        update_expires_sql,
+        update_values,
+    ))
+    .await?;
 
-    Ok(update_result.rows_affected() > 0)
+    Ok(false)
 }
 
 /// Give a slot back to the semaphore with this `id`, the one the job took it
@@ -596,7 +597,8 @@ where
 ///
 /// If that semaphore expired and was deleted, a semaphore now holding the same
 /// key belongs to other jobs, so nothing is given back and this returns false.
-/// Otherwise behaves like [`release_semaphore`].
+/// Otherwise behaves like [`release_semaphore`], returning false too when the
+/// semaphore was already all free.
 pub async fn release_semaphore_by_id<C>(
     db: &C,
     table_config: &TableConfig,
@@ -641,15 +643,13 @@ where
     }
 
     // Already at the limit: keep the row alive, as release_semaphore does.
-    let touched = db
-        .execute_raw(Statement::from_sql_and_values(
-            backend,
-            touch_sql,
-            vec![expires_at.into(), now.into(), id.into()],
-        ))
-        .await?
-        .rows_affected();
-    Ok(touched > 0)
+    db.execute_raw(Statement::from_sql_and_values(
+        backend,
+        touch_sql,
+        vec![expires_at.into(), now.into(), id.into()],
+    ))
+    .await?;
+    Ok(false)
 }
 
 // ──────────────────────────────────────────────────────────────────────
