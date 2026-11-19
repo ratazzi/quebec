@@ -14,7 +14,7 @@ use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
 use crate::worker::Worker;
 use async_trait::async_trait;
-use sea_orm::{DatabaseConnection, DbErr, TransactionTrait};
+use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -151,8 +151,6 @@ impl Supervisor {
         }
         let mut orphaned_count = 0usize;
         for execution in orphaned {
-            let ctx = self.ctx.clone();
-            let tc = table_config.clone();
             let job_id = execution.job_id;
             let exec_id = execution.id;
             // Per-row best-effort: a failing row (e.g. an experimental
@@ -160,21 +158,14 @@ impl Supervisor {
             // remaining orphaned rows. This is the crash-recovery safety net,
             // so one bad row is logged and skipped, left for the next
             // maintenance tick / another process to retry.
-            let result = db
-                .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                    Box::pin(async move {
-                        Worker::fail_claimed_execution(
-                            &ctx,
-                            txn,
-                            &tc,
-                            job_id,
-                            exec_id,
-                            "Process crashed or was killed before job completion",
-                        )
-                        .await
-                    })
-                })
-                .await;
+            let result = Worker::fail_claimed(
+                &self.ctx,
+                db.as_ref(),
+                job_id,
+                exec_id,
+                "Process crashed or was killed before job completion",
+            )
+            .await;
 
             match result {
                 Ok((true, released)) => {
@@ -225,7 +216,7 @@ async fn fail_claimed_by_process_id_inner(
 
     // Per-row best-effort. We deliberately trade the old single-transaction
     // atomicity (fail-all-rows + prune as one unit) for best-effort cleanup
-    // backed by the orphan-sweep: each row's `fail_claimed_execution` runs in
+    // backed by the orphan-sweep: each row's `fail_claimed` runs in
     // its OWN small transaction so a single row's failure (e.g. an experimental
     // queue-slot release error) rolls back only that row, not its siblings or
     // the process prune. The process row is pruned regardless of whether some
@@ -234,26 +225,9 @@ async fn fail_claimed_by_process_id_inner(
     // safety net that reclaims the leftovers.
     let mut failed = 0u64;
     for execution in &claimed {
-        let txn_ctx = ctx.clone();
-        let tc = table_config.clone();
-        let error_msg = error_msg.clone();
         let job_id = execution.job_id;
         let execution_id = execution.id;
-        let result = db
-            .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                Box::pin(async move {
-                    Worker::fail_claimed_execution(
-                        &txn_ctx,
-                        txn,
-                        &tc,
-                        job_id,
-                        execution_id,
-                        &error_msg,
-                    )
-                    .await
-                })
-            })
-            .await;
+        let result = Worker::fail_claimed(ctx, db, job_id, execution_id, &error_msg).await;
 
         match result {
             Ok((true, released)) => {

@@ -480,7 +480,7 @@ impl Dispatcher {
     }
 }
 
-fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
+pub(crate) fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
     match e {
         TransactionError::Connection(e) | TransactionError::Transaction(e) => e,
     }
