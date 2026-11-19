@@ -486,6 +486,11 @@ async fn enqueue_all_jobs(
     let mut scheduled_data: Vec<(i64, &str, i32, chrono::NaiveDateTime)> = Vec::new();
     let mut ready_queues: HashSet<String> = HashSet::new();
 
+    // Concurrency-limited jobs each hold their semaphore row until this
+    // transaction ends, so take them by concurrency key (then id) like Solid
+    // Queue's `dispatch_all_one_by_one`: concurrent enqueues and dispatches
+    // then lock the keys they share in the same order and can't deadlock.
+    let mut concurrency_limited = Vec::new();
     for (model, prepared) in job_models.iter().zip(jobs.iter()) {
         let concurrency_key = prepared.concurrency_key.as_deref().unwrap_or_default();
 
@@ -497,59 +502,8 @@ async fn enqueue_all_jobs(
             }
         }
 
-        // Handle concurrency control if configured
         if !concurrency_key.is_empty() {
-            // Concurrency jobs go through the existing per-job route
-            let dummy_active_job = ActiveJob {
-                logger: crate::types::ActiveLogger,
-                id: Some(model.id),
-                queue_name: prepared.queue_name.clone(),
-                class_name: prepared.class_name.clone(),
-                arguments: prepared.arguments.clone(),
-                priority: prepared.priority,
-                executions: 0,
-                active_job_id: prepared.active_job_id.clone(),
-                scheduled_at: prepared.scheduled_at.unwrap_or(now),
-                finished_at: None,
-                concurrency_key: prepared.concurrency_key.clone(),
-                concurrency_limit: prepared.concurrency_limit,
-                concurrency_duration: prepared.concurrency_duration,
-                concurrency_on_conflict: prepared.concurrency_on_conflict,
-                created_at: None,
-                updated_at: None,
-                batch_id: prepared.batch_id,
-                callback_batch_id: None,
-            };
-            let (destination, released) = route_job(
-                txn,
-                ctx,
-                model,
-                &dummy_active_job,
-                concurrency_key,
-                now,
-                concurrency_duration,
-            )
-            .await?;
-            if destination.should_notify() {
-                ready_queues.insert(model.queue_name.clone());
-                ready_data.push((
-                    model.id,
-                    &model.queue_name,
-                    model.priority,
-                    chrono::Utc::now().naive_utc(),
-                ));
-            } else if destination == JobDestination::Blocked {
-                blocked_data.push((
-                    model.id,
-                    &model.queue_name,
-                    model.priority,
-                    concurrency_key,
-                    now + prepared
-                        .concurrency_duration
-                        .unwrap_or(concurrency_duration),
-                ));
-            }
-            released_batches.extend(released);
+            concurrency_limited.push((concurrency_key, model, prepared));
             continue;
         }
 
@@ -561,6 +515,60 @@ async fn enqueue_all_jobs(
             model.priority,
             chrono::Utc::now().naive_utc(),
         ));
+    }
+    concurrency_limited.sort_by_key(|(key, model, _)| (*key, model.id));
+
+    for (concurrency_key, model, prepared) in concurrency_limited {
+        let dummy_active_job = ActiveJob {
+            logger: crate::types::ActiveLogger,
+            id: Some(model.id),
+            queue_name: prepared.queue_name.clone(),
+            class_name: prepared.class_name.clone(),
+            arguments: prepared.arguments.clone(),
+            priority: prepared.priority,
+            executions: 0,
+            active_job_id: prepared.active_job_id.clone(),
+            scheduled_at: prepared.scheduled_at.unwrap_or(now),
+            finished_at: None,
+            concurrency_key: prepared.concurrency_key.clone(),
+            concurrency_limit: prepared.concurrency_limit,
+            concurrency_duration: prepared.concurrency_duration,
+            concurrency_on_conflict: prepared.concurrency_on_conflict,
+            created_at: None,
+            updated_at: None,
+            batch_id: prepared.batch_id,
+            callback_batch_id: None,
+        };
+        let (destination, released) = route_job(
+            txn,
+            ctx,
+            model,
+            &dummy_active_job,
+            concurrency_key,
+            now,
+            concurrency_duration,
+        )
+        .await?;
+        if destination.should_notify() {
+            ready_queues.insert(model.queue_name.clone());
+            ready_data.push((
+                model.id,
+                &model.queue_name,
+                model.priority,
+                chrono::Utc::now().naive_utc(),
+            ));
+        } else if destination == JobDestination::Blocked {
+            blocked_data.push((
+                model.id,
+                &model.queue_name,
+                model.priority,
+                concurrency_key,
+                now + prepared
+                    .concurrency_duration
+                    .unwrap_or(concurrency_duration),
+            ));
+        }
+        released_batches.extend(released);
     }
 
     // Phase 3: bulk insert the chosen execution destinations

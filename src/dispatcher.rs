@@ -265,7 +265,16 @@ impl Dispatcher {
 
                     // Concurrency-limited ones go one-by-one so each can
                     // acquire the semaphore and route to ready / blocked /
-                    // discarded per its on_conflict policy.
+                    // discarded per its on_conflict policy. Each holds its
+                    // semaphore row until this transaction ends, so go by
+                    // concurrency key (then id) like Solid Queue's
+                    // `dispatch_all_one_by_one`: everyone dispatching at the
+                    // same time then takes the locks they share in the same
+                    // order and can't deadlock.
+                    concurrency_limited.sort_by(|a, b| {
+                        (a.concurrency_key.as_deref(), a.id)
+                            .cmp(&(b.concurrency_key.as_deref(), b.id))
+                    });
                     for job in concurrency_limited {
                         let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
                         let Some(class) = ctx.class_concurrency(&job.class_name) else {
