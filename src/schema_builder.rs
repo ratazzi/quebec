@@ -10,6 +10,7 @@ use sea_orm::sea_query::{
 use sea_orm::{ConnectionTrait, DbBackend, DbErr, Statement};
 
 use crate::context::TableConfig;
+use crate::dialect::Dialect;
 use crate::query_builder::index_name;
 
 // Time columns are DATETIME-family, never `.timestamp()`: on MySQL, TIMESTAMP
@@ -29,9 +30,9 @@ fn col(name: &str) -> Alias {
 /// SQLite text already keep microseconds.
 fn time_col(name: &str, backend: DbBackend) -> ColumnDef {
     let mut def = ColumnDef::new(col(name));
-    match backend {
-        DbBackend::MySql => def.custom(Alias::new("datetime(6)")),
-        DbBackend::Postgres | DbBackend::Sqlite => def.date_time(),
+    match Dialect::from(backend) {
+        Dialect::MySql => def.custom(Alias::new("datetime(6)")),
+        Dialect::Postgres | Dialect::Sqlite => def.date_time(),
     };
     def
 }
@@ -43,10 +44,10 @@ fn tbl(name: &str) -> Alias {
 
 /// Build SQL string from a TableCreateStatement based on database backend
 fn build_create_table_sql(backend: DbBackend, stmt: &TableCreateStatement) -> String {
-    match backend {
-        DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
-        DbBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
-        DbBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+    match Dialect::from(backend) {
+        Dialect::Postgres => stmt.to_string(PostgresQueryBuilder),
+        Dialect::Sqlite => stmt.to_string(SqliteQueryBuilder),
+        Dialect::MySql => stmt.to_string(MysqlQueryBuilder),
     }
 }
 
@@ -56,7 +57,7 @@ where
     C: ConnectionTrait,
 {
     let sql = build_create_table_sql(db.get_database_backend(), &stmt);
-    db.execute(Statement::from_string(db.get_database_backend(), sql))
+    db.execute_raw(Statement::from_string(db.get_database_backend(), sql))
         .await?;
     Ok(())
 }
@@ -725,17 +726,17 @@ where
     }
 
     for index in indexes {
-        let sql = match db.get_database_backend() {
-            DbBackend::Postgres => index.to_string(PostgresQueryBuilder),
-            DbBackend::Sqlite => index.to_string(SqliteQueryBuilder),
-            DbBackend::MySql => index.to_string(MysqlQueryBuilder),
+        let sql = match Dialect::from(db.get_database_backend()) {
+            Dialect::Postgres => index.to_string(PostgresQueryBuilder),
+            Dialect::Sqlite => index.to_string(SqliteQueryBuilder),
+            Dialect::MySql => index.to_string(MysqlQueryBuilder),
         };
 
         // Check if this is the critical unique index for recurring_executions
         let is_recurring_unique_index = sql.contains(&recurring_unique_index_name);
 
         match db
-            .execute(Statement::from_string(
+            .execute_raw(Statement::from_string(
                 db.get_database_backend(),
                 sql.clone(),
             ))
@@ -792,12 +793,12 @@ where
         .table(tbl(table))
         .add_column(ColumnDef::new(col("batch_id")).big_integer().null())
         .to_owned();
-    let sql = match backend {
-        DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
-        DbBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
-        DbBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => stmt.to_string(PostgresQueryBuilder),
+        Dialect::Sqlite => stmt.to_string(SqliteQueryBuilder),
+        Dialect::MySql => stmt.to_string(MysqlQueryBuilder),
     };
-    let altered = db.execute(Statement::from_string(backend, sql)).await;
+    let altered = db.execute_raw(Statement::from_string(backend, sql)).await;
 
     if column_exists(db, table, "batch_id").await {
         return Ok(());
@@ -827,22 +828,20 @@ where
     C: ConnectionTrait,
 {
     let backend = db.get_database_backend();
-    let sql = match backend {
-        DbBackend::Postgres => {
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
             "SELECT 1 FROM information_schema.tables \
              WHERE table_schema = ANY (current_schemas(false)) \
              AND table_name = $1 LIMIT 1"
         }
-        DbBackend::MySql => {
+        Dialect::MySql => {
             "SELECT 1 FROM information_schema.tables \
              WHERE table_schema = DATABASE() AND table_name = ? LIMIT 1"
         }
-        DbBackend::Sqlite => {
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1"
-        }
+        Dialect::Sqlite => "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
     };
     let stmt = Statement::from_sql_and_values(backend, sql, [table.into()]);
-    match db.query_one(stmt).await {
+    match db.query_one_raw(stmt).await {
         Ok(row) => row.is_some(),
         Err(e) => {
             tracing::debug!("table probe for {table} failed, assuming missing: {e}");
@@ -886,7 +885,7 @@ where
     );
 
     if let Err(e) = db
-        .execute(Statement::from_string(DbBackend::Postgres, sql))
+        .execute_raw(Statement::from_string(DbBackend::Postgres, sql))
         .await
     {
         tracing::warn!(
@@ -910,7 +909,7 @@ where
 {
     let sql = format!("SELECT 1 FROM {} LIMIT 1", table_config.jobs);
     match db
-        .execute(Statement::from_string(db.get_database_backend(), sql))
+        .execute_raw(Statement::from_string(db.get_database_backend(), sql))
         .await
     {
         Ok(_) => Ok(true),
@@ -951,12 +950,12 @@ where
         .table(tbl(table))
         .add_column(time_col("paused_at", backend).null())
         .to_owned();
-    let sql = match backend {
-        DbBackend::Postgres => stmt.to_string(PostgresQueryBuilder),
-        DbBackend::Sqlite => stmt.to_string(SqliteQueryBuilder),
-        DbBackend::MySql => stmt.to_string(MysqlQueryBuilder),
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => stmt.to_string(PostgresQueryBuilder),
+        Dialect::Sqlite => stmt.to_string(SqliteQueryBuilder),
+        Dialect::MySql => stmt.to_string(MysqlQueryBuilder),
     };
-    let altered = db.execute(Statement::from_string(backend, sql)).await;
+    let altered = db.execute_raw(Statement::from_string(backend, sql)).await;
 
     if column_exists(db, table, "paused_at").await {
         return Ok(());
@@ -988,21 +987,21 @@ where
     C: ConnectionTrait,
 {
     let backend = db.get_database_backend();
-    let sql = match backend {
-        DbBackend::Postgres => {
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => {
             "SELECT 1 FROM information_schema.columns \
              WHERE table_schema = ANY (current_schemas(false)) \
              AND table_name = $1 AND column_name = $2 LIMIT 1"
         }
-        DbBackend::MySql => {
+        Dialect::MySql => {
             "SELECT 1 FROM information_schema.columns \
              WHERE table_schema = DATABASE() \
              AND table_name = ? AND column_name = ? LIMIT 1"
         }
-        DbBackend::Sqlite => "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1",
+        Dialect::Sqlite => "SELECT 1 FROM pragma_table_info(?) WHERE name = ? LIMIT 1",
     };
     let stmt = Statement::from_sql_and_values(backend, sql, [table.into(), column.into()]);
-    match db.query_one(stmt).await {
+    match db.query_one_raw(stmt).await {
         Ok(row) => row.is_some(),
         Err(e) => {
             tracing::debug!("column probe for {table}.{column} failed, assuming missing: {e}");

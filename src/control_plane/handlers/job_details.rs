@@ -3,12 +3,13 @@ use axum::{
     http::StatusCode,
     response::Html,
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
+use sea_orm::{ConnectionTrait, Statement, Value};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
 
 use crate::control_plane::{models::JobDetailsInfo, utils::clean_sql, ControlPlane};
+use crate::dialect::Dialect;
 
 impl ControlPlane {
     pub async fn job_details(
@@ -28,9 +29,9 @@ impl ControlPlane {
         let start = Instant::now();
 
         // Get placeholder based on database backend
-        let p1 = match backend {
-            DbBackend::Postgres => "$1",
-            DbBackend::MySql | DbBackend::Sqlite => "?",
+        let p1 = match Dialect::from(backend) {
+            Dialect::Postgres => "$1",
+            Dialect::MySql | Dialect::Sqlite => "?",
         };
 
         // Get job basic information using dynamic table names
@@ -83,7 +84,7 @@ impl ControlPlane {
         p = p1));
 
         let job_result = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 &job_details_sql,
                 [Value::from(id)],
@@ -176,7 +177,7 @@ impl ControlPlane {
                     ));
 
                     if let Ok(failed_info) = db
-                        .query_one(Statement::from_sql_and_values(
+                        .query_one_raw(Statement::from_sql_and_values(
                             backend,
                             &failed_details_sql,
                             [Value::from(failed_id)],
@@ -261,7 +262,7 @@ impl ControlPlane {
                         ));
 
                         if let Ok(worker_info) = db
-                            .query_one(Statement::from_sql_and_values(
+                            .query_one_raw(Statement::from_sql_and_values(
                                 backend,
                                 &worker_details_sql,
                                 [Value::from(process_id)],
@@ -295,7 +296,7 @@ impl ControlPlane {
                     ));
 
                     if let Ok(claimed_info) = db
-                        .query_one(Statement::from_sql_and_values(
+                        .query_one_raw(Statement::from_sql_and_values(
                             backend,
                             &claimed_details_sql,
                             [Value::from(claimed_id)],
@@ -329,7 +330,7 @@ impl ControlPlane {
             ));
 
             let history_result = db
-                .query_all(Statement::from_sql_and_values(
+                .query_all_raw(Statement::from_sql_and_values(
                     backend,
                     &history_sql,
                     [Value::from(id)],

@@ -113,6 +113,7 @@ fn secs_to_duration(field: &str, seconds: f64) -> PyResult<Duration> {
 }
 
 use crate::control_plane::{ControlPlane, ControlPlaneExt};
+use crate::dialect::Dialect;
 
 use crate::context::*;
 use crate::core::{PreparedJob, Quebec};
@@ -3253,7 +3254,7 @@ impl PyQuebec {
         batch_size: Option<u64>,
         finished_before: Option<f64>,
     ) -> PyResult<u64> {
-        let batch_size = batch_size.unwrap_or(self.ctx.cleanup_batch_size).max(1);
+        let batch_size = std::cmp::max(batch_size.unwrap_or(self.ctx.cleanup_batch_size), 1);
         let finished_before = match finished_before {
             Some(ts) => parse_optional_timestamp(Some(ts), "finished_before")?
                 .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid timestamp"))?,
@@ -4722,9 +4723,9 @@ impl PyQuebec {
                 })?;
                 let db_ref = db.as_ref();
                 let backend = db_ref.get_database_backend();
-                let p1 = match backend {
-                    DbBackend::Postgres => "$1",
-                    DbBackend::MySql | DbBackend::Sqlite => "?",
+                let p1 = match Dialect::from(backend) {
+                    Dialect::Postgres => "$1",
+                    Dialect::MySql | Dialect::Sqlite => "?",
                 };
                 // `key` is a reserved word in MySQL, so quote it for every backend.
                 let key_col = crate::query_builder::quote_identifier(backend, "key");
@@ -4734,7 +4735,7 @@ impl PyQuebec {
                     table_config.recurring_tasks, key_col, p1
                 );
                 let row = db_ref
-                    .query_one(Statement::from_sql_and_values(
+                    .query_one_raw(Statement::from_sql_and_values(
                         backend,
                         &sql,
                         [DbValue::from(key.clone())],

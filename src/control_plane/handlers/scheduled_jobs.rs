@@ -94,7 +94,7 @@ impl ControlPlane {
         values.push(Value::from(offset as i32));
 
         let scheduled_jobs_result = db
-            .query_all(Statement::from_sql_and_values(
+            .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 &scheduled_jobs_sql,
                 values,
@@ -211,7 +211,7 @@ impl ControlPlane {
         ));
 
         let total_count = db
-            .query_one(Statement::from_sql_and_values(
+            .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 &count_sql,
                 count_values,

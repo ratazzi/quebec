@@ -51,10 +51,13 @@ const MYSQL_DEADLOCK_RETRIES: u32 = 4;
 
 fn is_mysql_deadlock(error: &TransactionError<DbErr>) -> bool {
     let TransactionError::Transaction(
-        DbErr::Exec(RuntimeErr::SqlxError(SqlxError::Database(source)))
-        | DbErr::Query(RuntimeErr::SqlxError(SqlxError::Database(source))),
+        DbErr::Exec(RuntimeErr::SqlxError(sqlx_error))
+        | DbErr::Query(RuntimeErr::SqlxError(sqlx_error)),
     ) = error
     else {
+        return false;
+    };
+    let SqlxError::Database(source) = sqlx_error.as_ref() else {
         return false;
     };
 
