@@ -4326,20 +4326,21 @@ impl PyQuebec {
         })
     }
 
-    /// Promote a single blocked job back to the ready queue.
+    /// Release a single blocked job, the way Solid Queue's
+    /// ``BlockedExecution#release`` does.
     ///
-    /// Inserts a ready_execution mirroring the blocked row's queue and
-    /// priority, then removes the blocked_execution. This **bypasses the
-    /// concurrency semaphore** — call sites are typically admin recovery
-    /// paths where the user is explicitly overriding the lock; the
-    /// dispatcher's auto-unblock path (`expires_at` sweep) is the one that
-    /// respects the semaphore.
+    /// The job is promoted to the ready queue only if its concurrency
+    /// semaphore can be acquired. Otherwise it stays blocked and is released
+    /// automatically once a slot frees up (a finishing job hands its slot to
+    /// the next blocked job, and the dispatcher sweeps expired keys). The
+    /// semaphore is never bypassed: a job that skipped it would later release
+    /// a slot it never held and let unrelated jobs exceed the limit.
     ///
     /// Returns:
-    ///     bool: True if a blocked execution existed and was promoted to
-    ///           ready, False if no blocked execution exists for ``job_id``.
+    ///     bool: True if the job was promoted to ready. False if no blocked
+    ///           execution exists for ``job_id`` or no concurrency slot is
+    ///           free; in the latter case the job is still blocked.
     fn unblock(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
-        let table_config = self.ctx.table_config.clone();
         py.detach(|| {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await.map_err(|e| {
@@ -4347,36 +4348,14 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, bool, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    Box::pin(async move {
-                        let blocked = crate::query_builder::blocked_executions::find_by_job_id(
-                            txn,
-                            &table_config,
-                            job_id,
-                        )
-                        .await?;
-                        let Some(blocked) = blocked else {
-                            return Ok(false);
-                        };
-                        crate::query_builder::ready_executions::insert(
-                            txn,
-                            &table_config,
-                            blocked.job_id,
-                            &blocked.queue_name,
-                            blocked.priority,
-                        )
-                        .await?;
-                        crate::query_builder::blocked_executions::delete_by_job_id(
-                            txn,
-                            &table_config,
-                            job_id,
-                        )
-                        .await?;
-                        Ok(true)
-                    })
-                })
+                crate::dispatcher::release_blocked_by(
+                    &self.ctx,
+                    &db,
+                    crate::query_builder::blocked_executions::BlockedLookup::JobId,
+                    job_id,
+                )
                 .await
+                .map(|outcome| outcome == crate::dispatcher::UnblockOutcome::Released)
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "Failed to unblock job {job_id}: {e}"
@@ -4439,9 +4418,11 @@ impl PyQuebec {
         })
     }
 
-    /// Bulk promote matching blocked jobs back to the ready queue. All
-    /// filters are optional and combined with AND. Like :func:`unblock`,
-    /// this **bypasses the concurrency semaphore**.
+    /// Release matching blocked jobs, one at a time in blocked order
+    /// (priority, then job id), the way Solid Queue's ``release_many`` does.
+    /// All filters are optional and combined with AND. Like :meth:`unblock`,
+    /// each job is promoted only if its concurrency semaphore can be acquired;
+    /// jobs without a free slot stay blocked.
     ///
     /// Args:
     ///     class_name: Match exact class name (e.g. ``"MyJob"``).
@@ -4456,7 +4437,6 @@ impl PyQuebec {
         class_name: Option<String>,
         queue_name: Option<String>,
     ) -> PyResult<u64> {
-        let table_config = self.ctx.table_config.clone();
         py.detach(|| {
             self.rt.block_on(async {
                 let db = self.ctx.get_db().await.map_err(|e| {
@@ -4464,43 +4444,12 @@ impl PyQuebec {
                         "Database connection failed: {e}"
                     ))
                 })?;
-                db.transaction::<_, u64, sea_orm::DbErr>(|txn| {
-                    let table_config = table_config.clone();
-                    let class_name = class_name.clone();
-                    let queue_name = queue_name.clone();
-                    Box::pin(async move {
-                        let rows = crate::query_builder::blocked_executions::find_all_filtered(
-                            txn,
-                            &table_config,
-                            class_name.as_deref(),
-                            queue_name.as_deref(),
-                        )
-                        .await?;
-                        if rows.is_empty() {
-                            return Ok(0);
-                        }
-                        let ready_rows: Vec<(i64, &str, i32)> = rows
-                            .iter()
-                            .map(|m| (m.job_id, m.queue_name.as_str(), m.priority))
-                            .collect();
-                        crate::query_builder::ready_executions::insert_all(
-                            txn,
-                            &table_config,
-                            &ready_rows,
-                        )
-                        .await?;
-                        let mut deleted: u64 = 0;
-                        for blocked in &rows {
-                            deleted += crate::query_builder::blocked_executions::delete_by_id(
-                                txn,
-                                &table_config,
-                                blocked.id,
-                            )
-                            .await?;
-                        }
-                        Ok(deleted)
-                    })
-                })
+                crate::dispatcher::release_blocked_matching(
+                    &self.ctx,
+                    &db,
+                    class_name.as_deref(),
+                    queue_name.as_deref(),
+                )
                 .await
                 .map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(

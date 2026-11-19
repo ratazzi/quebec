@@ -42,6 +42,13 @@ def _enqueue_blocked_pair(qc, job_cls):
     return first, second
 
 
+def _free_slots(session, prefix):
+    """Drop every semaphore row, as the dispatcher's expired-semaphore sweep
+    does once concurrency_duration lapses, so blocked jobs can acquire one."""
+    session.execute(text(f"DELETE FROM {prefix}_semaphores"))
+    session.commit()
+
+
 def test_unblock_promotes_blocked_execution_to_ready(qc_with_sqlalchemy) -> None:
     qc = qc_with_sqlalchemy["qc"]
     session = qc_with_sqlalchemy["session"]
@@ -52,6 +59,7 @@ def test_unblock_promotes_blocked_execution_to_ready(qc_with_sqlalchemy) -> None
     session.expire_all()
     assert _count(session, prefix, "blocked_executions") == 1
 
+    _free_slots(session, prefix)
     assert qc.unblock(blocked.id) is True
 
     session.expire_all()
@@ -67,6 +75,12 @@ def test_unblock_promotes_blocked_execution_to_ready(qc_with_sqlalchemy) -> None
             where=f"WHERE job_id = {blocked.id}",
         )
         == 1
+    )
+    # Released through the semaphore (Solid Queue's BlockedExecution#release),
+    # so the slot is now held: value 0 for concurrency_limit = 1.
+    assert (
+        session.execute(text(f"SELECT value FROM {prefix}_semaphores")).scalar_one()
+        == 0
     )
 
 
@@ -106,6 +120,7 @@ def test_unblock_all_without_filters_promotes_everything(qc_with_sqlalchemy) -> 
     session.expire_all()
     assert _count(session, prefix, "blocked_executions") == 2
 
+    _free_slots(session, prefix)
     count = qc.unblock_all()
     assert count == 2
 
@@ -128,6 +143,7 @@ def test_unblock_all_filters_by_class_name(qc_with_sqlalchemy) -> None:
     _enqueue_blocked_pair(qc, OtherExclusiveJob)
     session.expire_all()
 
+    _free_slots(session, prefix)
     count = qc.unblock_all(class_name=ExclusiveJob.__qualname__)
     assert count == 1
 
@@ -170,6 +186,7 @@ def test_unblock_all_filters_by_queue_name(qc_with_sqlalchemy) -> None:
     session.expire_all()
     assert _count(session, prefix, "blocked_executions") == 2
 
+    _free_slots(session, prefix)
     count = qc.unblock_all(queue_name="emails")
     assert count == 1
 

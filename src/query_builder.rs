@@ -2237,7 +2237,7 @@ pub mod blocked_executions {
     }
 
     /// Find all blocked executions matching the optional class_name /
-    /// queue_name filters (same predicates as [`delete_all`]).
+    /// queue_name filters (combined with AND).
     pub async fn find_all_filtered<C>(
         db: &C,
         table_config: &TableConfig,
@@ -2330,6 +2330,52 @@ pub mod blocked_executions {
         quebec_blocked_executions::Model::find_by_statement(stmt)
             .one(db)
             .await
+    }
+
+    /// Lock one blocked execution, looked up by `id` or `job_id`, for the
+    /// rest of the transaction.
+    ///
+    /// Plain `FOR UPDATE` (no SKIP LOCKED): an explicit unblock of a specific
+    /// row should wait for a concurrent release of that same row and then
+    /// observe that it is gone, rather than silently skip it. SQLite has no
+    /// row locks; its write transaction serializes this instead.
+    pub async fn lock_by<C>(
+        db: &C,
+        table_config: &TableConfig,
+        column: BlockedLookup,
+        value: i64,
+    ) -> Result<Option<quebec_blocked_executions::Model>, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let backend = db.get_database_backend();
+        let table = quote_identifier(backend, &table_config.blocked_executions);
+        let column = quote_identifier(backend, column.as_str());
+        let sql = match Dialect::from(backend) {
+            Dialect::Postgres => format!("SELECT * FROM {table} WHERE {column} = $1 FOR UPDATE"),
+            Dialect::MySql => format!("SELECT * FROM {table} WHERE {column} = ? FOR UPDATE"),
+            Dialect::Sqlite => format!("SELECT * FROM {table} WHERE {column} = ?"),
+        };
+        let stmt = Statement::from_sql_and_values(backend, sql, [value.into()]);
+        quebec_blocked_executions::Model::find_by_statement(stmt)
+            .one(db)
+            .await
+    }
+
+    /// Which unique column [`lock_by`] matches on.
+    #[derive(Debug, Clone, Copy)]
+    pub enum BlockedLookup {
+        Id,
+        JobId,
+    }
+
+    impl BlockedLookup {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Id => "id",
+                Self::JobId => "job_id",
+            }
+        }
     }
 
     /// Count all blocked executions
@@ -2432,55 +2478,6 @@ pub mod blocked_executions {
             .to_owned();
 
         execute_select_one(db, query).await
-    }
-
-    /// Delete all blocked executions, optionally filtered by class_name/queue_name
-    pub async fn delete_all<C>(
-        db: &C,
-        table_config: &TableConfig,
-        class_name: Option<&str>,
-        queue_name: Option<&str>,
-    ) -> Result<u64, DbErr>
-    where
-        C: ConnectionTrait,
-    {
-        let table = Alias::new(&table_config.blocked_executions);
-
-        // No filters: simple bulk delete
-        if class_name.is_none() && queue_name.is_none() {
-            let query = Query::delete().from_table(table).to_owned();
-            return execute_delete(db, query).await;
-        }
-
-        // With filters: collect matching ids, then delete by id
-        let jobs_table = Alias::new(&table_config.jobs);
-        let mut select = Query::select();
-        select.column((table.clone(), Asterisk));
-        select.from(table.clone());
-        if class_name.is_some() {
-            select.inner_join(
-                jobs_table.clone(),
-                Expr::col((table.clone(), col("job_id"))).equals((jobs_table.clone(), col("id"))),
-            );
-            if let Some(cn) = class_name {
-                select.and_where(Expr::col((jobs_table, col("class_name"))).eq(cn));
-            }
-        }
-        if let Some(qn) = queue_name {
-            select.and_where(Expr::col((table.clone(), col("queue_name"))).eq(qn));
-        }
-
-        let rows = execute_select::<quebec_blocked_executions::Model, C>(db, select).await?;
-        let ids: Vec<i64> = rows.into_iter().map(|m| m.id).collect();
-        if ids.is_empty() {
-            return Ok(0);
-        }
-
-        let query = Query::delete()
-            .from_table(table)
-            .and_where(Expr::col(col("id")).is_in(ids))
-            .to_owned();
-        execute_delete(db, query).await
     }
 }
 

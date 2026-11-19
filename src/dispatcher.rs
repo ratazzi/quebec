@@ -482,79 +482,178 @@ impl Dispatcher {
                     return Ok(false);
                 };
 
-                // Resolve concurrency_limit + duration from the registered runnable
-                // via the job's class_name. Solid Queue's `#release` calls
-                // `Semaphore.wait(job)`, which sets the semaphore TTL from
-                // `job.concurrency_duration`; pass it through so unblock matches
-                // both Solid Queue and the scheduled-dispatch path instead of
-                // falling back to `acquire_semaphore`'s default TTL.
-                let (concurrency_limit, concurrency_duration) = {
-                    #[cfg(feature = "python")]
-                    {
-                        query_builder::jobs::find_by_id(txn, &ctx.table_config, execution.job_id)
-                            .await?
-                            .and_then(|job| {
-                                ctx.runnables.read().ok().and_then(|runnables| {
-                                    runnables.get(&job.class_name).map(|r| {
-                                        (
-                                            r.concurrency_limit.unwrap_or(1),
-                                            r.concurrency_duration
-                                                .map(|s| chrono::Duration::seconds(s as i64)),
-                                        )
-                                    })
-                                })
-                            })
-                            .unwrap_or((1, None))
-                    }
-                    #[cfg(not(feature = "python"))]
-                    {
-                        (1, None)
-                    }
-                };
-
-                if acquire_semaphore(
-                    txn,
-                    &ctx.table_config,
-                    key.clone(),
-                    concurrency_limit,
-                    concurrency_duration,
-                )
-                .await?
-                {
-                    query_builder::ready_executions::insert(
-                        txn,
-                        &ctx.table_config,
-                        execution.job_id,
-                        &execution.queue_name,
-                        execution.priority,
-                    )
-                    .await?;
-                    query_builder::blocked_executions::delete_by_id(
-                        txn,
-                        &ctx.table_config,
-                        execution.id,
-                    )
-                    .await?;
-                    info!(
-                        "Unblocked job {} for concurrency key: {}",
-                        execution.job_id, key
-                    );
-                    Ok(true)
-                } else {
-                    trace!(
-                        "Failed to acquire semaphore for key: {} (no available slots)",
-                        key
-                    );
-                    Ok(false)
-                }
+                release_blocked_execution(&ctx, txn, &execution).await
             })
         })
         .await
-        .map_err(|e| match e {
-            TransactionError::Connection(e) => e,
-            TransactionError::Transaction(e) => e,
-        })
+        .map_err(flatten_txn_err)
     }
+}
+
+fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
+    match e {
+        TransactionError::Connection(e) | TransactionError::Transaction(e) => e,
+    }
+}
+
+/// Concurrency limit and duration for `job_id`'s class, from the registered
+/// runnable (Solid Queue's `job.concurrency_limit` / `concurrency_duration`).
+/// Falls back to `(1, None)` when the class is not registered in this process.
+async fn concurrency_settings<C>(
+    ctx: &AppContext,
+    db: &C,
+    job_id: i64,
+) -> Result<(i32, Option<chrono::Duration>), DbErr>
+where
+    C: ConnectionTrait,
+{
+    #[cfg(feature = "python")]
+    {
+        let job = query_builder::jobs::find_by_id(db, &ctx.table_config, job_id).await?;
+        Ok(job
+            .and_then(|job| {
+                ctx.runnables.read().ok().and_then(|runnables| {
+                    runnables.get(&job.class_name).map(|r| {
+                        (
+                            r.concurrency_limit.unwrap_or(1),
+                            r.concurrency_duration
+                                .map(|s| chrono::Duration::seconds(s as i64)),
+                        )
+                    })
+                })
+            })
+            .unwrap_or((1, None)))
+    }
+    #[cfg(not(feature = "python"))]
+    {
+        let _ = (ctx, db, job_id);
+        Ok((1, None))
+    }
+}
+
+/// Solid Queue's `BlockedExecution#release`: acquire the concurrency
+/// semaphore for the job and, only if that succeeds, promote it to ready and
+/// delete the blocked row. Without a free slot the job stays blocked.
+///
+/// The caller must already hold `execution`'s row lock in `db`'s transaction.
+/// This is the only way a blocked job becomes ready, so every job that
+/// reaches ready through it holds a slot that its completion later releases.
+pub(crate) async fn release_blocked_execution<C>(
+    ctx: &AppContext,
+    db: &C,
+    execution: &crate::entities::quebec_blocked_executions::Model,
+) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    // Semaphore.wait(job) sets the TTL from job.concurrency_duration; pass it
+    // through instead of falling back to acquire_semaphore's default TTL.
+    let (concurrency_limit, concurrency_duration) =
+        concurrency_settings(ctx, db, execution.job_id).await?;
+    let key = execution.concurrency_key.clone();
+
+    if !acquire_semaphore(
+        db,
+        &ctx.table_config,
+        key.clone(),
+        concurrency_limit,
+        concurrency_duration,
+    )
+    .await?
+    {
+        trace!("Failed to acquire semaphore for key: {key} (no available slots)");
+        return Ok(false);
+    }
+
+    query_builder::ready_executions::insert(
+        db,
+        &ctx.table_config,
+        execution.job_id,
+        &execution.queue_name,
+        execution.priority,
+    )
+    .await?;
+    query_builder::blocked_executions::delete_by_id(db, &ctx.table_config, execution.id).await?;
+    info!(
+        "Unblocked job {} for concurrency key: {}",
+        execution.job_id, key
+    );
+    Ok(true)
+}
+
+/// Outcome of an explicit unblock request for one blocked execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnblockOutcome {
+    /// Semaphore acquired; the job is now ready.
+    Released,
+    /// No free concurrency slot; the job stays blocked until one frees up.
+    StillBlocked,
+    /// No blocked execution matched.
+    NotFound,
+}
+
+/// Release one blocked execution, looked up by `id` or `job_id`, in its own
+/// transaction (Solid Queue's `release_one` + `#release` for a chosen row).
+pub(crate) async fn release_blocked_by(
+    ctx: &Arc<AppContext>,
+    db: &DatabaseConnection,
+    lookup: query_builder::blocked_executions::BlockedLookup,
+    value: i64,
+) -> Result<UnblockOutcome, DbErr> {
+    let ctx = ctx.clone();
+    db.transaction::<_, UnblockOutcome, DbErr>(|txn| {
+        Box::pin(async move {
+            let Some(execution) =
+                query_builder::blocked_executions::lock_by(txn, &ctx.table_config, lookup, value)
+                    .await?
+            else {
+                return Ok(UnblockOutcome::NotFound);
+            };
+            Ok(if release_blocked_execution(&ctx, txn, &execution).await? {
+                UnblockOutcome::Released
+            } else {
+                UnblockOutcome::StillBlocked
+            })
+        })
+    })
+    .await
+    .map_err(flatten_txn_err)
+}
+
+/// Release every blocked execution matching the optional filters, one row per
+/// transaction in blocked order (priority, then job_id), like Solid Queue's
+/// `release_many`. Rows whose key has no free slot stay blocked.
+///
+/// Returns how many were promoted to ready.
+pub(crate) async fn release_blocked_matching(
+    ctx: &Arc<AppContext>,
+    db: &DatabaseConnection,
+    class_name: Option<&str>,
+    queue_name: Option<&str>,
+) -> Result<u64, DbErr> {
+    let mut candidates = query_builder::blocked_executions::find_all_filtered(
+        db,
+        &ctx.table_config,
+        class_name,
+        queue_name,
+    )
+    .await?;
+    candidates.sort_by_key(|e| (e.priority, e.job_id));
+
+    let mut released = 0;
+    for candidate in candidates {
+        let outcome = release_blocked_by(
+            ctx,
+            db,
+            query_builder::blocked_executions::BlockedLookup::Id,
+            candidate.id,
+        )
+        .await?;
+        if outcome == UnblockOutcome::Released {
+            released += 1;
+        }
+    }
+    Ok(released)
 }
 
 #[async_trait]
