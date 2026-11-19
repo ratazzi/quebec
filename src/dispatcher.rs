@@ -484,6 +484,7 @@ impl Dispatcher {
                         txn,
                         &ctx.table_config,
                         &key,
+                        ctx.use_skip_locked,
                     )
                     .await?
                 else {
