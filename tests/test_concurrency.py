@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -97,14 +97,16 @@ def test_first_job_goes_to_ready_second_goes_to_blocked(
     assert db_assert.count_blocked_executions() == 1
 
 
-def test_full_semaphore_enqueue_does_not_wait_on_row_lock(
+def test_full_semaphore_enqueue_waits_for_a_release_in_progress(
     qc_with_sqlalchemy, db_assert
 ) -> None:
-    """A full key must not queue behind a transaction holding its semaphore row.
+    """Enqueueing onto a full key waits for a release that is in progress.
 
-    Mirrors Solid Queue's read-before-write: while a worker is mid-release
-    (row updated, not committed), enqueueing onto a full key is a plain read
-    and goes straight to blocked instead of waiting for that commit.
+    Solid Queue #456: a worker giving a slot back while an enqueue on the
+    same full key is deciding to block must not miss the blocked job. The
+    enqueue re-reads a full semaphore with a row lock, so it waits for the
+    release to commit and then takes the freed slot instead of blocking
+    (and being stranded until the blocked row expires).
     """
     if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
         pytest.skip("SQLite serializes all writers")
@@ -118,22 +120,26 @@ def test_full_semaphore_enqueue_does_not_wait_on_row_lock(
     ConcurrentJob.perform_later(qc, 1)
 
     pool = ThreadPoolExecutor(max_workers=1)
-    with engine.connect() as holder:
-        holder.execute(
-            text(
-                f"UPDATE {prefix}_semaphores SET updated_at = updated_at "
-                f"WHERE {key} = :key"
-            ),
-            {"key": "ConcurrentJob/exclusive-resource"},
-        )
-        try:
-            pool.submit(ConcurrentJob.perform_later, qc, 2).result(timeout=2)
-        finally:
-            holder.rollback()
-            pool.shutdown(wait=True)
+    try:
+        with engine.connect() as releaser:
+            # A worker mid-release: slot given back, not committed yet.
+            releaser.execute(
+                text(
+                    f"UPDATE {prefix}_semaphores SET value = value + 1 "
+                    f"WHERE {key} = :key"
+                ),
+                {"key": "ConcurrentJob/exclusive-resource"},
+            )
+            future = pool.submit(ConcurrentJob.perform_later, qc, 2)
+            done, _ = wait([future], timeout=0.5)
+            assert not done, "enqueue on a full key should wait for the release"
+            releaser.commit()
+        future.result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
 
-    assert db_assert.count_ready_executions() == 1
-    assert db_assert.count_blocked_executions() == 1
+    assert db_assert.count_ready_executions() == 2
+    assert db_assert.count_blocked_executions() == 0
 
 
 def test_completing_first_job_releases_semaphore(qc_with_sqlalchemy) -> None:

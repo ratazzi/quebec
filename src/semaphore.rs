@@ -4,13 +4,84 @@ use crate::query_builder::quote_identifier;
 use chrono::NaiveDateTime;
 use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Statement};
 
+/// How long taking a slot may take before the semaphore's expiry is written
+/// again once the slot is ours: a tenth of the period, at most a second.
+///
+/// An uncontended acquire takes a few milliseconds and skips the extra
+/// write; any wait for a row lock long enough to eat into the period
+/// triggers it, including with a sub-second period.
+fn restamp_after(duration: chrono::Duration) -> std::time::Duration {
+    (duration / 10)
+        .to_std()
+        .unwrap_or_default()
+        .min(std::time::Duration::from_secs(1))
+}
+
 /// Take a slot on the semaphore for `key`, Solid Queue's `Semaphore.wait`.
 ///
 /// Returns the id of the semaphore the slot was taken from, or `None` when no
 /// slot is free. Callers acquiring a job's concurrency slot record that id
 /// (see [`crate::concurrency_lock`]) so the job later gives the slot back to
 /// this very semaphore, not to whichever one holds the key by then.
+///
+/// The expiry written with the slot is computed before any statement that
+/// may wait for another transaction's row lock. Solid Queue computes it only
+/// once it holds the lock. So when taking the slot took a while, the expiry
+/// is written again from the current time: otherwise a wait as long as
+/// `duration` leaves a semaphore that is already expired when it commits,
+/// and concurrency maintenance deletes it under its holder.
 pub async fn acquire_semaphore<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: String,
+    concurrency_limit: i32,
+    duration: chrono::Duration,
+) -> Result<Option<i64>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let started = std::time::Instant::now();
+    let acquired = take_slot(db, table_config, key, concurrency_limit, duration).await?;
+    if let Some(id) = acquired.filter(|_| started.elapsed() >= restamp_after(duration)) {
+        restamp_expiry(db, table_config, id, duration).await?;
+    }
+    Ok(acquired)
+}
+
+/// Set the expiry of semaphore `id`, on which this transaction just took a
+/// slot (so it already holds the row lock), to `duration` from now, as
+/// Solid Queue's `attempt_decrement` does once it holds the lock.
+async fn restamp_expiry<C>(
+    db: &C,
+    table_config: &TableConfig,
+    id: i64,
+    duration: chrono::Duration,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let backend = db.get_database_backend();
+    let now = chrono::Utc::now().naive_utc();
+    let sql = match Dialect::from(backend) {
+        Dialect::Postgres => format!(
+            "UPDATE {} SET expires_at = $1, updated_at = $2 WHERE id = $3",
+            table_config.semaphores
+        ),
+        Dialect::MySql | Dialect::Sqlite => format!(
+            "UPDATE {} SET expires_at = ?, updated_at = ? WHERE id = ?",
+            table_config.semaphores
+        ),
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        backend,
+        sql,
+        vec![(now + duration).into(), now.into(), id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn take_slot<C>(
     db: &C,
     table_config: &TableConfig,
     key: String,
@@ -24,28 +95,26 @@ where
     let expires_at = now + duration;
     let key_col = quote_identifier(db.get_database_backend(), "key");
 
-    // Read before writing, like Solid Queue's `Semaphore::Proxy#wait`. A plain
-    // SELECT never waits on row locks, so a full semaphore is rejected without
-    // queuing behind the transaction that currently holds the row (a worker
-    // releasing a slot, another enqueue). Writing first does wait: Postgres
-    // `ON CONFLICT DO NOTHING` blocks until a concurrent updater of the
-    // conflicting row finishes, and the MySQL UPSERT always takes an exclusive
-    // lock. Only a missing key falls through to the creation path below.
+    // Read before writing, like Solid Queue's `Semaphore::Proxy#wait`. An open
+    // semaphore is taken with the conditional UPDATE below, which locks the
+    // row anyway; only a missing key falls through to the creation path.
     //
-    // Like Solid Queue, the read can see a slot that a worker is freeing but
-    // has not committed yet. The job then goes to blocked while the worker
-    // finds no blocked job to promote. The dispatcher's concurrency
-    // maintenance releases it once the blocked row expires
-    // (`concurrency_duration`), as Solid Queue's `BlockedExecution.unblock`
-    // does.
-    match find_value(db, table_config, &key).await? {
-        Some(value) if value > 0 => {
-            let acquired =
-                attempt_decrement(db, table_config, key.clone(), expires_at, now).await?;
-            return id_if_acquired(acquired, db, table_config, &key).await;
+    // A semaphore found full, or whose last slot another transaction took
+    // between our read and our UPDATE, is decided under a row lock (Solid
+    // Queue reads it with `lock` outright, since #456): see
+    // [`decide_under_lock`]. The lock is taken only then, so open keys stay a
+    // single UPDATE.
+    let found = find_value(db, table_config, &key, false).await?;
+    if found.is_some_and(|value| value > 0)
+        && attempt_decrement(db, table_config, key.clone(), expires_at, now).await?
+    {
+        return acquired_semaphore_id(db, table_config, &key).await;
+    }
+    if found.is_some() {
+        if let Some(decided) = decide_under_lock(db, table_config, &key, expires_at, now).await? {
+            return Ok(decided);
         }
-        Some(_) => return Ok(None),
-        None => {}
+        // Expired and deleted since our first read: create it below.
     }
 
     if db.get_database_backend() == DatabaseBackend::MySql {
@@ -130,8 +199,47 @@ where
     // callers to wait for `expires_at` to elapse before the dispatcher's
     // delete_expired sweep cleared the row — turning concurrency_duration
     // into a minimum cooldown rather than a crash-safety TTL.
-    let acquired = attempt_decrement(db, table_config, key.clone(), expires_at, now).await?;
-    id_if_acquired(acquired, db, table_config, &key).await
+    if attempt_decrement(db, table_config, key.clone(), expires_at, now).await? {
+        return acquired_semaphore_id(db, table_config, &key).await;
+    }
+    // Full: decide under the row lock, as above. The row exists (we just
+    // conflicted with it), so a missing one now gives no slot either.
+    Ok(decide_under_lock(db, table_config, &key, expires_at, now)
+        .await?
+        .flatten())
+}
+
+/// Read the semaphore for `key` again with a row lock and take a slot if one
+/// is free; `None` when the row no longer exists.
+///
+/// The caller holds the lock until its transaction ends. When no slot is
+/// free, its blocked execution therefore commits before any worker giving a
+/// slot back can look for blocked jobs, so that worker sees and promotes it.
+/// Without the lock, a slot freed between an unlocked read (or a decrement
+/// that matched nothing) and the caller's commit leaves the new job stranded
+/// until its blocked row expires and the dispatcher's concurrency
+/// maintenance comes round.
+async fn decide_under_lock<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: &str,
+    expires_at: NaiveDateTime,
+    now: NaiveDateTime,
+) -> Result<Option<Option<i64>>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    match find_value(db, table_config, key, true).await? {
+        Some(value) if value > 0 => {
+            let acquired =
+                attempt_decrement(db, table_config, key.to_string(), expires_at, now).await?;
+            id_if_acquired(acquired, db, table_config, key)
+                .await
+                .map(Some)
+        }
+        Some(_) => Ok(Some(None)),
+        None => Ok(None),
+    }
 }
 
 async fn id_if_acquired<C>(
@@ -186,8 +294,15 @@ where
     .transpose()
 }
 
-/// Current value of the semaphore row for `key`, if it exists.
-async fn find_value<C>(db: &C, table_config: &TableConfig, key: &str) -> Result<Option<i32>, DbErr>
+/// Current value of the semaphore row for `key`, if it exists. With `lock`,
+/// a locking read that holds the row until the transaction ends (SQLite has
+/// no row locks; its write transaction already serializes writers).
+async fn find_value<C>(
+    db: &C,
+    table_config: &TableConfig,
+    key: &str,
+    lock: bool,
+) -> Result<Option<i32>, DbErr>
 where
     C: ConnectionTrait,
 {
@@ -197,8 +312,13 @@ where
         Dialect::Postgres => "$1",
         Dialect::Sqlite | Dialect::MySql => "?",
     };
+    let lock_clause = if lock && backend != DatabaseBackend::Sqlite {
+        " FOR UPDATE"
+    } else {
+        ""
+    };
     let sql = format!(
-        "SELECT value FROM {} WHERE {key_col} = {placeholder}",
+        "SELECT value FROM {} WHERE {key_col} = {placeholder}{lock_clause}",
         table_config.semaphores
     );
     db.query_one_raw(Statement::from_sql_and_values(

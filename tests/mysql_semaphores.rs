@@ -100,9 +100,14 @@ async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
 }
 
 #[tokio::test]
-async fn full_semaphore_is_rejected_without_writing() {
+async fn full_semaphore_is_rejected_under_row_lock_without_writing() {
+    // A full key is read again with a row lock, which the caller then holds
+    // until its blocked execution commits (Solid Queue #456).
     let db = MockDatabase::new(DbBackend::MySql)
-        .append_query_results([vec![BTreeMap::from([("value", Value::from(0_i32))])]])
+        .append_query_results([
+            vec![BTreeMap::from([("value", Value::from(0_i32))])],
+            vec![BTreeMap::from([("value", Value::from(0_i32))])],
+        ])
         .into_connection();
     assert!(
         acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, ttl())
@@ -111,8 +116,57 @@ async fn full_semaphore_is_rejected_without_writing() {
             .is_none()
     );
     let log = db.into_transaction_log();
-    assert_eq!(log.len(), 1);
+    assert_eq!(log.len(), 2);
     assert!(log[0].statements()[0].sql.starts_with("SELECT value"));
+    assert!(!log[0].statements()[0].sql.contains("FOR UPDATE"));
+    assert!(log[1].statements()[0].sql.starts_with("SELECT value"));
+    assert!(log[1].statements()[0].sql.ends_with("FOR UPDATE"));
+}
+
+#[tokio::test]
+async fn last_slot_lost_after_read_is_decided_under_row_lock() {
+    // The read saw a free slot, but another transaction took it before our
+    // UPDATE, which then matched nothing. The key is read again with a row
+    // lock, which the caller holds until its blocked execution commits.
+    let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([
+            vec![BTreeMap::from([("value", Value::from(1_i32))])],
+            vec![BTreeMap::from([("value", Value::from(0_i32))])],
+        ])
+        .append_exec_results([executed(0)])
+        .into_connection();
+    assert!(
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, ttl())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let log = db.into_transaction_log();
+    assert_eq!(log.len(), 3);
+    assert!(log[1].statements()[0].sql.starts_with("UPDATE"));
+    assert!(log[2].statements()[0].sql.ends_with("FOR UPDATE"));
+}
+
+#[tokio::test]
+async fn slot_freed_while_waiting_on_full_semaphore_is_taken() {
+    // The locking read waited for a release to commit and now sees its slot.
+    let db = MockDatabase::new(DbBackend::MySql)
+        .append_query_results([
+            vec![BTreeMap::from([("value", Value::from(0_i32))])],
+            vec![BTreeMap::from([("value", Value::from(1_i32))])],
+            id_row(4),
+        ])
+        .append_exec_results([executed(1)])
+        .into_connection();
+    assert_eq!(
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, ttl())
+            .await
+            .unwrap(),
+        Some(4)
+    );
+    let log = db.into_transaction_log();
+    assert_eq!(log.len(), 4);
+    assert!(log[2].statements()[0].sql.starts_with("UPDATE"));
 }
 
 #[tokio::test]
@@ -267,4 +321,116 @@ async fn mysql_live_semaphore_and_rate_limit() {
     .await
     .unwrap();
     db.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_MYSQL_URL pointing to a disposable MySQL database"]
+async fn mysql_live_slot_taken_after_a_lock_wait_gets_a_fresh_expiry() {
+    use sea_orm::TransactionTrait;
+
+    let dsn = std::env::var("TEST_MYSQL_URL").expect("set TEST_MYSQL_URL for this test");
+    let db = sea_orm::Database::connect(dsn.clone()).await.unwrap();
+    let prefix = format!("mysql_wait_{}", std::process::id());
+    let tc = TableConfig::with_prefix(&prefix);
+    let create = quebec::schema_builder::create_semaphores_table(&tc, DbBackend::MySql)
+        .to_string(sea_orm::sea_query::MysqlQueryBuilder);
+    db.execute_raw(Statement::from_string(DbBackend::MySql, create))
+        .await
+        .unwrap();
+    let key = "slow";
+    assert!(acquire_semaphore(&db, &tc, key.into(), 2, ttl())
+        .await
+        .unwrap()
+        .is_some());
+
+    // Another transaction holds the row for longer than the period, so the
+    // expiry computed before our UPDATE waited for it is already past.
+    let holder = db.begin().await.unwrap();
+    holder
+        .execute_raw(Statement::from_string(
+            DbBackend::MySql,
+            format!(
+                "SELECT id FROM `{}` WHERE `key` = '{key}' FOR UPDATE",
+                tc.semaphores
+            ),
+        ))
+        .await
+        .unwrap();
+    let period = chrono::Duration::milliseconds(250);
+    let waiter = {
+        let dsn = dsn.clone();
+        let tc = tc.clone();
+        tokio::spawn(async move {
+            let db = sea_orm::Database::connect(dsn).await.unwrap();
+            let txn = db.begin().await.unwrap();
+            let acquired = acquire_semaphore(&txn, &tc, key.into(), 2, period)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            acquired
+        })
+    };
+    // Count the period from when the waiter is actually waiting on the lock,
+    // not from when its task started (connecting can take a while).
+    wait_for_lock_waiter(&db, &tc.semaphores).await;
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    holder.commit().await.unwrap();
+    assert!(waiter.await.unwrap().is_some());
+
+    let expires_at: chrono::NaiveDateTime = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::MySql,
+            format!(
+                "SELECT expires_at FROM `{}` WHERE `key` = '{key}'",
+                tc.semaphores
+            ),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "expires_at")
+        .unwrap();
+    assert!(
+        expires_at > chrono::Utc::now().naive_utc(),
+        "expiry {expires_at} must be counted from when the slot was taken"
+    );
+
+    db.execute_raw(Statement::from_string(
+        DbBackend::MySql,
+        format!("DROP TABLE `{}`", tc.semaphores),
+    ))
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+}
+
+/// Wait until another connection is running a statement on `table`: the
+/// waiter's write, blocked on the row lock the test holds. (The process list
+/// works on MySQL and MariaDB alike; `innodb_trx` doesn't always list the
+/// waiter.)
+async fn wait_for_lock_waiter(db: &sea_orm::DatabaseConnection, table: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::MySql,
+                "SELECT COUNT(*) AS n FROM information_schema.processlist \
+                 WHERE id <> CONNECTION_ID() AND command IN ('Query', 'Execute') \
+                 AND info LIKE ?",
+                [format!("%{table}%").into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "waiter never blocked on the row lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
