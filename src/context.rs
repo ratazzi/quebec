@@ -911,6 +911,14 @@ pub struct RunnableDefaults {
     pub priority: i32,
 }
 
+/// A registered job class's concurrency settings, with the period resolved.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassConcurrency {
+    pub limit: i32,
+    pub duration: chrono::Duration,
+    pub on_conflict: ConcurrencyConflict,
+}
+
 impl AppContext {
     /// Resolve the final worker selector after configuration has been applied.
     ///
@@ -1325,7 +1333,7 @@ impl AppContext {
             clear_finished_jobs_after: Duration::from_secs(3600 * 24 * 14), // 14 days
             cleanup_batch_size: 500,
             cleanup_interval: Duration::ZERO, // disabled by default, set to enable (e.g. 3600s)
-            default_concurrency_control_period: Duration::from_secs(60), // 1 minute
+            default_concurrency_control_period: Duration::from_secs(180), // 3 minutes
             dispatcher_polling_interval: Duration::from_secs(1), // 1 seconds
             dispatcher_batch_size: 500,
             dispatcher_concurrency_maintenance_interval: Duration::from_secs(600),
@@ -1827,6 +1835,40 @@ impl AppContext {
     /// runnable registry without Python job classes.
     #[cfg(not(feature = "python"))]
     pub fn get_runnable_defaults(&self, _class_name: &str) -> Option<RunnableDefaults> {
+        None
+    }
+
+    /// A job's concurrency period: its class's `concurrency_duration`, or
+    /// `default_concurrency_control_period` when the class sets none (Solid
+    /// Queue's `job.concurrency_duration`). Both the semaphore's and the
+    /// blocked execution's `expires_at` come from it.
+    pub fn concurrency_period(&self, duration: Option<chrono::Duration>) -> chrono::Duration {
+        duration.unwrap_or_else(|| {
+            chrono::Duration::from_std(self.default_concurrency_control_period)
+                .unwrap_or_else(|_| chrono::Duration::seconds(60))
+        })
+    }
+
+    /// Concurrency settings of a registered job class, read without the GIL.
+    /// `None` when the class is not registered in this process: like Solid
+    /// Queue's `job_class.nil?`, callers then let the job skip its limits
+    /// instead of guessing one.
+    #[cfg(feature = "python")]
+    pub fn class_concurrency(&self, class_name: &str) -> Option<ClassConcurrency> {
+        self.runnables.read().ok().and_then(|runnables| {
+            runnables.get(class_name).map(|r| ClassConcurrency {
+                limit: r.concurrency_limit.unwrap_or(1),
+                duration: self.concurrency_period(
+                    r.concurrency_duration
+                        .map(|s| chrono::Duration::seconds(s as i64)),
+                ),
+                on_conflict: r.concurrency_on_conflict,
+            })
+        })
+    }
+
+    #[cfg(not(feature = "python"))]
+    pub fn class_concurrency(&self, _class_name: &str) -> Option<ClassConcurrency> {
         None
     }
 

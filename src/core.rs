@@ -361,7 +361,7 @@ async fn route_job(
             table_config,
             concurrency_key.to_string(),
             limit,
-            job.concurrency_duration,
+            job.concurrency_duration.unwrap_or(concurrency_duration),
         )
         .await?;
 

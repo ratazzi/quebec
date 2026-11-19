@@ -59,6 +59,20 @@ impl ConcurrencyLock {
 /// payload is wrapped into the object form first, as `increment_executions`
 /// does, so there is somewhere to put the record.
 pub fn with_lock(arguments: Option<&str>, semaphore_id: i64, limit: i32) -> String {
+    with_record(
+        arguments,
+        json!({ "semaphore_id": semaphore_id, "limit": limit }),
+    )
+}
+
+/// `arguments` recorded as holding no slot: the job skipped its limits
+/// because its class isn't registered here (Solid Queue's
+/// `record_concurrency_lock(semaphore_id: nil)`), so it gives nothing back.
+pub fn with_no_slot(arguments: Option<&str>) -> String {
+    with_record(arguments, json!({ "semaphore_id": null, "limit": null }))
+}
+
+fn with_record(arguments: Option<&str>, record: Value) -> String {
     let mut obj = arguments
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or_else(|| Value::Array(vec![]));
@@ -66,7 +80,7 @@ pub fn with_lock(arguments: Option<&str>, semaphore_id: i64, limit: i32) -> Stri
         let args = if obj.is_array() { obj } else { json!([]) };
         obj = json!({ "arguments": args, "executions": 0, "exception_executions": {} });
     }
-    obj[CONCURRENCY_LOCK_KEY] = json!({ "semaphore_id": semaphore_id, "limit": limit });
+    obj[CONCURRENCY_LOCK_KEY] = record;
     obj.to_string()
 }
 
@@ -102,6 +116,20 @@ where
     Ok(())
 }
 
+/// Record on `job` that it holds no slot (see [`with_no_slot`]).
+pub async fn record_no_slot<C>(
+    db: &C,
+    table_config: &TableConfig,
+    job: &quebec_jobs::Model,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let arguments = with_no_slot(job.arguments.as_deref());
+    query_builder::jobs::update_arguments(db, table_config, job.id, &arguments).await?;
+    Ok(())
+}
+
 /// Give back the concurrency slot `job` holds for `key`
 /// (Solid Queue's `release_concurrency_lock` → `Semaphore.signal`).
 ///
@@ -114,7 +142,7 @@ pub async fn release<C>(
     job: &quebec_jobs::Model,
     key: &str,
     limit: i32,
-    duration: Option<chrono::Duration>,
+    duration: chrono::Duration,
 ) -> Result<bool, sea_orm::DbErr>
 where
     C: sea_orm::ConnectionTrait,
@@ -190,5 +218,11 @@ mod tests {
             ConcurrencyLock::NotRecorded
         );
         assert_eq!(without_lock("[1]"), "[1]");
+    }
+
+    #[test]
+    fn no_slot_record_reads_as_no_slot() {
+        let args = with_no_slot(Some(r#"{"arguments":[1]}"#));
+        assert_eq!(ConcurrencyLock::read(Some(&args)), ConcurrencyLock::NoSlot);
     }
 }

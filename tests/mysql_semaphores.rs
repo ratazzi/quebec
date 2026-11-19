@@ -14,6 +14,10 @@ fn id_row(id: i64) -> Vec<BTreeMap<&'static str, Value>> {
     vec![BTreeMap::from([("id", Value::from(id))])]
 }
 
+fn ttl() -> chrono::Duration {
+    chrono::Duration::minutes(3)
+}
+
 fn executed(rows_affected: u64) -> MockExecResult {
     MockExecResult {
         last_insert_id: 0,
@@ -40,12 +44,12 @@ async fn mysql_semaphore_statements_quote_key() {
     // Read the missing key, create it in one UPSERT, read back the id of the
     // semaphore taken, then exercise both release statements.
     assert_eq!(
-        acquire_semaphore(&db, &tc, key.into(), 2, None)
+        acquire_semaphore(&db, &tc, key.into(), 2, ttl())
             .await
             .unwrap(),
         Some(1)
     );
-    assert!(release_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
 
@@ -87,7 +91,7 @@ async fn mysql_full_semaphore_does_not_acquire_with_found_rows() {
         }])
         .into_connection();
     assert!(
-        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 1, None)
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 1, ttl())
             .await
             .unwrap()
             .is_none()
@@ -101,7 +105,7 @@ async fn full_semaphore_is_rejected_without_writing() {
         .append_query_results([vec![BTreeMap::from([("value", Value::from(0_i32))])]])
         .into_connection();
     assert!(
-        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, None)
+        acquire_semaphore(&db, &TableConfig::default(), "busy".into(), 2, ttl())
             .await
             .unwrap()
             .is_none()
@@ -121,7 +125,7 @@ async fn open_semaphore_decrements_without_upsert() {
         .append_exec_results([executed(1)])
         .into_connection();
     assert_eq!(
-        acquire_semaphore(&db, &TableConfig::default(), "open".into(), 2, None)
+        acquire_semaphore(&db, &TableConfig::default(), "open".into(), 2, ttl())
             .await
             .unwrap(),
         Some(9)
@@ -194,22 +198,22 @@ async fn mysql_live_semaphore_and_rate_limit() {
         .unwrap();
 
     let key = "customer's semaphore";
-    assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(acquire_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap()
         .is_some());
-    assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(acquire_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap()
         .is_some());
-    assert!(acquire_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(acquire_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap()
         .is_none());
-    assert!(release_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
-    assert!(release_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
     // Force a changed expiry so MySQL reports an affected row even when the
@@ -223,7 +227,7 @@ async fn mysql_live_semaphore_and_rate_limit() {
     ))
     .await
     .unwrap();
-    assert!(release_semaphore(&db, &tc, key.into(), 2, None)
+    assert!(release_semaphore(&db, &tc, key.into(), 2, ttl())
         .await
         .unwrap());
     let values =

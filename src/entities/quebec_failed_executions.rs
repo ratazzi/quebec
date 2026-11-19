@@ -47,6 +47,7 @@ pub trait Retryable {
 /// `dispatch` → `acquire_concurrency_lock`.
 ///
 /// - No concurrency_key → straight into ready_executions
+/// - Class not registered here → ready, skipping its limits (no slot held)
 /// - Has key + acquire succeeds → ready_executions
 /// - Has key + acquire fails → blocked_executions (Block) or finished
 ///   (Discard)
@@ -81,45 +82,36 @@ async fn route_retried_job(
         return Ok(());
     }
 
-    // Look up the runnable for this job's class to get the concurrency
-    // policy. Falls back to safe defaults (limit=1, Block, default duration)
-    // if the runnable isn't registered in this process — same defensive
-    // behaviour as the dispatcher's scheduled-due promotion path.
-    let (limit, duration_opt, on_conflict) = {
-        #[cfg(feature = "python")]
-        {
-            ctx.runnables
-                .read()
-                .ok()
-                .and_then(|runnables| {
-                    runnables.get(&job.class_name).map(|r| {
-                        (
-                            r.concurrency_limit.unwrap_or(1),
-                            r.concurrency_duration
-                                .map(|s| chrono::Duration::seconds(s as i64)),
-                            r.concurrency_on_conflict,
-                        )
-                    })
-                })
-                .unwrap_or((1, None, ConcurrencyConflict::Block))
-        }
-        #[cfg(not(feature = "python"))]
-        {
-            (1, None, ConcurrencyConflict::Block)
-        }
+    let Some(class) = ctx.class_concurrency(&job.class_name) else {
+        warn!(
+            job_id = job.id,
+            concurrency_key,
+            "Job class `{}' is not registered; retrying it without its concurrency limit",
+            job.class_name
+        );
+        crate::concurrency_lock::record_no_slot(txn, table_config, job).await?;
+        query_builder::ready_executions::insert(
+            txn,
+            table_config,
+            job.id,
+            &job.queue_name,
+            job.priority,
+        )
+        .await?;
+        return Ok(());
     };
 
     let acquired = crate::semaphore::acquire_semaphore(
         txn,
         table_config,
         concurrency_key.to_string(),
-        limit,
-        duration_opt,
+        class.limit,
+        class.duration,
     )
     .await?;
 
     if let Some(semaphore_id) = acquired {
-        crate::concurrency_lock::record(txn, table_config, job, semaphore_id, limit).await?;
+        crate::concurrency_lock::record(txn, table_config, job, semaphore_id, class.limit).await?;
         query_builder::ready_executions::insert(
             txn,
             table_config,
@@ -132,11 +124,7 @@ async fn route_retried_job(
     }
 
     // Slot taken — route per on_conflict so the limit is actually enforced.
-    let duration = duration_opt.unwrap_or_else(|| {
-        chrono::Duration::from_std(ctx.default_concurrency_control_period)
-            .unwrap_or_else(|_| chrono::Duration::seconds(60))
-    });
-    match on_conflict {
+    match class.on_conflict {
         ConcurrencyConflict::Discard => {
             warn!(
                 job_id = job.id,
@@ -163,7 +151,7 @@ async fn route_retried_job(
                 &job.queue_name,
                 job.priority,
                 concurrency_key,
-                now + duration,
+                now + class.duration,
             )
             .await?;
         }

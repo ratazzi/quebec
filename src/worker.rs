@@ -1893,13 +1893,6 @@ impl Execution {
             .as_ref()
             .map(|info| (info.scheduled_at, info.arguments.clone()));
 
-        // Capture concurrency info for semaphore release
-        let concurrency_key = job.concurrency_key.clone();
-        let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
-        let concurrency_duration = self
-            .runnable
-            .concurrency_duration
-            .map(|s| chrono::Duration::seconds(s as i64));
         // Solid Queue's `finished!`: keep the finished job, or delete it.
         let preserve_finished_jobs = self.ctx.preserve_finished_jobs;
         // EXPERIMENTAL queue-level concurrency: release is delegated to
@@ -1972,7 +1965,6 @@ impl Execution {
             let table_config = table_config_orig.clone();
             let job = job.clone();
             let err = err.clone();
-            let concurrency_key = concurrency_key.clone();
             let ctx = ctx.clone();
             let claimed = claimed.clone();
             let queue_name = queue_name.clone();
@@ -2034,39 +2026,14 @@ impl Execution {
 
                         // Release semaphore and unblock next job if job has concurrency control
                         // This must happen AFTER job execution completes (ensure block in Solid Queue)
-                        if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
-                            // Step 1: Give the slot back to the semaphore it came from
-                            let released = crate::concurrency_lock::release(
-                                txn,
-                                &table_config,
-                                &job,
-                                key,
-                                concurrency_limit,
-                                concurrency_duration,
-                            )
+                        Worker::release_concurrency_slot(&ctx, txn, &job)
                             .await
                             .inspect_err(|e| {
-                                warn!("Failed to release semaphore for key {}: {:?}", key, e)
-                            })?;
-
-                            // Step 2: Immediately try to release next blocked job (like Solid Queue)
-                            if released {
-                                Worker::release_next_blocked_job(
-                                    &ctx,
-                                    txn,
-                                    key,
-                                    concurrency_limit,
-                                    true,
+                                warn!(
+                                    "Failed to release concurrency slot for key {:?}: {:?}",
+                                    job.concurrency_key, e
                                 )
-                                .await
-                                .inspect_err(|e| {
-                                    warn!(
-                                        "Failed to release next blocked job for key {}: {:?}",
-                                        key, e
-                                    )
-                                })?;
-                            }
-                        }
+                            })?;
 
                         // Solid Queue's `finished!` without preserve_finished_jobs:
                         // the job is deleted outright. After the claimed row,
@@ -3114,43 +3081,22 @@ impl Worker {
                 // until TTL. Mirrors after_executed (worker.rs around the
                 // release_semaphore call) so concurrency accounting stays
                 // consistent across both code paths.
-                if let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) {
-                    let limit = runnable.concurrency_limit.unwrap_or(1);
-                    let duration = runnable
-                        .concurrency_duration
-                        .map(|s| chrono::Duration::seconds(s as i64));
-                    // Propagate release errors (lock timeout, conn drop, ...)
-                    // so the whole rate-routed transaction rolls back. The
-                    // ready-delete + scheduled-insert / mark_finished writes
-                    // above MUST stay consistent with the semaphore state —
-                    // a silently-failed release would re-create the very slot
-                    // leak this code path was added to prevent.
-                    let released = crate::concurrency_lock::release(
-                        txn,
-                        table_config,
-                        &job,
-                        key,
-                        limit,
-                        duration,
-                    )
-                    .await?;
-
-                    if released {
-                        // A database error here may have rolled back the whole
-                        // MySQL transaction. Propagate it so the caller does not
-                        // commit an already-aborted rate-route operation.
-                        Self::release_next_blocked_job(ctx, txn, key, limit, true)
-                            .await
-                            .inspect_err(|e| {
-                                warn!(
-                                    jid = job.active_job_id.as_deref(),
-                                    concurrency_key = key,
-                                    "rate-limit: failed to release next blocked: {:?}",
-                                    e
-                                )
-                            })?;
-                    }
-                }
+                // Propagate release errors (lock timeout, conn drop, ...) so
+                // the whole rate-routed transaction rolls back. The
+                // ready-delete + scheduled-insert / mark_finished writes above
+                // MUST stay consistent with the semaphore state — a silently
+                // failed release would re-create the very slot leak this code
+                // path was added to prevent. A database error may also have
+                // rolled back the whole MySQL transaction, so the caller must
+                // not commit it.
+                Self::release_concurrency_slot(ctx, txn, &job)
+                    .await
+                    .inspect_err(|e| {
+                        warn!(
+                            jid = job.active_job_id.as_deref(),
+                            "rate-limit: failed to release concurrency slot: {:?}", e
+                        )
+                    })?;
                 Ok(RateGateResult::Routed)
             }
         }
@@ -4770,36 +4716,44 @@ impl Worker {
         // when the job has no class-level concurrency_key.
         Self::release_queue_slot(ctx, db, table_config, &job.queue_name).await?;
 
-        let Some(key) = job.concurrency_key.as_ref().filter(|k| !k.is_empty()) else {
-            return Ok(());
-        };
-
-        // Read plain fields without the GIL: the queue slot released above
-        // keeps its semaphore row locked until this transaction commits.
-        let (limit, duration) = ctx
-            .runnables
-            .read()
-            .ok()
-            .and_then(|runnables| {
-                runnables.get(&job.class_name).map(|r| {
-                    (
-                        r.concurrency_limit.unwrap_or(1),
-                        r.concurrency_duration
-                            .map(|s| chrono::Duration::seconds(s as i64)),
-                    )
-                })
-            })
-            .unwrap_or((1, None));
-
         // Propagate database errors. Every caller runs this inside a
         // transaction; after a failed statement (e.g. a MySQL deadlock, which
         // rolls the transaction back) the caller must not report success, or
         // emergency cleanup skips its delete-only fallback and the claim stays.
-        if crate::concurrency_lock::release(db, table_config, &job, key, limit, duration).await? {
-            Worker::release_next_blocked_job(ctx, db, key, limit, false).await?;
-        }
+        Self::release_concurrency_slot(ctx, db, &job).await?;
 
         Ok(())
+    }
+
+    /// Give `job`'s concurrency slot back to the semaphore it came from and,
+    /// if a slot was given back, release the next blocked job for its key.
+    /// Runs in the caller's transaction; database errors propagate. Returns
+    /// whether a blocked job was released.
+    pub(crate) async fn release_concurrency_slot<C>(
+        ctx: &AppContext,
+        db: &C,
+        job: &quebec_jobs::Model,
+    ) -> std::result::Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) else {
+            return Ok(false);
+        };
+        // Read plain fields without the GIL: the release below holds the
+        // semaphore row lock until commit. A class that isn't registered here
+        // falls back to limit 1; a recorded limit takes precedence anyway.
+        let (limit, duration) = ctx
+            .class_concurrency(&job.class_name)
+            .map(|c| (c.limit, c.duration))
+            .unwrap_or_else(|| (1, ctx.concurrency_period(None)));
+
+        if !crate::concurrency_lock::release(db, &ctx.table_config, job, key, limit, duration)
+            .await?
+        {
+            return Ok(false);
+        }
+        crate::dispatcher::release_next_blocked(ctx, db, key, true).await
     }
 
     /// EXPERIMENTAL: attempt to acquire the `queue:<name>` semaphore at
@@ -4867,7 +4821,7 @@ impl Worker {
         let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
             return Ok(true);
         };
-        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        let duration = ctx.concurrency_period(None);
         // Queue slots are taken and given back by key: they are not a job's
         // concurrency slot and have no record on the job.
         crate::semaphore::acquire_semaphore(
@@ -4904,7 +4858,7 @@ impl Worker {
         let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
             return Ok(());
         };
-        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        let duration = ctx.concurrency_period(None);
         // Propagate failures: callers already `.await?` this helper. In-tx callers
         // (claim/throttle/cleanup paths) rely on the propagation to abort the
         // enclosing tx; the out-of-tx emergency cleanup caller relies on it to
@@ -4923,113 +4877,6 @@ impl Worker {
         .await
         .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e))?;
         Ok(())
-    }
-
-    /// Release the next blocked job for a given concurrency key.
-    /// Called after a job completes to immediately unblock waiting jobs.
-    /// This matches Solid Queue's `unblock_next_blocked_job` behavior.
-    async fn release_next_blocked_job<C>(
-        ctx: &Arc<AppContext>,
-        db: &C,
-        concurrency_key: &str,
-        concurrency_limit: i32,
-        reuse_released_slot: bool,
-    ) -> std::result::Result<bool, DbErr>
-    where
-        C: ConnectionTrait,
-    {
-        use crate::semaphore::{acquire_semaphore, reacquire_released_semaphore};
-
-        let table_config = &ctx.table_config;
-
-        // Find the next blocked execution for this concurrency key (with FOR UPDATE SKIP LOCKED)
-        let blocked = query_builder::blocked_executions::find_one_by_key_for_update(
-            db,
-            table_config,
-            concurrency_key,
-            ctx.use_skip_locked,
-        )
-        .await?;
-
-        let Some(execution) = blocked else {
-            // No blocked jobs waiting for this key
-            return Ok(false);
-        };
-
-        // Get the job first to access class_name for runnable lookup
-        let Some(job) = query_builder::jobs::find_by_id(db, table_config, execution.job_id).await?
-        else {
-            warn!(
-                "Job {} not found for blocked execution {}",
-                execution.job_id, execution.id
-            );
-            return Ok(false);
-        };
-
-        // Get concurrency_duration from the runnable (like Solid Queue's job.concurrency_duration)
-        // Read without the GIL: the caller's release holds the semaphore row
-        // lock until commit, and waiting on busy Python threads here would
-        // stall every enqueue onto this key.
-        let concurrency_duration = ctx
-            .runnables
-            .read()
-            .ok()
-            .and_then(|runnables| {
-                runnables
-                    .get(&job.class_name)
-                    .and_then(|r| r.concurrency_duration)
-            })
-            .map(|s| chrono::Duration::seconds(s as i64));
-
-        // A successful release in the same MySQL transaction already locked
-        // an existing semaphore row. Re-acquire by UPDATE so this blocked-row
-        // lock cannot cycle with a producer's UPSERT insert-intention gap lock.
-        let acquired = if reuse_released_slot && db.get_database_backend() == DatabaseBackend::MySql
-        {
-            reacquire_released_semaphore(db, table_config, concurrency_key, concurrency_duration)
-                .await?
-        } else {
-            acquire_semaphore(
-                db,
-                table_config,
-                concurrency_key.to_string(),
-                concurrency_limit,
-                concurrency_duration,
-            )
-            .await?
-        };
-
-        let Some(semaphore_id) = acquired else {
-            // Semaphore not available (shouldn't happen normally since we just released one)
-            trace!(
-                "Could not acquire semaphore for blocked job {} (key: {})",
-                execution.job_id,
-                concurrency_key
-            );
-            return Ok(false);
-        };
-        crate::concurrency_lock::record(db, table_config, &job, semaphore_id, concurrency_limit)
-            .await?;
-
-        // Move to ready_executions
-        query_builder::ready_executions::insert(
-            db,
-            table_config,
-            job.id,
-            &job.queue_name,
-            job.priority,
-        )
-        .await?;
-
-        // Delete from blocked_executions
-        query_builder::blocked_executions::delete_by_id(db, table_config, execution.id).await?;
-
-        debug!(
-            "Released blocked job {} to ready state (key: {})",
-            job.id, concurrency_key
-        );
-
-        Ok(true)
     }
 
     /// Set up PostgreSQL LISTEN/NOTIFY for immediate job notifications
