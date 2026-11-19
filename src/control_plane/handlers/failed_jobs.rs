@@ -177,14 +177,16 @@ impl ControlPlane {
                         query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
                             .await?;
 
-                    match failed_execution {
-                        Some(execution) => {
-                            execution.retry(txn, &table_config, &ctx).await?;
-                            Ok(())
-                        }
-                        None => Err(DbErr::Custom(format!(
+                    let retried = match failed_execution {
+                        Some(execution) => execution.retry(txn, &table_config, &ctx).await?,
+                        None => false,
+                    };
+                    if retried {
+                        Ok(())
+                    } else {
+                        Err(DbErr::Custom(format!(
                             "Failed execution for job {id} not found"
-                        ))),
+                        )))
                     }
                 })
             })
@@ -227,11 +229,16 @@ impl ControlPlane {
                         query_builder::failed_executions::find_by_job_id(txn, &table_config, id)
                             .await?;
 
-                    match failed_execution {
-                        Some(execution) => execution.discard(txn, &table_config).await,
-                        None => Err(DbErr::Custom(format!(
+                    let (discarded, released) = match failed_execution {
+                        Some(execution) => execution.discard(txn, &table_config).await?,
+                        None => (false, None),
+                    };
+                    if discarded {
+                        Ok(released)
+                    } else {
+                        Err(DbErr::Custom(format!(
                             "Failed execution for job {id} not found"
-                        ))),
+                        )))
                     }
                 })
             })

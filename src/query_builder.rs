@@ -2684,6 +2684,20 @@ pub mod failed_executions {
         execute_delete(db, query).await
     }
 
+    /// Delete a failed execution by its own id
+    pub async fn delete_by_id<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.failed_executions);
+        let query = Query::delete()
+            .from_table(table)
+            .and_where(Expr::col(col("id")).eq(id))
+            .to_owned();
+
+        execute_delete(db, query).await
+    }
+
     /// Count failed executions, optionally filtered by class_name, queue_name,
     /// creation time range (since/until), and error message pattern.
     #[allow(clippy::too_many_arguments)]

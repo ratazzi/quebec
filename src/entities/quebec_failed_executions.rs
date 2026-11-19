@@ -13,12 +13,15 @@ pub trait Retryable {
     /// checks `core::route_job` applies at enqueue time so the declared
     /// `concurrency_limit` is honoured even on manual retry. Falls back to a
     /// direct ready_executions insert when the job has no concurrency_key.
+    ///
+    /// Returns false when the failed execution is already gone: a concurrent
+    /// retry or discard took it first.
     async fn retry(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
         ctx: &Arc<AppContext>,
-    ) -> Result<(), DbErr>;
+    ) -> Result<bool, DbErr>;
 
     /// Bulk retry — same concurrency routing per job as :func:`retry`.
     /// Optional filters: `class_name`, `queue_name`, `since`/`until`
@@ -39,8 +42,9 @@ pub trait Retryable {
 }
 
 /// Promote a retried job back to the right execution table based on its
-/// concurrency state. Mirrors Solid Queue's `FailedExecution#retry` which
-/// calls `job.prepare_for_execution` → `dispatch` → `acquire_concurrency_lock`.
+/// concurrency state. Mirrors Solid Queue's `FailedExecution#retry`:
+/// `reset_execution_counters`, then `job.prepare_for_execution` →
+/// `dispatch` → `acquire_concurrency_lock`.
 ///
 /// - No concurrency_key → straight into ready_executions
 /// - Has key + acquire succeeds → ready_executions
@@ -52,6 +56,18 @@ async fn route_retried_job(
     ctx: &Arc<AppContext>,
     job: &super::quebec_jobs::Model,
 ) -> Result<(), DbErr> {
+    // Start its retry_on attempts over, and drop the previous attempt's slot
+    // record: it gave that slot back when it failed.
+    let job = &super::quebec_jobs::Model {
+        arguments: job.arguments.as_deref().map(|args| {
+            crate::concurrency_lock::without_lock(&crate::utils::reset_executions(args))
+        }),
+        ..job.clone()
+    };
+    if let Some(arguments) = job.arguments.as_deref() {
+        query_builder::jobs::update_arguments(txn, table_config, job.id, arguments).await?;
+    }
+
     let concurrency_key = job.concurrency_key.as_deref().unwrap_or("");
     if concurrency_key.is_empty() {
         query_builder::ready_executions::insert(
@@ -155,15 +171,52 @@ async fn route_retried_job(
     Ok(())
 }
 
+/// Take `failed` off the table, returning whether this transaction did. The
+/// delete is the ownership gate (Solid Queue's `with_lock` on the row): a
+/// concurrent retry or discard of the same job waits for it and then finds
+/// nothing, so a job is never routed twice.
+///
+/// It matches the row by its own id, not the job's: if the job was retried
+/// and failed again after `failed` was read, its new failed execution is not
+/// the one the caller chose and stays put.
+async fn take_failed(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    failed: &Model,
+) -> Result<bool, DbErr> {
+    Ok(query_builder::failed_executions::delete_by_id(txn, table_config, failed.id).await? > 0)
+}
+
+/// [`take_failed`] for each of `failed_executions`, in job order (Solid
+/// Queue's `lock_all_from_jobs`), returning the job ids this transaction
+/// took: a concurrent retry or discard got the rest.
+async fn take_all_failed(
+    txn: &DatabaseTransaction,
+    table_config: &TableConfig,
+    failed_executions: &[Model],
+) -> Result<Vec<i64>, DbErr> {
+    let mut ordered: Vec<&Model> = failed_executions.iter().collect();
+    ordered.sort_unstable_by_key(|e| (e.job_id, e.id));
+    let mut taken = Vec::with_capacity(ordered.len());
+    for failed in ordered {
+        if take_failed(txn, table_config, failed).await? {
+            taken.push(failed.job_id);
+        }
+    }
+    Ok(taken)
+}
+
 #[allow(async_fn_in_trait)]
 pub trait Discardable {
     /// Discard a failed job by removing it from failed_executions and marking the job as finished.
-    /// Returns the job's batch, if any, for a completion check after the transaction commits.
+    /// Returns whether this call took the failed execution (false when a
+    /// concurrent retry or discard got it first), and the job's batch, if any,
+    /// for a completion check after the transaction commits.
     async fn discard(
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
-    ) -> Result<Option<i64>, DbErr>;
+    ) -> Result<(bool, Option<i64>), DbErr>;
 
     /// Discard all failed jobs by removing them from failed_executions and marking the jobs as finished.
     /// Optional filters: `class_name`, `queue_name`, `since`/`until` (failed_executions.created_at
@@ -237,16 +290,18 @@ impl Retryable for Model {
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
         ctx: &Arc<AppContext>,
-    ) -> Result<(), DbErr> {
+    ) -> Result<bool, DbErr> {
+        if !take_failed(txn, table_config, self).await? {
+            return Ok(false);
+        }
         let job = query_builder::jobs::find_by_id(txn, table_config, self.job_id)
             .await?
             .ok_or_else(|| DbErr::Custom(format!("Job with ID {} not found", self.job_id)))?;
 
         route_retried_job(txn, table_config, ctx, &job).await?;
-        query_builder::failed_executions::delete_by_job_id(txn, table_config, self.job_id).await?;
 
         info!("Retried failed job {}", self.job_id);
-        Ok(())
+        Ok(true)
     }
 
     async fn retry_all(
@@ -281,27 +336,17 @@ impl Discardable for Model {
         &self,
         txn: &DatabaseTransaction,
         table_config: &TableConfig,
-    ) -> Result<Option<i64>, DbErr> {
-        // 1. Find job record
-        let job_result = query_builder::jobs::find_by_id(txn, table_config, self.job_id).await?;
-
-        if let Some(job) = job_result {
-            // 2. Update job status to completed
-            query_builder::jobs::mark_finished(txn, table_config, self.job_id).await?;
-            let released = crate::batch::release_batched_job(txn, table_config, &job).await?;
-
-            // 3. Delete failed execution record
-            query_builder::failed_executions::delete_by_job_id(txn, table_config, self.job_id)
-                .await?;
-
-            info!("Discarded failed job {}", self.job_id);
-            Ok(released)
-        } else {
-            Err(DbErr::Custom(format!(
-                "Job with ID {} not found",
-                self.job_id
-            )))
+    ) -> Result<(bool, Option<i64>), DbErr> {
+        // Take the failed execution first, the same ownership gate as retry
+        // (Solid Queue's `with_lock`): a job a concurrent retry already put
+        // back to ready must not also be marked finished.
+        if !take_failed(txn, table_config, self).await? {
+            return Ok((false, None));
         }
+        let released = finish_discarded_jobs(txn, table_config, &[self.job_id]).await?;
+
+        info!("Discarded failed job {}", self.job_id);
+        Ok((true, released.into_iter().next()))
     }
 
     async fn discard_all(
@@ -335,7 +380,7 @@ impl Retryable for Entity {
         _txn: &DatabaseTransaction,
         _table_config: &TableConfig,
         _ctx: &Arc<AppContext>,
-    ) -> Result<(), DbErr> {
+    ) -> Result<bool, DbErr> {
         // Since Entity doesn't have a specific job_id, this method needs a different implementation
         Err(DbErr::Custom(
             "Cannot retry a job from Entity, please use a Model instance instead".to_string(),
@@ -368,12 +413,8 @@ impl Retryable for Entity {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> = failed_executions
-            .iter()
-            .map(|execution| execution.job_id)
-            .collect();
-
-        let jobs = query_builder::jobs::find_by_ids(txn, table_config, job_ids.clone()).await?;
+        let taken = take_all_failed(txn, table_config, &failed_executions).await?;
+        let jobs = query_builder::jobs::find_by_ids(txn, table_config, taken).await?;
 
         // Route each retried job through the concurrency check so the
         // declared limit is enforced even on bulk retry (matches Solid
@@ -384,11 +425,8 @@ impl Retryable for Entity {
             route_retried_job(txn, table_config, ctx, job).await?;
         }
 
-        let count =
-            query_builder::failed_executions::delete_by_job_ids(txn, table_config, job_ids).await?;
-
         info!("Retried all {} failed jobs", jobs.len());
-        Ok(count)
+        Ok(jobs.len() as u64)
     }
 }
 
@@ -398,7 +436,7 @@ impl Discardable for Entity {
         &self,
         _txn: &DatabaseTransaction,
         _table_config: &TableConfig,
-    ) -> Result<Option<i64>, DbErr> {
+    ) -> Result<(bool, Option<i64>), DbErr> {
         // Since Entity doesn't have a specific job_id, this method needs a different implementation
         Err(DbErr::Custom(
             "Cannot discard a job from Entity, please use a Model instance instead".to_string(),
@@ -431,19 +469,11 @@ impl Discardable for Entity {
             return Ok((0, Vec::new()));
         }
 
-        let job_ids: Vec<i64> = failed_executions
-            .iter()
-            .map(|execution| execution.job_id)
-            .collect();
+        // 2. Take them, then mark only those jobs finished (releasing batch rows)
+        let taken = take_all_failed(txn, table_config, &failed_executions).await?;
+        let released = finish_discarded_jobs(txn, table_config, &taken).await?;
 
-        // 2. Update all related jobs to completed status (releasing batch rows)
-        let released = finish_discarded_jobs(txn, table_config, &job_ids).await?;
-
-        // 3. Delete all failed execution records
-        let count =
-            query_builder::failed_executions::delete_by_job_ids(txn, table_config, job_ids).await?;
-
-        info!("Discarded all {} failed jobs", count);
-        Ok((count, released))
+        info!("Discarded all {} failed jobs", taken.len());
+        Ok((taken.len() as u64, released))
     }
 }
