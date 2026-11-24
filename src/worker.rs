@@ -1098,7 +1098,7 @@ impl Runnable {
                 strategy,
                 exception_key,
             }) => {
-                return self.apply_retry_strategy(py, job, error, strategy, &exception_key);
+                return self.apply_retry_strategy(py, job, strategy, &exception_key);
             }
             // Attempts exhausted with a handler — run it and complete the job,
             // matching ActiveJob's `retry_on ... do |job, error|` block.
@@ -1182,7 +1182,6 @@ impl Runnable {
         &mut self,
         py: Python,
         job: &mut quebec_jobs::Model,
-        error: &PyErr,
         strategy: RetryStrategy,
         exception_key: &str,
     ) -> Result<quebec_jobs::Model> {
