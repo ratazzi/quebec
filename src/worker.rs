@@ -1098,7 +1098,7 @@ impl Runnable {
                 strategy,
                 exception_key,
             }) => {
-                return self.apply_retry_strategy(job, strategy, &exception_key);
+                return self.apply_retry_strategy(py, job, error, strategy, &exception_key);
             }
             // Attempts exhausted with a handler — run it and complete the job,
             // matching ActiveJob's `retry_on ... do |job, error|` block.
@@ -1180,18 +1180,25 @@ impl Runnable {
     /// Apply retry strategy
     fn apply_retry_strategy(
         &mut self,
-        job: &quebec_jobs::Model,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
         strategy: RetryStrategy,
         exception_key: &str,
     ) -> Result<quebec_jobs::Model> {
         let exception_count =
             crate::utils::get_exception_executions(job.arguments.as_deref(), exception_key);
-        warn!("Job will be retried (attempt #{})", exception_count + 1);
 
-        let delay = strategy.wait;
-        let scheduled_at = chrono::Utc::now().naive_utc()
-            + chrono::Duration::from_std(delay)
-                .map_err(|e| QuebecError::validation(format!("Invalid delay duration: {e}")))?;
+        // ActiveJob passes `executions_for(exceptions)`, i.e. the count
+        // including this failure. A custom `wait` that raises (or a delay out
+        // of range) fails the job like any other raising handler.
+        let scheduled_at = match strategy.next_attempt_at(py, i64::from(exception_count) + 1) {
+            Ok(at) => at,
+            // Count it against the matched declaration's key, not the raised
+            // class, so the retry budget isn't spent twice on a later attempt.
+            Err(wait_error) => return self.fail_with_error(py, job, exception_key, &wait_error),
+        };
+        warn!("Job will be retried (attempt #{})", exception_count + 1);
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
@@ -1254,10 +1261,21 @@ impl Runnable {
             .get_type(py)
             .qualname()
             .map_or_else(|_| "Unknown".to_string(), |q| q.to_string());
-        let exception_key = format!("[{error_type}]");
+        self.fail_with_error(py, job, &format!("[{error_type}]"), raised)
+    }
+
+    /// Count the failure under `exception_key` and fail the job with `raised`
+    /// (its class, message and traceback become the failed execution's error).
+    fn fail_with_error(
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        exception_key: &str,
+        raised: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         job.arguments = Some(crate::utils::increment_executions(
             job.arguments.as_deref(),
-            Some(&exception_key),
+            Some(exception_key),
         ));
         let error_payload = self.create_error_payload(py, raised);
         Err(QuebecError::generic(error_payload))
@@ -2398,8 +2416,6 @@ impl Execution {
         _exc: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let job = self.job.clone();
-        let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-
         let exception_key = Runnable::strategy_exception_key(py, &strategy.exceptions)?;
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(&exception_key));
@@ -2435,6 +2451,7 @@ impl Execution {
             );
             return Ok(());
         }
+        let scheduled_at = strategy.next_attempt_at(py, i64::from(exception_count) + 1)?;
 
         py.detach(|| {
             let retry_future = async {
