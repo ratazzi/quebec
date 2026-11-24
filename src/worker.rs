@@ -1098,7 +1098,7 @@ impl Runnable {
                 strategy,
                 exception_key,
             }) => {
-                return self.apply_retry_strategy(py, job, strategy, &exception_key);
+                return self.apply_retry_strategy(py, job, error, strategy, &exception_key);
             }
             // Attempts exhausted with a handler — run it and complete the job,
             // matching ActiveJob's `retry_on ... do |job, error|` block.
@@ -1181,20 +1181,22 @@ impl Runnable {
     fn apply_retry_strategy(
         &mut self,
         py: Python,
-        job: &quebec_jobs::Model,
+        job: &mut quebec_jobs::Model,
+        error: &PyErr,
         strategy: RetryStrategy,
         exception_key: &str,
     ) -> Result<quebec_jobs::Model> {
         let exception_count =
             crate::utils::get_exception_executions(job.arguments.as_deref(), exception_key);
-        warn!("Job will be retried (attempt #{})", exception_count + 1);
 
         // ActiveJob passes `executions_for(exceptions)`, i.e. the count
-        // including this failure.
-        let delay = strategy
-            .delay_for(py, i64::from(exception_count) + 1)
-            .map_err(|e| QuebecError::validation(format!("Invalid retry delay: {e}")))?;
-        let scheduled_at = chrono::Utc::now().naive_utc() + delay;
+        // including this failure. A custom `wait` that raises (or a delay out
+        // of range) fails the job like any other raising handler.
+        let scheduled_at = match strategy.next_attempt_at(py, i64::from(exception_count) + 1) {
+            Ok(at) => at,
+            Err(wait_error) => return self.handle_handler_failure(py, job, error, &wait_error),
+        };
+        warn!("Job will be retried (attempt #{})", exception_count + 1);
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
@@ -2436,8 +2438,7 @@ impl Execution {
             );
             return Ok(());
         }
-        let scheduled_at = chrono::Utc::now().naive_utc()
-            + strategy.delay_for(py, i64::from(exception_count) + 1)?;
+        let scheduled_at = strategy.next_attempt_at(py, i64::from(exception_count) + 1)?;
 
         py.detach(|| {
             let retry_future = async {

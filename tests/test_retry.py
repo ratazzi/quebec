@@ -136,4 +136,71 @@ def test_retry_strategy_rejects_bad_wait() -> None:
     with pytest.raises(ValueError):
         quebec.RetryStrategy((ValueError,), wait=-1)
     with pytest.raises(ValueError):
+        quebec.RetryStrategy((ValueError,), wait=timedelta(seconds=-1))
+    with pytest.raises(ValueError):
+        quebec.RetryStrategy((ValueError,), wait=1e30)
+    with pytest.raises(TypeError):
+        quebec.RetryStrategy((ValueError,), wait=object())
+    with pytest.raises(ValueError):
         quebec.RetryStrategy((ValueError,), jitter=-0.1)
+
+
+def _raising_backoff(executions: int) -> float:
+    raise KeyError(f"backoff {executions}")
+
+
+class RaisingBackoffJob(quebec.BaseClass):
+    retry_on = [quebec.RetryStrategy((ValueError,), wait=_raising_backoff, attempts=3)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError("boom")
+
+
+class HugeBackoffJob(quebec.BaseClass):
+    retry_on = [quebec.RetryStrategy((ValueError,), wait=lambda n: 1e30, attempts=3)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError("boom")
+
+
+def _failed_error(qc_with_sqlalchemy) -> dict:
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+    session.expire_all()
+    row = session.execute(
+        text(f"SELECT error FROM {prefix}_failed_executions")
+    ).scalar_one()
+    return json.loads(row)
+
+
+def test_raising_custom_wait_fails_job_with_its_error(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(RaisingBackoffJob)
+
+    enqueued = RaisingBackoffJob.perform_later(qc, 1)
+    qc.drain_one().perform()
+
+    assert db_assert.count_failed_executions() == 1
+    assert db_assert.count_scheduled_executions() == 0
+    error = _failed_error(qc_with_sqlalchemy)
+    assert error["exception_class"] == "KeyError"
+    assert "backoff 1" in error["message"]
+    assert any("_raising_backoff" in line for line in error["backtrace"])
+    payload = json.loads(db_assert.get_job(enqueued.id)["arguments"])
+    assert payload["exception_executions"] == {"[ValueError]": 1}
+
+
+def test_out_of_range_custom_wait_fails_job_instead_of_panicking(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(HugeBackoffJob)
+
+    HugeBackoffJob.perform_later(qc, 1)
+    qc.drain_one().perform()
+
+    assert db_assert.count_failed_executions() == 1
+    assert db_assert.count_scheduled_executions() == 0
+    assert _failed_error(qc_with_sqlalchemy)["exception_class"] == "ValueError"

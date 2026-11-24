@@ -280,7 +280,7 @@ impl RetryWait {
         if wait.is_callable() {
             return Ok(Self::Custom(wait.clone().unbind()));
         }
-        seconds_from_py(wait).map(|secs| Self::Fixed(Duration::from_secs_f64(secs)))
+        duration_from_py(wait).map(Self::Fixed)
     }
 
     fn to_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -295,31 +295,40 @@ impl RetryWait {
     }
 }
 
-/// Read a non-negative number of seconds from an int, float or `timedelta`.
+/// Read a non-negative delay from an int/float (seconds) or a `timedelta`.
 #[cfg(feature = "python")]
-fn seconds_from_py(value: &Bound<'_, PyAny>) -> PyResult<f64> {
-    let secs = value
-        .extract::<Duration>()
-        .map(|d| d.as_secs_f64())
-        .or_else(|_| value.extract::<f64>())
-        .map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(format!(
-                "retry wait must be seconds (int/float), a timedelta, \"polynomially_longer\" \
-                 or a callable, got {}",
-                value
-                    .get_type()
-                    .name()
-                    .map(|n| n.to_string())
-                    .unwrap_or_default()
-            ))
-        })?;
-    if secs.is_finite() && secs >= 0.0 {
-        Ok(secs)
-    } else {
-        Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "retry wait must be a non-negative finite duration, got {secs}"
-        )))
+fn duration_from_py(value: &Bound<'_, PyAny>) -> PyResult<Duration> {
+    // A timedelta's own conversion error (e.g. negative) is the meaningful one,
+    // so don't fall through to the numeric branch for it.
+    if value.is_instance_of::<pyo3::types::PyDelta>() {
+        return value.extract::<Duration>();
     }
+    let secs = value.extract::<f64>().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "retry wait must be seconds (int/float), a timedelta, \"polynomially_longer\" \
+             or a callable, got {}",
+            value
+                .get_type()
+                .name()
+                .map(|n| n.to_string())
+                .unwrap_or_default()
+        ))
+    })?;
+    secs_to_duration(secs)
+}
+
+/// Convert seconds to a `Duration`, rejecting negative, non-finite and
+/// out-of-range values instead of panicking like `Duration::from_secs_f64`.
+#[cfg(feature = "python")]
+fn secs_to_duration(secs: f64) -> PyResult<Duration> {
+    if !(secs.is_finite() && secs >= 0.0) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "retry wait must be a non-negative finite duration, got {secs}"
+        )));
+    }
+    Duration::try_from_secs_f64(secs).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!("retry wait too large: {secs}s"))
+    })
 }
 
 /// ActiveJob's default `retry_jitter`.
@@ -342,17 +351,32 @@ impl RetryStrategy {
     /// Delay before the next attempt, matching ActiveJob's `determine_delay`.
     /// `executions` is this declaration's exception count *including* the
     /// failure being handled (ActiveJob's `executions_for(exceptions)`).
-    pub fn delay_for(&self, py: Python<'_>, executions: i64) -> PyResult<chrono::Duration> {
-        let secs = match &self.wait {
-            RetryWait::Fixed(d) => with_jitter(d.as_secs_f64(), self.jitter),
+    pub fn delay_for(&self, py: Python<'_>, executions: i64) -> PyResult<Duration> {
+        match &self.wait {
+            RetryWait::Fixed(d) => secs_to_duration(with_jitter(d.as_secs_f64(), self.jitter)),
             RetryWait::PolynomiallyLonger => {
-                with_jitter((executions as f64).powi(4), self.jitter) + 2.0
+                secs_to_duration(with_jitter((executions as f64).powi(4), self.jitter) + 2.0)
             }
-            RetryWait::Custom(f) => seconds_from_py(f.bind(py).call1((executions,))?.as_any())?,
-        };
-        chrono::Duration::from_std(Duration::from_secs_f64(secs)).map_err(|e| {
-            pyo3::exceptions::PyOverflowError::new_err(format!("retry delay too large: {e}"))
-        })
+            RetryWait::Custom(f) => duration_from_py(f.bind(py).call1((executions,))?.as_any()),
+        }
+    }
+
+    /// When the next attempt should run: now + [`Self::delay_for`], erroring
+    /// (not panicking) if that falls outside the representable date range.
+    pub fn next_attempt_at(
+        &self,
+        py: Python<'_>,
+        executions: i64,
+    ) -> PyResult<chrono::NaiveDateTime> {
+        let delay = self.delay_for(py, executions)?;
+        chrono::Duration::from_std(delay)
+            .ok()
+            .and_then(|d| chrono::Utc::now().naive_utc().checked_add_signed(d))
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "retry delay {delay:?} is out of the representable date range"
+                ))
+            })
     }
 }
 
