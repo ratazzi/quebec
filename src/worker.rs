@@ -1194,7 +1194,9 @@ impl Runnable {
         // of range) fails the job like any other raising handler.
         let scheduled_at = match strategy.next_attempt_at(py, i64::from(exception_count) + 1) {
             Ok(at) => at,
-            Err(wait_error) => return self.handle_handler_failure(py, job, error, &wait_error),
+            // Count it against the matched declaration's key, not the raised
+            // class, so the retry budget isn't spent twice on a later attempt.
+            Err(wait_error) => return self.fail_with_error(py, job, exception_key, &wait_error),
         };
         warn!("Job will be retried (attempt #{})", exception_count + 1);
         let new_arguments =
@@ -1259,10 +1261,21 @@ impl Runnable {
             .get_type(py)
             .qualname()
             .map_or_else(|_| "Unknown".to_string(), |q| q.to_string());
-        let exception_key = format!("[{error_type}]");
+        self.fail_with_error(py, job, &format!("[{error_type}]"), raised)
+    }
+
+    /// Count the failure under `exception_key` and fail the job with `raised`
+    /// (its class, message and traceback become the failed execution's error).
+    fn fail_with_error(
+        &self,
+        py: Python,
+        job: &mut quebec_jobs::Model,
+        exception_key: &str,
+        raised: &PyErr,
+    ) -> Result<quebec_jobs::Model> {
         job.arguments = Some(crate::utils::increment_executions(
             job.arguments.as_deref(),
-            Some(&exception_key),
+            Some(exception_key),
         ));
         let error_payload = self.create_error_payload(py, raised);
         Err(QuebecError::generic(error_payload))

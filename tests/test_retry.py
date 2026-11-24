@@ -95,15 +95,15 @@ class PolynomialJob(quebec.BaseClass):
         raise ValueError("boom")
 
 
+def _custom_backoff(executions: int) -> timedelta:
+    # Module level: a bare staticmethod object isn't callable on Python 3.9.
+    CustomBackoffJob.seen.append(executions)
+    return timedelta(seconds=100 * executions)
+
+
 class CustomBackoffJob(quebec.BaseClass):
     seen = []
-
-    @staticmethod
-    def _backoff(executions: int) -> timedelta:
-        CustomBackoffJob.seen.append(executions)
-        return timedelta(seconds=100 * executions)
-
-    retry_on = [quebec.RetryStrategy((ValueError,), wait=_backoff, attempts=3)]
+    retry_on = [quebec.RetryStrategy((ValueError,), wait=_custom_backoff, attempts=3)]
 
     def perform(self, value: int) -> None:
         raise ValueError("boom")
@@ -156,6 +156,13 @@ class RaisingBackoffJob(quebec.BaseClass):
         raise ValueError("boom")
 
 
+class SubclassRaisingBackoffJob(quebec.BaseClass):
+    retry_on = [quebec.RetryStrategy((OSError,), wait=_raising_backoff, attempts=3)]
+
+    def perform(self, value: int) -> None:
+        raise FileNotFoundError("missing")
+
+
 class HugeBackoffJob(quebec.BaseClass):
     retry_on = [quebec.RetryStrategy((ValueError,), wait=lambda n: 1e30, attempts=3)]
 
@@ -190,6 +197,24 @@ def test_raising_custom_wait_fails_job_with_its_error(
     assert any("_raising_backoff" in line for line in error["backtrace"])
     payload = json.loads(db_assert.get_job(enqueued.id)["arguments"])
     assert payload["exception_executions"] == {"[ValueError]": 1}
+
+
+def test_raising_custom_wait_counts_against_matched_declaration(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    # The strategy matched (OSError,) for a FileNotFoundError; the failure must
+    # count under that declaration's key, or a later attempt would see
+    # executions=1 again and get an extra retry.
+    qc = qc_with_sqlalchemy["qc"]
+    qc.register_job(SubclassRaisingBackoffJob)
+
+    enqueued = SubclassRaisingBackoffJob.perform_later(qc, 1)
+    qc.drain_one().perform()
+
+    assert db_assert.count_failed_executions() == 1
+    assert _failed_error(qc_with_sqlalchemy)["exception_class"] == "KeyError"
+    payload = json.loads(db_assert.get_job(enqueued.id)["arguments"])
+    assert payload["exception_executions"] == {"[OSError]": 1}
 
 
 def test_out_of_range_custom_wait_fails_job_instead_of_panicking(
