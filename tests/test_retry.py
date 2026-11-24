@@ -56,3 +56,84 @@ def test_pick_job_and_perform_schedules_retry(qc_with_sqlalchemy, db_assert) -> 
     assert db_assert.count_claimed_executions() == 0
     assert db_assert.count_failed_executions() == 0
     assert db_assert.count_scheduled_executions() == 1
+
+
+def _retry_delay_seconds(qc_with_sqlalchemy, job_class) -> float:
+    """Perform one failing attempt and return the retry's scheduled delay."""
+    from datetime import datetime, timezone
+
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    qc.register_job(job_class)
+    enqueued = job_class.perform_later(qc, 1)
+    before = datetime.now(timezone.utc).replace(tzinfo=None)
+    qc.drain_one().perform()
+    session.expire_all()
+
+    scheduled_at = session.execute(
+        text(
+            f"SELECT scheduled_at FROM {prefix}_jobs "
+            f"WHERE active_job_id = :id ORDER BY id DESC LIMIT 1"
+        ),
+        {"id": enqueued.active_job_id},
+    ).scalar_one()
+    if isinstance(scheduled_at, str):
+        scheduled_at = datetime.fromisoformat(scheduled_at)
+    return (scheduled_at.replace(tzinfo=None) - before).total_seconds()
+
+
+class PolynomialJob(quebec.BaseClass):
+    retry_on = [
+        quebec.RetryStrategy(
+            (ValueError,), wait="polynomially_longer", attempts=3, jitter=0
+        )
+    ]
+
+    def perform(self, value: int) -> None:
+        raise ValueError("boom")
+
+
+class CustomBackoffJob(quebec.BaseClass):
+    seen = []
+
+    @staticmethod
+    def _backoff(executions: int) -> timedelta:
+        CustomBackoffJob.seen.append(executions)
+        return timedelta(seconds=100 * executions)
+
+    retry_on = [quebec.RetryStrategy((ValueError,), wait=_backoff, attempts=3)]
+
+    def perform(self, value: int) -> None:
+        raise ValueError("boom")
+
+
+def test_polynomially_longer_first_retry(qc_with_sqlalchemy) -> None:
+    # ActiveJob: executions**4 + 2 with executions=1 -> 3s
+    delay = _retry_delay_seconds(qc_with_sqlalchemy, PolynomialJob)
+    assert 2 <= delay <= 5
+
+
+def test_custom_backoff_callable_receives_executions(qc_with_sqlalchemy) -> None:
+    CustomBackoffJob.seen.clear()
+    delay = _retry_delay_seconds(qc_with_sqlalchemy, CustomBackoffJob)
+    assert CustomBackoffJob.seen == [1]
+    assert 99 <= delay <= 102
+
+
+def test_fixed_wait_and_default_jitter() -> None:
+    strategy = quebec.RetryStrategy((ValueError,), wait=10)
+    assert strategy.wait == timedelta(seconds=10)
+    assert strategy.jitter == 0.15
+
+
+def test_retry_strategy_rejects_bad_wait() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        quebec.RetryStrategy((ValueError,), wait="exponentially_longer")
+    with pytest.raises(ValueError):
+        quebec.RetryStrategy((ValueError,), wait=-1)
+    with pytest.raises(ValueError):
+        quebec.RetryStrategy((ValueError,), jitter=-0.1)

@@ -1098,7 +1098,7 @@ impl Runnable {
                 strategy,
                 exception_key,
             }) => {
-                return self.apply_retry_strategy(job, strategy, &exception_key);
+                return self.apply_retry_strategy(py, job, strategy, &exception_key);
             }
             // Attempts exhausted with a handler — run it and complete the job,
             // matching ActiveJob's `retry_on ... do |job, error|` block.
@@ -1180,6 +1180,7 @@ impl Runnable {
     /// Apply retry strategy
     fn apply_retry_strategy(
         &mut self,
+        py: Python,
         job: &quebec_jobs::Model,
         strategy: RetryStrategy,
         exception_key: &str,
@@ -1188,10 +1189,12 @@ impl Runnable {
             crate::utils::get_exception_executions(job.arguments.as_deref(), exception_key);
         warn!("Job will be retried (attempt #{})", exception_count + 1);
 
-        let delay = strategy.wait;
-        let scheduled_at = chrono::Utc::now().naive_utc()
-            + chrono::Duration::from_std(delay)
-                .map_err(|e| QuebecError::validation(format!("Invalid delay duration: {e}")))?;
+        // ActiveJob passes `executions_for(exceptions)`, i.e. the count
+        // including this failure.
+        let delay = strategy
+            .delay_for(py, i64::from(exception_count) + 1)
+            .map_err(|e| QuebecError::validation(format!("Invalid retry delay: {e}")))?;
+        let scheduled_at = chrono::Utc::now().naive_utc() + delay;
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
 
@@ -2398,8 +2401,6 @@ impl Execution {
         _exc: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         let job = self.job.clone();
-        let scheduled_at = chrono::Utc::now().naive_utc() + strategy.wait();
-
         let exception_key = Runnable::strategy_exception_key(py, &strategy.exceptions)?;
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(&exception_key));
@@ -2435,6 +2436,8 @@ impl Execution {
             );
             return Ok(());
         }
+        let scheduled_at = chrono::Utc::now().naive_utc()
+            + strategy.delay_for(py, i64::from(exception_count) + 1)?;
 
         py.detach(|| {
             let retry_future = async {

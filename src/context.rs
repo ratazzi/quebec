@@ -250,37 +250,161 @@ impl RescueStrategy {
     }
 }
 
+/// How long to wait before a retry, mirroring ActiveJob's `retry_on wait:`.
+#[cfg(feature = "python")]
+#[derive(Debug, Clone)]
+pub enum RetryWait {
+    /// A fixed delay (`wait=timedelta(...)` or seconds as int/float).
+    Fixed(Duration),
+    /// `wait="polynomially_longer"`: `executions**4 + 2` seconds plus jitter.
+    PolynomiallyLonger,
+    /// `wait=callable(executions)` returning seconds or a `timedelta`.
+    /// As in ActiveJob, no jitter is applied to a custom algorithm.
+    Custom(Py<PyAny>),
+}
+
+#[cfg(feature = "python")]
+impl RetryWait {
+    const POLYNOMIALLY_LONGER: &'static str = "polynomially_longer";
+
+    fn extract(wait: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(name) = wait.extract::<String>() {
+            return match name.as_str() {
+                Self::POLYNOMIALLY_LONGER => Ok(Self::PolynomiallyLonger),
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown retry wait algorithm {other:?}; expected \"{}\"",
+                    Self::POLYNOMIALLY_LONGER
+                ))),
+            };
+        }
+        if wait.is_callable() {
+            return Ok(Self::Custom(wait.clone().unbind()));
+        }
+        seconds_from_py(wait).map(|secs| Self::Fixed(Duration::from_secs_f64(secs)))
+    }
+
+    fn to_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::Fixed(d) => Ok(d.into_pyobject(py)?.into_any().unbind()),
+            Self::PolynomiallyLonger => Ok(Self::POLYNOMIALLY_LONGER
+                .into_pyobject(py)?
+                .into_any()
+                .unbind()),
+            Self::Custom(f) => Ok(f.clone_ref(py)),
+        }
+    }
+}
+
+/// Read a non-negative number of seconds from an int, float or `timedelta`.
+#[cfg(feature = "python")]
+fn seconds_from_py(value: &Bound<'_, PyAny>) -> PyResult<f64> {
+    let secs = value
+        .extract::<Duration>()
+        .map(|d| d.as_secs_f64())
+        .or_else(|_| value.extract::<f64>())
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(format!(
+                "retry wait must be seconds (int/float), a timedelta, \"polynomially_longer\" \
+                 or a callable, got {}",
+                value
+                    .get_type()
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default()
+            ))
+        })?;
+    if secs.is_finite() && secs >= 0.0 {
+        Ok(secs)
+    } else {
+        Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "retry wait must be a non-negative finite duration, got {secs}"
+        )))
+    }
+}
+
+/// ActiveJob's default `retry_jitter`.
+#[cfg(feature = "python")]
+const DEFAULT_RETRY_JITTER: f64 = 0.15;
+
 #[cfg(feature = "python")]
 #[pyclass(from_py_object)]
 #[derive(Debug, Clone)]
 pub struct RetryStrategy {
-    pub wait: Duration,
+    pub wait: RetryWait,
+    pub jitter: f64,
     pub attempts: i64,
     pub exceptions: Py<PyAny>,
     pub handler: Option<Py<PyAny>>,
 }
 
 #[cfg(feature = "python")]
+impl RetryStrategy {
+    /// Delay before the next attempt, matching ActiveJob's `determine_delay`.
+    /// `executions` is this declaration's exception count *including* the
+    /// failure being handled (ActiveJob's `executions_for(exceptions)`).
+    pub fn delay_for(&self, py: Python<'_>, executions: i64) -> PyResult<chrono::Duration> {
+        let secs = match &self.wait {
+            RetryWait::Fixed(d) => with_jitter(d.as_secs_f64(), self.jitter),
+            RetryWait::PolynomiallyLonger => {
+                with_jitter((executions as f64).powi(4), self.jitter) + 2.0
+            }
+            RetryWait::Custom(f) => seconds_from_py(f.bind(py).call1((executions,))?.as_any())?,
+        };
+        chrono::Duration::from_std(Duration::from_secs_f64(secs)).map_err(|e| {
+            pyo3::exceptions::PyOverflowError::new_err(format!("retry delay too large: {e}"))
+        })
+    }
+}
+
+/// `delay + rand * delay * jitter`, as in ActiveJob's `determine_jitter_for_delay`.
+#[cfg(feature = "python")]
+fn with_jitter(delay: f64, jitter: f64) -> f64 {
+    if jitter == 0.0 {
+        return delay;
+    }
+    delay + rand::random::<f64>() * delay * jitter
+}
+
+#[cfg(feature = "python")]
 #[pymethods]
 impl RetryStrategy {
     #[new]
+    #[pyo3(signature = (exceptions, wait=None, attempts=None, handler=None, jitter=None))]
     fn new(
         exceptions: Py<PyAny>,
-        wait: Option<Duration>,
+        wait: Option<Bound<'_, PyAny>>,
         attempts: Option<i64>,
         handler: Option<Py<PyAny>>,
-    ) -> Self {
-        RetryStrategy {
-            wait: wait.unwrap_or(Duration::from_secs(3)),
+        jitter: Option<f64>,
+    ) -> PyResult<Self> {
+        let wait = wait
+            .filter(|w| !w.is_none())
+            .map(|w| RetryWait::extract(&w))
+            .transpose()?
+            .unwrap_or(RetryWait::Fixed(Duration::from_secs(3)));
+        let jitter = jitter.unwrap_or(DEFAULT_RETRY_JITTER);
+        if !(jitter.is_finite() && jitter >= 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "jitter must be a non-negative number, got {jitter}"
+            )));
+        }
+        Ok(RetryStrategy {
+            wait,
+            jitter,
             attempts: attempts.unwrap_or(5),
             exceptions,
             handler,
-        }
+        })
     }
 
     #[getter]
-    pub fn wait(&self) -> Duration {
-        self.wait
+    pub fn wait(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.wait.to_object(py)
+    }
+
+    #[getter]
+    pub fn jitter(&self) -> f64 {
+        self.jitter
     }
 
     #[getter]
@@ -295,8 +419,8 @@ impl RetryStrategy {
 
     fn __repr__(&self) -> String {
         format!(
-            "RetryStrategy(wait={:?}, attempts={}, exceptions={:?})",
-            self.wait, self.attempts, self.exceptions
+            "RetryStrategy(wait={:?}, jitter={}, attempts={}, exceptions={:?})",
+            self.wait, self.jitter, self.attempts, self.exceptions
         )
     }
 }

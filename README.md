@@ -315,6 +315,13 @@ class PaymentJob(quebec.BaseClass):
         process_payment(order_id)
 ```
 
+`wait` accepts seconds, a `timedelta`, `"polynomially_longer"` (ActiveJob's backoff: `executions**4 + 2` seconds, i.e. 3s, 18s, 83s, ...), or a callable `f(executions)` returning seconds or a `timedelta`. As in ActiveJob, a random `jitter` (default `0.15`, i.e. up to +15%) is added to fixed and polynomial waits; pass `jitter=0` for exact delays.
+
+```python
+quebec.RetryStrategy((ConnectionError,), wait="polynomially_longer", attempts=10)
+quebec.RetryStrategy((TimeoutError,), wait=lambda n: min(2 ** n, 300), attempts=8)
+```
+
 Multiple `RetryStrategy` entries can target different exception types with independent wait/attempts. The optional `handler` fires only when a strategy's attempts are exhausted (mirroring ActiveJob's `retry_on ... do |job, error|` block) and is called with `(job, error)`. `discard_on` and `rescue_from` handlers use the same `(job, error)` signature.
 
 When the handler returns normally the error counts as handled: the job is marked finished and no failed execution is recorded. To alert and still keep the job in Failed jobs (so it can be retried after a fix), re-raise from the handler — as in ActiveJob, an exception escaping the handler fails the job with that exception:
