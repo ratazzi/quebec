@@ -1956,11 +1956,27 @@ impl ScheduledEntry {
     }
 }
 
-/// Standard cron semantics: when both day-of-month and day-of-week are
+/// Vixie cron day matching: when both day-of-month and day-of-week are
 /// restricted, a day matching either one fires (`0 0 1 * MON` is the 1st and
-/// every Monday), as in Vixie cron and Solid Queue's Fugit.
+/// every Monday). A day field starting with `*` (or `?`) counts as
+/// unrestricted even when stepped, so `0 0 */1 * MON` is Mondays only.
 fn parse_cron(expr: &str) -> std::result::Result<Cron, croner::errors::CronError> {
-    Cron::new(expr).with_seconds_optional().parse()
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    // Five fields, or six with seconds first: dom and dow are the 3rd and
+    // 5th from the end of the five-field form.
+    let day_field_unrestricted = |i: usize| {
+        fields
+            .len()
+            .checked_sub(5)
+            .and_then(|offset| fields.get(offset + i))
+            .is_some_and(|f| f.starts_with('*') || f.starts_with('?'))
+    };
+    let mut cron = Cron::new(expr);
+    cron.with_seconds_optional();
+    if day_field_unrestricted(2) || day_field_unrestricted(4) {
+        cron.with_dom_and_dow();
+    }
+    cron.parse()
 }
 
 /// Whether `schedule` is laid out as cron fields (`61 3 * * MON`,
@@ -2035,8 +2051,13 @@ mod schedule_tests {
     }
 
     fn next_dates(schedule: &str) -> (String, String) {
+        next_dates_from(schedule, 1)
+    }
+
+    /// The next two run dates after 00:00:30 on 2026-01-`day`.
+    fn next_dates_from(schedule: &str, day: u32) -> (String, String) {
         let cron = parse_schedule(schedule).unwrap();
-        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 30).unwrap();
         let a = cron.find_next_occurrence(&start, false).unwrap();
         let b = cron.find_next_occurrence(&a, false).unwrap();
         (
@@ -2101,8 +2122,22 @@ mod schedule_tests {
             next_dates("every monday at 9am"),
             ("2026-01-05".into(), "2026-01-12".into())
         );
+        // Both triggers: Sunday 1 Feb (day of month), Monday 2 Feb (weekday).
+        assert_eq!(
+            next_dates_from("0 0 1 * MON", 31),
+            ("2026-02-01".into(), "2026-02-02".into())
+        );
         assert_eq!(
             next_dates("0 0 1 * *"),
+            ("2026-02-01".into(), "2026-03-01".into())
+        );
+        // A stepped `*` day field is unrestricted: Mondays only (Fri 2nd skipped).
+        assert_eq!(
+            next_dates("0 0 */1 * MON"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        assert_eq!(
+            next_dates("0 0 1 */1 *"),
             ("2026-02-01".into(), "2026-03-01".into())
         );
     }
