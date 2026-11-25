@@ -312,28 +312,11 @@ impl ControlPlane {
     }
 
     fn calculate_next_run(schedule: &str) -> Option<String> {
-        use croner::Cron;
-        use english_to_cron::str_cron_syntax;
+        let cron = crate::context::parse_schedule(schedule).ok()?;
 
-        // Convert natural language to cron expression if needed
-        let mut expr = schedule.to_string();
-        if let Ok(s) = str_cron_syntax(schedule) {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            // If 7 parts (with year), take first 6
-            if parts.len() >= 7 {
-                expr = parts[..6].join(" ");
-            } else {
-                expr = s;
-            }
-        }
-
-        let cron = Cron::new(&expr)
-            .with_seconds_optional()
-            .with_dom_and_dow()
-            .parse()
-            .ok()?;
-
-        let now = chrono::Utc::now();
+        // Walk the schedule in local time, as the scheduler does
+        // (`scheduler.rs`), so "0 3 * * *" shows the same 03:00 it runs at.
+        let now = chrono::Local::now();
         let next = cron.find_next_occurrence(&now, false).ok()?;
 
         // If next occurrence is in the past (just executed), find the one after

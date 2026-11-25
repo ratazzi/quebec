@@ -1952,20 +1952,211 @@ pub struct ScheduledEntry {
 
 impl ScheduledEntry {
     pub fn as_cron(&self) -> Result<Cron> {
-        let mut expr = self.schedule.clone();
-        let _ = str_cron_syntax(&self.schedule).map(|s| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            if parts.len() >= 7 {
-                // https://docs.rs/cron/latest/cron: sec min hour day_of_month month day_of_week year
-                expr = parts[..6].join(" ");
-                debug!("Job({:?}): {} -> {}", self.key, self.schedule, expr);
-            }
-        });
+        parse_schedule(&self.schedule)
+    }
+}
 
-        let cron = Cron::new(&expr)
-            .with_seconds_optional()
-            .with_dom_and_dow()
-            .parse();
-        Ok(cron?)
+/// Vixie cron day matching: when both day-of-month and day-of-week are
+/// restricted, a day matching either one fires (`0 0 1 * MON` is the 1st and
+/// every Monday). A day field starting with `*` (or `?`) counts as
+/// unrestricted even when stepped, so `0 0 */1 * MON` is Mondays only.
+fn parse_cron(expr: &str) -> std::result::Result<Cron, croner::errors::CronError> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    // Five fields, or six with seconds first: dom and dow are the 3rd and
+    // 5th from the end of the five-field form.
+    let day_field_unrestricted = |i: usize| {
+        fields
+            .len()
+            .checked_sub(5)
+            .and_then(|offset| fields.get(offset + i))
+            .is_some_and(|f| f.starts_with('*') || f.starts_with('?'))
+    };
+    let mut cron = Cron::new(expr);
+    cron.with_seconds_optional();
+    if day_field_unrestricted(2) || day_field_unrestricted(4) {
+        cron.with_dom_and_dow();
+    }
+    cron.parse()
+}
+
+/// Whether `schedule` is laid out as cron fields (`61 3 * * MON`,
+/// `*/5 * * *`): its first two words use only cron field characters. Such
+/// input is never re-read as English, so a mistyped cron line keeps its
+/// cron error instead of whatever english-to-cron half recognises in it.
+fn looks_like_cron(schedule: &str) -> bool {
+    let is_field = |w: &str| {
+        w.chars()
+            .all(|c| c.is_ascii_digit() || "*?/,-LW#".contains(c))
+    };
+    let words: Vec<&str> = schedule.split_whitespace().take(2).collect();
+    words.len() == 2 && words.into_iter().all(is_field)
+}
+
+/// `english-to-cron`'s answer for input it only half understands
+/// ("every ten minutes", "every 5 bananas", "5").
+const ENGLISH_EVERY_MINUTE: &str = "0 * * * * ?";
+
+/// Schedules that really mean the every-minute expression above.
+fn says_every_minute(schedule: &str) -> bool {
+    let words = schedule.to_lowercase();
+    matches!(
+        words.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["every", "minute" | "min"]
+    )
+}
+
+/// Translate an English schedule ("every 5 minutes", "14:30") into a
+/// six-field cron expression.
+fn english_to_cron(schedule: &str) -> Option<String> {
+    if looks_like_cron(schedule) {
+        return None;
+    }
+    // english-to-cron yields `sec min hour dom month dow year`; croner takes
+    // at most six fields, so drop the year.
+    let expr = str_cron_syntax(schedule)
+        .ok()?
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (expr != ENGLISH_EVERY_MINUTE || says_every_minute(schedule)).then_some(expr)
+}
+
+/// Parse a recurring schedule: a cron expression first, falling back to
+/// English only when it is not one, like Solid Queue's `Fugit.parse`. An
+/// invalid schedule is an error, never silently "every minute".
+pub fn parse_schedule(schedule: &str) -> Result<Cron> {
+    parse_cron(schedule).or_else(|cron_err| {
+        english_to_cron(schedule)
+            .inspect(|expr| debug!("schedule {:?} -> {:?}", schedule, expr))
+            .map_or(Err(cron_err), |expr| parse_cron(&expr))
+            .map_err(Into::into)
+    })
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::parse_schedule;
+    use chrono::{TimeZone, Utc};
+
+    fn next_two(schedule: &str) -> (String, String) {
+        let cron = parse_schedule(schedule).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let a = cron.find_next_occurrence(&start, false).unwrap();
+        let b = cron.find_next_occurrence(&a, false).unwrap();
+        (
+            a.format("%H:%M:%S").to_string(),
+            b.format("%H:%M:%S").to_string(),
+        )
+    }
+
+    fn next_dates(schedule: &str) -> (String, String) {
+        next_dates_from(schedule, 1)
+    }
+
+    /// The next two run dates after 00:00:30 on 2026-01-`day`.
+    fn next_dates_from(schedule: &str, day: u32) -> (String, String) {
+        let cron = parse_schedule(schedule).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 30).unwrap();
+        let a = cron.find_next_occurrence(&start, false).unwrap();
+        let b = cron.find_next_occurrence(&a, false).unwrap();
+        (
+            a.format("%Y-%m-%d").to_string(),
+            b.format("%Y-%m-%d").to_string(),
+        )
+    }
+
+    #[test]
+    fn standard_cron_is_not_rewritten_to_every_minute() {
+        assert_eq!(
+            next_two("*/5 * * * *"),
+            ("00:05:00".into(), "00:10:00".into())
+        );
+        assert_eq!(
+            next_two("0 3 * * *"),
+            ("03:00:00".into(), "03:00:00".into())
+        );
+        assert_eq!(
+            next_two("0 */2 * * *"),
+            ("02:00:00".into(), "04:00:00".into())
+        );
+        assert_eq!(
+            next_two("*/20 * * * * *"),
+            ("00:00:40".into(), "00:01:00".into())
+        );
+    }
+
+    #[test]
+    fn english_schedules_still_parse() {
+        assert_eq!(
+            next_two("every 5 minutes"),
+            ("00:05:00".into(), "00:10:00".into())
+        );
+        assert_eq!(
+            next_two("every day at 3am"),
+            ("03:00:00".into(), "03:00:00".into())
+        );
+    }
+
+    #[test]
+    fn english_every_minute_is_kept() {
+        for s in ["every minute", "every min", "Every Minute"] {
+            assert_eq!(next_two(s), ("00:01:00".into(), "00:02:00".into()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn bare_time_of_day_parses() {
+        assert_eq!(next_two("14:30"), ("14:30:00".into(), "14:30:00".into()));
+    }
+
+    #[test]
+    fn day_of_month_or_day_of_week() {
+        // 2026-01-01 is a Thursday: next is Monday the 5th, then the 12th.
+        assert_eq!(
+            next_dates("0 0 1 * MON"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        // english-to-cron leaves the other day field as `?`: Mondays only.
+        assert_eq!(
+            next_dates("every monday at 9am"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        // Both triggers: Sunday 1 Feb (day of month), Monday 2 Feb (weekday).
+        assert_eq!(
+            next_dates_from("0 0 1 * MON", 31),
+            ("2026-02-01".into(), "2026-02-02".into())
+        );
+        assert_eq!(
+            next_dates("0 0 1 * *"),
+            ("2026-02-01".into(), "2026-03-01".into())
+        );
+        // A stepped `*` day field is unrestricted: Mondays only (Fri 2nd skipped).
+        assert_eq!(
+            next_dates("0 0 */1 * MON"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        assert_eq!(
+            next_dates("0 0 1 */1 *"),
+            ("2026-02-01".into(), "2026-03-01".into())
+        );
+    }
+
+    #[test]
+    fn invalid_schedule_is_an_error_not_every_minute() {
+        for bad in [
+            "not a schedule at all",
+            "*/5 * * *",
+            "61 * * * *",
+            "0 3 * * * * * *",
+            "5",
+            "every 5 bananas",
+            "0 9 * * FOO",
+            "61 3 * * MON",
+            "0 25 * * MON",
+            "every ten minutes",
+        ] {
+            assert!(parse_schedule(bad).is_err(), "{bad:?} should not parse");
+        }
     }
 }
