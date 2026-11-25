@@ -173,7 +173,27 @@ pub struct Runnable {
 pub(crate) struct ContinuationInfo {
     pub(crate) state: crate::continuation::ContinuationState,
     pub(crate) resumptions: i32,
-    pub(crate) original_args: serde_json::Value,
+}
+
+impl ContinuationInfo {
+    /// Whether any step has completed or holds a cursor.
+    fn has_progress(&self) -> bool {
+        !self.state.completed.is_empty() || self.state.current.is_some()
+    }
+
+    /// `arguments` with this run's step progress and resumption count in
+    /// place of the ones loaded at start, as ActiveJob's `serialize` does for
+    /// `retry_job`. Everything else in `arguments` (e.g. the bumped
+    /// `executions`) is kept.
+    fn apply_to(&self, arguments: &str) -> String {
+        let (_, _, base) = crate::continuation::parse_continuation_from_arguments(Some(arguments));
+        crate::continuation::serialize_continuation_to_arguments(
+            &base,
+            &self.state,
+            self.resumptions,
+        )
+        .to_string()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -803,6 +823,89 @@ impl Runnable {
         })
     }
 
+    /// Run `before_perform`, `perform` (wrapped by `around_perform` when
+    /// overridden) and `after_perform`. Every error comes back as `Err`,
+    /// whichever of them raised it, so the caller handles them in one place.
+    fn perform_with_hooks(
+        &self,
+        py: Python,
+        instance: &Bound<'_, PyAny>,
+        args: &Py<PyTuple>,
+        kwargs: &Py<PyDict>,
+    ) -> PyResult<()> {
+        if self.hooks.before_perform {
+            instance.call_method0("before_perform")?;
+        }
+
+        let perform = || {
+            instance
+                .getattr("perform")?
+                .call(args.bind(py), Some(kwargs.bind(py)))
+                .map(|_| ())
+        };
+
+        if self.hooks.around_perform {
+            // Yield-style: def around_perform(self): ... yield ... perform runs at yield
+            let gen = instance.call_method0("around_perform")?;
+            let next = py.import("builtins")?.getattr("next")?;
+            let is_stop = |e: &PyErr| e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py);
+            match next.call1((&gen,)) {
+                // Generator returned without yielding — skip perform (job completes normally)
+                Err(e) if is_stop(&e) => {
+                    info!("Job `{}' skipped by around_perform hook", self.class_name);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+                Ok(_) => {}
+            }
+            // Execute perform() at the yield point, then resume the generator.
+            // If perform failed, throw its error into the generator: the hook
+            // may swallow it (job succeeds); otherwise perform's own error is
+            // the job's error.
+            match perform() {
+                Ok(()) => match next.call1((&gen,)) {
+                    Err(e) if !is_stop(&e) => return Err(e),
+                    _ => {}
+                },
+                Err(err) => match gen.call_method1("throw", (err.get_type(py), err.value(py))) {
+                    Err(e) if !is_stop(&e) => return Err(err),
+                    _ => {}
+                },
+            }
+        } else {
+            perform()?;
+        }
+
+        // after_perform — only if overridden and perform() actually ran
+        if self.hooks.after_perform {
+            if let Err(e) = instance.call_method0("after_perform") {
+                error!("after_perform hook error: {:?}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the continuation state the job instance reached into
+    /// `continuation_info`, when it changed during this run.
+    fn capture_continuation_state(&mut self, instance: &Bound<'_, PyAny>) {
+        let captured = instance
+            .getattr("_continuation")
+            .ok()
+            .and_then(|attr| attr.extract::<crate::continuation::Continuable>().ok())
+            .and_then(|continuable| continuable.get_state().ok())
+            .filter(|(_, _, dirty)| *dirty);
+        if let (Some((state, resumptions, _)), Some(info)) =
+            (captured, self.continuation_info.as_mut())
+        {
+            info.state = state;
+            info.resumptions = resumptions;
+            debug!(
+                "Captured continuation state: completed={:?}, current={:?}",
+                info.state.completed, info.state.current
+            );
+        }
+    }
+
     /// Execute Python task (parameter parsing + invocation)
     fn execute_python_task(
         &mut self,
@@ -816,11 +919,10 @@ impl Runnable {
         let (cont_state, resumptions, original_args) =
             parse_continuation_from_arguments(job.arguments.as_deref());
 
-        // Store original args for potential re-enqueue
+        // Keep the loaded state; it is updated from the instance on error
         self.continuation_info = Some(ContinuationInfo {
             state: cont_state.clone(),
             resumptions,
-            original_args: original_args.clone(),
         });
 
         // Parse task parameters from original args (without continuation metadata)
@@ -858,90 +960,18 @@ impl Runnable {
             // This is handled by the Python Continuable mixin
         }
 
-        // before_perform — only if overridden
-        if self.hooks.before_perform {
-            instance.call_method0("before_perform")?;
-        }
+        let result = self.perform_with_hooks(py, &instance, &args, &kwargs);
 
-        let mut result;
-        let performed = true;
-
-        if self.hooks.around_perform {
-            // Yield-style: def around_perform(self): ... yield ... perform runs at yield
-            let gen = instance.call_method0("around_perform")?;
-            let builtins = py.import("builtins")?;
-            let first_next = builtins.getattr("next")?.call1((&gen,));
-            if let Err(ref e) = first_next {
-                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                    // Generator returned without yielding — skip perform (job completes normally)
-                    info!("Job `{}' skipped by around_perform hook", self.class_name);
-                    return Ok(());
-                }
-            }
-            first_next?;
-            // Execute perform() at the yield point
-            let func = instance.getattr("perform")?;
-            result = func
-                .call(&args, Some(kwargs.bind(py)))
-                .map(|r| r.into_any());
-            // Resume or throw: if perform failed, propagate into generator
-            if let Err(ref err) = result {
-                let throw_result = gen.call_method1("throw", (err.get_type(py), err.value(py)));
-                match &throw_result {
-                    Ok(_) => {
-                        result = throw_result.map(|r| r.into_any());
-                    }
-                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-                        result = Ok(py.None().into_bound(py));
-                    }
-                    Err(_) => {}
-                }
-            } else {
-                if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
-                    if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                        return Err(e);
-                    }
-                }
-            }
-        } else {
-            // Direct path: call perform() without wrapper
-            let func = instance.getattr("perform")?;
-            result = func
-                .call(&args, Some(kwargs.bind(py)))
-                .map(|r| r.into_any());
-        }
-
-        // after_perform — only if overridden and perform() actually ran
-        if self.hooks.after_perform && result.is_ok() && performed {
-            if let Err(e) = instance.call_method0("after_perform") {
-                error!("after_perform hook error: {:?}", e);
-            }
-        }
-
-        // On error (including JobInterrupted), capture continuation state from the instance
-        // BEFORE the instance goes out of scope
+        // On any error (including JobInterrupted) — from perform or from a
+        // hook before or after it — capture the continuation state from the
+        // instance BEFORE it goes out of scope, so a retry or resume keeps
+        // the steps completed so far.
         if result.is_err() {
-            if let Ok(cont_attr) = instance.getattr("_continuation") {
-                if let Ok(continuable) = cont_attr.extract::<crate::continuation::Continuable>() {
-                    if let Ok((state, resump, dirty)) = continuable.get_state() {
-                        if dirty {
-                            // Update continuation_info with the actual state from the running job
-                            if let Some(ref mut info) = self.continuation_info {
-                                info.state = state;
-                                info.resumptions = resump;
-                                debug!(
-                                    "Captured continuation state: completed={:?}, current={:?}",
-                                    info.state.completed, info.state.current
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            self.capture_continuation_state(&instance);
         }
 
         // Propagate the result (error or success)
-        result.map(|_| ())?;
+        result?;
 
         // After successful execution, clear continuation info
         self.continuation_info = None;
@@ -1067,12 +1097,10 @@ impl Runnable {
             .and_then(|attr| attr.extract::<bool>().ok())
             .unwrap_or(true);
 
-        let (has_continuation_progress, current_resumptions) =
-            self.continuation_info.as_ref().map_or((false, 0), |info| {
-                // Check if state has any completed steps or current step with cursor
-                let has_progress = !info.state.completed.is_empty() || info.state.current.is_some();
-                (has_progress, info.resumptions)
-            });
+        let (has_continuation_progress, current_resumptions) = self
+            .continuation_info
+            .as_ref()
+            .map_or((false, 0), |info| (info.has_progress(), info.resumptions));
 
         if resume_errors_after_advancing && has_continuation_progress {
             if current_resumptions >= max_resumptions {
@@ -1135,43 +1163,33 @@ impl Runnable {
         _py: Python,
         job: &quebec_jobs::Model,
     ) -> Result<quebec_jobs::Model> {
-        use crate::continuation::serialize_continuation_to_arguments;
-
-        // Get the continuation state from the stored info (already updated by execute_python_task)
+        // State was already captured in execute_python_task before the instance went out of scope
         let Some(cont_info) = self.continuation_info.take() else {
             warn!("JobInterrupted raised but no continuation info available");
             return Ok(job.clone());
         };
 
-        // State was already captured in execute_python_task before the instance went out of scope
-        // Just increment resumptions for the next run
-        let final_state = cont_info.state;
-        let resumptions = cont_info.resumptions + 1;
-
-        // Serialize the updated continuation state back to arguments
-        let new_arguments = serialize_continuation_to_arguments(
-            &cont_info.original_args,
-            &final_state,
-            resumptions,
-        );
-
         debug!(
             "Job will be re-enqueued with continuation state: completed={:?}, current={:?}",
-            final_state.completed, final_state.current
+            cont_info.state.completed, cont_info.state.current
         );
 
-        // Set retry_info to trigger immediate re-enqueue (scheduled_at = now)
-        // Don't increment executions for interruption - keep current arguments
+        // Re-enqueue immediately (scheduled_at = now). Interruption does not
+        // count as an execution: only the continuation state and the
+        // resumption count change, and only once a step has made progress.
+        let current = job.arguments.clone().unwrap_or_default();
+        let arguments = if cont_info.has_progress() {
+            ContinuationInfo {
+                resumptions: cont_info.resumptions + 1,
+                ..cont_info
+            }
+            .apply_to(&current)
+        } else {
+            current
+        };
         self.retry_info = Some(RetryInfo {
             scheduled_at: chrono::Utc::now().naive_utc(),
-            arguments: job.arguments.clone().unwrap_or_default(),
-        });
-
-        // Update the continuation_info with new arguments for the re-enqueue
-        self.continuation_info = Some(ContinuationInfo {
-            state: final_state,
-            resumptions,
-            original_args: new_arguments,
+            arguments,
         });
 
         Ok(job.clone())
@@ -1201,6 +1219,15 @@ impl Runnable {
         warn!("Job will be retried (attempt #{})", exception_count + 1);
         let new_arguments =
             crate::utils::increment_executions(job.arguments.as_deref(), Some(exception_key));
+        // Keep the step progress made so far: the retry resumes from it and
+        // its resumption count still applies, as ActiveJob serializes the
+        // continuation into `retry_job`. Replacing the bumped arguments with
+        // the ones loaded at start would reset `executions`, so `retry_on`
+        // would never run out of attempts.
+        let new_arguments = match self.continuation_info.as_ref() {
+            Some(info) if info.has_progress() => info.apply_to(&new_arguments),
+            _ => new_arguments,
+        };
 
         // Set retry information to runnable
         self.retry_info = Some(RetryInfo {
@@ -1424,8 +1451,6 @@ pub struct Execution {
     runnable: Runnable,
     metric: Option<Metric>,
     retry_info: Option<RetryInfo>,
-    /// Continuation info for interrupted jobs
-    continuation_info: Option<ContinuationInfo>,
     /// Wall-clock timestamp when the worker thread picked up this execution.
     /// Used to compute queue delay (start - max(scheduled_at, created_at)).
     pub(crate) started_at: Option<chrono::NaiveDateTime>,
@@ -1509,7 +1534,6 @@ impl Execution {
             runnable,
             metric: None,
             retry_info: None,
-            continuation_info: None,
             started_at: None,
             idle_notify: None,
             faults_at_start: None,
@@ -1617,10 +1641,6 @@ impl Execution {
             if let Some(retry_info) = self.runnable.retry_info.take() {
                 self.retry_info = Some(retry_info);
             }
-            // Move continuation information from runnable to execution
-            if let Some(cont_info) = self.runnable.continuation_info.take() {
-                self.continuation_info = Some(cont_info);
-            }
             invoke_result
         }
         .instrument(span.clone())
@@ -1637,18 +1657,14 @@ impl Execution {
     }
 
     /// Schedule a retry job with the given parameters
-    /// If `override_arguments` is provided, it will be used instead of the job's original arguments
-    /// (used for continuation support)
     async fn schedule_retry_job<C: ConnectionTrait>(
         txn: &C,
         ctx: &AppContext,
         job: &quebec_jobs::Model,
         scheduled_at: chrono::NaiveDateTime,
         arguments: &str,
-        override_arguments: Option<&str>,
     ) -> std::result::Result<(), DbErr> {
         let table_config = &ctx.table_config;
-        let arguments = override_arguments.unwrap_or(arguments);
 
         let new_job_id = query_builder::jobs::insert(
             txn,
@@ -1872,15 +1888,6 @@ impl Execution {
             .as_ref()
             .map(|info| (info.scheduled_at, info.arguments.clone()));
 
-        // Get continuation arguments if available (for interrupted jobs with actual progress)
-        // Only override retry arguments when continuation has made progress,
-        // otherwise the incremented executions counter would be lost.
-        let continuation_arguments = self
-            .continuation_info
-            .as_ref()
-            .filter(|info| !info.state.completed.is_empty() || info.state.current.is_some())
-            .map(|info| serde_json::to_string(&info.original_args).unwrap_or_default());
-
         // Capture concurrency info for semaphore release
         let concurrency_key = job.concurrency_key.clone();
         let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
@@ -1955,7 +1962,6 @@ impl Execution {
             }
 
             let retry_job_data = retry_job_data.clone();
-            let continuation_arguments = continuation_arguments.clone();
             let table_config = table_config_orig.clone();
             let job = job.clone();
             let err = err.clone();
@@ -1969,15 +1975,8 @@ impl Execution {
                     let queue_name = queue_name.clone();
                     Box::pin(async move {
                         if let Some((scheduled_at, ref arguments)) = retry_job_data {
-                            Self::schedule_retry_job(
-                                txn,
-                                &ctx,
-                                &job,
-                                scheduled_at,
-                                arguments,
-                                continuation_arguments.as_deref(),
-                            )
-                            .await?;
+                            Self::schedule_retry_job(txn, &ctx, &job, scheduled_at, arguments)
+                                .await?;
                         }
 
                         if failed {
@@ -2474,15 +2473,8 @@ impl Execution {
                     let new_arguments = new_arguments.clone();
 
                     Box::pin(async move {
-                        Self::schedule_retry_job(
-                            txn,
-                            &ctx,
-                            &job,
-                            scheduled_at,
-                            &new_arguments,
-                            None,
-                        )
-                        .await
+                        Self::schedule_retry_job(txn, &ctx, &job, scheduled_at, &new_arguments)
+                            .await
                     })
                 })
                 .await
