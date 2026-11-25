@@ -823,6 +823,89 @@ impl Runnable {
         })
     }
 
+    /// Run `before_perform`, `perform` (wrapped by `around_perform` when
+    /// overridden) and `after_perform`. Every error comes back as `Err`,
+    /// whichever of them raised it, so the caller handles them in one place.
+    fn perform_with_hooks(
+        &self,
+        py: Python,
+        instance: &Bound<'_, PyAny>,
+        args: &Py<PyTuple>,
+        kwargs: &Py<PyDict>,
+    ) -> PyResult<()> {
+        if self.hooks.before_perform {
+            instance.call_method0("before_perform")?;
+        }
+
+        let perform = || {
+            instance
+                .getattr("perform")?
+                .call(args.bind(py), Some(kwargs.bind(py)))
+                .map(|_| ())
+        };
+
+        if self.hooks.around_perform {
+            // Yield-style: def around_perform(self): ... yield ... perform runs at yield
+            let gen = instance.call_method0("around_perform")?;
+            let next = py.import("builtins")?.getattr("next")?;
+            let is_stop = |e: &PyErr| e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py);
+            match next.call1((&gen,)) {
+                // Generator returned without yielding — skip perform (job completes normally)
+                Err(e) if is_stop(&e) => {
+                    info!("Job `{}' skipped by around_perform hook", self.class_name);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+                Ok(_) => {}
+            }
+            // Execute perform() at the yield point, then resume the generator.
+            // If perform failed, throw its error into the generator: the hook
+            // may swallow it (job succeeds); otherwise perform's own error is
+            // the job's error.
+            match perform() {
+                Ok(()) => match next.call1((&gen,)) {
+                    Err(e) if !is_stop(&e) => return Err(e),
+                    _ => {}
+                },
+                Err(err) => match gen.call_method1("throw", (err.get_type(py), err.value(py))) {
+                    Err(e) if !is_stop(&e) => return Err(err),
+                    _ => {}
+                },
+            }
+        } else {
+            perform()?;
+        }
+
+        // after_perform — only if overridden and perform() actually ran
+        if self.hooks.after_perform {
+            if let Err(e) = instance.call_method0("after_perform") {
+                error!("after_perform hook error: {:?}", e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy the continuation state the job instance reached into
+    /// `continuation_info`, when it changed during this run.
+    fn capture_continuation_state(&mut self, instance: &Bound<'_, PyAny>) {
+        let captured = instance
+            .getattr("_continuation")
+            .ok()
+            .and_then(|attr| attr.extract::<crate::continuation::Continuable>().ok())
+            .and_then(|continuable| continuable.get_state().ok())
+            .filter(|(_, _, dirty)| *dirty);
+        if let (Some((state, resumptions, _)), Some(info)) =
+            (captured, self.continuation_info.as_mut())
+        {
+            info.state = state;
+            info.resumptions = resumptions;
+            debug!(
+                "Captured continuation state: completed={:?}, current={:?}",
+                info.state.completed, info.state.current
+            );
+        }
+    }
+
     /// Execute Python task (parameter parsing + invocation)
     fn execute_python_task(
         &mut self,
@@ -877,90 +960,18 @@ impl Runnable {
             // This is handled by the Python Continuable mixin
         }
 
-        // before_perform — only if overridden
-        if self.hooks.before_perform {
-            instance.call_method0("before_perform")?;
-        }
+        let result = self.perform_with_hooks(py, &instance, &args, &kwargs);
 
-        let mut result;
-        let performed = true;
-
-        if self.hooks.around_perform {
-            // Yield-style: def around_perform(self): ... yield ... perform runs at yield
-            let gen = instance.call_method0("around_perform")?;
-            let builtins = py.import("builtins")?;
-            let first_next = builtins.getattr("next")?.call1((&gen,));
-            if let Err(ref e) = first_next {
-                if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                    // Generator returned without yielding — skip perform (job completes normally)
-                    info!("Job `{}' skipped by around_perform hook", self.class_name);
-                    return Ok(());
-                }
-            }
-            first_next?;
-            // Execute perform() at the yield point
-            let func = instance.getattr("perform")?;
-            result = func
-                .call(&args, Some(kwargs.bind(py)))
-                .map(|r| r.into_any());
-            // Resume or throw: if perform failed, propagate into generator
-            if let Err(ref err) = result {
-                let throw_result = gen.call_method1("throw", (err.get_type(py), err.value(py)));
-                match &throw_result {
-                    Ok(_) => {
-                        result = throw_result.map(|r| r.into_any());
-                    }
-                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) => {
-                        result = Ok(py.None().into_bound(py));
-                    }
-                    Err(_) => {}
-                }
-            } else if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
-                // The hook raised after perform: fail through `result` so the
-                // step progress perform made is still captured below.
-                if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                    result = Err(e);
-                }
-            }
-        } else {
-            // Direct path: call perform() without wrapper
-            let func = instance.getattr("perform")?;
-            result = func
-                .call(&args, Some(kwargs.bind(py)))
-                .map(|r| r.into_any());
-        }
-
-        // after_perform — only if overridden and perform() actually ran
-        if self.hooks.after_perform && result.is_ok() && performed {
-            if let Err(e) = instance.call_method0("after_perform") {
-                error!("after_perform hook error: {:?}", e);
-            }
-        }
-
-        // On error (including JobInterrupted), capture continuation state from the instance
-        // BEFORE the instance goes out of scope
+        // On any error (including JobInterrupted) — from perform or from a
+        // hook before or after it — capture the continuation state from the
+        // instance BEFORE it goes out of scope, so a retry or resume keeps
+        // the steps completed so far.
         if result.is_err() {
-            if let Ok(cont_attr) = instance.getattr("_continuation") {
-                if let Ok(continuable) = cont_attr.extract::<crate::continuation::Continuable>() {
-                    if let Ok((state, resump, dirty)) = continuable.get_state() {
-                        if dirty {
-                            // Update continuation_info with the actual state from the running job
-                            if let Some(ref mut info) = self.continuation_info {
-                                info.state = state;
-                                info.resumptions = resump;
-                                debug!(
-                                    "Captured continuation state: completed={:?}, current={:?}",
-                                    info.state.completed, info.state.current
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            self.capture_continuation_state(&instance);
         }
 
         // Propagate the result (error or success)
-        result.map(|_| ())?;
+        result?;
 
         // After successful execution, clear continuation info
         self.continuation_info = None;

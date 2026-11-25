@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import quebec
 from sqlalchemy import text
 
@@ -226,31 +227,59 @@ def test_retry_after_resumptions_keeps_the_resumption_count(
     assert ResumesThenRetriesJob.runs == [(0, 0, 0), (0, 1, 1), (1, 1, 2)]
 
 
-class FailsAfterPerformJob(quebec.BaseClass, quebec.Continuable):
-    """`perform` completes its step; `around_perform` then raises."""
+class _WriteStepRetried(quebec.BaseClass, quebec.Continuable):
+    """Completes the `write` step, then raises an error `retry_on` handles;
+    subclasses differ in where that happens."""
 
     resume_errors_after_advancing = False
     retry_on = [quebec.RetryStrategy((ValueError,), wait=0, attempts=2)]
     write_runs = 0
 
-    def around_perform(self):
-        yield
-        raise ValueError("raised by around_perform after perform")
-
-    def perform(self) -> None:
+    def write(self) -> None:
         with self.step("write") as step:
             if not step.skip:
                 type(self).write_runs += 1
 
 
-def test_around_perform_error_after_perform_keeps_step_progress(
-    qc_with_sqlalchemy,
-) -> None:
+class FailsInBeforePerformJob(_WriteStepRetried):
+    def before_perform(self) -> None:
+        self.write()
+        raise ValueError("raised by before_perform")
+
+    def perform(self) -> None:
+        pass
+
+
+class FailsBeforeYieldJob(_WriteStepRetried):
+    def around_perform(self):
+        self.write()
+        raise ValueError("raised by around_perform before yield")
+        yield
+
+    def perform(self) -> None:
+        pass
+
+
+class FailsAfterYieldJob(_WriteStepRetried):
+    def around_perform(self):
+        yield
+        raise ValueError("raised by around_perform after perform")
+
+    def perform(self) -> None:
+        self.write()
+
+
+@pytest.mark.parametrize(
+    "job_class",
+    [FailsInBeforePerformJob, FailsBeforeYieldJob, FailsAfterYieldJob],
+    ids=["before_perform", "around_perform-before-yield", "around_perform-after-yield"],
+)
+def test_hook_error_keeps_step_progress(qc_with_sqlalchemy, job_class) -> None:
     qc = qc_with_sqlalchemy["qc"]
-    FailsAfterPerformJob.write_runs = 0
-    qc.register_job(FailsAfterPerformJob)
-    FailsAfterPerformJob.perform_later(qc)
+    job_class.write_runs = 0
+    qc.register_job(job_class)
+    job_class.perform_later(qc)
 
     _run_until_failed(qc_with_sqlalchemy, runs=2)
     # The retry skipped the step the first run completed.
-    assert FailsAfterPerformJob.write_runs == 1
+    assert job_class.write_runs == 1
