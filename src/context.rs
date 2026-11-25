@@ -1956,23 +1956,43 @@ impl ScheduledEntry {
     }
 }
 
+/// Standard cron semantics: when both day-of-month and day-of-week are
+/// restricted, a day matching either one fires (`0 0 1 * MON` is the 1st and
+/// every Monday), as in Vixie cron and Solid Queue's Fugit.
 fn parse_cron(expr: &str) -> std::result::Result<Cron, croner::errors::CronError> {
-    Cron::new(expr)
-        .with_seconds_optional()
-        .with_dom_and_dow()
-        .parse()
+    Cron::new(expr).with_seconds_optional().parse()
 }
 
-/// `english-to-cron`'s answer for input it only half understands.
+/// Whether `schedule` is laid out as cron fields (`61 3 * * MON`,
+/// `*/5 * * *`): its first two words use only cron field characters. Such
+/// input is never re-read as English, so a mistyped cron line keeps its
+/// cron error instead of whatever english-to-cron half recognises in it.
+fn looks_like_cron(schedule: &str) -> bool {
+    let is_field = |w: &str| {
+        w.chars()
+            .all(|c| c.is_ascii_digit() || "*?/,-LW#".contains(c))
+    };
+    let words: Vec<&str> = schedule.split_whitespace().take(2).collect();
+    words.len() == 2 && words.into_iter().all(is_field)
+}
+
+/// `english-to-cron`'s answer for input it only half understands
+/// ("every ten minutes", "every 5 bananas", "5").
 const ENGLISH_EVERY_MINUTE: &str = "0 * * * * ?";
 
-/// Translate an English schedule ("every 5 minutes") into a six-field cron
-/// expression. `english-to-cron` maps much of what it does not understand —
-/// a mistyped cron line, "every 5 bananas" — to "every minute", so input
-/// without words is never handed to it, and an every-minute result is only
-/// believed when the schedule says "minute".
+/// Schedules that really mean the every-minute expression above.
+fn says_every_minute(schedule: &str) -> bool {
+    let words = schedule.to_lowercase();
+    matches!(
+        words.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["every", "minute" | "min"]
+    )
+}
+
+/// Translate an English schedule ("every 5 minutes", "14:30") into a
+/// six-field cron expression.
 fn english_to_cron(schedule: &str) -> Option<String> {
-    if !schedule.chars().any(char::is_alphabetic) {
+    if looks_like_cron(schedule) {
         return None;
     }
     // english-to-cron yields `sec min hour dom month dow year`; croner takes
@@ -1983,8 +2003,7 @@ fn english_to_cron(schedule: &str) -> Option<String> {
         .take(6)
         .collect::<Vec<_>>()
         .join(" ");
-    let says_minute = schedule.to_lowercase().contains("minute");
-    (expr != ENGLISH_EVERY_MINUTE || says_minute).then_some(expr)
+    (expr != ENGLISH_EVERY_MINUTE || says_every_minute(schedule)).then_some(expr)
 }
 
 /// Parse a recurring schedule: a cron expression first, falling back to
@@ -2012,6 +2031,17 @@ mod schedule_tests {
         (
             a.format("%H:%M:%S").to_string(),
             b.format("%H:%M:%S").to_string(),
+        )
+    }
+
+    fn next_dates(schedule: &str) -> (String, String) {
+        let cron = parse_schedule(schedule).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let a = cron.find_next_occurrence(&start, false).unwrap();
+        let b = cron.find_next_occurrence(&a, false).unwrap();
+        (
+            a.format("%Y-%m-%d").to_string(),
+            b.format("%Y-%m-%d").to_string(),
         )
     }
 
@@ -2049,9 +2079,31 @@ mod schedule_tests {
 
     #[test]
     fn english_every_minute_is_kept() {
+        for s in ["every minute", "every min", "Every Minute"] {
+            assert_eq!(next_two(s), ("00:01:00".into(), "00:02:00".into()), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn bare_time_of_day_parses() {
+        assert_eq!(next_two("14:30"), ("14:30:00".into(), "14:30:00".into()));
+    }
+
+    #[test]
+    fn day_of_month_or_day_of_week() {
+        // 2026-01-01 is a Thursday: next is Monday the 5th, then the 12th.
         assert_eq!(
-            next_two("every minute"),
-            ("00:01:00".into(), "00:02:00".into())
+            next_dates("0 0 1 * MON"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        // english-to-cron leaves the other day field as `?`: Mondays only.
+        assert_eq!(
+            next_dates("every monday at 9am"),
+            ("2026-01-05".into(), "2026-01-12".into())
+        );
+        assert_eq!(
+            next_dates("0 0 1 * *"),
+            ("2026-02-01".into(), "2026-03-01".into())
         );
     }
 
@@ -2065,6 +2117,9 @@ mod schedule_tests {
             "5",
             "every 5 bananas",
             "0 9 * * FOO",
+            "61 3 * * MON",
+            "0 25 * * MON",
+            "every ten minutes",
         ] {
             assert!(parse_schedule(bad).is_err(), "{bad:?} should not parse");
         }

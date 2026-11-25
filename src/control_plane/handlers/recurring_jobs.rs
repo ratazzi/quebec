@@ -314,7 +314,9 @@ impl ControlPlane {
     fn calculate_next_run(schedule: &str) -> Option<String> {
         let cron = crate::context::parse_schedule(schedule).ok()?;
 
-        let now = chrono::Utc::now();
+        // Walk the schedule in local time, as the scheduler does
+        // (`scheduler.rs`), so "0 3 * * *" shows the same 03:00 it runs at.
+        let now = chrono::Local::now();
         let next = cron.find_next_occurrence(&now, false).ok()?;
 
         // If next occurrence is in the past (just executed), find the one after
