@@ -915,11 +915,11 @@ impl Runnable {
                     }
                     Err(_) => {}
                 }
-            } else {
-                if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
-                    if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                        return Err(e);
-                    }
+            } else if let Err(e) = builtins.getattr("next")?.call1((&gen,)) {
+                // The hook raised after perform: fail through `result` so the
+                // step progress perform made is still captured below.
+                if !e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                    result = Err(e);
                 }
             }
         } else {
