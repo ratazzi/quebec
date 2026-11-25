@@ -1952,20 +1952,121 @@ pub struct ScheduledEntry {
 
 impl ScheduledEntry {
     pub fn as_cron(&self) -> Result<Cron> {
-        let mut expr = self.schedule.clone();
-        let _ = str_cron_syntax(&self.schedule).map(|s| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            if parts.len() >= 7 {
-                // https://docs.rs/cron/latest/cron: sec min hour day_of_month month day_of_week year
-                expr = parts[..6].join(" ");
-                debug!("Job({:?}): {} -> {}", self.key, self.schedule, expr);
-            }
-        });
+        parse_schedule(&self.schedule)
+    }
+}
 
-        let cron = Cron::new(&expr)
-            .with_seconds_optional()
-            .with_dom_and_dow()
-            .parse();
-        Ok(cron?)
+fn parse_cron(expr: &str) -> std::result::Result<Cron, croner::errors::CronError> {
+    Cron::new(expr)
+        .with_seconds_optional()
+        .with_dom_and_dow()
+        .parse()
+}
+
+/// `english-to-cron`'s answer for input it only half understands.
+const ENGLISH_EVERY_MINUTE: &str = "0 * * * * ?";
+
+/// Translate an English schedule ("every 5 minutes") into a six-field cron
+/// expression. `english-to-cron` maps much of what it does not understand —
+/// a mistyped cron line, "every 5 bananas" — to "every minute", so input
+/// without words is never handed to it, and an every-minute result is only
+/// believed when the schedule says "minute".
+fn english_to_cron(schedule: &str) -> Option<String> {
+    if !schedule.chars().any(char::is_alphabetic) {
+        return None;
+    }
+    // english-to-cron yields `sec min hour dom month dow year`; croner takes
+    // at most six fields, so drop the year.
+    let expr = str_cron_syntax(schedule)
+        .ok()?
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let says_minute = schedule.to_lowercase().contains("minute");
+    (expr != ENGLISH_EVERY_MINUTE || says_minute).then_some(expr)
+}
+
+/// Parse a recurring schedule: a cron expression first, falling back to
+/// English only when it is not one, like Solid Queue's `Fugit.parse`. An
+/// invalid schedule is an error, never silently "every minute".
+pub fn parse_schedule(schedule: &str) -> Result<Cron> {
+    parse_cron(schedule).or_else(|cron_err| {
+        english_to_cron(schedule)
+            .inspect(|expr| debug!("schedule {:?} -> {:?}", schedule, expr))
+            .map_or(Err(cron_err), |expr| parse_cron(&expr))
+            .map_err(Into::into)
+    })
+}
+
+#[cfg(test)]
+mod schedule_tests {
+    use super::parse_schedule;
+    use chrono::{TimeZone, Utc};
+
+    fn next_two(schedule: &str) -> (String, String) {
+        let cron = parse_schedule(schedule).unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let a = cron.find_next_occurrence(&start, false).unwrap();
+        let b = cron.find_next_occurrence(&a, false).unwrap();
+        (
+            a.format("%H:%M:%S").to_string(),
+            b.format("%H:%M:%S").to_string(),
+        )
+    }
+
+    #[test]
+    fn standard_cron_is_not_rewritten_to_every_minute() {
+        assert_eq!(
+            next_two("*/5 * * * *"),
+            ("00:05:00".into(), "00:10:00".into())
+        );
+        assert_eq!(
+            next_two("0 3 * * *"),
+            ("03:00:00".into(), "03:00:00".into())
+        );
+        assert_eq!(
+            next_two("0 */2 * * *"),
+            ("02:00:00".into(), "04:00:00".into())
+        );
+        assert_eq!(
+            next_two("*/20 * * * * *"),
+            ("00:00:40".into(), "00:01:00".into())
+        );
+    }
+
+    #[test]
+    fn english_schedules_still_parse() {
+        assert_eq!(
+            next_two("every 5 minutes"),
+            ("00:05:00".into(), "00:10:00".into())
+        );
+        assert_eq!(
+            next_two("every day at 3am"),
+            ("03:00:00".into(), "03:00:00".into())
+        );
+    }
+
+    #[test]
+    fn english_every_minute_is_kept() {
+        assert_eq!(
+            next_two("every minute"),
+            ("00:01:00".into(), "00:02:00".into())
+        );
+    }
+
+    #[test]
+    fn invalid_schedule_is_an_error_not_every_minute() {
+        for bad in [
+            "not a schedule at all",
+            "*/5 * * *",
+            "61 * * * *",
+            "0 3 * * * * * *",
+            "5",
+            "every 5 bananas",
+            "0 9 * * FOO",
+        ] {
+            assert!(parse_schedule(bad).is_err(), "{bad:?} should not parse");
+        }
     }
 }
