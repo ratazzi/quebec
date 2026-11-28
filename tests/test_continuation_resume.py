@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import ClassVar
 
 import pytest
 import quebec
@@ -283,3 +284,39 @@ def test_hook_error_keeps_step_progress(qc_with_sqlalchemy, job_class) -> None:
     _run_until_failed(qc_with_sqlalchemy, runs=2)
     # The retry skipped the step the first run completed.
     assert job_class.write_runs == 1
+
+
+class IsolatedFirstStepJob(quebec.BaseClass, quebec.Continuable):
+    runs: ClassVar[list[list[str]]] = []
+
+    def perform(self) -> None:
+        ran: list[str] = []
+        type(self).runs.append(ran)
+        for name, isolated in (("first", True), ("second", False), ("third", False)):
+            with self.step(name, isolated=isolated) as step:
+                if not step.skip:
+                    ran.append(name)
+
+
+def test_replayed_isolated_step_does_not_isolate_later_steps(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """Only a step that actually runs isolated starts isolating. Replaying a
+    completed isolated step must not make the next non-isolated step wait for
+    an execution of its own."""
+    qc = qc_with_sqlalchemy["qc"]
+    IsolatedFirstStepJob.runs = []
+    qc.register_job(IsolatedFirstStepJob)
+
+    IsolatedFirstStepJob.perform_later(qc)
+    qc.drain_one().perform()
+    assert IsolatedFirstStepJob.runs == [["first"]]
+
+    qc.spawn_dispatcher()
+    wait_until(lambda: _count(qc_with_sqlalchemy, "ready_executions") == 1, timeout=5)
+    qc.drain_one().perform()
+
+    assert IsolatedFirstStepJob.runs == [["first"], ["second", "third"]]
+    assert db_assert.count_jobs() == 2
+    assert db_assert.count_scheduled_executions() == 0
+    assert db_assert.count_ready_executions() == 0

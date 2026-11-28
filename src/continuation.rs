@@ -498,21 +498,23 @@ impl Continuable {
             // Record this step as encountered
             ctx.encountered.push(name.to_string());
 
-            // Handle isolated mode - if we're isolating and have made progress,
-            // interrupt to let this step run in its own execution
-            if isolated {
-                ctx.isolating = true;
-            }
-            if ctx.isolating && ctx.advanced {
-                // Drop lock before raising exception
-                drop(ctx);
-                return Err(JobInterrupted::new_err(format!(
-                    "Isolated step '{name}' requires separate execution"
-                )));
-            }
-
             // Check if step is already completed
             let noop = ctx.state.is_completed(name);
+
+            // Handle isolated mode - if we're isolating and have made progress,
+            // interrupt to let this step run in its own execution. Like Rails,
+            // only a step that runs counts: replaying a completed isolated step
+            // must not isolate the steps after it.
+            if !noop {
+                ctx.isolating |= isolated;
+                if ctx.isolating && ctx.advanced {
+                    // Drop lock before raising exception
+                    drop(ctx);
+                    return Err(JobInterrupted::new_err(format!(
+                        "Isolated step '{name}' requires separate execution"
+                    )));
+                }
+            }
 
             // Determine if this step is being resumed (has saved cursor)
             let resumed = ctx.state.get_cursor(name).is_some();
