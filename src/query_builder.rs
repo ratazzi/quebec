@@ -2335,9 +2335,23 @@ pub mod blocked_executions {
             Dialect::Postgres => format!(
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 {lock}"#
             ),
-            Dialect::MySql => format!(
-                r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 {lock}"#
-            ),
+            Dialect::MySql => {
+                // Pin the release index, like Solid Queue's
+                // `use_index(:index_solid_queue_blocked_executions_for_release)`.
+                // Without it MySQL may pick another plan, under which
+                // concurrent SKIP LOCKED releases of one key found no row
+                // although unlocked blocked rows remained.
+                let index = quote_identifier(
+                    DbBackend::MySql,
+                    &index_name(
+                        DbBackend::MySql,
+                        &format!("idx_{table_name}_key_priority_job"),
+                    ),
+                );
+                format!(
+                    r#"SELECT /*+ INDEX(b {index}) */ * FROM `{table_name}` AS b WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 {lock}"#
+                )
+            }
             Dialect::Sqlite => format!(
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = ? ORDER BY "priority" ASC, "job_id" ASC LIMIT 1"#
             ),
@@ -4596,6 +4610,15 @@ mod lock_tests {
                 assert!(sql.ends_with("FOR UPDATE"), "{backend:?}: {sql}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn mysql_blocked_release_pins_the_release_index() {
+        let sql = &locking_selects(DbBackend::MySql, true).await[3];
+        assert!(
+            sql.contains("/*+ INDEX(b `idx_lk_blocked_executions_key_priority_job`) */"),
+            "{sql}"
+        );
     }
 
     #[tokio::test]
