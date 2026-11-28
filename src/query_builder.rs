@@ -1356,7 +1356,7 @@ pub mod ready_executions {
         let lock_clause = lock_clause(backend, use_skip_locked);
 
         // Add limit parameter
-        params.push((limit as i64).into());
+        params.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
         let limit_placeholder = placeholder(params.len());
 
         let sql = if backend == DbBackend::MySql {
@@ -1443,7 +1443,7 @@ pub mod ready_executions {
 
         let lock_clause = lock_clause(backend, use_skip_locked);
 
-        params.push((limit as i64).into());
+        params.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
         let limit_placeholder = placeholder(params.len());
         let queue_list = placeholders.join(", ");
 
@@ -2967,7 +2967,9 @@ pub mod scheduled_executions {
             .order_by(col("scheduled_at"), Order::Asc)
             .order_by(col("priority"), Order::Asc)
             .order_by(col("job_id"), Order::Asc)
-            .limit(limit)
+            // Drivers bind LIMIT as a signed 64-bit value and panic on a
+            // larger u64 (e.g. a huge dispatcher batch_size).
+            .limit(std::cmp::min(limit, i64::MAX as u64))
             .to_owned();
         non_blocking_lock(&mut query, use_skip_locked);
 
