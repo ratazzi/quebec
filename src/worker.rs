@@ -1685,14 +1685,16 @@ impl Execution {
         )
         .await?;
 
-        // A retry is a new attempt of the same logical job: it keeps the batch
-        // open with its own tracking row but does not bump `total_jobs`
-        // (`executions > 0`). Inserted before the previous attempt's row is
-        // released in the same transaction, so the batch cannot finish in
-        // between. The batch is only ever already finished if the sweep
-        // removed our row underneath us; then the retry runs untracked.
+        // A retry or a resumption is a new attempt of the same logical job: it
+        // keeps the batch open with its own tracking row but does not bump
+        // `total_jobs`. A resumption does not count as an execution, so its
+        // `executions` can still be 0; treat it as a later attempt anyway.
+        // Inserted before the previous attempt's row is released in the same
+        // transaction, so the batch cannot finish in between. The batch is only
+        // ever already finished if the sweep removed our row underneath us;
+        // then the retry runs untracked.
         if let Some(batch_id) = job.batch_id {
-            let executions = crate::utils::get_executions(Some(arguments));
+            let executions = std::cmp::max(crate::utils::get_executions(Some(arguments)), 1);
             let active_job_id = job.active_job_id.as_deref().unwrap_or_default();
             match crate::batch::track_jobs(
                 txn,

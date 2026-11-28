@@ -283,3 +283,28 @@ def test_hook_error_keeps_step_progress(qc_with_sqlalchemy, job_class) -> None:
     _run_until_failed(qc_with_sqlalchemy, runs=2)
     # The retry skipped the step the first run completed.
     assert job_class.write_runs == 1
+
+
+def test_resumed_job_does_not_grow_its_batch(qc_with_sqlalchemy) -> None:
+    """Resuming is the same logical job, so it must not count towards the
+    batch's `total_jobs` again."""
+    qc = qc_with_sqlalchemy["qc"]
+    ResumesOnceJob.resumed_runs = 0
+    qc.register_job(ResumesOnceJob)
+
+    with qc.batch() as batch:
+        ResumesOnceJob.perform_later(qc)
+    assert batch.reload().total_jobs == 1
+
+    qc.drain_one().perform()
+    assert batch.reload().total_jobs == 1
+    assert not batch.finished
+
+    qc.spawn_dispatcher()
+    wait_until(lambda: _count(qc_with_sqlalchemy, "ready_executions") == 1, timeout=5)
+    qc.drain_one().perform()
+
+    assert ResumesOnceJob.resumed_runs == 1
+    batch.reload()
+    assert batch.finished
+    assert (batch.total_jobs, batch.completed_jobs, batch.failed_jobs) == (1, 1, 0)
