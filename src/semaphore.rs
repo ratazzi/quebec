@@ -399,42 +399,6 @@ where
     Ok(decrement_result.rows_affected() > 0)
 }
 
-/// Re-acquire a MySQL semaphore slot that was just released in this transaction.
-/// The successful release already locked an existing row. An UPDATE avoids
-/// the auto-increment PRIMARY insert-intention lock taken by the generic UPSERT
-/// while we hold the blocked-execution ordering-index lock.
-pub async fn reacquire_released_semaphore<C>(
-    db: &C,
-    table_config: &TableConfig,
-    key: &str,
-    duration: chrono::Duration,
-) -> Result<Option<i64>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    if db.get_database_backend() != DatabaseBackend::MySql {
-        return Err(DbErr::Custom(
-            "reacquire_released_semaphore requires MySQL".into(),
-        ));
-    }
-    let now = chrono::Utc::now().naive_utc();
-    let expires_at = now + duration;
-    let key_col = quote_identifier(DatabaseBackend::MySql, "key");
-    let sql = format!(
-        "UPDATE {} SET value = value - 1, expires_at = ?, updated_at = ? \
-         WHERE {key_col} = ? AND value > 0",
-        table_config.semaphores
-    );
-    let result = db
-        .execute_raw(Statement::from_sql_and_values(
-            DatabaseBackend::MySql,
-            sql,
-            vec![expires_at.into(), now.into(), key.to_string().into()],
-        ))
-        .await?;
-    id_if_acquired(result.rows_affected() > 0, db, table_config, key).await
-}
-
 /// Convenience function to acquire semaphore using ConcurrencyConstraint.
 /// `default_duration` applies when the constraint sets no duration
 /// (`AppContext::concurrency_period`).

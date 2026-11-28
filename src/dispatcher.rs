@@ -2,7 +2,7 @@ use crate::context::*;
 use crate::dialect::Dialect;
 use crate::process::{ProcessInfo, ProcessTrait};
 use crate::query_builder;
-use crate::semaphore::{acquire_semaphore, reacquire_released_semaphore};
+use crate::semaphore::acquire_semaphore;
 
 use crate::error::Result;
 use async_trait::async_trait;
@@ -471,10 +471,12 @@ impl Dispatcher {
 
     /// Release a single blocked execution for `concurrency_key` in its own
     /// transaction, mirroring Solid Queue's `BlockedExecution.release_one` +
-    /// `#release`: lock the head blocked row (FOR UPDATE SKIP LOCKED), acquire
-    /// the semaphore, then promote it to ready and delete the blocked row
-    /// (see [`release_next_blocked`]).
-    async fn release_one(
+    /// `#release`: lock the head blocked row, acquire the semaphore, then
+    /// promote it to ready and delete the blocked row (see
+    /// [`release_next_blocked`]). Also how a worker releases the next blocked
+    /// job once the slot it gave back has committed
+    /// (`Worker::unblock_after_commit`).
+    pub(crate) async fn release_one(
         db: &DatabaseConnection,
         ctx: &Arc<AppContext>,
         concurrency_key: &str,
@@ -482,7 +484,7 @@ impl Dispatcher {
         let ctx = ctx.clone();
         let key = concurrency_key.to_string();
         db.transaction::<_, bool, DbErr>(|txn| {
-            Box::pin(async move { release_next_blocked(&ctx, txn, &key, false).await })
+            Box::pin(async move { release_next_blocked(&ctx, txn, &key).await })
         })
         .await
         .map_err(flatten_txn_err)
@@ -511,15 +513,10 @@ pub(crate) fn flatten_txn_err(e: TransactionError<DbErr>) -> DbErr {
 /// that lacks one must not fail a job a worker could run. A worker without
 /// the class fails it when it claims it, like Solid Queue's
 /// `ClaimedExecution#perform`.
-///
-/// `reuse_released_slot` is for a caller that just gave a slot back to this
-/// key's semaphore in the same transaction (see
-/// [`crate::semaphore::reacquire_released_semaphore`]).
 pub(crate) async fn release_blocked_execution<C>(
     ctx: &AppContext,
     db: &C,
     execution: &crate::entities::quebec_blocked_executions::Model,
-    reuse_released_slot: bool,
 ) -> Result<BlockedRelease, DbErr>
 where
     C: ConnectionTrait,
@@ -536,22 +533,14 @@ where
     let Some(class) = ctx.class_concurrency(&job.class_name) else {
         return promote_without_limits(ctx, db, execution, &job).await;
     };
-    // MySQL: a slot given back in this transaction already locked an
-    // existing row. Re-acquire by UPDATE so this blocked-row lock
-    // cannot cycle with a producer's UPSERT insert-intention lock.
-    let acquired =
-        if reuse_released_slot && db.get_database_backend() == sea_orm::DatabaseBackend::MySql {
-            reacquire_released_semaphore(db, &ctx.table_config, &key, class.duration).await?
-        } else {
-            acquire_semaphore(
-                db,
-                &ctx.table_config,
-                key.clone(),
-                class.limit,
-                class.duration,
-            )
-            .await?
-        };
+    let acquired = acquire_semaphore(
+        db,
+        &ctx.table_config,
+        key.clone(),
+        class.limit,
+        class.duration,
+    )
+    .await?;
     let Some(semaphore_id) = acquired else {
         trace!("Failed to acquire semaphore for key: {key} (no available slots)");
         return Ok(BlockedRelease::StillBlocked);
@@ -628,8 +617,7 @@ where
 }
 
 /// Release the next blocked job for `concurrency_key`, in blocked order
-/// (Solid Queue's `BlockedExecution.release_one`). `reuse_released_slot` is
-/// set when a slot on it was given back in this transaction.
+/// (Solid Queue's `BlockedExecution.release_one`).
 ///
 /// A job promoted without its limits ([`BlockedRelease::Bypassed`]) took no
 /// slot, so the one that may be free goes on to the job behind it rather
@@ -639,7 +627,6 @@ pub(crate) async fn release_next_blocked<C>(
     ctx: &AppContext,
     db: &C,
     concurrency_key: &str,
-    reuse_released_slot: bool,
 ) -> Result<bool, DbErr>
 where
     C: ConnectionTrait,
@@ -653,7 +640,7 @@ where
     )
     .await?
     {
-        match release_blocked_execution(ctx, db, &execution, reuse_released_slot).await? {
+        match release_blocked_execution(ctx, db, &execution).await? {
             BlockedRelease::Bypassed => released = true,
             outcome => return Ok(released || outcome.released()),
         }
@@ -690,7 +677,7 @@ pub(crate) async fn release_blocked_by(
                 return Ok(UnblockOutcome::NotFound);
             };
             Ok(
-                match release_blocked_execution(&ctx, txn, &execution, false).await? {
+                match release_blocked_execution(&ctx, txn, &execution).await? {
                     BlockedRelease::Promoted | BlockedRelease::Bypassed => UnblockOutcome::Released,
                     BlockedRelease::StillBlocked => UnblockOutcome::StillBlocked,
                 },

@@ -3091,7 +3091,7 @@ impl Worker {
                 // path was added to prevent. A database error may also have
                 // rolled back the whole MySQL transaction, so the caller must
                 // not commit it.
-                Self::release_concurrency_slot(ctx, txn, &job)
+                let released = Self::release_concurrency_slot(ctx, txn, &job)
                     .await
                     .inspect_err(|e| {
                         warn!(
@@ -3099,6 +3099,13 @@ impl Worker {
                             "rate-limit: failed to release concurrency slot: {:?}", e
                         )
                     })?;
+                // The next blocked job is released once the claim
+                // transaction has ended (`finish_deferred_unblocks`).
+                if released {
+                    if let Some(key) = job.concurrency_key.as_deref() {
+                        ctx.defer_unblock(key);
+                    }
+                }
                 Ok(RateGateResult::Routed)
             }
         }
@@ -3397,6 +3404,7 @@ impl Worker {
             })
             .await;
         self.finish_deferred_batches(&db).await;
+        self.finish_deferred_unblocks(&db).await;
         let job =
             job?.ok_or_else(|| QuebecError::Database(DbErr::Custom("No job found".into())))?;
 
@@ -3410,6 +3418,16 @@ impl Worker {
         let deferred = self.ctx.take_deferred_batch_finishes();
         if !deferred.is_empty() {
             crate::core::finish_released_batches(&self.ctx, db, deferred).await;
+        }
+    }
+
+    /// Release the next blocked job for each slot a claim transaction gave
+    /// back (rate-limit throttling), now that the transaction has ended.
+    /// Harmless when it rolled back: a blocked job is promoted only if a
+    /// slot is free.
+    async fn finish_deferred_unblocks(&self, db: &DatabaseConnection) {
+        for key in self.ctx.take_deferred_unblocks() {
+            Self::release_next_blocked_job(&self.ctx, db, &key).await;
         }
     }
 
@@ -3804,6 +3822,7 @@ impl Worker {
             })
             .await;
         self.finish_deferred_batches(&db).await;
+        self.finish_deferred_unblocks(&db).await;
         let jobs = jobs?;
 
         // Record each claimed row as Dispatched. It stays Dispatched until
@@ -4699,43 +4718,66 @@ impl Worker {
         Ok((owned, released_batch))
     }
 
-    /// Give `job`'s concurrency slot back and release the next blocked job, in
-    /// a transaction of its own, after the job's outcome has committed (Solid
-    /// Queue's `unblock_next_blocked_job`, run outside `finalize`). Only the
-    /// caller that finalized the claim calls this, so the slot is given back
-    /// once. A failure is logged: the job's outcome stands, and the slot comes
-    /// back when its semaphore expires.
+    /// Give `job`'s concurrency slot back, then release the next blocked job,
+    /// each in a transaction of its own, after the job's outcome has
+    /// committed (Solid Queue's `unblock_next_blocked_job`: `Semaphore.signal`,
+    /// then `BlockedExecution.release_one`, run outside `finalize`).
+    ///
+    /// Releasing the blocked job while still holding the semaphore row would
+    /// lock the two rows in the reverse of `qc.unblock` and the dispatcher
+    /// (blocked row, then semaphore), which deadlocks when the blocked-row
+    /// lock waits instead of skipping (`use_skip_locked = false`).
+    ///
+    /// Only the caller that finalized the claim calls this, so the slot is
+    /// given back once. A failure is logged: the job's outcome stands, the
+    /// slot comes back when its semaphore expires, and the dispatcher's
+    /// concurrency maintenance releases the blocked job.
     pub(crate) async fn unblock_after_commit(
         ctx: &Arc<AppContext>,
         db: &DatabaseConnection,
         job: &quebec_jobs::Model,
     ) {
-        if job.concurrency_key.as_deref().is_none_or(str::is_empty) {
+        let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) else {
             return;
-        }
+        };
         let txn_ctx = ctx.clone();
         let txn_job = job.clone();
-        let result = db
+        let released = db
             .transaction::<_, bool, DbErr>(|txn| {
                 Box::pin(
                     async move { Self::release_concurrency_slot(&txn_ctx, txn, &txn_job).await },
                 )
             })
             .await;
-        if let Err(e) = result {
-            warn!(
+        match released {
+            Ok(true) => Self::release_next_blocked_job(ctx, db, key).await,
+            Ok(false) => {}
+            Err(e) => warn!(
                 job_id = job.id,
-                concurrency_key = job.concurrency_key.as_deref(),
+                concurrency_key = key,
                 "Failed to give back concurrency slot: {:?}; it frees up when its semaphore expires",
                 e
+            ),
+        }
+    }
+
+    /// Release the next blocked job for `key` in a transaction of its own,
+    /// after a slot on it was given back. A failure is logged and left to the
+    /// dispatcher's concurrency maintenance.
+    async fn release_next_blocked_job(ctx: &Arc<AppContext>, db: &DatabaseConnection, key: &str) {
+        if let Err(e) = crate::dispatcher::Dispatcher::release_one(db, ctx, key).await {
+            warn!(
+                concurrency_key = key,
+                "Failed to release the next blocked job: {:?}", e
             );
         }
     }
 
-    /// Give `job`'s concurrency slot back to the semaphore it came from and,
-    /// if a slot was given back, release the next blocked job for its key.
+    /// Give `job`'s concurrency slot back to the semaphore it came from.
     /// Runs in the caller's transaction; database errors propagate. Returns
-    /// whether a blocked job was released.
+    /// whether a slot was given back, in which case the caller releases the
+    /// next blocked job once this transaction has committed (see
+    /// [`Self::unblock_after_commit`]).
     pub(crate) async fn release_concurrency_slot<C>(
         ctx: &AppContext,
         db: &C,
@@ -4755,12 +4797,7 @@ impl Worker {
             .map(|c| (c.limit, c.duration))
             .unwrap_or_else(|| (1, ctx.concurrency_period(None)));
 
-        if !crate::concurrency_lock::release(db, &ctx.table_config, job, key, limit, duration)
-            .await?
-        {
-            return Ok(false);
-        }
-        crate::dispatcher::release_next_blocked(ctx, db, key, true).await
+        crate::concurrency_lock::release(db, &ctx.table_config, job, key, limit, duration).await
     }
 
     /// EXPERIMENTAL: attempt to acquire the `queue:<name>` semaphore at
@@ -6045,16 +6082,21 @@ mod release_concurrency_slot_tests {
     }
 
     #[tokio::test]
-    async fn blocked_promotion_error_propagates() {
+    async fn giving_a_slot_back_leaves_the_blocked_rows_alone() {
         let ctx = context();
         let db = MockDatabase::new(DbBackend::Postgres)
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
             }])
-            .append_query_errors([DbErr::Custom("deadlock".into())])
             .into_connection();
         let result = Worker::release_concurrency_slot(&ctx, &db, &keyed_job()).await;
-        assert!(matches!(result, Err(DbErr::Custom(message)) if message == "deadlock"));
+        assert!(matches!(result, Ok(true)));
+
+        // Locking a blocked row while this transaction holds the semaphore
+        // row would invert qc.unblock's lock order (blocked row, then
+        // semaphore). The caller releases the next blocked job afterwards.
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(!log.contains("blocked_executions"), "{log}");
     }
 }
