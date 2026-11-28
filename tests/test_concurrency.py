@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import json
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -96,14 +97,16 @@ def test_first_job_goes_to_ready_second_goes_to_blocked(
     assert db_assert.count_blocked_executions() == 1
 
 
-def test_full_semaphore_enqueue_does_not_wait_on_row_lock(
+def test_full_semaphore_enqueue_waits_for_a_release_in_progress(
     qc_with_sqlalchemy, db_assert
 ) -> None:
-    """A full key must not queue behind a transaction holding its semaphore row.
+    """Enqueueing onto a full key waits for a release that is in progress.
 
-    Mirrors Solid Queue's read-before-write: while a worker is mid-release
-    (row updated, not committed), enqueueing onto a full key is a plain read
-    and goes straight to blocked instead of waiting for that commit.
+    Solid Queue #456: a worker giving a slot back while an enqueue on the
+    same full key is deciding to block must not miss the blocked job. The
+    enqueue re-reads a full semaphore with a row lock, so it waits for the
+    release to commit and then takes the freed slot instead of blocking
+    (and being stranded until the blocked row expires).
     """
     if qc_with_sqlalchemy["db_url"].startswith("sqlite:"):
         pytest.skip("SQLite serializes all writers")
@@ -117,22 +120,26 @@ def test_full_semaphore_enqueue_does_not_wait_on_row_lock(
     ConcurrentJob.perform_later(qc, 1)
 
     pool = ThreadPoolExecutor(max_workers=1)
-    with engine.connect() as holder:
-        holder.execute(
-            text(
-                f"UPDATE {prefix}_semaphores SET updated_at = updated_at "
-                f"WHERE {key} = :key"
-            ),
-            {"key": "ConcurrentJob/exclusive-resource"},
-        )
-        try:
-            pool.submit(ConcurrentJob.perform_later, qc, 2).result(timeout=2)
-        finally:
-            holder.rollback()
-            pool.shutdown(wait=True)
+    try:
+        with engine.connect() as releaser:
+            # A worker mid-release: slot given back, not committed yet.
+            releaser.execute(
+                text(
+                    f"UPDATE {prefix}_semaphores SET value = value + 1 "
+                    f"WHERE {key} = :key"
+                ),
+                {"key": "ConcurrentJob/exclusive-resource"},
+            )
+            future = pool.submit(ConcurrentJob.perform_later, qc, 2)
+            done, _ = wait([future], timeout=0.5)
+            assert not done, "enqueue on a full key should wait for the release"
+            releaser.commit()
+        future.result(timeout=10)
+    finally:
+        pool.shutdown(wait=True)
 
-    assert db_assert.count_ready_executions() == 1
-    assert db_assert.count_blocked_executions() == 1
+    assert db_assert.count_ready_executions() == 2
+    assert db_assert.count_blocked_executions() == 0
 
 
 def test_completing_first_job_releases_semaphore(qc_with_sqlalchemy) -> None:
@@ -646,3 +653,71 @@ def test_manual_retry_all_promotes_when_slot_free(
     assert db_assert.count_ready_executions() == 1
     assert db_assert.count_blocked_executions() == 1
     assert db_assert.count_failed_executions() == 0
+
+
+def _rename_job_class(session, prefix: str, job_id: int, class_name: str) -> None:
+    session.execute(
+        text(f"UPDATE {prefix}_jobs SET class_name = :name WHERE id = :id"),
+        {"name": class_name, "id": job_id},
+    )
+    session.commit()
+
+
+def test_unblocking_a_job_whose_class_is_not_registered_here_readies_it(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """A process that doesn't know a job's class (say, a control plane in a
+    web process) can't tell whether some worker can run it, so unblocking
+    sends it to ready past its limits instead of failing it, recorded as
+    holding no slot, as dispatching it does."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    ConcurrentJob.calls = []
+    qc.register_job(ConcurrentJob)
+    ConcurrentJob.perform_later(qc, 1)
+    blocked = ConcurrentJob.perform_later(qc, 2)
+    _rename_job_class(session, prefix, blocked.id, "RegisteredElsewhereJob")
+
+    assert qc.unblock(blocked.id) is True
+
+    session.expire_all()
+    assert db_assert.count_blocked_executions() == 0
+    assert db_assert.count_ready_executions() == 2
+    assert db_assert.count_failed_executions() == 0
+    sem = session.execute(text(f"SELECT value FROM {prefix}_semaphores")).fetchone()
+    assert sem.value == 0, "the bypassed job must not take the slot"
+    arguments = session.execute(
+        text(f"SELECT arguments FROM {prefix}_jobs WHERE id = :id"),
+        {"id": blocked.id},
+    ).scalar()
+    lock = json.loads(arguments)["solid_queue_concurrency_lock"]
+    assert lock == {"semaphore_id": None, "limit": None}
+
+
+def test_slot_given_back_passes_an_unregistered_job_to_the_next_blocked(
+    qc_with_sqlalchemy, db_assert
+) -> None:
+    """The unregistered head of the blocked queue goes to ready without the
+    slot, so the slot goes on to the job behind it rather than sitting free
+    until concurrency maintenance."""
+    qc = qc_with_sqlalchemy["qc"]
+    session = qc_with_sqlalchemy["session"]
+    prefix = qc_with_sqlalchemy["prefix"]
+
+    ConcurrentJob.calls = []
+    qc.register_job(ConcurrentJob)
+    ConcurrentJob.perform_later(qc, 1)
+    unregistered = ConcurrentJob.perform_later(qc, 2)
+    ConcurrentJob.perform_later(qc, 3)
+    _rename_job_class(session, prefix, unregistered.id, "RegisteredElsewhereJob")
+
+    qc.drain_one().perform()
+
+    session.expire_all()
+    assert ConcurrentJob.calls == [1]
+    assert db_assert.count_blocked_executions() == 0
+    assert db_assert.count_ready_executions() == 2
+    sem = session.execute(text(f"SELECT value FROM {prefix}_semaphores")).fetchone()
+    assert sem.value == 0, "the registered job behind it took the slot"

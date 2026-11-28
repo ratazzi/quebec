@@ -1665,6 +1665,11 @@ impl Execution {
         arguments: &str,
     ) -> std::result::Result<(), DbErr> {
         let table_config = &ctx.table_config;
+        // The retry is a new job: the slot record belongs to this attempt,
+        // and the retry records its own when it acquires one (in Solid Queue
+        // the retry is re-serialized by Active Job and carries no record).
+        let arguments = crate::concurrency_lock::without_lock(arguments);
+        let arguments = arguments.as_str();
 
         let new_job_id = query_builder::jobs::insert(
             txn,
@@ -1888,13 +1893,8 @@ impl Execution {
             .as_ref()
             .map(|info| (info.scheduled_at, info.arguments.clone()));
 
-        // Capture concurrency info for semaphore release
-        let concurrency_key = job.concurrency_key.clone();
-        let concurrency_limit = self.runnable.concurrency_limit.unwrap_or(1);
-        let concurrency_duration = self
-            .runnable
-            .concurrency_duration
-            .map(|s| chrono::Duration::seconds(s as i64));
+        // Solid Queue's `finished!`: keep the finished job, or delete it.
+        let preserve_finished_jobs = self.ctx.preserve_finished_jobs;
         // EXPERIMENTAL queue-level concurrency: release is delegated to
         // `Worker::release_queue_slot` which looks up the limit from `ctx`
         // at call time.
@@ -1910,6 +1910,9 @@ impl Execution {
         > = Err(TransactionError::Transaction(DbErr::Custom(
             "not attempted".into(),
         )));
+        // Whether this call's own transaction committed the claim's removal,
+        // and so owns giving back the job's concurrency slot.
+        let mut finalized_here = false;
 
         for attempt in 0..=max_retries {
             if attempt > 0 {
@@ -1931,12 +1934,16 @@ impl Execution {
                 // Lost-ack guard (mirrors Solid Queue's "the claimed row is the
                 // source of truth"): the cleanup closure is atomic, so a prior
                 // attempt either committed everything — mark_finished/failed,
-                // semaphore release, retry schedule AND the claimed-row delete —
-                // or rolled back entirely. If the claimed row is already gone,
-                // the previous attempt committed and we merely lost the commit
-                // ack; re-running the closure would double every side effect
-                // (second failed_executions row, second retry job, double
-                // semaphore release). Treat the missing row as success instead.
+                // retry schedule AND the claimed-row delete — or rolled back
+                // entirely. If the claimed row is already gone, either the
+                // previous attempt committed and we merely lost the commit ack,
+                // or a recovery path finalized the claim; re-running the
+                // closure would double every side effect (second
+                // failed_executions row, second retry job). Treat the missing
+                // row as success instead, but leave the concurrency slot alone:
+                // we can't tell which of the two finalized it, and a recovery
+                // path gives the slot back itself. Worst case the slot is held
+                // until its semaphore expires.
                 match query_builder::claimed_executions::find_by_id(
                     db.as_ref(),
                     &table_config_orig,
@@ -1965,7 +1972,6 @@ impl Execution {
             let table_config = table_config_orig.clone();
             let job = job.clone();
             let err = err.clone();
-            let concurrency_key = concurrency_key.clone();
             let ctx = ctx.clone();
             let claimed = claimed.clone();
             let queue_name = queue_name.clone();
@@ -1999,7 +2005,7 @@ impl Execution {
                                 err.map(|e| e.to_string()).as_deref(),
                             )
                             .await?;
-                        } else {
+                        } else if preserve_finished_jobs {
                             // Only mark as finished for successful jobs (like Solid Queue)
                             query_builder::jobs::mark_finished(txn, &table_config, job_id).await?;
                         }
@@ -2025,40 +2031,15 @@ impl Execution {
                             return Err(DbErr::Custom("Claimed job not found".into()));
                         }
 
-                        // Release semaphore and unblock next job if job has concurrency control
-                        // This must happen AFTER job execution completes (ensure block in Solid Queue)
-                        if let Some(key) = concurrency_key.as_ref().filter(|k| !k.is_empty()) {
-                            // Step 1: Release semaphore (increment value)
-                            let released = release_semaphore(
-                                txn,
-                                &table_config,
-                                key.clone(),
-                                concurrency_limit,
-                                concurrency_duration,
-                            )
-                            .await
-                            .inspect_err(|e| {
-                                warn!("Failed to release semaphore for key {}: {:?}", key, e)
-                            })?;
-
-                            // Step 2: Immediately try to release next blocked job (like Solid Queue)
-                            if released {
-                                Worker::release_next_blocked_job(
-                                    &ctx,
-                                    txn,
-                                    key,
-                                    concurrency_limit,
-                                    true,
-                                )
-                                .await
-                                .inspect_err(|e| {
-                                    warn!(
-                                        "Failed to release next blocked job for key {}: {:?}",
-                                        key, e
-                                    )
-                                })?;
-                            }
+                        // Solid Queue's `finished!` without preserve_finished_jobs:
+                        // the job is deleted outright. After the claimed row,
+                        // whose delete above is the ownership gate.
+                        if !failed && !preserve_finished_jobs {
+                            query_builder::jobs::delete_by_id(txn, &table_config, job_id).await?;
                         }
+
+                        // The concurrency slot is given back after this commits
+                        // (see below), not here.
 
                         // EXPERIMENTAL: release queue-level semaphore
                         // acquired at claim time. No release_next_blocked
@@ -2073,8 +2054,19 @@ impl Execution {
                 .await;
 
             if transaction_result.is_ok() {
+                finalized_here = true;
                 break;
             }
+        }
+
+        // Give the job's concurrency slot back and unblock the next job only
+        // now, outside the transaction that recorded its outcome, as Solid
+        // Queue's `ClaimedExecution#finalize` does: a failure here (a deadlock
+        // on the semaphore row, say) can't roll back a job that already
+        // finished, nor send it down the emergency path as failed. Should it
+        // fail, the slot comes back when its semaphore expires.
+        if finalized_here {
+            Worker::unblock_after_commit(&self.ctx, db.as_ref(), &job).await;
         }
 
         // The attempt's outcome is committed; now see whether it was the
@@ -2111,24 +2103,16 @@ impl Execution {
                     job_id, e
                 );
             }) {
-                // Try fail_claimed_execution first (marks failed + deletes claimed + releases semaphore)
-                let cleanup_ctx = self.ctx.clone();
-                let cleanup_tables = table_config_orig.clone();
-                let fail_result = cleanup_db
-                    .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                        Box::pin(async move {
-                            Worker::fail_claimed_execution(
-                                &cleanup_ctx,
-                                txn,
-                                &cleanup_tables,
-                                job_id,
-                                claimed_id,
-                                "Emergency cleanup: after_executed transaction failed after all retries",
-                            )
-                            .await
-                        })
-                    })
-                    .await;
+                // Try fail_claimed first (marks failed + deletes claimed, then
+                // releases the semaphore)
+                let fail_result = Worker::fail_claimed(
+                    &self.ctx,
+                    cleanup_db.as_ref(),
+                    job_id,
+                    claimed_id,
+                    "Emergency cleanup: after_executed transaction failed after all retries",
+                )
+                .await;
                 if let Ok((_, released)) = fail_result {
                     crate::core::finish_released_batches(&self.ctx, cleanup_db.as_ref(), released)
                         .await;
@@ -3099,42 +3083,22 @@ impl Worker {
                 // until TTL. Mirrors after_executed (worker.rs around the
                 // release_semaphore call) so concurrency accounting stays
                 // consistent across both code paths.
-                if let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) {
-                    let limit = runnable.concurrency_limit.unwrap_or(1);
-                    let duration = runnable
-                        .concurrency_duration
-                        .map(|s| chrono::Duration::seconds(s as i64));
-                    // Propagate release errors (lock timeout, conn drop, ...)
-                    // so the whole rate-routed transaction rolls back. The
-                    // ready-delete + scheduled-insert / mark_finished writes
-                    // above MUST stay consistent with the semaphore state —
-                    // a silently-failed release would re-create the very slot
-                    // leak this code path was added to prevent.
-                    let released = crate::semaphore::release_semaphore(
-                        txn,
-                        table_config,
-                        key.to_string(),
-                        limit,
-                        duration,
-                    )
-                    .await?;
-
-                    if released {
-                        // A database error here may have rolled back the whole
-                        // MySQL transaction. Propagate it so the caller does not
-                        // commit an already-aborted rate-route operation.
-                        Self::release_next_blocked_job(ctx, txn, key, limit, true)
-                            .await
-                            .inspect_err(|e| {
-                                warn!(
-                                    jid = job.active_job_id.as_deref(),
-                                    concurrency_key = key,
-                                    "rate-limit: failed to release next blocked: {:?}",
-                                    e
-                                )
-                            })?;
-                    }
-                }
+                // Propagate release errors (lock timeout, conn drop, ...) so
+                // the whole rate-routed transaction rolls back. The
+                // ready-delete + scheduled-insert / mark_finished writes above
+                // MUST stay consistent with the semaphore state — a silently
+                // failed release would re-create the very slot leak this code
+                // path was added to prevent. A database error may also have
+                // rolled back the whole MySQL transaction, so the caller must
+                // not commit it.
+                Self::release_concurrency_slot(ctx, txn, &job)
+                    .await
+                    .inspect_err(|e| {
+                        warn!(
+                            jid = job.active_job_id.as_deref(),
+                            "rate-limit: failed to release concurrency slot: {:?}", e
+                        )
+                    })?;
                 Ok(RateGateResult::Routed)
             }
         }
@@ -4052,8 +4016,6 @@ impl Worker {
 
         let mut reclaimed = 0usize;
         for execution in orphaned {
-            let ctx = self.ctx.clone();
-            let tc = table_config.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
             let process_id = execution.process_id;
@@ -4064,21 +4026,14 @@ impl Worker {
             // line of defense, so one bad row is logged and skipped, left for
             // the next sweep tick / another process to retry, instead of
             // propagating and leaving every other orphan un-reclaimed.
-            let result = db
-                .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                    Box::pin(async move {
-                        Self::fail_claimed_execution(
-                            &ctx,
-                            txn,
-                            &tc,
-                            job_id,
-                            execution_id,
-                            "Process crashed or was killed before job completion",
-                        )
-                        .await
-                    })
-                })
-                .await;
+            let result = Self::fail_claimed(
+                &self.ctx,
+                db.as_ref(),
+                job_id,
+                execution_id,
+                "Process crashed or was killed before job completion",
+            )
+            .await;
 
             match result {
                 Ok((true, released)) => {
@@ -4176,26 +4131,11 @@ impl Worker {
 
             let mut failed = 0u64;
             for execution in &claimed {
-                let ctx = self.ctx.clone();
-                let tc = table_config.clone();
-                let error_msg = error_msg.clone();
                 let job_id = execution.job_id;
                 let execution_id = execution.id;
-                let result = db
-                    .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                        Box::pin(async move {
-                            Self::fail_claimed_execution(
-                                &ctx,
-                                txn,
-                                &tc,
-                                job_id,
-                                execution_id,
-                                &error_msg,
-                            )
-                            .await
-                        })
-                    })
-                    .await;
+                let result =
+                    Self::fail_claimed(&self.ctx, db.as_ref(), job_id, execution_id, &error_msg)
+                        .await;
 
                 match result {
                     Ok((true, released)) => {
@@ -4399,52 +4339,21 @@ impl Worker {
 
         let mut released = 0usize;
         for execution in claimed {
-            let table_config = table_config.clone();
             let ctx = self.ctx.clone();
             let job_id = execution.job_id;
             let execution_id = execution.id;
 
             let result = db
-                .transaction::<_, (), DbErr>(|txn| {
+                .transaction::<_, bool, DbErr>(|txn| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
-                        if let Some(job) =
-                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                        {
-                            // Bypass class-level concurrency limits: the job
-                            // already holds the class-level semaphore slot from
-                            // when it was dispatched. Put it back to ready
-                            // directly so the dispatcher can re-claim it
-                            // without re-acquiring. Matches Solid Queue's
-                            // `dispatch_bypassing_concurrency_limits`.
-                            query_builder::ready_executions::insert(
-                                txn,
-                                &table_config,
-                                job.id,
-                                &job.queue_name,
-                                job.priority,
-                            )
-                            .await?;
-                            // EXPERIMENTAL queue-level slot was acquired at
-                            // claim time and must be released here — the next
-                            // worker that re-claims this job will re-acquire.
-                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                                .await?;
-                        } else {
-                            warn!(
-                                "Job {} not found, dropping claimed execution {}",
-                                job_id, execution_id
-                            );
-                        }
-
-                        query_builder::claimed_executions::delete_by_id(
-                            txn,
-                            &table_config,
-                            execution_id,
-                        )
-                        .await?;
-
-                        Ok(())
+                        // Bypass class-level concurrency limits: the job
+                        // already holds the class-level semaphore slot from
+                        // when it was dispatched. Put it back to ready
+                        // directly so the dispatcher can re-claim it without
+                        // re-acquiring. Matches Solid Queue's
+                        // `dispatch_bypassing_concurrency_limits`.
+                        Worker::requeue_claimed(&ctx, txn, job_id, execution_id).await
                     })
                 })
                 .await;
@@ -4455,16 +4364,18 @@ impl Worker {
             // whereas aborting would orphan every still-claimed row once
             // `on_stop` deletes this process's row.
             match result {
-                Ok(()) => {
-                    released += 1;
-                    // Claim requeued + row deleted: drop the ledger entry so
+                Ok(requeued) => {
+                    if requeued {
+                        released += 1;
+                        debug!("Released job {} back to ready state", job_id);
+                    }
+                    // Claim gone (requeued or finalized elsewhere): drop the ledger entry so
                     // close()/test-hook paths don't leak (the real
                     // graceful_shutdown exits the process, but those paths
                     // keep running). Also CAS-clear exclusive ownership in case
                     // the released row was an unowned exclusive sieve leftover.
                     self.ctx.ledger_remove(execution_id);
                     self.ctx.clear_exclusive_owner_if(execution_id);
-                    debug!("Released job {} back to ready state", job_id);
                 }
                 Err(e) => {
                     warn!(
@@ -4476,6 +4387,56 @@ impl Worker {
         }
 
         Ok(released)
+    }
+
+    /// Put a claimed execution's job back to ready, if the claim still exists
+    /// (Solid Queue's `ClaimedExecution#release`, guarded by
+    /// `unless_already_finalized`). The claimed-row delete comes first and is
+    /// the ownership gate: if a recovery path already failed the job and
+    /// removed the claim, the job must not also go back to ready, or it would
+    /// be both failed and run again.
+    ///
+    /// Returns whether the job went back to ready. Either way the claim is
+    /// gone afterwards.
+    async fn requeue_claimed<C>(
+        ctx: &Arc<AppContext>,
+        txn: &C,
+        job_id: i64,
+        execution_id: i64,
+    ) -> std::result::Result<bool, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table_config = &ctx.table_config;
+        if query_builder::claimed_executions::delete_by_id(txn, table_config, execution_id).await?
+            == 0
+        {
+            debug!(
+                "Claimed execution {} (job {}) already finalized, not requeuing",
+                execution_id, job_id
+            );
+            return Ok(false);
+        }
+        let Some(job) = query_builder::jobs::find_by_id(txn, table_config, job_id).await? else {
+            warn!(
+                "Job {} not found, dropping claimed execution {}",
+                job_id, execution_id
+            );
+            return Ok(false);
+        };
+        query_builder::ready_executions::insert(
+            txn,
+            table_config,
+            job.id,
+            &job.queue_name,
+            job.priority,
+        )
+        .await?;
+        // EXPERIMENTAL queue-level slot was acquired at claim time and must be
+        // released here — the next worker that re-claims this job will
+        // re-acquire.
+        Worker::release_queue_slot(ctx, txn, table_config, &job.queue_name).await?;
+        Ok(true)
     }
 
     /// Release a batch of claimed executions back to ready state (best-effort).
@@ -4497,64 +4458,46 @@ impl Worker {
             // No DB connection: nothing could be released, all rows fail.
             return claimed.to_vec();
         };
-        let table_config = ctx.table_config.clone();
         let mut failed: Vec<quebec_claimed_executions::Model> = Vec::new();
+        let mut requeued = 0usize;
         for row in claimed {
-            let table_config = table_config.clone();
             let ctx = ctx.clone();
             let job_id = row.job_id;
             let execution_id = row.id;
-            if let Err(e) = db
-                .transaction::<_, (), DbErr>(|txn| {
+            match db
+                .transaction::<_, bool, DbErr>(|txn| {
                     let ctx = ctx.clone();
                     Box::pin(async move {
-                        if let Some(job) =
-                            query_builder::jobs::find_by_id(txn, &table_config, job_id).await?
-                        {
-                            query_builder::ready_executions::insert(
-                                txn,
-                                &table_config,
-                                job.id,
-                                &job.queue_name,
-                                job.priority,
-                            )
-                            .await?;
-                            // EXPERIMENTAL queue-level slot release on
-                            // requeue (see `release_all_claimed_executions`).
-                            Worker::release_queue_slot(&ctx, txn, &table_config, &job.queue_name)
-                                .await?;
-                        }
-                        query_builder::claimed_executions::delete_by_id(
-                            txn,
-                            &table_config,
-                            execution_id,
-                        )
-                        .await?;
-                        Ok(())
+                        Worker::requeue_claimed(&ctx, txn, job_id, execution_id).await
                     })
                 })
                 .await
             {
-                warn!(
-                    "Failed to release claimed execution {} back to ready: {:?}",
-                    execution_id, e
-                );
-                failed.push(row.clone());
-            } else {
-                // Requeued: the claim is gone, drop it from the ledger so it
-                // stops counting against in-flight / blocking drain exit.
-                ctx.ledger_remove(execution_id);
-                // CAS-clear exclusive ownership: if this row was the exclusive
-                // sieve's kept row (e.g. find_by_ids failure released it
-                // pre-dispatch), release the seat. CAS so non-exclusive rows
-                // and rows from older exclusives are no-ops.
-                ctx.clear_exclusive_owner_if(execution_id);
+                Err(e) => {
+                    warn!(
+                        "Failed to release claimed execution {} back to ready: {:?}",
+                        execution_id, e
+                    );
+                    failed.push(row.clone());
+                    continue;
+                }
+                Ok(true) => requeued += 1,
+                Ok(false) => {}
             }
+            // Requeued or finalized elsewhere: the claim is gone, drop it from
+            // the ledger so it stops counting against in-flight / blocking
+            // drain exit.
+            ctx.ledger_remove(execution_id);
+            // CAS-clear exclusive ownership: if this row was the exclusive
+            // sieve's kept row (e.g. find_by_ids failure released it
+            // pre-dispatch), release the seat. CAS so non-exclusive rows and
+            // rows from older exclusives are no-ops.
+            ctx.clear_exclusive_owner_if(execution_id);
         }
         if !claimed.is_empty() {
             info!(
                 "Released {}/{} claimed execution(s) back to ready state",
-                claimed.len() - failed.len(),
+                requeued,
                 claimed.len()
             );
         }
@@ -4664,27 +4607,7 @@ impl Worker {
             ctx.ledger_remove(execution_id);
             return;
         };
-        let table_config = ctx.table_config.clone();
-        let ctx = ctx.clone();
-        match db
-            .transaction::<_, (bool, Option<i64>), DbErr>(|txn| {
-                let table_config = table_config.clone();
-                let ctx = ctx.clone();
-                let error_msg = error_msg.to_string();
-                Box::pin(async move {
-                    Self::fail_claimed_execution(
-                        &ctx,
-                        txn,
-                        &table_config,
-                        job_id,
-                        execution_id,
-                        &error_msg,
-                    )
-                    .await
-                })
-            })
-            .await
-        {
+        match Self::fail_claimed(ctx, db.as_ref(), job_id, execution_id, error_msg).await {
             Ok((_, released)) => {
                 crate::core::finish_released_batches(&ctx, db.as_ref(), released).await;
                 // Claim row failed + deleted: drop the ledger entry so it stops
@@ -4708,8 +4631,11 @@ impl Worker {
     /// Fail a single claimed execution, if it still exists. The delete is the
     /// ownership gate: a concurrent recovery that finds no row must not release
     /// its queue slot or semaphore a second time.
-    /// Returns the batch the job belonged to, for a completion check once the
-    /// caller's transaction has committed. Returns whether this call owned it.
+    ///
+    /// Returns whether this call owned it, the batch the job belonged to (for
+    /// a completion check once the caller's transaction has committed), and
+    /// the job, whose concurrency slot the owner gives back after commit (see
+    /// [`Self::fail_claimed`]).
     pub(crate) async fn fail_claimed_execution<C>(
         ctx: &Arc<AppContext>,
         db: &C,
@@ -4717,70 +4643,124 @@ impl Worker {
         job_id: i64,
         execution_id: i64,
         error_msg: &str,
-    ) -> std::result::Result<(bool, Option<i64>), DbErr>
+    ) -> std::result::Result<(bool, Option<i64>, Option<quebec_jobs::Model>), DbErr>
     where
         C: ConnectionTrait,
     {
         if query_builder::claimed_executions::delete_by_id(db, table_config, execution_id).await?
             == 0
         {
-            return Ok((false, None));
+            return Ok((false, None, None));
         }
         query_builder::failed_executions::insert(db, table_config, job_id, Some(error_msg)).await?;
         let released_batch = crate::batch::release_job(ctx, db, job_id).await?;
-        Self::unblock_next_job(ctx, db, table_config, job_id).await?;
-        Ok((true, released_batch))
+        let job = query_builder::jobs::find_by_id(db, table_config, job_id).await?;
+        // EXPERIMENTAL: the queue-level slot belongs to the claim, so it goes
+        // with it, even when the job has no class-level concurrency_key.
+        if let Some(job) = &job {
+            Self::release_queue_slot(ctx, db, table_config, &job.queue_name).await?;
+        }
+        Ok((true, released_batch, job))
     }
 
-    /// Look up a job's concurrency config, release its semaphore, and unblock the next waiting job.
-    /// Used during recovery (orphan/prune) to prevent blocked jobs from getting permanently stuck.
-    pub(crate) async fn unblock_next_job<C>(
+    /// Fail a claimed execution in its own transaction (see
+    /// [`Self::fail_claimed_execution`]) and, if this call owned it, give the
+    /// job's concurrency slot back afterwards, like Solid Queue's
+    /// `ClaimedExecution#failed_with` → `finalize`.
+    pub(crate) async fn fail_claimed(
         ctx: &Arc<AppContext>,
-        db: &C,
-        table_config: &TableConfig,
+        db: &DatabaseConnection,
         job_id: i64,
-    ) -> std::result::Result<(), DbErr>
+        execution_id: i64,
+        error_msg: &str,
+    ) -> std::result::Result<(bool, Option<i64>), DbErr> {
+        let (owned, released_batch, job) = {
+            let ctx = ctx.clone();
+            let error_msg = error_msg.to_string();
+            db.transaction::<_, _, DbErr>(|txn| {
+                Box::pin(async move {
+                    Self::fail_claimed_execution(
+                        &ctx,
+                        txn,
+                        &ctx.table_config,
+                        job_id,
+                        execution_id,
+                        &error_msg,
+                    )
+                    .await
+                })
+            })
+            .await
+            .map_err(crate::dispatcher::flatten_txn_err)?
+        };
+        if let Some(job) = job {
+            Self::unblock_after_commit(ctx, db, &job).await;
+        }
+        Ok((owned, released_batch))
+    }
+
+    /// Give `job`'s concurrency slot back and release the next blocked job, in
+    /// a transaction of its own, after the job's outcome has committed (Solid
+    /// Queue's `unblock_next_blocked_job`, run outside `finalize`). Only the
+    /// caller that finalized the claim calls this, so the slot is given back
+    /// once. A failure is logged: the job's outcome stands, and the slot comes
+    /// back when its semaphore expires.
+    pub(crate) async fn unblock_after_commit(
+        ctx: &Arc<AppContext>,
+        db: &DatabaseConnection,
+        job: &quebec_jobs::Model,
+    ) {
+        if job.concurrency_key.as_deref().is_none_or(str::is_empty) {
+            return;
+        }
+        let txn_ctx = ctx.clone();
+        let txn_job = job.clone();
+        let result = db
+            .transaction::<_, bool, DbErr>(|txn| {
+                Box::pin(
+                    async move { Self::release_concurrency_slot(&txn_ctx, txn, &txn_job).await },
+                )
+            })
+            .await;
+        if let Err(e) = result {
+            warn!(
+                job_id = job.id,
+                concurrency_key = job.concurrency_key.as_deref(),
+                "Failed to give back concurrency slot: {:?}; it frees up when its semaphore expires",
+                e
+            );
+        }
+    }
+
+    /// Give `job`'s concurrency slot back to the semaphore it came from and,
+    /// if a slot was given back, release the next blocked job for its key.
+    /// Runs in the caller's transaction; database errors propagate. Returns
+    /// whether a blocked job was released.
+    pub(crate) async fn release_concurrency_slot<C>(
+        ctx: &AppContext,
+        db: &C,
+        job: &quebec_jobs::Model,
+    ) -> std::result::Result<bool, DbErr>
     where
         C: ConnectionTrait,
     {
-        let Some(job) = query_builder::jobs::find_by_id(db, table_config, job_id).await? else {
-            return Ok(());
+        let Some(key) = job.concurrency_key.as_deref().filter(|k| !k.is_empty()) else {
+            return Ok(false);
         };
-
-        // EXPERIMENTAL: release queue-level slot first so it's freed even
-        // when the job has no class-level concurrency_key.
-        Self::release_queue_slot(ctx, db, table_config, &job.queue_name).await?;
-
-        let Some(key) = job.concurrency_key.as_ref().filter(|k| !k.is_empty()) else {
-            return Ok(());
-        };
-
-        // Read plain fields without the GIL: the queue slot released above
-        // keeps its semaphore row locked until this transaction commits.
+        // Read plain fields without the GIL: the release below holds the
+        // semaphore row lock until commit. A class that isn't registered here
+        // falls back to limit 1; a recorded limit takes precedence anyway.
         let (limit, duration) = ctx
-            .runnables
-            .read()
-            .ok()
-            .and_then(|runnables| {
-                runnables.get(&job.class_name).map(|r| {
-                    (
-                        r.concurrency_limit.unwrap_or(1),
-                        r.concurrency_duration
-                            .map(|s| chrono::Duration::seconds(s as i64)),
-                    )
-                })
-            })
-            .unwrap_or((1, None));
+            .class_concurrency(&job.class_name)
+            .map(|c| (c.limit, c.duration))
+            .unwrap_or_else(|| (1, ctx.concurrency_period(None)));
 
-        // Propagate database errors. Every caller runs this inside a
-        // transaction; after a failed statement (e.g. a MySQL deadlock, which
-        // rolls the transaction back) the caller must not report success, or
-        // emergency cleanup skips its delete-only fallback and the claim stays.
-        if release_semaphore(db, table_config, key.clone(), limit, duration).await? {
-            Worker::release_next_blocked_job(ctx, db, key, limit, false).await?;
+        if !crate::concurrency_lock::release(db, &ctx.table_config, job, key, limit, duration)
+            .await?
+        {
+            return Ok(false);
         }
-
-        Ok(())
+        crate::dispatcher::release_next_blocked(ctx, db, key, true).await
     }
 
     /// EXPERIMENTAL: attempt to acquire the `queue:<name>` semaphore at
@@ -4848,7 +4828,9 @@ impl Worker {
         let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
             return Ok(true);
         };
-        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        let duration = ctx.concurrency_period(None);
+        // Queue slots are taken and given back by key: they are not a job's
+        // concurrency slot and have no record on the job.
         crate::semaphore::acquire_semaphore(
             db,
             table_config,
@@ -4857,6 +4839,7 @@ impl Worker {
             duration,
         )
         .await
+        .map(|semaphore_id| semaphore_id.is_some())
     }
 
     /// EXPERIMENTAL: release the `queue:<name>` semaphore. No-op when the
@@ -4882,7 +4865,7 @@ impl Worker {
         let Some(&limit) = ctx.experimental_queue_concurrency.get(queue_name) else {
             return Ok(());
         };
-        let duration = chrono::Duration::from_std(ctx.default_concurrency_control_period).ok();
+        let duration = ctx.concurrency_period(None);
         // Propagate failures: callers already `.await?` this helper. In-tx callers
         // (claim/throttle/cleanup paths) rely on the propagation to abort the
         // enclosing tx; the out-of-tx emergency cleanup caller relies on it to
@@ -4901,110 +4884,6 @@ impl Worker {
         .await
         .inspect_err(|e| warn!("Failed to release queue:{} semaphore: {:?}", queue_name, e))?;
         Ok(())
-    }
-
-    /// Release the next blocked job for a given concurrency key.
-    /// Called after a job completes to immediately unblock waiting jobs.
-    /// This matches Solid Queue's `unblock_next_blocked_job` behavior.
-    async fn release_next_blocked_job<C>(
-        ctx: &Arc<AppContext>,
-        db: &C,
-        concurrency_key: &str,
-        concurrency_limit: i32,
-        reuse_released_slot: bool,
-    ) -> std::result::Result<bool, DbErr>
-    where
-        C: ConnectionTrait,
-    {
-        use crate::semaphore::{acquire_semaphore, reacquire_released_semaphore};
-
-        let table_config = &ctx.table_config;
-
-        // Find the next blocked execution for this concurrency key (with FOR UPDATE SKIP LOCKED)
-        let blocked = query_builder::blocked_executions::find_one_by_key_for_update(
-            db,
-            table_config,
-            concurrency_key,
-        )
-        .await?;
-
-        let Some(execution) = blocked else {
-            // No blocked jobs waiting for this key
-            return Ok(false);
-        };
-
-        // Get the job first to access class_name for runnable lookup
-        let Some(job) = query_builder::jobs::find_by_id(db, table_config, execution.job_id).await?
-        else {
-            warn!(
-                "Job {} not found for blocked execution {}",
-                execution.job_id, execution.id
-            );
-            return Ok(false);
-        };
-
-        // Get concurrency_duration from the runnable (like Solid Queue's job.concurrency_duration)
-        // Read without the GIL: the caller's release holds the semaphore row
-        // lock until commit, and waiting on busy Python threads here would
-        // stall every enqueue onto this key.
-        let concurrency_duration = ctx
-            .runnables
-            .read()
-            .ok()
-            .and_then(|runnables| {
-                runnables
-                    .get(&job.class_name)
-                    .and_then(|r| r.concurrency_duration)
-            })
-            .map(|s| chrono::Duration::seconds(s as i64));
-
-        // A successful release in the same MySQL transaction already locked
-        // an existing semaphore row. Re-acquire by UPDATE so this blocked-row
-        // lock cannot cycle with a producer's UPSERT insert-intention gap lock.
-        let acquired = if reuse_released_slot && db.get_database_backend() == DatabaseBackend::MySql
-        {
-            reacquire_released_semaphore(db, table_config, concurrency_key, concurrency_duration)
-                .await?
-        } else {
-            acquire_semaphore(
-                db,
-                table_config,
-                concurrency_key.to_string(),
-                concurrency_limit,
-                concurrency_duration,
-            )
-            .await?
-        };
-
-        if !acquired {
-            // Semaphore not available (shouldn't happen normally since we just released one)
-            trace!(
-                "Could not acquire semaphore for blocked job {} (key: {})",
-                execution.job_id,
-                concurrency_key
-            );
-            return Ok(false);
-        }
-
-        // Move to ready_executions
-        query_builder::ready_executions::insert(
-            db,
-            table_config,
-            job.id,
-            &job.queue_name,
-            job.priority,
-        )
-        .await?;
-
-        // Delete from blocked_executions
-        query_builder::blocked_executions::delete_by_id(db, table_config, execution.id).await?;
-
-        debug!(
-            "Released blocked job {} to ready state (key: {})",
-            job.id, concurrency_key
-        );
-
-        Ok(true)
     }
 
     /// Set up PostgreSQL LISTEN/NOTIFY for immediate job notifications
@@ -6122,7 +6001,7 @@ mod argument_conversion_tests {
 }
 
 #[cfg(test)]
-mod unblock_next_job_tests {
+mod release_concurrency_slot_tests {
     use super::*;
     use sea_orm::{ConnectOptions, DbBackend, MockDatabase, MockExecResult};
 
@@ -6159,10 +6038,9 @@ mod unblock_next_job_tests {
     async fn semaphore_release_error_propagates() {
         let ctx = context();
         let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([vec![keyed_job()]])
             .append_exec_errors([DbErr::Custom("deadlock".into())])
             .into_connection();
-        let result = Worker::unblock_next_job(&ctx, &db, &ctx.table_config, 1).await;
+        let result = Worker::release_concurrency_slot(&ctx, &db, &keyed_job()).await;
         assert!(matches!(result, Err(DbErr::Custom(message)) if message == "deadlock"));
     }
 
@@ -6170,14 +6048,13 @@ mod unblock_next_job_tests {
     async fn blocked_promotion_error_propagates() {
         let ctx = context();
         let db = MockDatabase::new(DbBackend::Postgres)
-            .append_query_results([vec![keyed_job()]])
             .append_exec_results([MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
             }])
             .append_query_errors([DbErr::Custom("deadlock".into())])
             .into_connection();
-        let result = Worker::unblock_next_job(&ctx, &db, &ctx.table_config, 1).await;
+        let result = Worker::release_concurrency_slot(&ctx, &db, &keyed_job()).await;
         assert!(matches!(result, Err(DbErr::Custom(message)) if message == "deadlock"));
     }
 }

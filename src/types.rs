@@ -3942,10 +3942,7 @@ impl PyQuebec {
                         )
                         .await?;
                         match failed {
-                            Some(model) => {
-                                model.retry(txn, &table_config, &ctx).await?;
-                                Ok(true)
-                            }
+                            Some(model) => model.retry(txn, &table_config, &ctx).await,
                             None => Ok(false),
                         }
                     })
@@ -3988,10 +3985,7 @@ impl PyQuebec {
                             )
                             .await?;
                             match failed {
-                                Some(model) => {
-                                    let released = model.discard(txn, &table_config).await?;
-                                    Ok((true, released))
-                                }
+                                Some(model) => model.discard(txn, &table_config).await,
                                 None => Ok((false, None)),
                             }
                         })

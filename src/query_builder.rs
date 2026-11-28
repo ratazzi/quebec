@@ -7,7 +7,9 @@ use sea_orm::sea_query::{
     Alias, Asterisk, Cond, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
     PostgresQueryBuilder, Query, Returning, SelectStatement, SqliteQueryBuilder, UpdateStatement,
 };
-use sea_orm::{ConnectionTrait, DbBackend, DbErr, ExprTrait, FromQueryResult, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DbBackend, DbErr, ExprTrait, FromQueryResult, SqlErr, Statement, Value,
+};
 
 use crate::context::TableConfig;
 use crate::dialect::Dialect;
@@ -1455,22 +1457,24 @@ pub mod ready_executions {
         // Escape LIKE metacharacters so the pattern is a literal prefix match:
         // `_` matches any single character in SQL LIKE, so `order_*` would
         // otherwise also match `orders`. Solid Queue semantics are a plain
-        // string prefix (`starts_with?`).
+        // string prefix (`starts_with?`). `!` is the escape character, as in
+        // Solid Queue: MySQL reads the backslash literal `'\\'` as one
+        // character only without NO_BACKSLASH_ESCAPES, and as two with it.
         let escaped_prefix = pattern
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+            .replace('!', "!!")
+            .replace('%', "!%")
+            .replace('_', "!_");
         let like_pattern = format!("{escaped_prefix}%");
 
         let sql = match Dialect::from(db.get_database_backend()) {
             Dialect::Postgres => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ESCAPE '\' ORDER BY "queue_name" ASC"#
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE $1 ESCAPE '!' ORDER BY "queue_name" ASC"#
             ),
             Dialect::MySql => format!(
-                r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ESCAPE '\\' ORDER BY `queue_name` ASC"#
+                r#"SELECT DISTINCT `queue_name` FROM `{table_name}` WHERE `queue_name` LIKE ? ESCAPE '!' ORDER BY `queue_name` ASC"#
             ),
             Dialect::Sqlite => format!(
-                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ESCAPE '\' ORDER BY "queue_name" ASC"#
+                r#"SELECT DISTINCT "queue_name" FROM "{table_name}" WHERE "queue_name" LIKE ? ESCAPE '!' ORDER BY "queue_name" ASC"#
             ),
         };
 
@@ -2300,22 +2304,30 @@ pub mod blocked_executions {
         execute_delete(db, query).await
     }
 
-    /// Find one blocked execution by concurrency_key with FOR UPDATE SKIP LOCKED
+    /// Lock the next blocked execution for `concurrency_key`, in blocked
+    /// order, with FOR UPDATE SKIP LOCKED, or plain FOR UPDATE when
+    /// `use_skip_locked` is off (Solid Queue's `non_blocking_lock`).
     pub async fn find_one_by_key_for_update<C>(
         db: &C,
         table_config: &TableConfig,
         concurrency_key: &str,
+        use_skip_locked: bool,
     ) -> Result<Option<quebec_blocked_executions::Model>, DbErr>
     where
         C: ConnectionTrait,
     {
         let table_name = &table_config.blocked_executions;
+        let lock = if use_skip_locked {
+            "FOR UPDATE SKIP LOCKED"
+        } else {
+            "FOR UPDATE"
+        };
         let sql = match Dialect::from(db.get_database_backend()) {
             Dialect::Postgres => format!(
-                r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
+                r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 {lock}"#
             ),
             Dialect::MySql => format!(
-                r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 FOR UPDATE SKIP LOCKED"#
+                r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 {lock}"#
             ),
             Dialect::Sqlite => format!(
                 // SQLite doesn't support SKIP LOCKED
@@ -2667,6 +2679,20 @@ pub mod failed_executions {
         let query = Query::delete()
             .from_table(table)
             .and_where(Expr::col(col("job_id")).eq(job_id))
+            .to_owned();
+
+        execute_delete(db, query).await
+    }
+
+    /// Delete a failed execution by its own id
+    pub async fn delete_by_id<C>(db: &C, table_config: &TableConfig, id: i64) -> Result<u64, DbErr>
+    where
+        C: ConnectionTrait,
+    {
+        let table = Alias::new(&table_config.failed_executions);
+        let query = Query::delete()
+            .from_table(table)
+            .and_where(Expr::col(col("id")).eq(id))
             .to_owned();
 
         execute_delete(db, query).await
@@ -3416,9 +3442,15 @@ pub mod recurring_executions {
         execute_insert(db, query).await
     }
 
-    /// Try to insert a recurring execution record, returns true if inserted, false if already exists.
-    /// Uses INSERT ... ON CONFLICT DO NOTHING (PostgreSQL/SQLite) or INSERT IGNORE (MySQL)
-    /// to handle concurrent scheduler instances gracefully.
+    /// Try to insert a recurring execution record, returns true if inserted,
+    /// false if one already exists for `(task_key, run_at)`.
+    ///
+    /// Only that unique-key conflict counts as "already recorded", like Solid
+    /// Queue's `create_or_insert!`: PostgreSQL/SQLite name the conflict target,
+    /// and MySQL runs a plain INSERT whose duplicate-key error is caught.
+    /// `INSERT IGNORE` would also turn foreign-key and data errors into
+    /// "already recorded". A failed statement doesn't abort a MySQL
+    /// transaction, so the caller's transaction carries on.
     pub async fn try_insert<C>(
         db: &C,
         table_config: &TableConfig,
@@ -3433,27 +3465,21 @@ pub mod recurring_executions {
         let table = &table_config.recurring_executions;
         let now = chrono::Utc::now().naive_utc();
 
-        // Build database-specific INSERT with conflict handling
         let sql = match Dialect::from(backend) {
-            Dialect::Postgres => {
-                format!(
-                    r#"INSERT INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT ("task_key", "run_at") DO NOTHING"#
-                )
-            }
-            Dialect::Sqlite => {
-                format!(
-                    r#"INSERT OR IGNORE INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
-                       VALUES (?, ?, ?, ?)"#
-                )
-            }
-            Dialect::MySql => {
-                format!(
-                    r#"INSERT IGNORE INTO `{table}` (`job_id`, `task_key`, `run_at`, `created_at`)
-                       VALUES (?, ?, ?, ?)"#
-                )
-            }
+            Dialect::Postgres => format!(
+                r#"INSERT INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT ("task_key", "run_at") DO NOTHING"#
+            ),
+            Dialect::Sqlite => format!(
+                r#"INSERT INTO "{table}" ("job_id", "task_key", "run_at", "created_at")
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT ("task_key", "run_at") DO NOTHING"#
+            ),
+            Dialect::MySql => format!(
+                r#"INSERT INTO `{table}` (`job_id`, `task_key`, `run_at`, `created_at`)
+                   VALUES (?, ?, ?, ?)"#
+            ),
         };
 
         let values = vec![
@@ -3463,12 +3489,17 @@ pub mod recurring_executions {
             Value::from(now),
         ];
 
-        let result = db
+        match db
             .execute_raw(Statement::from_sql_and_values(backend, sql, values))
-            .await?;
-
-        // rows_affected > 0 means insert succeeded, 0 means conflict (already exists)
-        Ok(result.rows_affected() > 0)
+            .await
+        {
+            // rows_affected > 0 means inserted, 0 means the row already exists
+            Ok(result) => Ok(result.rows_affected() > 0),
+            Err(e) if matches!(e.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Delete a recurring execution by job_id

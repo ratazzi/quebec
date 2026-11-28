@@ -441,6 +441,22 @@ pub fn increment_executions(arguments: Option<&str>, exception_key: Option<&str>
     serde_json::to_string(&obj).unwrap_or_else(|_| "{}".to_string())
 }
 
+/// Return `arguments` with `executions` set to 0 and `exception_executions`
+/// emptied, for a failed job retried by hand (Solid Queue's
+/// `reset_execution_counters`), so its `retry_on` attempts start over.
+/// Plain-array and unparseable payloads are returned as is: they carry no
+/// counters.
+pub fn reset_executions(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(mut map)) => {
+            map.insert("executions".into(), Value::from(0));
+            map.insert("exception_executions".into(), serde_json::json!({}));
+            Value::Object(map).to_string()
+        }
+        _ => arguments.to_string(),
+    }
+}
+
 /// Parse environment-specific configuration from a HashMap with fallback behavior
 ///
 /// This is a generic helper for parsing environment-based YAML configs like:
