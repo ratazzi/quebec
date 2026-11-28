@@ -647,6 +647,9 @@ pub struct AppContext {
     /// discard) and still need a completion check once that transaction has
     /// committed. Drained by the worker right after claiming.
     pub deferred_batch_finishes: Arc<std::sync::Mutex<Vec<i64>>>,
+    /// Concurrency keys a claim transaction gave a slot back to; the worker
+    /// releases their next blocked job once that transaction has ended.
+    pub deferred_unblocks: Arc<std::sync::Mutex<Vec<String>>>,
     /// EXPERIMENTAL: per-class sliding-window rate limits. Empty means
     /// no class declared `rate_limit_max`; the worker claim path uses
     /// `.is_empty()` to skip the rate check path with zero overhead.
@@ -1365,6 +1368,7 @@ impl AppContext {
             batches_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             batches_probed_at: Arc::new(AtomicU64::new(0)),
             deferred_batch_finishes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            deferred_unblocks: Arc::new(std::sync::Mutex::new(Vec::new())),
             rate_limited_classes: Arc::new(RwLock::new(HashMap::new())),
             runtime_handle: None,
             table_config: TableConfig::default(),
@@ -1574,6 +1578,7 @@ impl AppContext {
             batches_state: self.batches_state.clone(),
             batches_probed_at: self.batches_probed_at.clone(),
             deferred_batch_finishes: self.deferred_batch_finishes.clone(),
+            deferred_unblocks: Arc::new(std::sync::Mutex::new(Vec::new())),
             rate_limited_classes: self.rate_limited_classes.clone(),
             runtime_handle: Some(runtime_handle),
             table_config: self.table_config.clone(),
@@ -1698,6 +1703,19 @@ impl AppContext {
 
     pub fn take_deferred_batch_finishes(&self) -> Vec<i64> {
         self.deferred_batch_finishes
+            .lock()
+            .map(|mut pending| std::mem::take(&mut *pending))
+            .unwrap_or_default()
+    }
+
+    pub fn defer_unblock(&self, concurrency_key: &str) {
+        if let Ok(mut pending) = self.deferred_unblocks.lock() {
+            pending.push(concurrency_key.to_string());
+        }
+    }
+
+    pub fn take_deferred_unblocks(&self) -> Vec<String> {
+        self.deferred_unblocks
             .lock()
             .map(|mut pending| std::mem::take(&mut *pending))
             .unwrap_or_default()
