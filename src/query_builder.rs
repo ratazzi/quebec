@@ -4,8 +4,9 @@
 //! allowing table names to be dynamically set at runtime via TableConfig.
 
 use sea_orm::sea_query::{
-    Alias, Asterisk, Cond, DeleteStatement, Expr, InsertStatement, MysqlQueryBuilder, Order,
-    PostgresQueryBuilder, Query, Returning, SelectStatement, SqliteQueryBuilder, UpdateStatement,
+    Alias, Asterisk, Cond, DeleteStatement, Expr, InsertStatement, LockBehavior, LockType,
+    MysqlQueryBuilder, Order, PostgresQueryBuilder, Query, Returning, SelectStatement,
+    SqliteQueryBuilder, UpdateStatement,
 };
 use sea_orm::{
     ConnectionTrait, DbBackend, DbErr, ExprTrait, FromQueryResult, SqlErr, Statement, Value,
@@ -119,6 +120,30 @@ pub fn build_delete_sql(backend: DbBackend, query: &DeleteStatement) -> (String,
         Dialect::MySql => query.build(MysqlQueryBuilder),
     };
     (sql, values.into_iter().collect())
+}
+
+/// Row lock for rows a process is about to take over, like Solid Queue's
+/// `non_blocking_lock`: `FOR UPDATE SKIP LOCKED`, or plain `FOR UPDATE` when
+/// `use_skip_locked` is off (for databases without SKIP LOCKED, e.g. MySQL
+/// 5.7). Turning SKIP LOCKED off must never drop the lock itself, or
+/// concurrent dispatchers and workers would take the same rows. SQLite has no
+/// row locks (writes are serialised), so it gets no clause.
+fn lock_clause(backend: DbBackend, use_skip_locked: bool) -> &'static str {
+    match (backend, use_skip_locked) {
+        (DbBackend::Sqlite, _) => "",
+        (_, true) => "FOR UPDATE SKIP LOCKED",
+        (_, false) => "FOR UPDATE",
+    }
+}
+
+/// [`lock_clause`] for a sea-query SELECT. The SQLite builder leaves the lock
+/// out by itself.
+fn non_blocking_lock(query: &mut SelectStatement, use_skip_locked: bool) {
+    if use_skip_locked {
+        query.lock_with_behavior(LockType::Update, LockBehavior::SkipLocked);
+    } else {
+        query.lock(LockType::Update);
+    }
 }
 
 /// Execute a SELECT query and return multiple results
@@ -1267,11 +1292,7 @@ pub mod ready_executions {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let lock_clause = if use_skip_locked && backend != DbBackend::Sqlite {
-            "FOR UPDATE SKIP LOCKED"
-        } else {
-            ""
-        };
+        let lock_clause = lock_clause(backend, use_skip_locked);
 
         let sql = format!(
             r#"SELECT * FROM {tq}{table_name}{tq} {where_clause} ORDER BY {q}priority{q} ASC, {q}job_id{q} ASC LIMIT 1 {lock_clause}"#
@@ -1332,11 +1353,7 @@ pub mod ready_executions {
             format!("WHERE {}", conditions.join(" AND "))
         };
 
-        let lock_clause = if use_skip_locked && backend != DbBackend::Sqlite {
-            "FOR UPDATE SKIP LOCKED"
-        } else {
-            ""
-        };
+        let lock_clause = lock_clause(backend, use_skip_locked);
 
         // Add limit parameter
         params.push((limit as i64).into());
@@ -1424,11 +1441,7 @@ pub mod ready_executions {
             })
             .collect();
 
-        let lock_clause = if use_skip_locked && backend != DbBackend::Sqlite {
-            "FOR UPDATE SKIP LOCKED"
-        } else {
-            ""
-        };
+        let lock_clause = lock_clause(backend, use_skip_locked);
 
         params.push((limit as i64).into());
         let limit_placeholder = placeholder(params.len());
@@ -2317,20 +2330,29 @@ pub mod blocked_executions {
         C: ConnectionTrait,
     {
         let table_name = &table_config.blocked_executions;
-        let lock = if use_skip_locked {
-            "FOR UPDATE SKIP LOCKED"
-        } else {
-            "FOR UPDATE"
-        };
+        let lock = lock_clause(db.get_database_backend(), use_skip_locked);
         let sql = match Dialect::from(db.get_database_backend()) {
             Dialect::Postgres => format!(
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = $1 ORDER BY "priority" ASC, "job_id" ASC LIMIT 1 {lock}"#
             ),
-            Dialect::MySql => format!(
-                r#"SELECT * FROM `{table_name}` WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 {lock}"#
-            ),
+            Dialect::MySql => {
+                // Pin the release index, like Solid Queue's
+                // `use_index(:index_solid_queue_blocked_executions_for_release)`.
+                // Without it MySQL may pick another plan, under which
+                // concurrent SKIP LOCKED releases of one key found no row
+                // although unlocked blocked rows remained.
+                let index = quote_identifier(
+                    DbBackend::MySql,
+                    &index_name(
+                        DbBackend::MySql,
+                        &format!("idx_{table_name}_key_priority_job"),
+                    ),
+                );
+                format!(
+                    r#"SELECT /*+ INDEX(b {index}) */ * FROM `{table_name}` AS b WHERE `concurrency_key` = ? ORDER BY `priority` ASC, `job_id` ASC LIMIT 1 {lock}"#
+                )
+            }
             Dialect::Sqlite => format!(
-                // SQLite doesn't support SKIP LOCKED
                 r#"SELECT * FROM "{table_name}" WHERE "concurrency_key" = ? ORDER BY "priority" ASC, "job_id" ASC LIMIT 1"#
             ),
         };
@@ -2927,7 +2949,7 @@ pub mod scheduled_executions {
         Ok(())
     }
 
-    /// Find due scheduled executions (with FOR UPDATE SKIP LOCKED support)
+    /// Find and lock due scheduled executions (see [`super::non_blocking_lock`])
     pub async fn find_due<C>(
         db: &C,
         table_config: &TableConfig,
@@ -2937,46 +2959,19 @@ pub mod scheduled_executions {
     where
         C: ConnectionTrait,
     {
-        let table_name = &table_config.scheduled_executions;
         let now = chrono::Utc::now().naive_utc();
+        let mut query = Query::select()
+            .column(Asterisk)
+            .from(Alias::new(&table_config.scheduled_executions))
+            .and_where(Expr::col(col("scheduled_at")).lte(now))
+            .order_by(col("scheduled_at"), Order::Asc)
+            .order_by(col("priority"), Order::Asc)
+            .order_by(col("job_id"), Order::Asc)
+            .limit(limit)
+            .to_owned();
+        non_blocking_lock(&mut query, use_skip_locked);
 
-        if use_skip_locked {
-            // Use raw SQL for FOR UPDATE SKIP LOCKED since sea-query SelectStatement
-            // doesn't directly support lock behavior
-            let sql = match Dialect::from(db.get_database_backend()) {
-                Dialect::Postgres => format!(
-                    r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= $1 ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT $2 FOR UPDATE SKIP LOCKED"#
-                ),
-                Dialect::MySql => format!(
-                    r#"SELECT * FROM `{table_name}` WHERE `scheduled_at` <= ? ORDER BY `scheduled_at` ASC, `priority` ASC, `job_id` ASC LIMIT ? FOR UPDATE SKIP LOCKED"#
-                ),
-                Dialect::Sqlite => format!(
-                    // SQLite doesn't support SKIP LOCKED, fallback to regular query
-                    r#"SELECT * FROM "{table_name}" WHERE "scheduled_at" <= ? ORDER BY "scheduled_at" ASC, "priority" ASC, "job_id" ASC LIMIT ?"#
-                ),
-            };
-            let stmt = Statement::from_sql_and_values(
-                db.get_database_backend(),
-                sql,
-                [now.into(), (limit as i64).into()],
-            );
-            quebec_scheduled_executions::Model::find_by_statement(stmt)
-                .all(db)
-                .await
-        } else {
-            let table = Alias::new(table_name);
-            let query = Query::select()
-                .column(Asterisk)
-                .from(table)
-                .and_where(Expr::col(col("scheduled_at")).lte(now))
-                .order_by(col("scheduled_at"), Order::Asc)
-                .order_by(col("priority"), Order::Asc)
-                .order_by(col("job_id"), Order::Asc)
-                .limit(limit)
-                .to_owned();
-
-            execute_select(db, query).await
-        }
+        execute_select(db, query).await
     }
 
     /// Delete a scheduled execution by job_id
@@ -3332,11 +3327,11 @@ pub mod processes {
     }
 
     /// Find prunable (stale) processes with heartbeat before threshold.
-    /// These are processes that have stopped sending heartbeats. When
-    /// `use_skip_locked` is set the SELECT uses `FOR UPDATE SKIP LOCKED`.
-    /// Callers currently do not hold a transaction across selection and
-    /// pruning, so this only avoids rows locked during the SELECT itself;
-    /// concurrent supervisors can still select the same stale process.
+    /// These are processes that have stopped sending heartbeats. The SELECT
+    /// locks them (see [`super::non_blocking_lock`]), but callers currently
+    /// do not hold a transaction across selection and pruning, so this only
+    /// covers the SELECT itself; concurrent supervisors can still select the
+    /// same stale process.
     pub async fn find_prunable<C>(
         db: &C,
         table_config: &TableConfig,
@@ -3347,49 +3342,15 @@ pub mod processes {
     where
         C: ConnectionTrait,
     {
-        let backend = db.get_database_backend();
-        let table_name = &table_config.processes;
-
-        if use_skip_locked && backend != DbBackend::Sqlite {
-            let (where_extra, params): (&str, Vec<sea_orm::Value>) = match exclude_id {
-                Some(id) => match backend {
-                    DbBackend::Postgres => (
-                        " AND \"id\" <> $2",
-                        vec![heartbeat_threshold.into(), id.into()],
-                    ),
-                    _ => (
-                        " AND `id` <> ?",
-                        vec![heartbeat_threshold.into(), id.into()],
-                    ),
-                },
-                None => ("", vec![heartbeat_threshold.into()]),
-            };
-
-            let sql = match Dialect::from(backend) {
-                Dialect::Postgres => format!(
-                    r#"SELECT * FROM "{table_name}" WHERE "last_heartbeat_at" < $1{where_extra} FOR UPDATE SKIP LOCKED"#
-                ),
-                Dialect::MySql => format!(
-                    r#"SELECT * FROM `{table_name}` WHERE `last_heartbeat_at` < ?{where_extra} FOR UPDATE SKIP LOCKED"#
-                ),
-                Dialect::Sqlite => unreachable!(),
-            };
-            let stmt = Statement::from_sql_and_values(backend, sql, params);
-            return quebec_processes::Model::find_by_statement(stmt)
-                .all(db)
-                .await;
-        }
-
-        let table = Alias::new(table_name);
         let mut query = Query::select()
             .column(Asterisk)
-            .from(table)
+            .from(Alias::new(&table_config.processes))
             .and_where(Expr::col(col("last_heartbeat_at")).lt(heartbeat_threshold))
             .to_owned();
-
         if let Some(id) = exclude_id {
-            query = query.and_where(Expr::col(col("id")).ne(id)).to_owned();
+            query.and_where(Expr::col(col("id")).ne(id));
         }
+        non_blocking_lock(&mut query, use_skip_locked);
 
         execute_select(db, query).await
     }
@@ -4590,5 +4551,82 @@ pub mod batch_executions {
             .group_by_col(col("batch_id"))
             .to_owned();
         super::batches::grouped_counts(db, query).await
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    use sea_orm::{DatabaseConnection, MockDatabase};
+    use std::collections::BTreeMap;
+
+    /// The SQL each locking SELECT sends, run against an empty mock database.
+    async fn locking_selects(backend: DbBackend, use_skip_locked: bool) -> Vec<String> {
+        let db: DatabaseConnection = MockDatabase::new(backend)
+            .append_query_results((0..6).map(|_| Vec::<BTreeMap<String, Value>>::new()))
+            .into_connection();
+        let t = TableConfig::with_prefix("lk");
+        let now = chrono::Utc::now().naive_utc();
+        let skip = use_skip_locked;
+
+        ready_executions::find_one_for_update(&db, &t, None, skip)
+            .await
+            .unwrap();
+        ready_executions::find_many_for_update(&db, &t, None, skip, 4)
+            .await
+            .unwrap();
+        ready_executions::find_many_in_queues_for_update(&db, &t, &["a", "b"], skip, 4)
+            .await
+            .unwrap();
+        blocked_executions::find_one_by_key_for_update(&db, &t, "key", skip)
+            .await
+            .unwrap();
+        scheduled_executions::find_due(&db, &t, 4, skip)
+            .await
+            .unwrap();
+        processes::find_prunable(&db, &t, now, Some(1), skip)
+            .await
+            .unwrap();
+
+        let sqls: Vec<String> = db
+            .into_transaction_log()
+            .iter()
+            .map(|txn| txn.statements()[0].sql.clone())
+            .collect();
+        assert_eq!(sqls.len(), 6, "{sqls:?}");
+        sqls
+    }
+
+    #[tokio::test]
+    async fn skip_locked_off_still_locks_rows() {
+        for backend in [DbBackend::Postgres, DbBackend::MySql] {
+            for sql in locking_selects(backend, true).await {
+                assert!(
+                    sql.ends_with("FOR UPDATE SKIP LOCKED"),
+                    "{backend:?}: {sql}"
+                );
+            }
+            for sql in locking_selects(backend, false).await {
+                assert!(sql.ends_with("FOR UPDATE"), "{backend:?}: {sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mysql_blocked_release_pins_the_release_index() {
+        let sql = &locking_selects(DbBackend::MySql, true).await[3];
+        assert!(
+            sql.contains("/*+ INDEX(b `idx_lk_blocked_executions_key_priority_job`) */"),
+            "{sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_gets_no_lock_clause() {
+        for skip in [true, false] {
+            for sql in locking_selects(DbBackend::Sqlite, skip).await {
+                assert!(!sql.contains("FOR UPDATE"), "{sql}");
+            }
+        }
     }
 }
